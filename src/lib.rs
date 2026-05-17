@@ -75,24 +75,41 @@ fn validate_header(cards: &[String], is_primary: bool) -> PyResult<()> {
 }
 
 // ====================== Calculate exact padded data section size ======================
+// Implements the general FITS formula:
+//
+//     N_bytes = |BITPIX|/8 * GCOUNT * (PCOUNT + Π NAXISn)
+//
+// For images: GCOUNT defaults to 1, PCOUNT defaults to 0, reducing to
+// bytes_per_pixel * Π NAXISn.  For binary tables, PCOUNT carries the size of
+// the variable-length-array heap, which must be included so that the next
+// HDU is located correctly.  An HDU with NAXIS=0 has no data unit regardless
+// of PCOUNT/GCOUNT.
 fn calculate_data_size(header_cards: &[String]) -> u64 {
     let bitpix = parse_keyword(header_cards, "BITPIX").unwrap_or(0);
     let naxis = parse_keyword(header_cards, "NAXIS").unwrap_or(0) as usize;
 
-    let raw_size = if bitpix != 0 && naxis > 0 {
-        let bytes_per_pixel = (bitpix.abs() / 8) as u64;
-        let mut size: u64 = bytes_per_pixel;
-        for i in 1..=naxis {
-            if let Some(dim) = parse_keyword(header_cards, &format!("NAXIS{}", i)) {
-                size = size.saturating_mul(dim as u64);
-            }
+    if bitpix == 0 || naxis == 0 {
+        return 0;
+    }
+
+    let bytes_per_pixel = (bitpix.abs() / 8) as u64;
+
+    let pcount_raw = parse_keyword(header_cards, "PCOUNT").unwrap_or(0);
+    let pcount: u64 = if pcount_raw > 0 { pcount_raw as u64 } else { 0 };
+
+    let gcount_raw = parse_keyword(header_cards, "GCOUNT").unwrap_or(1);
+    let gcount: u64 = if gcount_raw > 0 { gcount_raw as u64 } else { 1 };
+
+    let mut product: u64 = 1;
+    for i in 1..=naxis {
+        if let Some(dim) = parse_keyword(header_cards, &format!("NAXIS{}", i)) {
+            product = product.saturating_mul(dim as u64);
         }
-        size
-    } else {
-        let naxis1 = parse_keyword(header_cards, "NAXIS1").unwrap_or(0) as u64;
-        let naxis2 = parse_keyword(header_cards, "NAXIS2").unwrap_or(0) as u64;
-        naxis1 * naxis2
-    };
+    }
+
+    let raw_size = bytes_per_pixel
+        .saturating_mul(gcount)
+        .saturating_mul(product.saturating_add(pcount));
 
     if raw_size == 0 {
         0
