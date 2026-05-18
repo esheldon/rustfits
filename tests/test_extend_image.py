@@ -27,7 +27,7 @@ def _make_file_with_image(tmpdir, dtype, dims, name="t.fits", extname="img"):
     return fname
 
 
-# -------------------- default start (append at slow-axis end) --------------------
+# ---------------- default start (append at slow-axis end) ----------------
 
 
 def test_extend_default_start_grows_slow_axis():

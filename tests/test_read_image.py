@@ -30,7 +30,8 @@ def test_roundtrip_write_then_read(dtype):
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         original = np.arange(5 * 7, dtype=dtype).reshape(5, 7)
-        # Shift values so we exercise non-zero data for both signed and unsigned.
+        # Shift values so we exercise non-zero data for both signed and
+        # unsigned.
         if np.issubdtype(original.dtype, np.signedinteger):
             original = original - 3
         elif np.issubdtype(original.dtype, np.floating):
@@ -106,7 +107,8 @@ def test_read_result_is_native_endian():
             got = fits.hdus[0].read()
 
         # numpy dtype.str uses '<' / '>' / '|' explicitly; native should
-        # resolve to one of '<' or '>' depending on host, matching sys.byteorder.
+        # resolve to one of '<' or '>' depending on host, matching
+        # sys.byteorder.
         host = sys.byteorder  # 'little' or 'big'
         if host == "little":
             assert got.dtype.str.startswith("<")

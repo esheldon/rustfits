@@ -25,7 +25,10 @@ def _card(text):
 
 
 def _write_header_only(fname, cards):
-    """Write a single primary HDU with the given cards, padded to a 2880-byte block."""
+    """
+    Write a single primary HDU with the given cards, padded to a 2880-byte
+    block.
+    """
     block = "".join(cards).encode("ascii")
     block += b" " * ((-len(block)) % 2880)
     with open(fname, "wb") as f:
@@ -43,7 +46,7 @@ def _write_two_hdus(fname, cards1, cards2):
             f.write(b)
 
 
-# --------------------------- parse_keyword disambiguation ----------------------------
+# ----------------------- parse_keyword disambiguation -----------------------
 
 
 def test_naxis_keyword_not_matched_by_naxis1():
@@ -97,7 +100,7 @@ def test_end_card_does_not_match_endian():
         assert hd["OTHER"]["value"] == 42
 
 
-# --------------------------- printable-ASCII validation ----------------------------
+# ----------------------- printable-ASCII validation ------------------------
 
 
 def test_non_printable_byte_rejected():
@@ -119,7 +122,7 @@ def test_non_printable_byte_rejected():
             rustfits.FITS(fname, "r")
 
 
-# --------------------------- mandatory-keyword validation ----------------------------
+# ----------------------- mandatory-keyword validation ------------------------
 
 
 def test_missing_simple_rejected():

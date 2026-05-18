@@ -11,7 +11,8 @@ def _card(text):
 
 
 def _write_fits_with_extended_header(fname):
-    """Hand-craft a minimal FITS file exercising COMMENT, HISTORY, and CONTINUE.
+    """
+    Hand-craft a minimal FITS file exercising COMMENT, HISTORY, and CONTINUE.
 
     The primary HDU has no data (NAXIS=0), so the file is just a header block
     padded with spaces to 2880 bytes.
@@ -26,7 +27,7 @@ def _write_fits_with_extended_header(fname):
         _card("CONTINUE  'and the second part&' / middle"),
         _card("CONTINUE  'and the end.' / end of comment"),
         _card(
-            "COMMENT FITS (Flexible Image Transport System) format is defined in"
+            "COMMENT FITS (Flexible Image Transport System) format is defined in"  # noqa
         ),
         _card("COMMENT 'Astronomy and Astrophysics', volume 376, page 359."),
         _card("HISTORY Created 2026-05-16 for testing"),
@@ -88,7 +89,9 @@ def test_history_cards_accumulated():
 
 
 def test_continue_does_not_leak_keys():
-    """The CONTINUE cards themselves must not appear as separate header keys."""
+    """
+    The CONTINUE cards themselves must not appear as separate header keys.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "ext.fits")
         _write_fits_with_extended_header(fname)
