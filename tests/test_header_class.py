@@ -103,11 +103,14 @@ def test_len_counts_unique_keys(header):
     assert len(header) == len(_EXPECTED_KEYS)
 
 
-# --------------------------- __getitem__ (the main read API) ----------------------------
+# -------------- __getitem__ (the main read API) ---------
 
 
 def test_getitem_returns_value_directly_not_dict(header):
-    """header[key] returns the value itself, not the legacy {value, comment} shape."""
+    """
+    header[key] returns the value itself, not the legacy {value, comment}
+    shape.
+    """
     v = header["BITPIX"]
     assert v == 8
     assert not isinstance(v, dict)
@@ -122,14 +125,19 @@ def test_getitem_by_type(header):
 
 
 def test_getitem_hierarch_long_key(header):
-    """HIERARCH long keys are subscripted by the full keyword name (with spaces)."""
+    """
+    HIERARCH long keys are subscripted by the full keyword name (with spaces).
+    """
     assert header["ESO INS TEMP"] == 12.5
     with pytest.raises(KeyError):
         _ = header["HIERARCH"]  # the bare keyword is not a key
 
 
 def test_getitem_string_with_continue(header):
-    """A string value broken across CONTINUE cards reads as one concatenated string."""
+    """
+    A string value broken across CONTINUE cards reads as one concatenated
+    string.
+    """
     assert header["LONGSTR"] == "first partsecond part"
 
 
@@ -242,7 +250,7 @@ def test_cards_preserves_continue_card(header):
     assert any(c.startswith("CONTINUE") for c in header.cards)
 
 
-# --------------------------- to_dict() (legacy snapshot) ----------------------------
+# ----------------------- to_dict() (legacy snapshot) ------------------------
 
 
 def test_to_dict_has_value_comment_shape(header):
@@ -271,7 +279,7 @@ def test_to_dict_continue_concatenation(header):
     assert d["LONGSTR"]["comment"] == "start of comment end of comment"
 
 
-# --------------------------- comment_of() vs to_dict() agreement ----------------------------
+# ----------- comment_of() vs to_dict() agreement -------
 
 
 def test_comment_of_matches_to_dict(header):
