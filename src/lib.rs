@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyComplex, PyDict, PyList};
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::types::{PyComplex, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
+use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::Bound;
 use std::fs::OpenOptions;
@@ -589,6 +589,22 @@ impl ImageHDU {
             Some(start_for_write),
         )
     }
+
+    // Numpy-style indexing over the HDU data.  Accepts int, slice (with
+    // positive step), Ellipsis, or a tuple of those.  Integer-indexed axes
+    // are removed from the output shape; slice-indexed axes are preserved
+    // with their selected length.  Reads only the requested bytes from disk
+    // (one I/O per outer-position; fully-covered fast axes coalesce).
+    fn __getitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let super_: PyRef<HDU> = slf.into_super();
+        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&super_.header)?;
+        let slices = normalize_slice_key(key, &hdu_shape)?;
+        read_image_slice(py, &super_.header, super_.data_offset, &super_.file, &slices)
+    }
 }
 
 // Allocate a numpy array sized + typed to this HDU and fill it with the
@@ -641,6 +657,247 @@ fn read_image_data(
             byteswap_in_place(buffer.as_mut_slice(), bpp as usize);
         }
     }
+
+    Ok(arr.unbind())
+}
+
+// ====================== Slicing for image reads ======================
+
+// One axis of a normalized index.  `start`/`step`/`count` describe the source
+// range in HDU coordinates (numpy order — same convention as `hdu_shape`).
+// `is_int` distinguishes integer indexing (which consumes the axis from the
+// output shape) from slice indexing (which preserves it).
+#[derive(Debug, Clone)]
+struct AxisSlice {
+    start: u64,
+    step: u64,
+    count: u64,
+    is_int: bool,
+}
+
+fn full_axis_slice(dim: u64) -> AxisSlice {
+    AxisSlice { start: 0, step: 1, count: dim, is_int: false }
+}
+
+// Parse a single axis indexer (int or slice) given the corresponding HDU
+// dimension.  Ellipsis is handled by the caller (it expands to multiple
+// full-axis slices).  Negative ints are normalized; negative or zero steps
+// are rejected.
+fn parse_axis_indexer(item: &Bound<'_, PyAny>, dim: u64) -> PyResult<AxisSlice> {
+    if let Ok(slice) = item.cast::<PySlice>() {
+        let indices = slice.indices(dim as isize)?;
+        if indices.step <= 0 {
+            return Err(PyValueError::new_err(
+                "negative or zero step is not supported"
+            ));
+        }
+        // For positive step, `start` is non-negative per the docs.
+        let start = indices.start.max(0) as u64;
+        let step = indices.step as u64;
+        let count = indices.slicelength as u64;
+        Ok(AxisSlice { start, step, count, is_int: false })
+    } else if let Ok(i) = item.extract::<i64>() {
+        let dim_i = dim as i64;
+        let normalized = if i < 0 { dim_i + i } else { i };
+        if normalized < 0 || normalized >= dim_i {
+            return Err(PyIndexError::new_err(format!(
+                "index {} out of bounds for axis of size {}", i, dim
+            )));
+        }
+        Ok(AxisSlice {
+            start: normalized as u64,
+            step: 1,
+            count: 1,
+            is_int: true,
+        })
+    } else {
+        Err(PyValueError::new_err(
+            "unsupported index type (expected int, slice, or Ellipsis)",
+        ))
+    }
+}
+
+// Normalize a Python __getitem__ key into a per-axis list (length == naxis).
+// Accepts a single int/slice/Ellipsis or a tuple of these.  Ellipsis (at most
+// one) is expanded to enough full-axis slices to bring the total to naxis.
+// Trailing missing axes are filled with full-axis slices, matching numpy
+// semantics.
+fn normalize_slice_key(
+    key: &Bound<'_, PyAny>,
+    hdu_shape: &[u64],
+) -> PyResult<Vec<AxisSlice>> {
+    let naxis = hdu_shape.len();
+
+    let items: Vec<Bound<PyAny>> = if let Ok(tup) = key.cast::<PyTuple>() {
+        tup.iter().collect()
+    } else {
+        vec![key.clone()]
+    };
+
+    let mut ellipsis_pos: Option<usize> = None;
+    for (i, item) in items.iter().enumerate() {
+        if item.is_instance_of::<PyEllipsis>() {
+            if ellipsis_pos.is_some() {
+                return Err(PyValueError::new_err(
+                    "an index can only have a single ellipsis",
+                ));
+            }
+            ellipsis_pos = Some(i);
+        }
+    }
+
+    let n_explicit = items.len() - usize::from(ellipsis_pos.is_some());
+    if n_explicit > naxis {
+        return Err(PyValueError::new_err(format!(
+            "too many indices for array: HDU has {} axes, got {} explicit",
+            naxis, n_explicit
+        )));
+    }
+    let n_ellipsis_fill = naxis - n_explicit;
+
+    let mut out: Vec<AxisSlice> = Vec::with_capacity(naxis);
+    let mut axis = 0usize;
+    for (i, item) in items.iter().enumerate() {
+        if Some(i) == ellipsis_pos {
+            for _ in 0..n_ellipsis_fill {
+                out.push(full_axis_slice(hdu_shape[axis]));
+                axis += 1;
+            }
+        } else {
+            out.push(parse_axis_indexer(item, hdu_shape[axis])?);
+            axis += 1;
+        }
+    }
+    while axis < naxis {
+        out.push(full_axis_slice(hdu_shape[axis]));
+        axis += 1;
+    }
+
+    Ok(out)
+}
+
+// Strided-read variant of compute_strip_layout.  An axis can be folded into
+// the contiguous file strip only if its step is 1; any axis with step != 1
+// becomes an outer iteration axis.  The slowest axis that's still in the
+// strip may be partial, but partial coverage stops further coalescing.
+// Walks from the fastest axis (numpy axis n-1, i.e. FITS NAXIS1) inward,
+// which matches the on-disk byte order.
+fn compute_read_strip_layout(
+    hdu_shape: &[u64],
+    slices: &[AxisSlice],
+) -> (usize, u64) {
+    let n = hdu_shape.len();
+    let mut strip_pixels: u64 = 1;
+    for axis in (0..n).rev() {
+        if slices[axis].step != 1 {
+            // Can't include this axis in the strip — it becomes outer.
+            return (axis + 1, strip_pixels);
+        }
+        strip_pixels *= slices[axis].count;
+        if slices[axis].start != 0 || slices[axis].count != hdu_shape[axis] {
+            // Partial coverage: include this axis but stop coalescing.
+            return (axis, strip_pixels);
+        }
+    }
+    (0, strip_pixels)
+}
+
+// Read a sub-region of an image HDU and return a freshly-allocated,
+// native-endian numpy array.  Axes consumed by integer indexing are dropped
+// from the output shape.  Coalesces fully-covered fast axes with step==1
+// into one contiguous read per strip; falls back to a seek+read per outer
+// position otherwise.  A full read (all axes full, all step==1) collapses
+// to a single big read.
+fn read_image_slice(
+    py: Python<'_>,
+    header: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+    slices: &[AxisSlice],
+) -> PyResult<Py<PyAny>> {
+    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let naxis = hdu_shape.len();
+    if slices.len() != naxis {
+        return Err(PyValueError::new_err(format!(
+            "internal error: {} slices for {} axes", slices.len(), naxis
+        )));
+    }
+
+    let output_shape: Vec<u64> = slices.iter()
+        .filter(|s| !s.is_int)
+        .map(|s| s.count)
+        .collect();
+
+    let bpp = (bitpix.abs() / 8) as u64;
+    let dtype_str = bitpix_to_native_dtype(bitpix)?;
+    let np = py.import("numpy")?;
+    let arr = np.call_method1("empty", (output_shape.clone(), dtype_str))?;
+
+    let total_pixels: u64 = slices.iter().map(|s| s.count).product();
+    if total_pixels == 0 {
+        return Ok(arr.unbind());
+    }
+
+    let hdu_strides = row_major_strides(&hdu_shape);
+    let (outer_axes, strip_pixels) = compute_read_strip_layout(&hdu_shape, slices);
+    let strip_bytes = (strip_pixels * bpp) as usize;
+
+    let outer_count: u64 = slices[..outer_axes].iter().map(|s| s.count).product();
+
+    // Fixed-position contribution from axes inside the strip — their `start`
+    // values are constant across the outer iteration.
+    let inner_start_pixels: u64 = (outer_axes..naxis)
+        .map(|k| slices[k].start * hdu_strides[k])
+        .sum();
+
+    let mut buffer = RawBuffer::acquire_writable(&arr)?;
+    let expected_buffer_len = (output_shape.iter().product::<u64>() * bpp) as usize;
+    if buffer.len() != expected_buffer_len {
+        return Err(PyValueError::new_err(format!(
+            "allocated buffer length ({}) does not match expected ({})",
+            buffer.len(), expected_buffer_len
+        )));
+    }
+
+    {
+        let mut guard = lock_file(file_handle)?;
+        let file = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+        let mut output_offset: usize = 0;
+        let mut iter_idx = vec![0u64; outer_axes];
+
+        for _ in 0..outer_count {
+            let mut src_pixel: u64 = inner_start_pixels;
+            for k in 0..outer_axes {
+                let src_axis_idx = slices[k].start + iter_idx[k] * slices[k].step;
+                src_pixel += src_axis_idx * hdu_strides[k];
+            }
+            let file_pos = data_offset + src_pixel * bpp;
+
+            file.seek(SeekFrom::Start(file_pos))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let dest = &mut buffer.as_mut_slice()[output_offset..output_offset + strip_bytes];
+            file.read_exact(dest)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+            output_offset += strip_bytes;
+
+            // Row-major increment over outer axes (axis 0 slowest, outer_axes-1 fastest).
+            for axis in (0..outer_axes).rev() {
+                iter_idx[axis] += 1;
+                if iter_idx[axis] < slices[axis].count {
+                    break;
+                }
+                iter_idx[axis] = 0;
+            }
+        }
+    }
+
+    if bpp > 1 && !cfg!(target_endian = "big") {
+        byteswap_in_place(buffer.as_mut_slice(), bpp as usize);
+    }
+    drop(buffer);
 
     Ok(arr.unbind())
 }
