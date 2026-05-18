@@ -4,7 +4,7 @@ use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::Bound;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 const BLOCK_SIZE: usize = 2880;
 const CARD_SIZE: usize = 80;
@@ -402,6 +402,171 @@ impl AsciiTableHDU {
     }
 }
 
+// ====================== Parse all HDUs from an open file ======================
+// Walks the file from byte 0, extracting every HDU header and skipping over
+// each data section, returning the parsed HDU Python objects.
+fn parse_hdus_from_file(py: Python<'_>, file: &mut std::fs::File) -> PyResult<Vec<Py<PyAny>>> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+    let mut hdus: Vec<Py<PyAny>> = Vec::new();
+    let mut offset = 0u64;
+
+    loop {
+        let mut header_cards: Vec<String> = Vec::new();
+        let mut end_found = false;
+
+        while !end_found {
+            let mut block = vec![0u8; BLOCK_SIZE];
+            match file.read_exact(&mut block) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    if header_cards.is_empty() {
+                        break;
+                    } else {
+                        return Err(PyIOError::new_err("truncated FITS file"));
+                    }
+                }
+                Err(e) => return Err(PyIOError::new_err(e.to_string())),
+            }
+
+            // FITS header bytes are restricted to printable ASCII (0x20-0x7E).
+            for (j, &b) in block.iter().enumerate() {
+                if !(0x20..=0x7E).contains(&b) {
+                    return Err(PyValueError::new_err(format!(
+                        "non-printable byte 0x{:02X} in header block at byte offset {}",
+                        b, offset + j as u64
+                    )));
+                }
+            }
+
+            for i in (0..BLOCK_SIZE).step_by(CARD_SIZE) {
+                // Safe: bytes have just been validated as printable ASCII.
+                let card = std::str::from_utf8(&block[i..i + CARD_SIZE])
+                    .unwrap()
+                    .trim_end()
+                    .to_string();
+                header_cards.push(card.clone());
+                if card == "END" {
+                    end_found = true;
+                    break;
+                }
+            }
+        }
+
+        if header_cards.is_empty() {
+            break;
+        }
+
+        validate_header(&header_cards, hdus.is_empty())?;
+
+        let is_image = header_cards.iter().any(|c| {
+            c.starts_with("SIMPLE  =") || c.starts_with("XTENSION= 'IMAGE")
+        });
+        let is_binary_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'BINTABLE'"));
+        let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
+
+        let hdu_py: Py<PyAny> = if is_image {
+            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len()))?.into()
+        } else if is_binary_table {
+            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len()))?.into()
+        } else if is_ascii_table {
+            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len()))?.into()
+        } else {
+            Py::new(py, HDU::new(header_cards.clone(), hdus.len()))?.into()
+        };
+
+        hdus.push(hdu_py);
+
+        let data_size = calculate_data_size(&header_cards);
+        let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
+        let header_size = num_header_blocks * BLOCK_SIZE as u64;
+        let total_hdu_size = header_size + data_size;
+
+        offset += total_hdu_size;
+        let _ = file.seek(SeekFrom::Start(offset));
+
+        if offset >= file.metadata().map(|m| m.len()).unwrap_or(0) {
+            break;
+        }
+    }
+
+    let _ = file.seek(SeekFrom::Start(0));
+    Ok(hdus)
+}
+
+// ====================== Card-formatting helpers (for write) ======================
+fn pad_to_card(s: &str) -> String {
+    let mut out = s.to_string();
+    if out.len() < CARD_SIZE {
+        out.push_str(&" ".repeat(CARD_SIZE - out.len()));
+    } else if out.len() > CARD_SIZE {
+        out.truncate(CARD_SIZE);
+    }
+    out
+}
+
+fn card_int(key: &str, value: i64, comment: &str) -> String {
+    let head = format!("{:<8}= {:>20}", key, value);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    pad_to_card(&body)
+}
+
+fn card_logical(key: &str, value: bool, comment: &str) -> String {
+    let v = if value { "T" } else { "F" };
+    let head = format!("{:<8}= {:>20}", key, v);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    pad_to_card(&body)
+}
+
+fn card_string(key: &str, value: &str, comment: &str) -> String {
+    // FITS values of string type require a minimum length of 8 characters
+    // inside the quotes; embedded single quotes are doubled.
+    let escaped = value.replace('\'', "''");
+    let padded = if escaped.len() < 8 {
+        format!("{:<8}", escaped)
+    } else {
+        escaped
+    };
+    let quoted = format!("'{}'", padded);
+    let head = format!("{:<8}= {}", key, quoted);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    pad_to_card(&body)
+}
+
+// Map a numpy short-code or long-name dtype string to a FITS BITPIX value.
+// Endianness prefixes (`<`, `>`, `|`, `=`) are stripped.  Only the dtypes
+// directly representable in FITS without BZERO/BSCALE are supported; the
+// unsigned wide ints (uint16/32/64) need scaling and will be added later.
+fn dtype_to_bitpix(dtype: &str) -> PyResult<i32> {
+    let s = dtype.trim_start_matches(|c| c == '<' || c == '>' || c == '|' || c == '=');
+    let normalized = s.to_lowercase();
+    match normalized.as_str() {
+        "u1" | "uint8" => Ok(8),
+        "i2" | "int16" => Ok(16),
+        "i4" | "int32" => Ok(32),
+        "i8" | "int64" => Ok(64),
+        "f4" | "float32" => Ok(-32),
+        "f8" | "float64" => Ok(-64),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported numpy dtype '{}'. Supported: 'u1','i2','i4','i8','f4','f8'",
+            dtype
+        ))),
+    }
+}
+
 // ====================== Main FITS class ======================
 #[pyclass]
 struct FITS {
@@ -432,91 +597,13 @@ impl FITS {
         let mut file = options.open(&filename)
             .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filename, e)))?;
 
-        let mut hdus: Vec<Py<PyAny>> = Vec::new();
-        let mut offset = 0u64;
-
-        loop {
-            let mut header_cards: Vec<String> = Vec::new();
-            let mut end_found = false;
-
-            while !end_found {
-                let mut block = vec![0u8; BLOCK_SIZE];
-                match file.read_exact(&mut block) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        if header_cards.is_empty() {
-                            break;
-                        } else {
-                            return Err(PyIOError::new_err("truncated FITS file"));
-                        }
-                    }
-                    Err(e) => return Err(PyIOError::new_err(e.to_string())),
-                }
-
-                // FITS header bytes are restricted to printable ASCII (0x20-0x7E).
-                for (j, &b) in block.iter().enumerate() {
-                    if !(0x20..=0x7E).contains(&b) {
-                        return Err(PyValueError::new_err(format!(
-                            "non-printable byte 0x{:02X} in header block at byte offset {}",
-                            b, offset + j as u64
-                        )));
-                    }
-                }
-
-                for i in (0..BLOCK_SIZE).step_by(CARD_SIZE) {
-                    // Safe: bytes have just been validated as printable ASCII.
-                    let card = std::str::from_utf8(&block[i..i + CARD_SIZE])
-                        .unwrap()
-                        .trim_end()
-                        .to_string();
-                    header_cards.push(card.clone());
-                    // The FITS END card is exactly "END" in cols 1-8 with
-                    // blanks in cols 9-80, which trims to the bare string "END".
-                    if card == "END" {
-                        end_found = true;
-                        break;
-                    }
-                }
-            }
-
-            if header_cards.is_empty() {
-                break;
-            }
-
-            validate_header(&header_cards, hdus.is_empty())?;
-
-            let is_image = header_cards.iter().any(|c| {
-                c.starts_with("SIMPLE  =") || c.starts_with("XTENSION= 'IMAGE")
-            });
-            let is_binary_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'BINTABLE'"));
-            let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
-
-            let hdu_py: Py<PyAny> = if is_image {
-                Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len()))?.into()
-            } else if is_binary_table {
-                Py::new(py, TableHDU::new(header_cards.clone(), hdus.len()))?.into()
-            } else if is_ascii_table {
-                Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len()))?.into()
-            } else {
-                Py::new(py, HDU::new(header_cards.clone(), hdus.len()))?.into()
-            };
-
-            hdus.push(hdu_py);
-
-            let data_size = calculate_data_size(&header_cards);
-            let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
-            let header_size = num_header_blocks * BLOCK_SIZE as u64;
-            let total_hdu_size = header_size + data_size;
-
-            offset += total_hdu_size;
-            let _ = file.seek(SeekFrom::Start(offset));
-
-            if offset >= file.metadata().map(|m| m.len()).unwrap_or(0) {
-                break;
-            }
-        }
-
-        let _ = file.seek(SeekFrom::Start(0));
+        // Read-only modes ('w', 'a') can't be parsed; treat as empty.
+        let can_read = matches!(mode.as_str(), "r" | "r+" | "w+" | "a+");
+        let hdus = if can_read {
+            parse_hdus_from_file(py, &mut file)?
+        } else {
+            Vec::new()
+        };
 
         Ok(FITS {
             filename,
@@ -555,6 +642,130 @@ impl FITS {
 
     fn __len__(&self) -> usize {
         self.hdus.len()
+    }
+
+    // Create a new image HDU.  `dtype` follows numpy short-code convention
+    // (e.g. 'f8', 'i4').  `dims` is the array shape in numpy (row-major) order
+    // and is reversed internally to produce FITS NAXISn (where NAXIS1 is the
+    // fastest-varying axis).  The first HDU created becomes the primary HDU
+    // (SIMPLE=T, EXTEND=T); subsequent calls produce 'IMAGE' extensions.  The
+    // data section is allocated as zeros via sparse file extension.  After
+    // writing, the new HDU is appended to `self.hdus` without re-reading.
+    #[pyo3(signature = (dtype, dims, extname=None, extver=None))]
+    fn create_image_hdu(
+        &mut self,
+        py: Python<'_>,
+        dtype: String,
+        dims: Vec<i64>,
+        extname: Option<String>,
+        extver: Option<i64>,
+    ) -> PyResult<()> {
+        for (i, &d) in dims.iter().enumerate() {
+            if d <= 0 {
+                return Err(PyValueError::new_err(format!(
+                    "dimension {} must be > 0, got {}", i, d
+                )));
+            }
+        }
+
+        let bitpix = dtype_to_bitpix(&dtype)?;
+        let naxis = dims.len() as i64;
+
+        // numpy (row-major) -> FITS (NAXIS1 is fastest-varying): reverse.
+        let fits_dims: Vec<i64> = dims.iter().rev().copied().collect();
+
+        let is_primary = self.hdus.is_empty();
+
+        let mut cards: Vec<String> = Vec::new();
+        if is_primary {
+            cards.push(card_logical("SIMPLE", true, "file conforms to FITS standard"));
+        } else {
+            cards.push(card_string("XTENSION", "IMAGE", "image extension"));
+        }
+        cards.push(card_int("BITPIX", bitpix as i64, "number of bits per data pixel"));
+        cards.push(card_int("NAXIS", naxis, "number of data axes"));
+        for (i, &d) in fits_dims.iter().enumerate() {
+            cards.push(card_int(
+                &format!("NAXIS{}", i + 1),
+                d,
+                &format!("length of data axis {}", i + 1),
+            ));
+        }
+        if is_primary {
+            cards.push(card_logical("EXTEND", true, "FITS dataset may contain extensions"));
+        } else {
+            cards.push(card_int("PCOUNT", 0, "required keyword; must = 0"));
+            cards.push(card_int("GCOUNT", 1, "required keyword; must = 1"));
+        }
+        if let Some(name) = extname.as_deref() {
+            cards.push(card_string("EXTNAME", name, "name of this HDU"));
+        }
+        if let Some(ver) = extver {
+            cards.push(card_int("EXTVER", ver, "extension version"));
+        }
+        cards.push(pad_to_card("END"));
+
+        // Pad header to a 2880-byte boundary.
+        let header_bytes_len = cards.len() * CARD_SIZE;
+        let pad_n = (BLOCK_SIZE - header_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
+
+        // Data size (NAXIS=0 means no data unit).
+        let bytes_per_pixel = (bitpix.abs() / 8) as u64;
+        let mut product: u64 = 1;
+        for &d in &fits_dims {
+            product = product.saturating_mul(d as u64);
+        }
+        let data_size = if naxis == 0 { 0 } else { bytes_per_pixel * product };
+        let data_padded = if data_size == 0 {
+            0
+        } else {
+            ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+        };
+
+        {
+            let file = self.file.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+            file.seek(SeekFrom::End(0))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+            for c in &cards {
+                file.write_all(c.as_bytes())
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+            if pad_n > 0 {
+                let padding = vec![b' '; pad_n];
+                file.write_all(&padding)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+
+            if data_padded > 0 {
+                let header_end = file.stream_position()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let new_len = header_end + data_padded;
+                file.set_len(new_len)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                file.seek(SeekFrom::Start(new_len))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+
+            file.flush()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+
+        // Construct the matching ImageHDU in memory and append.  The parser
+        // stores cards with trailing whitespace trimmed; mirror that here so
+        // the in-memory HDU is byte-equivalent to what a re-parse would yield.
+        let stored_cards: Vec<String> = cards.iter()
+            .map(|c| c.trim_end().to_string())
+            .collect();
+        let new_hdu: Py<PyAny> = Py::new(
+            py,
+            ImageHDU::new(stored_cards, self.hdus.len()),
+        )?.into();
+        self.hdus.push(new_hdu);
+
+        Ok(())
     }
 
     fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
