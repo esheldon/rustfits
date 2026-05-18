@@ -602,6 +602,7 @@ impl FITSHeader {
         Ok(PyList::new(py, &items)?.unbind())
     }
 
+    #[pyo3(signature = (key, default=None))]
     fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.__getitem__(py, key) {
             Ok(v) => Ok(v),
