@@ -401,6 +401,14 @@ impl ImageHDU {
         write_image_data(&super_.header, super_.data_offset, &super_.file, data, start)
     }
 
+    // Read this HDU's entire data section into a newly-allocated numpy
+    // array.  The result is native-endian; FITS on-disk big-endian bytes
+    // are swapped into host byte order in place.
+    fn read(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let super_: PyRef<HDU> = slf.into_super();
+        read_image_data(py, &super_.header, super_.data_offset, &super_.file)
+    }
+
     // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to fit
     // the data being written, then write it.  `start` is in numpy order and
     // defaults to (current_slow_axis_dim, 0, 0, ...) so the new data lands
@@ -581,6 +589,60 @@ impl ImageHDU {
             Some(start_for_write),
         )
     }
+}
+
+// Allocate a numpy array sized + typed to this HDU and fill it with the
+// HDU's data from disk.  Shared by ImageHDU::read.  Steps:
+//   - parse BITPIX + shape from the header
+//   - allocate via `numpy.empty(shape, native_dtype)` (no zero-fill cost)
+//   - acquire a writable C-contiguous buffer view into the array's memory
+//   - read the entire data section directly into that buffer
+//   - byte-swap in place if host endian != big-endian (FITS on-disk order)
+// The result is a native-endian array, ready for downstream numpy ops.
+fn read_image_data(
+    py: Python<'_>,
+    header: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+) -> PyResult<Py<PyAny>> {
+    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bpp = (bitpix.abs() / 8) as u64;
+    let total_pixels: u64 = hdu_shape.iter().product();
+    let total_bytes = (total_pixels * bpp) as usize;
+
+    let dtype_str = bitpix_to_native_dtype(bitpix)?;
+    let np = py.import("numpy")?;
+    let arr = np.call_method1("empty", (hdu_shape.clone(), dtype_str))?;
+
+    // Fill the array from disk via the buffer protocol.  Scope the buffer
+    // so PyBuffer_Release fires before we return the array to Python.
+    {
+        let mut buffer = RawBuffer::acquire_writable(&arr)?;
+        if buffer.len() != total_bytes {
+            return Err(PyValueError::new_err(format!(
+                "allocated buffer length ({}) does not match expected ({})",
+                buffer.len(), total_bytes
+            )));
+        }
+
+        if total_bytes > 0 {
+            let mut guard = lock_file(file_handle)?;
+            let file = guard.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            file.seek(SeekFrom::Start(data_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            file.read_exact(buffer.as_mut_slice())
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+
+        // FITS stores big-endian; numpy.empty gave us native.  Swap when
+        // the host is little-endian and we have multi-byte elements.
+        if bpp > 1 && !cfg!(target_endian = "big") {
+            byteswap_in_place(buffer.as_mut_slice(), bpp as usize);
+        }
+    }
+
+    Ok(arr.unbind())
 }
 
 // Validate and write a numpy array into an image HDU's data section.
@@ -970,6 +1032,22 @@ fn bitpix_to_numpy_kind(bitpix: i32) -> PyResult<(&'static str, u64)> {
     }
 }
 
+// Native-endian numpy dtype short-code for a FITS BITPIX.  Used by the
+// read path: `numpy.empty(shape, dtype)` produces a native-endian array,
+// which is what downstream user code expects.  The on-disk big-endian
+// bytes are byte-swapped into native form after read.
+fn bitpix_to_native_dtype(bitpix: i32) -> PyResult<&'static str> {
+    match bitpix {
+        8   => Ok("u1"),
+        16  => Ok("i2"),
+        32  => Ok("i4"),
+        64  => Ok("i8"),
+        -32 => Ok("f4"),
+        -64 => Ok("f8"),
+        _   => Err(PyValueError::new_err(format!("unsupported BITPIX {}", bitpix))),
+    }
+}
+
 // Row-major (numpy / C-order) strides in pixels.  stride[k] = product of
 // shape[k+1..].  For an empty shape this returns an empty vec.
 fn row_major_strides(shape: &[u64]) -> Vec<u64> {
@@ -1092,14 +1170,14 @@ struct RawBuffer {
 }
 
 impl RawBuffer {
-    fn acquire(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn acquire_with_flags(obj: &Bound<'_, PyAny>, flags: std::os::raw::c_int) -> PyResult<Self> {
         let mut view: Box<pyo3::ffi::Py_buffer> =
             Box::new(unsafe { std::mem::zeroed() });
         let rc = unsafe {
             pyo3::ffi::PyObject_GetBuffer(
                 obj.as_ptr(),
                 &mut *view as *mut _,
-                pyo3::ffi::PyBUF_C_CONTIGUOUS,
+                flags,
             )
         };
         if rc != 0 {
@@ -1111,10 +1189,33 @@ impl RawBuffer {
         Ok(RawBuffer { view })
     }
 
+    // Read-only, C-contiguous.  Used by write paths.
+    fn acquire(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::acquire_with_flags(obj, pyo3::ffi::PyBUF_C_CONTIGUOUS)
+    }
+
+    // Writable + C-contiguous.  Used by the read path to receive disk bytes
+    // straight into a freshly-allocated numpy array's memory.
+    fn acquire_writable(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::acquire_with_flags(
+            obj,
+            pyo3::ffi::PyBUF_C_CONTIGUOUS | pyo3::ffi::PyBUF_WRITABLE,
+        )
+    }
+
     fn as_slice(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self.view.buf as *const u8,
+                self.view.len as usize,
+            )
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.view.buf as *mut u8,
                 self.view.len as usize,
             )
         }
