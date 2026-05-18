@@ -12,7 +12,6 @@ Verifies:
 """
 
 import os
-import struct
 import tempfile
 
 import pytest
@@ -23,7 +22,7 @@ import rustfits
 def test_create_primary_image_hdu():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             assert len(fits.hdus) == 0
             fits.create_image_hdu(dtype="f8", dims=(5, 20), extname="image1")
 
@@ -46,7 +45,7 @@ def test_create_primary_image_hdu():
 def test_create_image_extension():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="i4", dims=(3, 4), extname="image1")
             fits.create_image_hdu(
                 dtype="f4", dims=(2, 5, 6), extname="image2", extver=3,
@@ -90,7 +89,7 @@ def test_create_image_extension():
 def test_dtype_maps_to_bitpix(dtype, bitpix):
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype=dtype, dims=(2, 3))
             assert fits.hdus[0].header_dict["BITPIX"]["value"] == bitpix
 
@@ -98,7 +97,7 @@ def test_dtype_maps_to_bitpix(dtype, bitpix):
 def test_unsupported_dtype_raises():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             with pytest.raises(ValueError, match="unsupported numpy dtype"):
                 fits.create_image_hdu(dtype="u4", dims=(2, 3))
 
@@ -106,7 +105,7 @@ def test_unsupported_dtype_raises():
 def test_zero_dim_rejected():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             with pytest.raises(ValueError, match="must be > 0"):
                 fits.create_image_hdu(dtype="f8", dims=(0, 3))
 
@@ -119,7 +118,7 @@ def test_roundtrip_via_reopen():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="i4", dims=(5, 20), extname="img")
             fits.create_image_hdu(dtype="f8", dims=(3, 4), extname="ext1")
 
@@ -145,7 +144,7 @@ def test_data_section_padded_and_zero():
     and filled with zeros (allocated via sparse extension)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             # 5 x 20 i4 = 400 bytes -> padded to 2880
             fits.create_image_hdu(dtype="i4", dims=(5, 20))
 
@@ -162,7 +161,7 @@ def test_data_section_padded_and_zero():
 def test_naxis0_has_no_data_section():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="u1", dims=[])
 
             hd = fits.hdus[0].header_dict
@@ -177,7 +176,7 @@ def test_extname_with_embedded_quote():
     and the round-trip must recover the original string."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
-        with rustfits.FITS(fname, "w") as fits:
+        with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="f4", dims=(2, 2), extname="O'Brien")
 
         with rustfits.FITS(fname, "r") as fits:

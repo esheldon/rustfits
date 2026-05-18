@@ -583,13 +583,10 @@ impl FITS {
 
         match mode.as_str() {
             "r"  => options.read(true),
-            "w"  => options.write(true).truncate(true).create(true),
-            "a"  => options.write(true).append(true).create(true),
             "r+" => options.read(true).write(true),
             "w+" => options.read(true).write(true).truncate(true).create(true),
-            "a+" => options.read(true).write(true).append(true).create(true),
             _ => return Err(PyIOError::new_err(format!(
-                "Unsupported mode '{}'. Supported modes: 'r', 'w', 'a', 'r+', 'w+', 'a+'",
+                "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",
                 mode
             ))),
         };
@@ -597,13 +594,7 @@ impl FITS {
         let mut file = options.open(&filename)
             .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filename, e)))?;
 
-        // Read-only modes ('w', 'a') can't be parsed; treat as empty.
-        let can_read = matches!(mode.as_str(), "r" | "r+" | "w+" | "a+");
-        let hdus = if can_read {
-            parse_hdus_from_file(py, &mut file)?
-        } else {
-            Vec::new()
-        };
+        let hdus = parse_hdus_from_file(py, &mut file)?;
 
         Ok(FITS {
             filename,
