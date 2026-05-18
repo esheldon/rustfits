@@ -5,6 +5,15 @@ use pyo3::conversion::IntoPyObjectExt;
 use pyo3::Bound;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+// Shared, mutable file handle.  FITS owns the master Arc, each HDU clones it.
+// `None` after close().
+type FileHandle = Arc<Mutex<Option<std::fs::File>>>;
+
+fn lock_file(handle: &FileHandle) -> PyResult<MutexGuard<'_, Option<std::fs::File>>> {
+    handle.lock().map_err(|_| PyIOError::new_err("file lock poisoned"))
+}
 
 const BLOCK_SIZE: usize = 2880;
 const CARD_SIZE: usize = 80;
@@ -317,19 +326,27 @@ fn parse_header_dict(py: Python<'_>, cards: &[String]) -> PyResult<Py<PyDict>> {
 }
 
 // ====================== Base HDU ======================
+// HDUs hold a clone of the FITS file handle plus the byte offset of their
+// data section, enabling write-back methods on subclasses (e.g. ImageHDU.write).
+// `#[new]` is intentionally omitted from HDU and its subclasses: instances are
+// constructed only via FITS internals (which know the file handle and offset);
+// direct Python instantiation is not supported.
 #[pyclass(subclass)]
 struct HDU {
     header: Vec<String>,
     index: usize,
+    data_offset: u64,
+    file: FileHandle,
+}
+
+impl HDU {
+    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle) -> Self {
+        HDU { header, index, data_offset, file }
+    }
 }
 
 #[pymethods]
 impl HDU {
-    #[new]
-    fn new(header: Vec<String>, index: usize) -> Self {
-        HDU { header, index }
-    }
-
     fn __repr__(&self) -> String {
         format!("<HDU #{}>", self.index)
     }
@@ -354,30 +371,244 @@ impl HDU {
 #[pyclass(extends = HDU)]
 struct ImageHDU;
 
+impl ImageHDU {
+    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
+        -> (Self, HDU)
+    {
+        (ImageHDU, HDU::new(header, index, data_offset, file))
+    }
+}
+
 #[pymethods]
 impl ImageHDU {
-    #[new]
-    fn new(header: Vec<String>, index: usize) -> (Self, HDU) {
-        (ImageHDU, HDU::new(header, index))
-    }
-
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
         let index: usize = super_.index();
         Ok(format!("<ImageHDU #{}>", index))
+    }
+
+    // Write a numpy array into this HDU's data section.  `data` may cover the
+    // whole HDU or a sub-region; `start` (numpy-order, defaults to origin)
+    // names the top-left corner of the region in the HDU.  Internally:
+    //   - validate dtype matches BITPIX, and shape fits inside the HDU
+    //   - acquire data via the Python buffer protocol (C-contiguous required)
+    //   - detect byte order from numpy.dtype.str; if already big-endian, write
+    //     directly from the numpy buffer (zero copy), otherwise copy one strip
+    //     at a time into a scratch buffer and byte-swap there
+    //   - coalesce fully-aligned axes from the fast end so the strip is as
+    //     large as possible (a full overwrite collapses to a single write)
+    #[pyo3(signature = (data, start=None))]
+    fn write(
+        slf: PyRef<'_, Self>,
+        data: &Bound<'_, PyAny>,
+        start: Option<Vec<i64>>,
+    ) -> PyResult<()> {
+        let super_: PyRef<HDU> = slf.into_super();
+        let header = &super_.header;
+
+        let bitpix = parse_keyword(header, "BITPIX")
+            .ok_or_else(|| PyValueError::new_err("HDU header missing BITPIX"))?
+            as i32;
+        let naxis = parse_keyword(header, "NAXIS")
+            .ok_or_else(|| PyValueError::new_err("HDU header missing NAXIS"))?
+            as usize;
+        if naxis == 0 {
+            return Err(PyValueError::new_err(
+                "cannot write to an HDU with NAXIS=0 (no data section)",
+            ));
+        }
+
+        // HDU dims: FITS order (NAXIS1 fastest) -> numpy order (reversed).
+        let mut fits_dims: Vec<u64> = Vec::with_capacity(naxis);
+        for i in 1..=naxis {
+            let d = parse_keyword(header, &format!("NAXIS{}", i))
+                .ok_or_else(|| PyValueError::new_err(
+                    format!("HDU header missing NAXIS{}", i)
+                ))?;
+            if d < 0 {
+                return Err(PyValueError::new_err(
+                    format!("NAXIS{} is negative", i)
+                ));
+            }
+            fits_dims.push(d as u64);
+        }
+        let hdu_shape: Vec<u64> = fits_dims.iter().rev().copied().collect();
+
+        // Validate dtype against BITPIX via numpy attributes.
+        let dtype = data.getattr("dtype")?;
+        let kind: String = dtype.getattr("kind")?.extract()?;
+        let itemsize_attr: u64 = dtype.getattr("itemsize")?.extract()?;
+        let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
+        if kind != expected_kind || itemsize_attr != expected_size {
+            return Err(PyValueError::new_err(format!(
+                "data dtype ({}{}) does not match HDU BITPIX={} (expected {}{})",
+                kind, itemsize_attr, bitpix, expected_kind, expected_size,
+            )));
+        }
+
+        let data_shape: Vec<u64> = data.getattr("shape")?.extract()?;
+        if data_shape.len() != naxis {
+            return Err(PyValueError::new_err(format!(
+                "data has {} axes, HDU has {}", data_shape.len(), naxis
+            )));
+        }
+
+        // start: default to origin (numpy order).
+        let start_vec: Vec<u64> = match start {
+            Some(s) => {
+                if s.len() != naxis {
+                    return Err(PyValueError::new_err(format!(
+                        "start has {} components, expected {}", s.len(), naxis
+                    )));
+                }
+                let mut out = Vec::with_capacity(naxis);
+                for (i, &v) in s.iter().enumerate() {
+                    if v < 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "start[{}] must be >= 0, got {}", i, v
+                        )));
+                    }
+                    out.push(v as u64);
+                }
+                out
+            }
+            None => vec![0u64; naxis],
+        };
+
+        // Bounds: start + data_shape <= hdu_shape, per axis.
+        for i in 0..naxis {
+            if start_vec[i] + data_shape[i] > hdu_shape[i] {
+                return Err(PyValueError::new_err(format!(
+                    "axis {}: start ({}) + data shape ({}) exceeds HDU dim ({})",
+                    i, start_vec[i], data_shape[i], hdu_shape[i]
+                )));
+            }
+        }
+
+        let total_pixels: u64 = data_shape.iter().product();
+        if total_pixels == 0 {
+            return Ok(());
+        }
+
+        // Byte-order detection from numpy's canonical typestring (uses one
+        // of '<', '>', '|'; '|' is single-byte where order is moot).
+        let dtype_str: String = dtype.getattr("str")?.extract()?;
+        let needs_swap = if expected_size == 1 {
+            false
+        } else {
+            match dtype_str.chars().next() {
+                Some('>') | Some('|') => false,
+                Some('<') => true,
+                _ => return Err(PyValueError::new_err(format!(
+                    "unrecognized dtype byteorder in '{}'", dtype_str
+                ))),
+            }
+        };
+
+        // Acquire raw bytes via the buffer protocol.  PyBUF_C_CONTIGUOUS will
+        // cause numpy to fail for non-contiguous input; surface that with a
+        // hint about np.ascontiguousarray.
+        let buffer = RawBuffer::acquire(data).map_err(|e| {
+            PyValueError::new_err(format!(
+                "data must be a C-contiguous numpy array \
+                 (try np.ascontiguousarray): {}", e
+            ))
+        })?;
+        if buffer.itemsize() as u64 != expected_size {
+            return Err(PyValueError::new_err(
+                "buffer itemsize disagrees with dtype.itemsize",
+            ));
+        }
+        let bpp = expected_size;
+        if buffer.len() as u64 != total_pixels * bpp {
+            return Err(PyValueError::new_err(
+                "buffer length disagrees with data shape",
+            ));
+        }
+        let data_bytes = buffer.as_slice();
+
+        let (outer_axes, strip_pixels) =
+            compute_strip_layout(&hdu_shape, &data_shape, &start_vec);
+        let strip_bytes = (strip_pixels * bpp) as usize;
+        let hdu_strides = row_major_strides(&hdu_shape);
+        let src_strides = row_major_strides(&data_shape);
+
+        // Base file offset (in pixels) from the sub-region's leading corner.
+        // For a full write this is 0; for sub-regions it folds in start[].
+        let base_pixel: u64 = (0..naxis)
+            .map(|k| start_vec[k] * hdu_strides[k])
+            .sum();
+
+        // Scratch buffer for byte-swapping, sized for one strip.  Empty when
+        // no swap is needed (zero-copy path).
+        let mut scratch: Vec<u8> = if needs_swap {
+            vec![0u8; strip_bytes]
+        } else {
+            Vec::new()
+        };
+
+        let outer_count: u64 = data_shape[..outer_axes].iter().product();
+        let mut idx = vec![0u64; outer_axes];
+        let data_offset = super_.data_offset;
+
+        let mut guard = lock_file(&super_.file)?;
+        let file = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+        for _ in 0..outer_count {
+            let mut hdu_pixel = base_pixel;
+            let mut src_pixel: u64 = 0;
+            for axis in 0..outer_axes {
+                hdu_pixel += idx[axis] * hdu_strides[axis];
+                src_pixel += idx[axis] * src_strides[axis];
+            }
+            let file_pos = data_offset + hdu_pixel * bpp;
+            let src_byte = (src_pixel * bpp) as usize;
+            let src = &data_bytes[src_byte..src_byte + strip_bytes];
+
+            file.seek(SeekFrom::Start(file_pos))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            if needs_swap {
+                scratch.copy_from_slice(src);
+                byteswap_in_place(&mut scratch, bpp as usize);
+                file.write_all(&scratch)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            } else {
+                file.write_all(src)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+
+            // Row-major increment over the outer axes (slowest at idx 0,
+            // fastest at idx outer_axes-1).
+            for axis in (0..outer_axes).rev() {
+                idx[axis] += 1;
+                if idx[axis] < data_shape[axis] {
+                    break;
+                }
+                idx[axis] = 0;
+            }
+        }
+
+        file.flush()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+        Ok(())
     }
 }
 
 #[pyclass(extends = HDU)]
 struct TableHDU; // Binary table (BINTABLE)
 
+impl TableHDU {
+    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
+        -> (Self, HDU)
+    {
+        (TableHDU, HDU::new(header, index, data_offset, file))
+    }
+}
+
 #[pymethods]
 impl TableHDU {
-    #[new]
-    fn new(header: Vec<String>, index: usize) -> (Self, HDU) {
-        (TableHDU, HDU::new(header, index))
-    }
-
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
         let index: usize = super_.index();
@@ -388,13 +619,16 @@ impl TableHDU {
 #[pyclass(extends = HDU)]
 struct AsciiTableHDU; // ASCII table (TABLE)
 
+impl AsciiTableHDU {
+    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
+        -> (Self, HDU)
+    {
+        (AsciiTableHDU, HDU::new(header, index, data_offset, file))
+    }
+}
+
 #[pymethods]
 impl AsciiTableHDU {
-    #[new]
-    fn new(header: Vec<String>, index: usize) -> (Self, HDU) {
-        (AsciiTableHDU, HDU::new(header, index))
-    }
-
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
         let index: usize = super_.index();
@@ -404,8 +638,14 @@ impl AsciiTableHDU {
 
 // ====================== Parse all HDUs from an open file ======================
 // Walks the file from byte 0, extracting every HDU header and skipping over
-// each data section, returning the parsed HDU Python objects.
-fn parse_hdus_from_file(py: Python<'_>, file: &mut std::fs::File) -> PyResult<Vec<Py<PyAny>>> {
+// each data section, returning the parsed HDU Python objects.  Each HDU is
+// constructed with its data-section byte offset and a clone of the file
+// handle so that write-back methods can locate themselves on disk.
+fn parse_hdus_from_file(py: Python<'_>, handle: &FileHandle) -> PyResult<Vec<Py<PyAny>>> {
+    let mut guard = lock_file(handle)?;
+    let file = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
     file.seek(SeekFrom::Start(0))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
@@ -460,30 +700,32 @@ fn parse_hdus_from_file(py: Python<'_>, file: &mut std::fs::File) -> PyResult<Ve
 
         validate_header(&header_cards, hdus.is_empty())?;
 
+        let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
+        let header_size = num_header_blocks * BLOCK_SIZE as u64;
+        let data_offset = offset + header_size;
+        let data_size = calculate_data_size(&header_cards);
+
         let is_image = header_cards.iter().any(|c| {
             c.starts_with("SIMPLE  =") || c.starts_with("XTENSION= 'IMAGE")
         });
         let is_binary_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'BINTABLE'"));
         let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
 
+        let hdu_file = Arc::clone(handle);
         let hdu_py: Py<PyAny> = if is_image {
-            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len()))?.into()
+            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
         } else if is_binary_table {
-            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len()))?.into()
+            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
         } else if is_ascii_table {
-            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len()))?.into()
+            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
         } else {
-            Py::new(py, HDU::new(header_cards.clone(), hdus.len()))?.into()
+            let h = HDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file);
+            Py::new(py, h)?.into()
         };
 
         hdus.push(hdu_py);
 
-        let data_size = calculate_data_size(&header_cards);
-        let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
-        let header_size = num_header_blocks * BLOCK_SIZE as u64;
-        let total_hdu_size = header_size + data_size;
-
-        offset += total_hdu_size;
+        offset += header_size + data_size;
         let _ = file.seek(SeekFrom::Start(offset));
 
         if offset >= file.metadata().map(|m| m.len()).unwrap_or(0) {
@@ -546,6 +788,126 @@ fn card_string(key: &str, value: &str, comment: &str) -> String {
     pad_to_card(&body)
 }
 
+// ====================== Helpers for writing image data ======================
+
+// Inverse of dtype_to_bitpix: the numpy (dtype.kind, dtype.itemsize) tuple
+// expected for a given BITPIX.  Used to validate input arrays.
+fn bitpix_to_numpy_kind(bitpix: i32) -> PyResult<(&'static str, u64)> {
+    match bitpix {
+        8   => Ok(("u", 1)),
+        16  => Ok(("i", 2)),
+        32  => Ok(("i", 4)),
+        64  => Ok(("i", 8)),
+        -32 => Ok(("f", 4)),
+        -64 => Ok(("f", 8)),
+        _   => Err(PyValueError::new_err(format!("unsupported BITPIX {}", bitpix))),
+    }
+}
+
+// Row-major (numpy / C-order) strides in pixels.  stride[k] = product of
+// shape[k+1..].  For an empty shape this returns an empty vec.
+fn row_major_strides(shape: &[u64]) -> Vec<u64> {
+    let n = shape.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut strides = vec![1u64; n];
+    for k in (0..n - 1).rev() {
+        strides[k] = strides[k + 1] * shape[k + 1];
+    }
+    strides
+}
+
+// Plan a strided write of a sub-region into an HDU.  Returns (outer_axes,
+// strip_pixels) where:
+//   - strip_pixels: number of contiguous pixels written per strip.  Coalesces
+//     adjacent fully-covered axes (start=0 and data dim = HDU dim) from the
+//     fast (last) end inward.  The first axis that's partial is included in
+//     the strip and stops further coalescing.
+//   - outer_axes: number of "slower" axes to iterate over (axes 0..outer_axes).
+//     For a full write, outer_axes=0 and strip_pixels = total pixel count, so
+//     the iteration runs exactly once with one giant strip.
+fn compute_strip_layout(
+    hdu_shape: &[u64],
+    data_shape: &[u64],
+    start: &[u64],
+) -> (usize, u64) {
+    let n = hdu_shape.len();
+    let mut strip_pixels: u64 = 1;
+    for axis in (0..n).rev() {
+        strip_pixels *= data_shape[axis];
+        if start[axis] != 0 || data_shape[axis] != hdu_shape[axis] {
+            return (axis, strip_pixels);
+        }
+    }
+    (0, strip_pixels)
+}
+
+// Reverse the bytes of every `itemsize`-byte element in `buf` (in place).
+// itemsize=1 is a no-op.  Used to translate native little-endian to FITS
+// big-endian on the write path.
+fn byteswap_in_place(buf: &mut [u8], itemsize: usize) {
+    if itemsize <= 1 {
+        return;
+    }
+    for chunk in buf.chunks_exact_mut(itemsize) {
+        chunk.reverse();
+    }
+}
+
+// RAII wrapper around the Python buffer protocol.  Asks for a C-contiguous
+// view via the C API (bypassing pyo3's PyBuffer<T> typed wrapper, which
+// rejects non-native byte orders such as '>f8' for a PyBuffer<f64>).
+// PyBuffer_Release is guaranteed to run on drop.  Box the Py_buffer so its
+// address is stable across moves.
+struct RawBuffer {
+    view: Box<pyo3::ffi::Py_buffer>,
+}
+
+impl RawBuffer {
+    fn acquire(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut view: Box<pyo3::ffi::Py_buffer> =
+            Box::new(unsafe { std::mem::zeroed() });
+        let rc = unsafe {
+            pyo3::ffi::PyObject_GetBuffer(
+                obj.as_ptr(),
+                &mut *view as *mut _,
+                pyo3::ffi::PyBUF_C_CONTIGUOUS,
+            )
+        };
+        if rc != 0 {
+            // Python set an exception during the failed GetBuffer call.
+            return Err(PyErr::take(obj.py()).unwrap_or_else(|| {
+                PyValueError::new_err("buffer acquisition failed")
+            }));
+        }
+        Ok(RawBuffer { view })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.view.buf as *const u8,
+                self.view.len as usize,
+            )
+        }
+    }
+
+    fn itemsize(&self) -> usize {
+        self.view.itemsize as usize
+    }
+
+    fn len(&self) -> usize {
+        self.view.len as usize
+    }
+}
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        unsafe { pyo3::ffi::PyBuffer_Release(&mut *self.view) };
+    }
+}
+
 // Map a numpy short-code or long-name dtype string to a FITS BITPIX value.
 // Endianness prefixes (`<`, `>`, `|`, `=`) are stripped.  Only the dtypes
 // directly representable in FITS without BZERO/BSCALE are supported; the
@@ -571,7 +933,7 @@ fn dtype_to_bitpix(dtype: &str) -> PyResult<i32> {
 #[pyclass]
 struct FITS {
     filename: String,
-    file: Option<std::fs::File>,
+    file: FileHandle,
     hdus: Vec<Py<PyAny>>,
 }
 
@@ -591,14 +953,15 @@ impl FITS {
             ))),
         };
 
-        let mut file = options.open(&filename)
+        let file = options.open(&filename)
             .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filename, e)))?;
 
-        let hdus = parse_hdus_from_file(py, &mut file)?;
+        let handle: FileHandle = Arc::new(Mutex::new(Some(file)));
+        let hdus = parse_hdus_from_file(py, &handle)?;
 
         Ok(FITS {
             filename,
-            file: Some(file),
+            file: handle,
             hdus,
         })
     }
@@ -615,19 +978,25 @@ impl FITS {
     }
 
     fn close(&mut self) -> PyResult<()> {
-        if let Some(file) = self.file.take() {
+        let mut guard = lock_file(&self.file)?;
+        if let Some(file) = guard.take() {
             let _ = file.sync_all();
         }
         Ok(())
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.file.is_none()
+    fn closed(&self) -> PyResult<bool> {
+        let guard = lock_file(&self.file)?;
+        Ok(guard.is_none())
     }
 
     fn __repr__(&self) -> String {
-        let status = if self.closed() { "closed" } else { "open" };
+        let status = match self.file.lock() {
+            Ok(guard) if guard.is_none() => "closed",
+            Ok(_) => "open",
+            Err(_) => "poisoned",
+        };
         format!("FITS('{}', {} HDUs, {})", self.filename, self.hdus.len(), status)
     }
 
@@ -713,8 +1082,9 @@ impl FITS {
             ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
         };
 
-        {
-            let file = self.file.as_mut()
+        let data_offset = {
+            let mut guard = lock_file(&self.file)?;
+            let file = guard.as_mut()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
 
             file.seek(SeekFrom::End(0))
@@ -730,9 +1100,10 @@ impl FITS {
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
             }
 
+            let header_end = file.stream_position()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
             if data_padded > 0 {
-                let header_end = file.stream_position()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 let new_len = header_end + data_padded;
                 file.set_len(new_len)
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -742,7 +1113,9 @@ impl FITS {
 
             file.flush()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        }
+
+            header_end
+        };
 
         // Construct the matching ImageHDU in memory and append.  The parser
         // stores cards with trailing whitespace trimmed; mirror that here so
@@ -752,7 +1125,12 @@ impl FITS {
             .collect();
         let new_hdu: Py<PyAny> = Py::new(
             py,
-            ImageHDU::new(stored_cards, self.hdus.len()),
+            ImageHDU::new(
+                stored_cards,
+                self.hdus.len(),
+                data_offset,
+                Arc::clone(&self.file),
+            ),
         )?.into();
         self.hdus.push(new_hdu);
 
