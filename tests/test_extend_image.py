@@ -29,6 +29,7 @@ def _make_file_with_image(tmpdir, dtype, dims, name="t.fits", extname="img"):
 
 # -------------------- default start (append at slow-axis end) --------------------
 
+
 def test_extend_default_start_grows_slow_axis():
     """With no start, new data is appended along numpy axis 0; existing data
     is preserved and the slow axis grows by data.shape[0]."""
@@ -44,7 +45,7 @@ def test_extend_default_start_grows_slow_axis():
             # In-memory header reflects the new slow-axis size.
             hd = fits.hdus[0].header_dict
             assert hd["NAXIS1"]["value"] == 20  # fast axis unchanged
-            assert hd["NAXIS2"]["value"] == 8   # slow axis grew 5 -> 8
+            assert hd["NAXIS2"]["value"] == 8  # slow axis grew 5 -> 8
 
         # Round-trip from disk.
         with rustfits.FITS(fname, "r") as fits:
@@ -81,12 +82,13 @@ def test_extend_1d_default_start():
 
 # -------------------- explicit start --------------------
 
+
 def test_extend_explicit_start_with_growth():
     """Explicit start past the current slow-axis end; the HDU grows to
     accommodate."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f4", (3, 4))
-        new = (np.arange(2 * 4, dtype="f4").reshape(2, 4) + 10.0)
+        new = np.arange(2 * 4, dtype="f4").reshape(2, 4) + 10.0
 
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].extend(new, start=(3, 0))
@@ -105,7 +107,9 @@ def test_extend_with_gap_zero_filled():
 
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].write(original)
-            fits.hdus[0].extend(new, start=(4, 0))  # leaves row index 2 and 3 empty
+            fits.hdus[0].extend(
+                new, start=(4, 0)
+            )  # leaves row index 2 and 3 empty
             hd = fits.hdus[0].header_dict
             assert hd["NAXIS2"]["value"] == 5
 
@@ -134,6 +138,7 @@ def test_extend_no_growth_falls_through_to_write():
 
 
 # -------------------- error paths --------------------
+
 
 def test_extend_inner_axis_growth_rejected():
     """Attempting to grow an inner (fast) axis is rejected — only the slow
@@ -197,6 +202,7 @@ def test_extend_last_hdu_when_multiple_works():
 
 
 # -------------------- crossing block boundary --------------------
+
 
 def test_extend_crosses_block_boundary():
     """Growth that pushes the data section into a new 2880-byte block must

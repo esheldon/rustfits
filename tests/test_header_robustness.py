@@ -45,6 +45,7 @@ def _write_two_hdus(fname, cards1, cards2):
 
 # --------------------------- parse_keyword disambiguation ----------------------------
 
+
 def test_naxis_keyword_not_matched_by_naxis1():
     """parse_keyword('NAXIS') must not match a NAXIS1 card listed before NAXIS.
 
@@ -76,6 +77,7 @@ def test_naxis_keyword_not_matched_by_naxis1():
 
 # --------------------------- END card detection ----------------------------
 
+
 def test_end_card_does_not_match_endian():
     """A regular keyword like ENDIAN must not be misidentified as END."""
     cards = [
@@ -97,6 +99,7 @@ def test_end_card_does_not_match_endian():
 
 # --------------------------- printable-ASCII validation ----------------------------
 
+
 def test_non_printable_byte_rejected():
     cards = [
         _card("SIMPLE  =                    T"),
@@ -117,6 +120,7 @@ def test_non_printable_byte_rejected():
 
 
 # --------------------------- mandatory-keyword validation ----------------------------
+
 
 def test_missing_simple_rejected():
     cards = [

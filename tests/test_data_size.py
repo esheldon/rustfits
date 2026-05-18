@@ -32,6 +32,7 @@ def _pad_block(b):
 
 # --------------------------- PCOUNT ----------------------------
 
+
 def test_pcount_used_for_bintable_heap():
     """A BINTABLE declares PCOUNT=5000 (variable-length heap).  The reader
     must add PCOUNT to the row-array size, otherwise it lands inside the
@@ -82,6 +83,7 @@ def test_pcount_used_for_bintable_heap():
 
 # --------------------------- GCOUNT ----------------------------
 
+
 def test_gcount_multiplies_data_size():
     """A header with GCOUNT=2 must produce a data unit twice as large as
     GCOUNT=1 would imply, even with PCOUNT=0.  Constructs an artificial
@@ -126,10 +128,13 @@ def test_gcount_multiplies_data_size():
 
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 3
-            assert fits.hdus[2].header_dict["EXTNAME"]["value"] == "after-gcount"
+            assert (
+                fits.hdus[2].header_dict["EXTNAME"]["value"] == "after-gcount"
+            )
 
 
 # --------------------------- defaults still work ----------------------------
+
 
 def test_image_hdu_unaffected_by_defaults():
     """An image HDU without PCOUNT/GCOUNT keywords must still compute the
@@ -162,7 +167,9 @@ def test_image_hdu_unaffected_by_defaults():
 
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
-            assert fits.hdus[1].header_dict["EXTNAME"]["value"] == "after-image"
+            assert (
+                fits.hdus[1].header_dict["EXTNAME"]["value"] == "after-image"
+            )
 
 
 if __name__ == "__main__":

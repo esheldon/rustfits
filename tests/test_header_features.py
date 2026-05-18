@@ -28,33 +28,28 @@ def _card(text):
 def _write_extended_fits(fname):
     cards = [
         _card("SIMPLE  =                    T / conforms to FITS standard"),
-        _card("BITPIX  =                    8 / number of bits per data pixel"),
+        _card(
+            "BITPIX  =                    8 / number of bits per data pixel"
+        ),
         _card("NAXIS   =                    0 / number of data axes"),
-
         # HIERARCH long keyword (keyword contains spaces).
         _card("HIERARCH ESO INS DET TEMP = 12.5 / instrument temperature"),
         _card("HIERARCH ESO TEL ALT = -20.25 / telescope altitude"),
-
         # `''` escape inside a quoted string.
         _card("OBSERVER= 'O''Brien' / observer surname"),
         # Several escapes in one string.
         _card("QUOTED  = 'a''b''c' / multiple escapes"),
-
         # Trailing-space stripping (per FITS standard).
         _card("OBJECT  = 'M31     ' / target"),
-
         # `D` exponent (Fortran double precision), both cases.
         _card("EXPTIME = 1.5D-3 / exposure in seconds"),
         _card("BIGNUM  = 2.5d10 / lower-case d exponent"),
-
         # Complex literals: float and integer components.
         _card("IMPED   = (50.0, -25.0) / complex impedance"),
         _card("CINT    = (3, 4) / complex with integer parts"),
-
         # Blank-keyword commentary cards (cols 1-8 all spaces).
         _card("        Some commentary text without a keyword"),
         _card("        Another line of blank-keyword commentary"),
-
         _card("END"),
     ]
     header = "".join(cards).encode("ascii")
@@ -74,7 +69,9 @@ def header_dict():
 
 def test_hierarch_keyword(header_dict):
     assert header_dict["ESO INS DET TEMP"]["value"] == 12.5
-    assert header_dict["ESO INS DET TEMP"]["comment"] == "instrument temperature"
+    assert (
+        header_dict["ESO INS DET TEMP"]["comment"] == "instrument temperature"
+    )
     assert header_dict["ESO TEL ALT"]["value"] == -20.25
     # HIERARCH should not appear as a standalone key.
     assert "HIERARCH" not in header_dict
@@ -122,4 +119,5 @@ if __name__ == "__main__":
         with rustfits.FITS(fname, "r") as fits:
             hd = fits.hdus[0].header_dict
         from pprint import pprint
+
         pprint(hd)

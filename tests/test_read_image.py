@@ -21,6 +21,7 @@ import rustfits
 
 # -------------------- round-trip across dtypes --------------------
 
+
 @pytest.mark.parametrize(
     "dtype",
     ["u1", "i2", "i4", "i8", "f4", "f8"],
@@ -45,6 +46,7 @@ def test_roundtrip_write_then_read(dtype):
 
 
 # -------------------- shape variations --------------------
+
 
 def test_read_1d():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,6 +78,7 @@ def test_read_3d():
 
 # -------------------- freshly-created HDU is all zeros --------------------
 
+
 def test_read_fresh_hdu_returns_zeros():
     """create_image_hdu zero-fills the data section (sparse).  read() must
     surface those zeros."""
@@ -91,6 +94,7 @@ def test_read_fresh_hdu_returns_zeros():
 
 
 # -------------------- native endianness --------------------
+
 
 def test_read_result_is_native_endian():
     """Returned dtype must be native — that's the byte order downstream
@@ -129,6 +133,7 @@ def test_read_values_correct_after_byteswap():
 
 # -------------------- multi-HDU file --------------------
 
+
 def test_read_multi_hdu_file():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
@@ -155,6 +160,7 @@ def test_read_multi_hdu_file():
 
 # -------------------- partial-write then read --------------------
 
+
 def test_read_after_partial_write():
     """After a partial write, read must return the full HDU with the sub-
     region updated and the rest still zero (from create_image_hdu)."""
@@ -175,6 +181,7 @@ def test_read_after_partial_write():
 
 
 # -------------------- extend + read --------------------
+
 
 def test_read_after_extend():
     """After extend, read must return the larger array with both regions."""

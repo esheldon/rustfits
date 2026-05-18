@@ -18,12 +18,16 @@ def _write_fits_with_extended_header(fname):
     """
     cards = [
         _card("SIMPLE  =                    T / conforms to FITS standard"),
-        _card("BITPIX  =                    8 / number of bits per data pixel"),
+        _card(
+            "BITPIX  =                    8 / number of bits per data pixel"
+        ),
         _card("NAXIS   =                    0 / number of data axes"),
         _card("LONGKEY = 'first part of the long string&' / start of comment"),
         _card("CONTINUE  'and the second part&' / middle"),
         _card("CONTINUE  'and the end.' / end of comment"),
-        _card("COMMENT FITS (Flexible Image Transport System) format is defined in"),
+        _card(
+            "COMMENT FITS (Flexible Image Transport System) format is defined in"
+        ),
         _card("COMMENT 'Astronomy and Astrophysics', volume 376, page 359."),
         _card("HISTORY Created 2026-05-16 for testing"),
         _card("HISTORY Calibrated with rustfits test suite"),
@@ -45,11 +49,12 @@ def test_continue_long_string():
             hd = fits.hdus[0].header_dict
 
         assert hd["LONGKEY"]["value"] == (
-            "first part of the long string"
-            "and the second part"
-            "and the end."
+            "first part of the long stringand the second partand the end."
         )
-        assert hd["LONGKEY"]["comment"] == "start of comment middle end of comment"
+        assert (
+            hd["LONGKEY"]["comment"]
+            == "start of comment middle end of comment"
+        )
 
 
 def test_comment_cards_accumulated():

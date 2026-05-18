@@ -21,6 +21,7 @@ import rustfits
 
 # -------------------- helpers --------------------
 
+
 def _make_file_with_image(tmpdir, dtype, dims, extname="img"):
     """Create a fresh FITS file with one image HDU and return its filename."""
     fname = os.path.join(tmpdir, "t.fits")
@@ -49,6 +50,7 @@ def _read_image_bytes(fname, hdu_index=0):
 
 
 # -------------------- full write, round-trip --------------------
+
 
 def test_full_write_roundtrip_f8():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -96,6 +98,7 @@ def test_full_write_u1_zero_copy():
 
 # -------------------- byte order --------------------
 
+
 def test_write_already_big_endian_input():
     """Big-endian input takes the zero-copy path; result must match."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -125,6 +128,7 @@ def test_write_little_endian_input_swapped():
 
 
 # -------------------- partial write with start --------------------
+
 
 def test_partial_write_2d():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -187,7 +191,7 @@ def test_partial_write_full_inner_axis_coalesces():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "i2", (5, 8))
         # Fast axis = 8 (matches HDU); outer axis is partial.
-        sub = (np.arange(3 * 8, dtype="i2").reshape(3, 8) + 50)
+        sub = np.arange(3 * 8, dtype="i2").reshape(3, 8) + 50
 
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].write(sub, start=(1, 0))
@@ -200,6 +204,7 @@ def test_partial_write_full_inner_axis_coalesces():
 
 
 # -------------------- validation errors --------------------
+
 
 def test_wrong_dtype_rejected():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -257,6 +262,7 @@ def test_non_contiguous_rejected():
 
 # -------------------- extension HDU write --------------------
 
+
 def test_write_to_extension_hdu():
     """Writes addressed via hdus[1] must land in the second HDU's data
     section, not the primary's."""
@@ -267,7 +273,7 @@ def test_write_to_extension_hdu():
             fits.create_image_hdu(dtype="f8", dims=(2, 5), extname="second")
 
             primary = np.arange(12, dtype="i4").reshape(3, 4) + 1
-            second  = np.arange(10, dtype="f8").reshape(2, 5) - 0.5
+            second = np.arange(10, dtype="f8").reshape(2, 5) - 0.5
 
             fits.hdus[0].write(primary)
             fits.hdus[1].write(second)

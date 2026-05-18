@@ -48,7 +48,10 @@ def test_create_image_extension():
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="i4", dims=(3, 4), extname="image1")
             fits.create_image_hdu(
-                dtype="f4", dims=(2, 5, 6), extname="image2", extver=3,
+                dtype="f4",
+                dims=(2, 5, 6),
+                extname="image2",
+                extver=3,
             )
 
             assert len(fits.hdus) == 2
@@ -82,7 +85,7 @@ def test_create_image_extension():
         ("uint8", 8),
         ("int32", 32),
         ("float64", -64),
-        ("<f8", -64),   # endianness prefix stripped
+        ("<f8", -64),  # endianness prefix stripped
         (">i4", 32),
     ],
 )
