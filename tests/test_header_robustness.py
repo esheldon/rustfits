@@ -75,7 +75,7 @@ def test_naxis_keyword_not_matched_by_naxis1():
         _write_two_hdus(fname, cards1, cards2)
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
-            assert fits.hdus[1].header_dict["EXTNAME"]["value"] == "hdu1"
+            assert fits.hdus[1].header["EXTNAME"] == "hdu1"
 
 
 # --------------------------- END card detection ----------------------------
@@ -95,9 +95,9 @@ def test_end_card_does_not_match_endian():
         fname = os.path.join(tmpdir, "rb.fits")
         _write_header_only(fname, cards)
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
-        assert hd["ENDIAN"]["value"] == "little"
-        assert hd["OTHER"]["value"] == 42
+            hd = fits.hdus[0].header
+        assert hd["ENDIAN"] == "little"
+        assert hd["OTHER"] == 42
 
 
 # ----------------------- printable-ASCII validation ------------------------

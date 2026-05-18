@@ -31,15 +31,15 @@ def test_create_primary_image_hdu():
             assert isinstance(hdu, rustfits.ImageHDU)
             assert hdu.index == 0
 
-            hd = hdu.header_dict
-            assert hd["SIMPLE"]["value"] is True
-            assert hd["BITPIX"]["value"] == -64
-            assert hd["NAXIS"]["value"] == 2
+            hd = hdu.header
+            assert hd["SIMPLE"] is True
+            assert hd["BITPIX"] == -64
+            assert hd["NAXIS"] == 2
             # numpy dims (5, 20) -> FITS NAXIS1=20, NAXIS2=5
-            assert hd["NAXIS1"]["value"] == 20
-            assert hd["NAXIS2"]["value"] == 5
-            assert hd["EXTEND"]["value"] is True
-            assert hd["EXTNAME"]["value"] == "image1"
+            assert hd["NAXIS1"] == 20
+            assert hd["NAXIS2"] == 5
+            assert hd["EXTEND"] is True
+            assert hd["EXTNAME"] == "image1"
 
 
 def test_create_image_extension():
@@ -58,19 +58,19 @@ def test_create_image_extension():
             assert isinstance(fits.hdus[1], rustfits.ImageHDU)
             assert fits.hdus[1].index == 1
 
-            hd = fits.hdus[1].header_dict
+            hd = fits.hdus[1].header
             # Extension headers begin with XTENSION = 'IMAGE   '
-            assert hd["XTENSION"]["value"] == "IMAGE"
-            assert hd["BITPIX"]["value"] == -32
-            assert hd["NAXIS"]["value"] == 3
+            assert hd["XTENSION"] == "IMAGE"
+            assert hd["BITPIX"] == -32
+            assert hd["NAXIS"] == 3
             # numpy (2, 5, 6) -> FITS NAXIS1=6, NAXIS2=5, NAXIS3=2
-            assert hd["NAXIS1"]["value"] == 6
-            assert hd["NAXIS2"]["value"] == 5
-            assert hd["NAXIS3"]["value"] == 2
-            assert hd["PCOUNT"]["value"] == 0
-            assert hd["GCOUNT"]["value"] == 1
-            assert hd["EXTNAME"]["value"] == "image2"
-            assert hd["EXTVER"]["value"] == 3
+            assert hd["NAXIS1"] == 6
+            assert hd["NAXIS2"] == 5
+            assert hd["NAXIS3"] == 2
+            assert hd["PCOUNT"] == 0
+            assert hd["GCOUNT"] == 1
+            assert hd["EXTNAME"] == "image2"
+            assert hd["EXTVER"] == 3
 
 
 @pytest.mark.parametrize(
@@ -94,7 +94,7 @@ def test_dtype_maps_to_bitpix(dtype, bitpix):
         fname = os.path.join(tmpdir, "test.fits")
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype=dtype, dims=(2, 3))
-            assert fits.hdus[0].header_dict["BITPIX"]["value"] == bitpix
+            assert fits.hdus[0].header["BITPIX"] == bitpix
 
 
 def test_unsupported_dtype_raises():
@@ -128,18 +128,18 @@ def test_roundtrip_via_reopen():
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
 
-            hd0 = fits.hdus[0].header_dict
-            assert hd0["BITPIX"]["value"] == 32
-            assert hd0["NAXIS1"]["value"] == 20
-            assert hd0["NAXIS2"]["value"] == 5
-            assert hd0["EXTNAME"]["value"] == "img"
+            hd0 = fits.hdus[0].header
+            assert hd0["BITPIX"] == 32
+            assert hd0["NAXIS1"] == 20
+            assert hd0["NAXIS2"] == 5
+            assert hd0["EXTNAME"] == "img"
 
-            hd1 = fits.hdus[1].header_dict
-            assert hd1["XTENSION"]["value"] == "IMAGE"
-            assert hd1["BITPIX"]["value"] == -64
-            assert hd1["NAXIS1"]["value"] == 4
-            assert hd1["NAXIS2"]["value"] == 3
-            assert hd1["EXTNAME"]["value"] == "ext1"
+            hd1 = fits.hdus[1].header
+            assert hd1["XTENSION"] == "IMAGE"
+            assert hd1["BITPIX"] == -64
+            assert hd1["NAXIS1"] == 4
+            assert hd1["NAXIS2"] == 3
+            assert hd1["EXTNAME"] == "ext1"
 
 
 def test_data_section_padded_and_zero():
@@ -167,8 +167,8 @@ def test_naxis0_has_no_data_section():
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="u1", dims=[])
 
-            hd = fits.hdus[0].header_dict
-            assert hd["NAXIS"]["value"] == 0
+            hd = fits.hdus[0].header
+            assert hd["NAXIS"] == 0
 
         # one header block only (no data unit when NAXIS=0)
         assert os.path.getsize(fname) == 2880
@@ -183,7 +183,7 @@ def test_extname_with_embedded_quote():
             fits.create_image_hdu(dtype="f4", dims=(2, 2), extname="O'Brien")
 
         with rustfits.FITS(fname, "r") as fits:
-            assert fits.hdus[0].header_dict["EXTNAME"]["value"] == "O'Brien"
+            assert fits.hdus[0].header["EXTNAME"] == "O'Brien"
 
 
 if __name__ == "__main__":

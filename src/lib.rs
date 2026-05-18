@@ -325,6 +325,340 @@ fn parse_header_dict(py: Python<'_>, cards: &[String]) -> PyResult<Py<PyDict>> {
     Ok(dict.unbind())
 }
 
+// ====================== FITSHeader: card-list view of a header ======================
+//
+// Wraps the raw 80-char card list (`Vec<String>`) and exposes it to Python as
+// an ordered, dict-like view.  Cards are the single source of truth — every
+// value/comment/iteration access re-parses the relevant card(s).  Headers are
+// tiny (tens to a few hundred cards) so parse-on-demand cost is invisible,
+// and keeping no cache means future mutation methods only have to rewrite
+// cards without worrying about cache invalidation.
+//
+// Iteration order is the order keys first appear in the file.  Commentary
+// keys (COMMENT, HISTORY, blank-keyword cards) collapse to a single appearance
+// even if their cards repeat; `header[key]` for those returns a list of all
+// matching card texts in card order.
+
+// Extract the keyword name for a card.  Returns:
+//   - Some("X")   for a normal/HIERARCH keyword card
+//   - Some("END" / "COMMENT" / "HISTORY" / "CONTINUE")
+//   - Some("")    for a blank-keyword commentary card (cols 1-8 all spaces)
+//   - None        for an empty card after trimming
+fn keyword_of(card: &str) -> Option<String> {
+    let card = card.trim_end();
+    if card.is_empty() {
+        return None;
+    }
+    let key_field = if card.len() >= 8 { &card[..8] } else { card };
+    let trimmed = key_field.trim();
+    if trimmed == "HIERARCH" {
+        if let Some(eq_pos) = card.find('=') {
+            let kw = card[8..eq_pos].trim();
+            if !kw.is_empty() {
+                return Some(kw.to_string());
+            }
+        }
+        return Some("HIERARCH".to_string());
+    }
+    Some(trimmed.to_string())
+}
+
+// Walk cards once, return unique keys in order of first appearance.  END and
+// orphan CONTINUE cards are skipped; COMMENT/HISTORY/blank appear once each.
+fn unique_keys_in_order(cards: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for card in cards {
+        let kw = match keyword_of(card) {
+            Some(k) => k,
+            None => continue,
+        };
+        if kw == "END" || kw == "CONTINUE" {
+            continue;
+        }
+        if seen.insert(kw.clone()) {
+            out.push(kw);
+        }
+    }
+    out
+}
+
+// Find the first card with a matching key, returning (card_index, value_part).
+// Skips commentary keys (they require list-of-cards collection by the caller).
+// Handles HIERARCH long keys.
+fn find_card_for_key(cards: &[String], key: &str) -> Option<(usize, String)> {
+    for (i, card) in cards.iter().enumerate() {
+        let card = card.trim_end();
+        if card.is_empty() {
+            continue;
+        }
+        let key_field = if card.len() >= 8 { &card[..8] } else { card };
+        let kw_trimmed = key_field.trim();
+        if matches!(kw_trimmed, "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
+            continue;
+        }
+        if kw_trimmed == "HIERARCH" {
+            if let Some(eq_pos) = card.find('=') {
+                if card[8..eq_pos].trim() == key {
+                    return Some((i, card[eq_pos + 1..].to_string()));
+                }
+            }
+        } else if kw_trimmed == key {
+            if let Some(eq_pos) = card.find('=') {
+                return Some((i, card[eq_pos + 1..].to_string()));
+            }
+        }
+    }
+    None
+}
+
+// Collect all card texts (cols 9-80) for cards whose keyword field equals
+// `keyword` (e.g. "COMMENT", "HISTORY").
+fn collect_commentary_texts(cards: &[String], keyword: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for card in cards {
+        let card = card.trim_end();
+        if card.is_empty() {
+            continue;
+        }
+        let key_field = if card.len() >= 8 { &card[..8] } else { card };
+        if key_field.trim() == keyword {
+            let text = if card.len() > 8 {
+                card[8..].to_string()
+            } else {
+                String::new()
+            };
+            out.push(text);
+        }
+    }
+    out
+}
+
+// Collect text from blank-keyword commentary cards (cols 1-8 all spaces).
+fn collect_blank_commentary_texts(cards: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for card in cards {
+        let card = card.trim_end();
+        if card.is_empty() {
+            continue;
+        }
+        if card.len() >= 8 && card[..8].trim().is_empty() && card.len() > 8 {
+            out.push(card[8..].to_string());
+        }
+    }
+    out
+}
+
+// Parse a card's value_part into (Python value, comment), following the
+// FITS CONTINUE long-string convention when the value is a string ending
+// in `&`.  Comments on continuation cards are space-joined to the base
+// card's comment (matching `parse_header_dict`).
+fn parse_value_with_continue(
+    py: Python<'_>,
+    cards: &[String],
+    start_idx: usize,
+    value_part: &str,
+) -> PyResult<(Py<PyAny>, String)> {
+    let (raw_value, mut comment) = split_value_comment(value_part);
+    if raw_value.is_empty() {
+        return Ok((py.None(), comment));
+    }
+    if raw_value.starts_with('\'') && raw_value.ends_with('\'') && raw_value.len() >= 2 {
+        let mut s = extract_fits_string(&raw_value);
+        let mut i = start_idx;
+        while s.ends_with('&') {
+            if i + 1 >= cards.len() {
+                break;
+            }
+            let next_card = cards[i + 1].trim_end();
+            if !next_card.starts_with("CONTINUE") {
+                break;
+            }
+            let rest = if next_card.len() > 8 { &next_card[8..] } else { "" };
+            let (cont_raw, cont_comment) = split_value_comment(rest);
+            if !(cont_raw.starts_with('\'')
+                && cont_raw.ends_with('\'')
+                && cont_raw.len() >= 2)
+            {
+                break;
+            }
+            let segment = extract_fits_string(&cont_raw);
+            s.pop();
+            s.push_str(&segment);
+            if !cont_comment.is_empty() {
+                if !comment.is_empty() {
+                    comment.push(' ');
+                }
+                comment.push_str(&cont_comment);
+            }
+            i += 1;
+        }
+        return Ok((s.into_py_any(py)?, comment));
+    }
+    let value: Py<PyAny> = if raw_value == "T" {
+        true.into_py_any(py)?
+    } else if raw_value == "F" {
+        false.into_py_any(py)?
+    } else if let Some((r, im)) = parse_fits_complex(&raw_value) {
+        PyComplex::from_doubles(py, r, im).into_any().unbind()
+    } else if let Ok(n) = raw_value.parse::<i64>() {
+        n.into_py_any(py)?
+    } else if let Some(f) = parse_fits_float(&raw_value) {
+        f.into_py_any(py)?
+    } else {
+        raw_value.into_py_any(py)?
+    };
+    Ok((value, comment))
+}
+
+#[pyclass]
+struct FITSHeader {
+    cards: Vec<String>,
+}
+
+impl FITSHeader {
+    fn from_cards(cards: Vec<String>) -> Self {
+        FITSHeader { cards }
+    }
+}
+
+#[pymethods]
+impl FITSHeader {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        // Commentary keys are returned as ordered lists of card texts.
+        let commentary_list = match key {
+            "COMMENT" => Some(collect_commentary_texts(&self.cards, "COMMENT")),
+            "HISTORY" => Some(collect_commentary_texts(&self.cards, "HISTORY")),
+            "" => Some(collect_blank_commentary_texts(&self.cards)),
+            _ => None,
+        };
+        if let Some(items) = commentary_list {
+            if items.is_empty() {
+                return Err(pyo3::exceptions::PyKeyError::new_err(
+                    format!("'{}' not in header", key)
+                ));
+            }
+            return Ok(PyList::new(py, &items)?.into_any().unbind());
+        }
+
+        match find_card_for_key(&self.cards, key) {
+            Some((idx, value_part)) => {
+                let (value, _comment) =
+                    parse_value_with_continue(py, &self.cards, idx, &value_part)?;
+                Ok(value)
+            }
+            None => Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("'{}' not in header", key)
+            )),
+        }
+    }
+
+    fn __contains__(&self, key: &str) -> bool {
+        match key {
+            "COMMENT" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("COMMENT")),
+            "HISTORY" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("HISTORY")),
+            "" => self.cards.iter().any(|c| {
+                // Only blank cards with content count (pure padding doesn't).
+                let trimmed = c.trim_end();
+                trimmed.len() > 8 && trimmed[..8].trim().is_empty()
+            }),
+            _ => find_card_for_key(&self.cards, key).is_some(),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        unique_keys_in_order(&self.cards).len()
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let keys = unique_keys_in_order(&slf.cards);
+        let list = PyList::new(py, &keys)?;
+        Ok(list.call_method0("__iter__")?.unbind())
+    }
+
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let keys = unique_keys_in_order(&self.cards);
+        Ok(PyList::new(py, &keys)?.unbind())
+    }
+
+    fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let keys = unique_keys_in_order(&self.cards);
+        let mut values: Vec<Py<PyAny>> = Vec::with_capacity(keys.len());
+        for k in &keys {
+            values.push(self.__getitem__(py, k)?);
+        }
+        Ok(PyList::new(py, &values)?.unbind())
+    }
+
+    fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let keys = unique_keys_in_order(&self.cards);
+        let mut items: Vec<Py<PyAny>> = Vec::with_capacity(keys.len());
+        for k in &keys {
+            let v = self.__getitem__(py, k)?;
+            let tup = pyo3::types::PyTuple::new(py, &[k.clone().into_py_any(py)?, v])?;
+            items.push(tup.into_any().unbind());
+        }
+        Ok(PyList::new(py, &items)?.unbind())
+    }
+
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        match self.__getitem__(py, key) {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyKeyError>(py) => {
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // Comment text associated with a single-card key.  Errors for the
+    // commentary keys COMMENT/HISTORY/blank — those don't have per-card
+    // comments in the usual sense.
+    fn comment_of(&self, py: Python<'_>, key: &str) -> PyResult<String> {
+        if matches!(key, "COMMENT" | "HISTORY" | "") {
+            return Err(PyValueError::new_err(
+                "comment_of() is not defined for commentary keys (COMMENT/HISTORY/blank)"
+            ));
+        }
+        match find_card_for_key(&self.cards, key) {
+            Some((idx, value_part)) => {
+                let (_value, comment) =
+                    parse_value_with_continue(py, &self.cards, idx, &value_part)?;
+                Ok(comment)
+            }
+            None => Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("'{}' not in header", key)
+            )),
+        }
+    }
+
+    // Raw 80-char card strings in on-disk order.
+    #[getter]
+    fn cards(&self) -> Vec<String> {
+        self.cards.clone()
+    }
+
+    // Structured snapshot of all keys with values and comments, matching the
+    // legacy `header_dict` shape.  Useful for serialization, test comparisons,
+    // and code that doesn't want to learn the FITSHeader class.
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        parse_header_dict(py, &self.cards)
+    }
+
+    fn __repr__(&self) -> String {
+        let n_unique = unique_keys_in_order(&self.cards).len();
+        format!(
+            "<FITSHeader: {} unique keys, {} cards>",
+            n_unique, self.cards.len()
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.cards.iter().map(|c| c.trim_end()).collect::<Vec<_>>().join("\n")
+    }
+}
+
 // ====================== Base HDU ======================
 // HDUs hold a clone of the FITS file handle plus the byte offset of their
 // data section, enabling write-back methods on subclasses (e.g. ImageHDU.write).
@@ -351,19 +685,17 @@ impl HDU {
         format!("<HDU #{}>", self.index)
     }
 
+    // The header view.  Returns a fresh FITSHeader bound to a clone of the
+    // HDU's current cards.  Phase 2 will make this persistent so mutations
+    // on the returned object write back to the HDU; for now it is a snapshot.
     #[getter]
-    fn header(&self) -> Vec<String> {
-        self.header.clone()
+    fn header(&self, py: Python<'_>) -> PyResult<Py<FITSHeader>> {
+        Py::new(py, FITSHeader::from_cards(self.header.clone()))
     }
 
     #[getter]
     fn index(&self) -> usize {
         self.index
-    }
-
-    #[getter]
-    fn header_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        parse_header_dict(py, &self.header)
     }
 }
 
@@ -1753,5 +2085,6 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImageHDU>()?;
     m.add_class::<TableHDU>()?;
     m.add_class::<AsciiTableHDU>()?;
+    m.add_class::<FITSHeader>()?;
     Ok(())
 }

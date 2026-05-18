@@ -43,14 +43,14 @@ def test_extend_default_start_grows_slow_axis():
             fits.hdus[0].extend(new)
 
             # In-memory header reflects the new slow-axis size.
-            hd = fits.hdus[0].header_dict
-            assert hd["NAXIS1"]["value"] == 20  # fast axis unchanged
-            assert hd["NAXIS2"]["value"] == 8  # slow axis grew 5 -> 8
+            hd = fits.hdus[0].header
+            assert hd["NAXIS1"] == 20  # fast axis unchanged
+            assert hd["NAXIS2"] == 8  # slow axis grew 5 -> 8
 
         # Round-trip from disk.
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
-            assert hd["NAXIS2"]["value"] == 8
+            hd = fits.hdus[0].header
+            assert hd["NAXIS2"] == 8
 
         # Verify on-disk pixels: original in rows 0..4, new in rows 5..7.
         with open(fname, "rb") as f:
@@ -70,7 +70,7 @@ def test_extend_1d_default_start():
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].write(original)
             fits.hdus[0].extend(more)
-            assert fits.hdus[0].header_dict["NAXIS1"]["value"] == 13
+            assert fits.hdus[0].header["NAXIS1"] == 13
 
         with open(fname, "rb") as f:
             f.seek(2880)
@@ -92,8 +92,8 @@ def test_extend_explicit_start_with_growth():
 
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].extend(new, start=(3, 0))
-            hd = fits.hdus[0].header_dict
-            assert hd["NAXIS2"]["value"] == 5  # 3 + 2
+            hd = fits.hdus[0].header
+            assert hd["NAXIS2"] == 5  # 3 + 2
 
 
 def test_extend_with_gap_zero_filled():
@@ -110,8 +110,8 @@ def test_extend_with_gap_zero_filled():
             fits.hdus[0].extend(
                 new, start=(4, 0)
             )  # leaves row index 2 and 3 empty
-            hd = fits.hdus[0].header_dict
-            assert hd["NAXIS2"]["value"] == 5
+            hd = fits.hdus[0].header
+            assert hd["NAXIS2"] == 5
 
         with open(fname, "rb") as f:
             f.seek(2880)
@@ -132,7 +132,7 @@ def test_extend_no_growth_falls_through_to_write():
 
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].extend(sub, start=(1, 0))
-            assert fits.hdus[0].header_dict["NAXIS2"]["value"] == 5
+            assert fits.hdus[0].header["NAXIS2"] == 5
 
         assert os.path.getsize(fname) == size_before
 
@@ -163,7 +163,7 @@ def test_extend_dtype_mismatch_rejected_before_any_change():
             with pytest.raises(ValueError, match="does not match HDU BITPIX"):
                 fits.hdus[0].extend(bad)
             # Header is unchanged.
-            assert fits.hdus[0].header_dict["NAXIS2"]["value"] == 3
+            assert fits.hdus[0].header["NAXIS2"] == 3
 
         # File on disk is also unchanged.
         assert os.path.getsize(fname) == size_before
@@ -192,13 +192,13 @@ def test_extend_last_hdu_when_multiple_works():
 
             new = np.arange(3 * 5, dtype="f8").reshape(3, 5) + 1.0
             fits.hdus[1].extend(new)
-            assert fits.hdus[1].header_dict["NAXIS2"]["value"] == 5  # 2 + 3
+            assert fits.hdus[1].header["NAXIS2"] == 5  # 2 + 3
 
         # Reopen and confirm both HDUs are still parseable and correct.
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
-            assert fits.hdus[0].header_dict["NAXIS2"]["value"] == 3
-            assert fits.hdus[1].header_dict["NAXIS2"]["value"] == 5
+            assert fits.hdus[0].header["NAXIS2"] == 3
+            assert fits.hdus[1].header["NAXIS2"] == 5
 
 
 # -------------------- crossing block boundary --------------------
@@ -217,7 +217,7 @@ def test_extend_crosses_block_boundary():
         new = np.arange(100, dtype="f8").reshape(100, 1) + 1.0
         with rustfits.FITS(fname, "r+") as fits:
             fits.hdus[0].extend(new)
-            assert fits.hdus[0].header_dict["NAXIS2"]["value"] == 400
+            assert fits.hdus[0].header["NAXIS2"] == 400
 
         size_after = os.path.getsize(fname)
         assert size_after == 2880 * 3  # header + two data blocks

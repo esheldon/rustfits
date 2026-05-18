@@ -34,10 +34,10 @@ def _read_image_bytes(fname, hdu_index=0):
     """Read the on-disk data section bytes for the given HDU.  Returns the
     raw bytes (length = product(dims) * bpp, NOT padded to 2880)."""
     with rustfits.FITS(fname, "r") as fits:
-        hd = fits.hdus[hdu_index].header_dict
-        bitpix = hd["BITPIX"]["value"]
-        naxis = hd["NAXIS"]["value"]
-        fits_dims = [hd[f"NAXIS{i}"]["value"] for i in range(1, naxis + 1)]
+        hd = fits.hdus[hdu_index].header
+        bitpix = hd["BITPIX"]
+        naxis = hd["NAXIS"]
+        fits_dims = [hd[f"NAXIS{i}"] for i in range(1, naxis + 1)]
     bpp = abs(bitpix) // 8
     nbytes = bpp
     for d in fits_dims:

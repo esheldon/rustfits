@@ -59,53 +59,53 @@ def _write_extended_fits(fname):
 
 
 @pytest.fixture
-def header_dict():
+def header():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "ext.fits")
         _write_extended_fits(fname)
         with rustfits.FITS(fname, "r") as fits:
-            yield fits.hdus[0].header_dict
+            yield fits.hdus[0].header
 
 
-def test_hierarch_keyword(header_dict):
-    assert header_dict["ESO INS DET TEMP"]["value"] == 12.5
+def test_hierarch_keyword(header):
+    assert header["ESO INS DET TEMP"] == 12.5
     assert (
-        header_dict["ESO INS DET TEMP"]["comment"] == "instrument temperature"
+        header.comment_of("ESO INS DET TEMP") == "instrument temperature"
     )
-    assert header_dict["ESO TEL ALT"]["value"] == -20.25
+    assert header["ESO TEL ALT"] == -20.25
     # HIERARCH should not appear as a standalone key.
-    assert "HIERARCH" not in header_dict
+    assert "HIERARCH" not in header
 
 
-def test_escaped_single_quote_in_string(header_dict):
-    assert header_dict["OBSERVER"]["value"] == "O'Brien"
-    assert header_dict["QUOTED"]["value"] == "a'b'c"
+def test_escaped_single_quote_in_string(header):
+    assert header["OBSERVER"] == "O'Brien"
+    assert header["QUOTED"] == "a'b'c"
 
 
-def test_trailing_space_trimmed_in_string(header_dict):
-    assert header_dict["OBJECT"]["value"] == "M31"
+def test_trailing_space_trimmed_in_string(header):
+    assert header["OBJECT"] == "M31"
 
 
-def test_d_exponent_floats(header_dict):
-    assert header_dict["EXPTIME"]["value"] == pytest.approx(1.5e-3)
-    assert isinstance(header_dict["EXPTIME"]["value"], float)
-    assert header_dict["BIGNUM"]["value"] == pytest.approx(2.5e10)
+def test_d_exponent_floats(header):
+    assert header["EXPTIME"] == pytest.approx(1.5e-3)
+    assert isinstance(header["EXPTIME"], float)
+    assert header["BIGNUM"] == pytest.approx(2.5e10)
 
 
-def test_complex_values(header_dict):
-    v = header_dict["IMPED"]["value"]
+def test_complex_values(header):
+    v = header["IMPED"]
     assert isinstance(v, complex)
     assert v == complex(50.0, -25.0)
 
-    w = header_dict["CINT"]["value"]
+    w = header["CINT"]
     assert isinstance(w, complex)
     assert w == complex(3, 4)
 
 
-def test_blank_keyword_cards_accumulated(header_dict):
-    assert "" in header_dict
-    assert isinstance(header_dict[""], list)
-    assert header_dict[""] == [
+def test_blank_keyword_cards_accumulated(header):
+    assert "" in header
+    assert isinstance(header[""], list)
+    assert header[""] == [
         "Some commentary text without a keyword",
         "Another line of blank-keyword commentary",
     ]
@@ -117,7 +117,7 @@ if __name__ == "__main__":
         fname = os.path.join(tmpdir, "ext.fits")
         _write_extended_fits(fname)
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
+            hd = fits.hdus[0].header
         from pprint import pprint
 
         pprint(hd)

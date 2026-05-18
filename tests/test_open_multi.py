@@ -77,7 +77,7 @@ def test_open_two_images_and_table():
             assert isinstance(hdus[2], rustfits.TableHDU)
             assert hdus[2].index == 2
             pprint(hdus[2].header)
-            pprint(hdus[2].header_dict)
+            pprint(hdus[2].header)
 
 
 if __name__ == '__main__':

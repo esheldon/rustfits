@@ -78,7 +78,7 @@ def test_pcount_used_for_bintable_heap():
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 3
             assert isinstance(fits.hdus[1], rustfits.TableHDU)
-            assert fits.hdus[2].header_dict["EXTNAME"]["value"] == "last"
+            assert fits.hdus[2].header["EXTNAME"] == "last"
 
 
 # --------------------------- GCOUNT ----------------------------
@@ -129,7 +129,7 @@ def test_gcount_multiplies_data_size():
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 3
             assert (
-                fits.hdus[2].header_dict["EXTNAME"]["value"] == "after-gcount"
+                fits.hdus[2].header["EXTNAME"] == "after-gcount"
             )
 
 
@@ -168,7 +168,7 @@ def test_image_hdu_unaffected_by_defaults():
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
             assert (
-                fits.hdus[1].header_dict["EXTNAME"]["value"] == "after-image"
+                fits.hdus[1].header["EXTNAME"] == "after-image"
             )
 
 

@@ -28,7 +28,7 @@ def _make_test_image(fname, shape, dtype="f8"):
     return reference
 
 
-# --------------------------- whole-array round-trips ----------------------------
+# ----------------------- whole-array round-trips ------------------------
 
 
 def test_full_read_via_colon():
@@ -236,7 +236,7 @@ def test_dtype_round_trip(dtype):
             assert np.array_equal(sub, reference[1:4, 2:6])
 
 
-# --------------------------- empty / boundary slices ----------------------------
+# ----------------------- empty / boundary slices ------------------------
 
 
 def test_empty_slice_on_slow_axis():

@@ -47,13 +47,13 @@ def test_continue_long_string():
         _write_fits_with_extended_header(fname)
 
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
+            hd = fits.hdus[0].header
 
-        assert hd["LONGKEY"]["value"] == (
+        assert hd["LONGKEY"] == (
             "first part of the long stringand the second partand the end."
         )
         assert (
-            hd["LONGKEY"]["comment"]
+            hd.comment_of("LONGKEY")
             == "start of comment middle end of comment"
         )
 
@@ -64,7 +64,7 @@ def test_comment_cards_accumulated():
         _write_fits_with_extended_header(fname)
 
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
+            hd = fits.hdus[0].header
 
         assert isinstance(hd["COMMENT"], list)
         assert hd["COMMENT"] == [
@@ -79,7 +79,7 @@ def test_history_cards_accumulated():
         _write_fits_with_extended_header(fname)
 
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
+            hd = fits.hdus[0].header
 
         assert isinstance(hd["HISTORY"], list)
         assert hd["HISTORY"] == [
@@ -97,7 +97,7 @@ def test_continue_does_not_leak_keys():
         _write_fits_with_extended_header(fname)
 
         with rustfits.FITS(fname, "r") as fits:
-            hd = fits.hdus[0].header_dict
+            hd = fits.hdus[0].header
 
         assert "CONTINUE" not in hd
 
