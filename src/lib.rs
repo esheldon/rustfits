@@ -593,17 +593,17 @@ fn extract_existing_comment(py: Python<'_>, cards: &[String], key: &str) -> Opti
 
 // Build the card(s) representing (key, value, comment).  Most types emit a
 // single card; string values longer than what fits in one card emit a
-// CONTINUE-chained sequence.  HIERARCH long keys use a different card
-// layout and (in phase 2c) always emit exactly one card — CONTINUE-chained
-// HIERARCH long-string values are deferred.  Bool is checked before int
-// because Python bools are also ints (`extract::<i64>()` succeeds on `True`).
+// CONTINUE-chained sequence.  HIERARCH long keys use a different first-card
+// layout; long-string HIERARCH values also auto-chain via standard CONTINUE
+// cards.  Bool is checked before int because Python bools are also ints
+// (`extract::<i64>()` succeeds on `True`).
 fn build_card_from_value(
     key: &str,
     value: &Bound<'_, PyAny>,
     comment: &str,
 ) -> PyResult<Vec<String>> {
     if is_hierarch_key(key) {
-        return Ok(vec![build_hierarch_card(key, value, comment)?]);
+        return build_hierarch_cards(key, value, comment);
     }
     if value.is_instance_of::<PyBool>() {
         let b: bool = value.extract()?;
@@ -631,43 +631,58 @@ fn build_card_from_value(
     )))
 }
 
-// Build a HIERARCH-format card for a long key.  Layout:
+// Build the HIERARCH card(s) representing (key, value, comment).  Layout:
 //   HIERARCH <key> = <value>[ / <comment>]
-// String values: quoted, single quotes escaped (`'` -> `''`), padded to a
-// minimum of 8 chars inside the quotes (FITS convention).  Errors if the
-// resulting card exceeds 80 chars.
-fn build_hierarch_card(
+// Non-string values always emit exactly one card (errors if the framed body
+// exceeds 80 chars).  String values use the single-card form when they fit,
+// otherwise auto-chain via the FITS Long Strings convention: the first card
+// is a HIERARCH-prefixed card ending in `&'`, followed by N standard
+// CONTINUE cards with the comment on the last one.  Bool checked before int
+// (Python bools are ints); PyComplex before f64 (no implicit coercion).
+fn build_hierarch_cards(
     key: &str,
     value: &Bound<'_, PyAny>,
     comment: &str,
-) -> PyResult<String> {
-    // Format the value side per type.  Bool first (Python bools are ints);
-    // PyComplex before f64 (Python complex doesn't coerce to float).
-    let value_str = if value.is_instance_of::<PyBool>() {
+) -> PyResult<Vec<String>> {
+    if value.is_instance_of::<PyBool>() {
         let b: bool = value.extract()?;
-        (if b { "T" } else { "F" }).to_string()
-    } else if let Ok(n) = value.extract::<i64>() {
-        format!("{}", n)
-    } else if value.is_instance_of::<PyComplex>() {
+        return Ok(vec![assemble_hierarch_single(key, if b { "T" } else { "F" }, comment)?]);
+    }
+    if let Ok(n) = value.extract::<i64>() {
+        let s = format!("{}", n);
+        return Ok(vec![assemble_hierarch_single(key, &s, comment)?]);
+    }
+    if value.is_instance_of::<PyComplex>() {
         let c = value.cast::<PyComplex>()?;
-        format!("({}, {})", format_fits_float(c.real()), format_fits_float(c.imag()))
-    } else if let Ok(f) = value.extract::<f64>() {
-        format_fits_float(f)
-    } else if let Ok(s) = value.extract::<String>() {
-        let escaped = s.replace('\'', "''");
-        let padded = if escaped.len() < 8 {
-            format!("{:<8}", escaped)
-        } else {
-            escaped
-        };
-        format!("'{}'", padded)
-    } else {
-        return Err(PyValueError::new_err(format!(
-            "unsupported value type for HIERARCH key '{}'; \
-             supported: bool, int, float, complex, str", key
-        )));
-    };
+        let s = format!(
+            "({}, {})",
+            format_fits_float(c.real()),
+            format_fits_float(c.imag()),
+        );
+        return Ok(vec![assemble_hierarch_single(key, &s, comment)?]);
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        let s = format_fits_float(f);
+        return Ok(vec![assemble_hierarch_single(key, &s, comment)?]);
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return build_hierarch_string_cards(key, &s, comment);
+    }
+    Err(PyValueError::new_err(format!(
+        "unsupported value type for HIERARCH key '{}'; \
+         supported: bool, int, float, complex, str", key
+    )))
+}
 
+// Assemble the single-card form for a HIERARCH key with a non-string value
+// or a short string value.  Errors if the body overflows 80 chars (for
+// non-string types this is the only path; for strings the caller falls
+// back to CONTINUE-chaining instead).
+fn assemble_hierarch_single(
+    key: &str,
+    value_str: &str,
+    comment: &str,
+) -> PyResult<String> {
     let prefix = format!("HIERARCH {} = ", key);
     let body = if comment.is_empty() {
         format!("{}{}", prefix, value_str)
@@ -677,12 +692,157 @@ fn build_hierarch_card(
     if body.len() > CARD_SIZE {
         return Err(PyValueError::new_err(format!(
             "HIERARCH card too long ({} chars) for key '{}'; \
-             shorten the key, value, or comment to fit in 80 chars \
-             (CONTINUE-on-write for HIERARCH long-string values is deferred)",
+             shorten the key, value, or comment to fit in 80 chars",
             body.len(), key
         )));
     }
     Ok(pad_to_card(&body))
+}
+
+// Build the card sequence for a string value under a HIERARCH long key.
+// Layout, when chaining:
+//   HIERARCH <key> = '<chunk>&'
+//   CONTINUE  '<chunk>&'
+//   ...
+//   CONTINUE  '<final>' [ / <comment>]
+// Single-card path is used when the framed body (incl. comment) fits in 80
+// chars.  Errors if the key is so long that no payload fits on the first
+// card, or if the comment is too long to ride on the final card.
+fn build_hierarch_string_cards(
+    key: &str,
+    value: &str,
+    comment: &str,
+) -> PyResult<Vec<String>> {
+    let escaped = value.replace('\'', "''");
+
+    // Single-card attempt.  Match assemble_hierarch_single's framing but
+    // also apply the FITS 8-char minimum padding (only relevant when the
+    // value is short enough to be a single card).
+    let padded = if escaped.len() < 8 {
+        format!("{:<8}", escaped)
+    } else {
+        escaped.clone()
+    };
+    let single_body = if comment.is_empty() {
+        format!("HIERARCH {} = '{}'", key, padded)
+    } else {
+        format!("HIERARCH {} = '{}' / {}", key, padded, comment)
+    };
+    if single_body.len() <= CARD_SIZE {
+        return Ok(vec![pad_to_card(&single_body)]);
+    }
+
+    // Chain path.  Without payload we can't make progress.
+    if escaped.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "HIERARCH card too long ({} chars) for key '{}'; \
+             shorten the key or comment",
+            single_body.len(), key
+        )));
+    }
+
+    // First-card payload budget (with `&'` framing):
+    //   80 - len("HIERARCH ") - len(key) - len(" = ") - 2 (quotes) - 1 (&)
+    // = 65 - len(key)
+    if key.len() >= 65 {
+        return Err(PyValueError::new_err(format!(
+            "HIERARCH key '{}' is {} chars; max length for a CONTINUE-chained \
+             HIERARCH string value is 64 chars (the first card must have at \
+             least one byte of payload alongside framing)",
+            key, key.len()
+        )));
+    }
+    let first_max_payload: usize = 65 - key.len();
+
+    // Last-card payload budget (CONTINUE card, no `&`):
+    //   no comment: 68
+    //   with comment: 65 - len(comment)
+    let last_max_payload: usize = if comment.is_empty() {
+        68
+    } else {
+        if comment.len() >= 65 {
+            return Err(PyValueError::new_err(format!(
+                "comment is too long ({} chars) to fit in a FITS card alongside \
+                 a HIERARCH string value; max comment length is 64 chars for \
+                 CONTINUE-chained values",
+                comment.len()
+            )));
+        }
+        65 - comment.len()
+    };
+
+    let bytes = escaped.as_bytes();
+    let total = bytes.len();
+    let mut cards: Vec<String> = Vec::new();
+    let mut pos = 0;
+
+    while pos < total {
+        let is_first = cards.is_empty();
+        let remaining = total - pos;
+        let mut take;
+        let is_last;
+        if is_first {
+            // First card is always a HIERARCH non-last card.  Take up to
+            // first_max_payload bytes (and at most `remaining`).  The next
+            // iteration will emit the rest; if remaining hits 0 after this
+            // card, we append a terminating empty CONTINUE below.
+            take = first_max_payload.min(remaining);
+            is_last = false;
+        } else if remaining <= last_max_payload {
+            take = remaining;
+            is_last = true;
+        } else {
+            take = (remaining - last_max_payload).min(67);
+            is_last = false;
+        }
+
+        // Don't split a `''` escape pair across cards.  Back off if the
+        // chunk boundary lands between the two quotes of a pair.
+        while take > 0 && pos + take < total {
+            if bytes[pos + take - 1] == b'\'' && bytes[pos + take] == b'\'' {
+                take -= 1;
+            } else {
+                break;
+            }
+        }
+        if take == 0 {
+            // Backoff drove `take` to 0 — only possible when the chunk would
+            // begin with a quote-pair.  Include the whole pair so we make
+            // progress.  For the first card this can theoretically exceed
+            // first_max_payload by 1 byte if the budget is tight; in
+            // practice keys long enough to hit this are rejected up front.
+            take = 2.min(remaining);
+        }
+
+        let inner = std::str::from_utf8(&bytes[pos..pos + take]).unwrap();
+        let card = if is_first {
+            format!("HIERARCH {} = '{}&'", key, inner)
+        } else if is_last {
+            if comment.is_empty() {
+                format!("CONTINUE  '{}'", inner)
+            } else {
+                format!("CONTINUE  '{}' / {}", inner, comment)
+            }
+        } else {
+            format!("CONTINUE  '{}&'", inner)
+        };
+        cards.push(pad_to_card(&card));
+        pos += take;
+    }
+
+    // If the loop emitted only the first card (because the entire value fit
+    // alongside the `&'` framing), append an empty terminating CONTINUE to
+    // close the chain and carry the comment.
+    if cards.len() == 1 {
+        let last_card = if comment.is_empty() {
+            "CONTINUE  ''".to_string()
+        } else {
+            format!("CONTINUE  '' / {}", comment)
+        };
+        cards.push(pad_to_card(&last_card));
+    }
+
+    Ok(cards)
 }
 
 // Does this card's value (parsed as a FITS string) end with `&`?  Returns

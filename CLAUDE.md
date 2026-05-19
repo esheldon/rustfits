@@ -95,13 +95,20 @@ chain is removed before the new cards are inserted.  This is what
 
 ## HIERARCH long keys
 
-Keys >8 chars or containing spaces auto-route through `build_hierarch_card`,
+Keys >8 chars or containing spaces auto-route through `build_hierarch_cards`,
 which emits `HIERARCH <key> = <value> [/ comment]`.  Validation is relaxed
 to allow space, `.`, `+` in addition to the standard A-Z/0-9/`-`/`_`.  The
 literal "HIERARCH" is rejected as a user key (it's the convention prefix).
 Find/set/delete match HIERARCH cards via `keyword_of`, which returns the
-long-key for HIERARCH cards.  CONTINUE-chained HIERARCH long-string values
-are deferred.
+long-key for HIERARCH cards.
+
+Long HIERARCH string values auto-chain via `build_hierarch_string_cards`:
+the first card carries the HIERARCH prefix and a `&'`-terminated chunk
+(payload budget `65 - len(key)` bytes), followed by N standard CONTINUE
+cards with the comment on the last one.  HIERARCH keys ≥ 65 chars cannot
+chain (no room for any first-card payload) and are rejected.  The
+read-side already follows CONTINUE chains regardless of the first card's
+key shape, so no reader changes are needed.
 
 ## Tainted-header state on mid-write I/O failure
 
@@ -137,12 +144,7 @@ failure on the host filesystem.
 These are user-facing features that have been intentionally left out of
 phase 2.  Implement only if real users hit them.
 
-1. **CONTINUE-on-write for HIERARCH long-string values.** Currently
-   `build_hierarch_card` errors if the resulting card exceeds 80 chars.
-   Astropy supports CONTINUE-chained HIERARCH; we could too.  Rare in
-   practice.
-
-2. **File-rewrite path for header overflow.** Currently overflow raises
+1. **File-rewrite path for header overflow.** Currently overflow raises
    ValueError ("header overflow: N cards do not fit in M block(s)...").
    The slow-but-correct path: when overflowing, rewrite the whole file
    from this HDU forward, growing the reserved header blocks.  This is

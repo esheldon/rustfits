@@ -4,13 +4,16 @@ Long keywords (>8 chars or containing spaces) are written as HIERARCH cards:
 
     HIERARCH <long-key> = <value> [/ comment]
 
+Long string values auto-chain via the FITS Long Strings convention: the
+first card carries the HIERARCH prefix and a `&'`-terminated chunk,
+followed by N standard CONTINUE cards with the comment on the last one.
+
 Each test verifies its assertion through BOTH the same FITS handle that did
 the mutation AND a fresh reopen.
 
 Out of scope (phase 2c step 3):
     - Case preservation on HIERARCH keys (we always normalize to uppercase,
       same as standard keys).
-    - CONTINUE-chained HIERARCH long-string values (deferred).
 """
 
 import os
@@ -340,17 +343,22 @@ def test_literal_hierarch_keyword_rejected():
                 fits[0].header["HIERARCH"] = 1
 
 
-def test_hierarch_card_too_long_rejected():
-    """If key + value + comment + framing exceeds 80 chars, the write is
-    rejected with a clear error (no silent truncation)."""
+def test_hierarch_non_string_card_too_long_rejected():
+    """Non-string HIERARCH values can't chain, so a key + framing + value +
+    comment that doesn't fit in 80 chars is rejected."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(ValueError):
-                # 60-char key + long string value definitely won't fit in 80
-                # chars.
-                fits[0].header[
-                    "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z"
-                ] = "X" * 50
+                # 55-char key + int (2) + 30-char comment + framing = 102.
+                fits[0].header["A" * 55] = (42, "X" * 30)
+
+
+def test_hierarch_key_too_long_for_chain_rejected():
+    """A HIERARCH key >= 65 chars leaves no room for first-card payload."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(ValueError):
+                fits[0].header["A" * 65] = "X" * 100
 
 
 def test_hierarch_invalid_chars_rejected():
@@ -373,3 +381,209 @@ def test_hierarch_dot_and_plus_allowed():
             fits[0].header["ESO+SENSOR"] = 1
             assert fits[0].header["ESO INS.TEMP"] == 12.5
             assert fits[0].header["ESO+SENSOR"] == 1
+
+
+# ============================================================================
+# CONTINUE-chained HIERARCH string values
+# ============================================================================
+
+
+def test_hierarch_short_string_emits_single_card():
+    """A HIERARCH string that fits in one card stays a single card (no
+    CONTINUE)."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS NAME"] = "FORS2"
+
+            def check(hd):
+                assert hd["ESO INS NAME"] == "FORS2"
+                assert not any(c.startswith("CONTINUE") for c in hd.cards)
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_long_string_chains():
+    """A HIERARCH string that doesn't fit on one card auto-chains."""
+    with _new_file() as fname:
+        s = "X" * 100
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESCRIPTION"] = s
+
+            def check(hd):
+                assert hd["ESO INS DESCRIPTION"] == s
+                cards = hd.cards
+                # First card is the HIERARCH card.
+                first_idx = next(
+                    i for i, c in enumerate(cards)
+                    if c.startswith("HIERARCH ESO INS DESCRIPTION")
+                )
+                # At least one CONTINUE card follows.
+                assert cards[first_idx + 1].startswith("CONTINUE")
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_long_string_round_trip_with_comment():
+    """Comment lands on the final CONTINUE card and round-trips intact."""
+    with _new_file() as fname:
+        s = "Y" * 200
+        c = "long hierarch value"
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESCRIPTION"] = (s, c)
+
+            def check(hd):
+                assert hd["ESO INS DESCRIPTION"] == s
+                assert hd.comment_of("ESO INS DESCRIPTION") == c
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_long_string_with_embedded_quotes_round_trips():
+    """The chunker must not split a `''` escape pair across cards."""
+    with _new_file() as fname:
+        # Many quotes, ending in a non-space so trailing spaces aren't
+        # trimmed by the FITS string rule.
+        s = ("It's M31's brightest core; " * 8)[:199] + "Z"
+        assert "'" in s
+        assert not s.endswith(" ")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO OBS COMMENT"] = s
+
+            def check(hd):
+                assert hd["ESO OBS COMMENT"] == s
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_chain_layout_starts_hierarch_then_continue():
+    """On-disk layout: first card has the HIERARCH prefix; the rest are
+    standard CONTINUE cards."""
+    with _new_file() as fname:
+        s = "Z" * 200
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESCRIPTION"] = s
+
+            def check(hd):
+                cards = hd.cards
+                first_idx = next(
+                    i for i, c in enumerate(cards)
+                    if c.startswith("HIERARCH ESO INS DESCRIPTION")
+                )
+                chain = [cards[first_idx]]
+                i = first_idx + 1
+                while i < len(cards) and cards[i].startswith("CONTINUE"):
+                    chain.append(cards[i])
+                    i += 1
+                assert len(chain) >= 3
+                # Non-last cards in the chain end with `&'`.
+                for card in chain[:-1]:
+                    assert "&'" in card
+                assert not chain[-1].rstrip().endswith("&'")
+
+            _check_both(fname, fits, check)
+
+
+def test_replacing_hierarch_chain_with_short_string_removes_extras():
+    """Overwriting a chained HIERARCH value with a short one removes the
+    whole chain, not just the first card."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESC"] = "Q" * 200
+            chain_before = sum(
+                1 for c in fits[0].header.cards if c.startswith("CONTINUE")
+            )
+            assert chain_before >= 2
+
+            fits[0].header["ESO INS DESC"] = "short"
+
+            def check(hd):
+                assert hd["ESO INS DESC"] == "short"
+                assert not any(c.startswith("CONTINUE") for c in hd.cards)
+
+            _check_both(fname, fits, check)
+
+
+def test_replacing_hierarch_chain_with_longer_chain():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESC"] = "A" * 200
+            fits[0].header["ESO INS DESC"] = "B" * 400
+
+            def check(hd):
+                assert hd["ESO INS DESC"] == "B" * 400
+
+            _check_both(fname, fits, check)
+
+
+def test_del_hierarch_chain_removes_all_cards():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["ESO INS DESC"] = "X" * 200
+            assert any(
+                c.startswith("CONTINUE") for c in fits[0].header.cards
+            )
+
+            del fits[0].header["ESO INS DESC"]
+
+            def check(hd):
+                assert "ESO INS DESC" not in hd
+                assert not any(c.startswith("CONTINUE") for c in hd.cards)
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_chain_in_edit_batch():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with fits[0].header.edit() as h:
+                h["ESO INS DESC"] = "P" * 200
+                assert h["ESO INS DESC"] == "P" * 200
+
+            def check(hd):
+                assert hd["ESO INS DESC"] == "P" * 200
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_chain_edit_rollback():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(RuntimeError):
+                with fits[0].header.edit() as h:
+                    h["ESO INS DESC"] = "Q" * 200
+                    raise RuntimeError("boom")
+
+            def check(hd):
+                assert "ESO INS DESC" not in hd
+                assert not any(c.startswith("CONTINUE") for c in hd.cards)
+
+            _check_both(fname, fits, check)
+
+
+def test_hierarch_comment_too_long_for_chain_rejected():
+    """Comments are capped at 64 chars for CONTINUE-chained values."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(ValueError):
+                fits[0].header["ESO INS DESC"] = ("Z" * 200, "C" * 80)
+
+
+def test_hierarch_chain_can_overflow_slack():
+    """A chain too big for the reserved header blocks is rejected, and
+    in-memory + on-disk state remain consistent (write-disk-first)."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            initial = len(h.cards)
+            block_count = (initial + 35) // 36
+            slots_free = block_count * 36 - initial
+
+            # First-card payload ~= 65 - len(key); continuation cards ~67.
+            # (slots_free + 5) * 60 chars is comfortably over budget.
+            big = "X" * (60 * (slots_free + 5))
+
+            with pytest.raises(ValueError):
+                h["ESO INS DESC"] = big
+            assert "ESO INS DESC" not in h
+        with rustfits.FITS(fname, "r") as fits:
+            assert "ESO INS DESC" not in fits[0].header
