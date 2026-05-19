@@ -247,7 +247,11 @@ fn unique_keys_in_order(cards: &[String]) -> Vec<String> {
         if kw == "END" || kw == "CONTINUE" {
             continue;
         }
-        if seen.insert(kw.clone()) {
+        // Dedup by lookup-form so HIERARCH cards differing only in case
+        // (which shouldn't happen post-write but might in user-supplied
+        // input) are treated as the same key.  Output the storage form
+        // — what the user actually sees on disk.
+        if seen.insert(normalize_keyword(&kw)) {
             out.push(kw);
         }
     }
@@ -255,7 +259,10 @@ fn unique_keys_in_order(cards: &[String]) -> Vec<String> {
 }
 
 // Find the first card with a matching key, returning (card_index, value_part).
-// Skips commentary keys.  Handles HIERARCH long keys.
+// Skips commentary keys.  Handles HIERARCH long keys.  `key` must already
+// be in lookup form (`normalize_keyword`); the card's keyword is run
+// through `normalize_keyword` here so HIERARCH lookups are case-
+// insensitive and tolerant of stray inter-word whitespace.
 fn find_card_for_key(cards: &[String], key: &str) -> Option<(usize, String)> {
     for (i, card) in cards.iter().enumerate() {
         let card = card.trim_end();
@@ -269,11 +276,12 @@ fn find_card_for_key(cards: &[String], key: &str) -> Option<(usize, String)> {
         }
         if kw_trimmed == "HIERARCH" {
             if let Some(eq_pos) = card.find('=') {
-                if card[8..eq_pos].trim() == key {
+                let card_kw = card[8..eq_pos].trim();
+                if normalize_keyword(card_kw) == key {
                     return Some((i, card[eq_pos + 1..].to_string()));
                 }
             }
-        } else if kw_trimmed == key {
+        } else if normalize_keyword(kw_trimmed) == key {
             if let Some(eq_pos) = card.find('=') {
                 return Some((i, card[eq_pos + 1..].to_string()));
             }
@@ -379,12 +387,45 @@ fn parse_value_with_continue(
 
 // ===== mutation helpers =====
 
-fn normalize_keyword(key: &str) -> String {
-    key.trim().to_ascii_uppercase()
-}
-
 fn is_hierarch_key(key: &str) -> bool {
     key.len() > 8 || key.contains(' ')
+}
+
+// Collapse runs of ASCII whitespace to a single space.  Used for HIERARCH
+// long keys, where the ESO convention specifies single-space separators
+// between words; we canonicalize on write so a user passing "ESO  INS Det1"
+// (accidental double space) doesn't end up with a non-conforming card.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Keyword in the form used for lookup / equality.  Always trimmed and
+// uppercased; HIERARCH long keys additionally have their internal
+// whitespace collapsed.  All comparisons inside this module — finding,
+// updating, deleting, deduping — go through this form, so user-side
+// case-insensitive lookup matches no matter how the keyword was originally
+// stored.
+fn normalize_keyword(key: &str) -> String {
+    let trimmed = key.trim();
+    if is_hierarch_key(trimmed) {
+        collapse_whitespace(trimmed).to_ascii_uppercase()
+    } else {
+        trimmed.to_ascii_uppercase()
+    }
+}
+
+// Keyword in the form written to disk.  Standard 8-char keys are
+// uppercased (the FITS standard requires uppercase keywords); HIERARCH
+// long keys preserve the caller's case (per the ESO convention) and only
+// canonicalize internal whitespace.  Used by `apply_setitem` and the
+// new-card builders.
+fn storage_keyword(key: &str) -> String {
+    let trimmed = key.trim();
+    if is_hierarch_key(trimmed) {
+        collapse_whitespace(trimmed)
+    } else {
+        trimmed.to_ascii_uppercase()
+    }
 }
 
 // Is this (post-normalization) key one that rustfits manages on the user's
@@ -431,7 +472,7 @@ fn validate_keyword(key: &str) -> PyResult<()> {
     if key.is_empty() {
         return Err(PyValueError::new_err("keyword cannot be empty"));
     }
-    if key == "HIERARCH" {
+    if key.eq_ignore_ascii_case("HIERARCH") {
         return Err(PyValueError::new_err(
             "'HIERARCH' is not a valid user keyword; HIERARCH is the convention \
              prefix for long keys — pass a longer key (>8 chars or containing spaces) instead"
@@ -439,7 +480,13 @@ fn validate_keyword(key: &str) -> PyResult<()> {
     }
     let hierarch = is_hierarch_key(key);
     for c in key.chars() {
-        let ok = c.is_ascii_uppercase()
+        // Standard 8-char keys are uppercase-only on disk per the FITS
+        // standard — but at the validation entry point the user might have
+        // written lowercase; we allow it and upper-case it during the
+        // storage_keyword conversion.  HIERARCH long keys preserve the
+        // user's case on disk (per the ESO convention), so lowercase is
+        // accepted there too.
+        let ok = c.is_ascii_alphabetic()
             || c.is_ascii_digit()
             || c == '-'
             || c == '_'
@@ -696,6 +743,7 @@ fn find_chain_end(cards: &[String], start: usize) -> usize {
     end
 }
 
+// `key` must be in lookup form (`normalize_keyword`).
 fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) {
     let normalized: Vec<String> = new_cards
         .into_iter()
@@ -711,7 +759,7 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) 
         if matches!(card_key.as_str(), "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
             continue;
         }
-        if card_key == key {
+        if normalize_keyword(&card_key) == key {
             existing_start = Some(i);
             break;
         }
@@ -732,6 +780,7 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) 
     }
 }
 
+// `key` must be in lookup form (`normalize_keyword`).
 fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
     for i in 0..cards.len() {
         let card_key = match keyword_of(&cards[i]) {
@@ -741,7 +790,7 @@ fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
         if matches!(card_key.as_str(), "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
             continue;
         }
-        if card_key == key {
+        if normalize_keyword(&card_key) == key {
             let end = find_chain_end(cards, i);
             cards.drain(i..end);
             return true;
@@ -791,6 +840,13 @@ fn parse_setitem_value<'py>(
     }
 }
 
+// `key` is the RAW user-supplied key (or, when called from update() with a
+// FITSHeader source, the storage-form keyword extracted from the source
+// card).  We compute the lookup form internally and use it for all
+// existing-card matching; the storage form determines how a newly inserted
+// HIERARCH card is spelled on disk.  When an existing card matches, its
+// current storage spelling is kept (matches the "updates preserve card
+// position" rule extended to "updates preserve card spelling").
 fn apply_setitem(
     cards: &mut Vec<String>,
     key: &str,
@@ -798,13 +854,33 @@ fn apply_setitem(
     explicit_comment: Option<String>,
 ) -> PyResult<()> {
     validate_keyword(key)?;
+    let lookup = normalize_keyword(key);
     let comment = match explicit_comment {
         Some(c) => c,
-        None => extract_existing_comment(value.py(), cards, key).unwrap_or_default(),
+        None => extract_existing_comment(value.py(), cards, &lookup).unwrap_or_default(),
     };
-    let new_cards = build_card_from_value(key, value, &comment)?;
-    set_card_for_key(cards, key, new_cards);
+    let storage = existing_storage_keyword(cards, &lookup)
+        .unwrap_or_else(|| storage_keyword(key));
+    let new_cards = build_card_from_value(&storage, value, &comment)?;
+    set_card_for_key(cards, &lookup, new_cards);
     Ok(())
+}
+
+// If an existing card matches the lookup form, return its on-disk keyword
+// spelling (canonicalized via storage_keyword to collapse stray whitespace).
+// Returns None when no card matches — in that case apply_setitem falls back
+// to the user's storage spelling.
+fn existing_storage_keyword(cards: &[String], lookup: &str) -> Option<String> {
+    for card in cards {
+        let kw = keyword_of(card)?;
+        if matches!(kw.as_str(), "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
+            continue;
+        }
+        if normalize_keyword(&kw) == lookup {
+            return Some(storage_keyword(&kw));
+        }
+    }
+    None
 }
 
 // One staged change produced by `collect_update_actions`.  Used by both the
@@ -914,8 +990,10 @@ fn collect_update_actions(
             }
             let val_obj = pair.get_item(1)?;
             let (v, c) = parse_setitem_value(&val_obj)?;
+            // Store the raw user key (case-preserved) so HIERARCH dict
+            // sources land on disk with the user's chosen spelling.
             actions.push(UpdateAction::SetKey {
-                key: k,
+                key: k_raw,
                 value: v.unbind(),
                 explicit_comment: c,
             });
@@ -1433,27 +1511,29 @@ impl FITSHeader {
 
     fn __setitem__(&self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         check_not_tainted(&self.tainted)?;
-        let key = normalize_keyword(key);
-        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+        let normalized = normalize_keyword(key);
+        if matches!(normalized.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
                 "subscript assignment to commentary key '{}' is not supported; \
                  use add_comment(text) / add_history(text) / add_blank(text) to append",
-                key
+                normalized
             )));
         }
-        if is_protected_key(&key) {
+        if is_protected_key(&normalized) {
             return Err(PyValueError::new_err(format!(
                 "'{}' is a protected keyword managed by rustfits (file structure, \
                  integrity, or compression layout) and cannot be set directly; \
                  structural changes should go through the dedicated HDU APIs",
-                key
+                normalized
             )));
         }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         let mut new_cards = guard.clone();
-        apply_setitem(&mut new_cards, &key, &value_obj, explicit_comment)?;
+        // Pass the RAW user key — apply_setitem decides storage spelling
+        // (existing card's wins, else user's case-preserved form).
+        apply_setitem(&mut new_cards, key, &value_obj, explicit_comment)?;
         rewrite_header_to_disk(
             &self.file,
             &self.offsets,
@@ -1643,24 +1723,24 @@ impl FITSHeaderEdit {
 
     fn __setitem__(&mut self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         self.ensure_active()?;
-        let key = normalize_keyword(key);
-        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+        let normalized = normalize_keyword(key);
+        if matches!(normalized.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
                 "subscript assignment to commentary key '{}' is not supported; \
                  use add_comment(text) / add_history(text) / add_blank(text) to append",
-                key
+                normalized
             )));
         }
-        if is_protected_key(&key) {
+        if is_protected_key(&normalized) {
             return Err(PyValueError::new_err(format!(
                 "'{}' is a protected keyword managed by rustfits (file structure, \
                  integrity, or compression layout) and cannot be set directly; \
                  structural changes should go through the dedicated HDU APIs",
-                key
+                normalized
             )));
         }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
-        apply_setitem(&mut self.cards, &key, &value_obj, explicit_comment)
+        apply_setitem(&mut self.cards, key, &value_obj, explicit_comment)
     }
 
     fn __delitem__(&mut self, key: &str) -> PyResult<()> {

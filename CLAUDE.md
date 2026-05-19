@@ -79,9 +79,14 @@ Related conventions:
   `{value, comment}` dict.  Per-key comments come from `header.comment_of(key)`.
   The legacy `header_dict` shape is still available via `header.to_dict()`
   for serialization or tests.
-- Keyword normalization: `normalize_keyword()` trims whitespace and ASCII-
-  uppercases.  Case-insensitive lookup and writes.  HIERARCH long keys also
-  go through this normalization (case preservation deferred).
+- Keyword normalization: `normalize_keyword()` returns the lookup form
+  (trimmed + uppercased; HIERARCH long keys additionally have internal
+  whitespace collapsed to single spaces).  All in-module matching —
+  `find_card_for_key`, `set_card_for_key`, `delete_card_for_key`,
+  `unique_keys_in_order` — goes through this form, so user-facing lookup
+  is case-insensitive for both standard and HIERARCH keys.  Storage
+  spelling is decided separately by `storage_keyword()` — see the
+  HIERARCH section below.
 
 ## Header mutation order: disk write before in-memory commit
 
@@ -222,14 +227,41 @@ chain is removed before the new cards are inserted.  This is what
 
 Keys >8 chars or containing spaces auto-route through `build_hierarch_cards`,
 which emits `HIERARCH <key> = <value> [/ comment]`.  Validation is relaxed
-to allow space, `.`, `+` in addition to the standard A-Z/0-9/`-`/`_`.  The
-literal "HIERARCH" is rejected as a user key (it's the convention prefix).
-Find/set/delete match HIERARCH cards via `keyword_of`, which returns the
-long-key for HIERARCH cards.
+to allow space, `.`, `+` in addition to A-Z/a-z/0-9/`-`/`_`.  The literal
+"HIERARCH" is rejected as a user key (case-insensitively — it's the
+convention prefix).
+
+**Case preservation and case-insensitive lookup (ESO convention).** Standard
+8-char keys are uppercased on disk (FITS standard requires it).  HIERARCH
+long keys preserve the caller's case on disk; lookup, comparison, dedup,
+and `__contains__`/`__delitem__` are case-insensitive across the whole
+header.  Two helpers split the concern:
+
+- `normalize_keyword(key)` → lookup form: trimmed, uppercased, and (for
+  HIERARCH) with internal whitespace collapsed to single spaces.  Used
+  everywhere comparisons happen.
+- `storage_keyword(key)` → on-disk form: trimmed + whitespace-collapsed
+  for HIERARCH (case preserved); uppercased for standard keys.  Used by
+  `apply_setitem` when inserting a new card.
+
+When `apply_setitem` is called for an existing key, `existing_storage_keyword`
+returns the on-disk card's current spelling, which then wins over the
+caller's spelling for the rebuilt card.  Consequence: writing the same
+HIERARCH key with different case (`h["Eso Ins Det1"]` then
+`h["ESO INS DET1"]`) updates the value but leaves the keyword text as
+first written.  This matches astropy and extends the existing "in-place
+update preserves position" rule to also preserve spelling.
+
+Whitespace canonicalization runs at write time: `"Eso  Ins   Det1"` (extra
+spaces) lands on disk as `HIERARCH Eso Ins Det1`, conforming to the ESO
+single-space-separator convention.  Non-space whitespace (tab, etc.) is
+rejected by `validate_keyword` rather than silently rewritten — HIERARCH
+keywords are space-separated by spec.
 
 Long HIERARCH string values auto-chain via `build_hierarch_string_cards`:
 the first card carries the HIERARCH prefix and a `&'`-terminated chunk
-(payload budget `65 - len(key)` bytes), followed by N standard CONTINUE
+(payload budget `65 - len(key)` bytes — measured against the storage form
+including case-preserved characters), followed by N standard CONTINUE
 cards with the comment on the last one.  HIERARCH keys ≥ 65 chars cannot
 chain (no room for any first-card payload) and are rejected.  The
 read-side already follows CONTINUE chains regardless of the first card's

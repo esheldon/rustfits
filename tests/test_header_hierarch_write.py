@@ -175,21 +175,28 @@ def test_hierarch_string_with_embedded_quote():
 # ============================================================================
 
 
-def test_lowercase_hierarch_key_uppercased():
+def test_lowercase_hierarch_key_preserves_case_on_disk():
+    """HIERARCH keys are case-preserving on disk per the ESO convention.
+    A lowercase key writes a lowercase card; lookup is case-insensitive
+    so all case variants still find the same value."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["eso ins temp"] = 12.5
-            # Both case variants resolve to the same uppercase key.
+            # Lookup is case-insensitive — all variants find the value.
             assert fits[0].header["ESO INS TEMP"] == 12.5
             assert fits[0].header["eso ins temp"] == 12.5
             assert fits[0].header["Eso Ins Temp"] == 12.5
-            # On disk, the card is uppercase.
+            # On disk, the card preserves the user's case.
             assert any(
-                c.startswith("HIERARCH ESO INS TEMP")
+                c.startswith("HIERARCH eso ins temp")
                 for c in fits[0].header.cards
             )
         with rustfits.FITS(fname, "r") as fits:
             assert fits[0].header["ESO INS TEMP"] == 12.5
+            assert any(
+                c.startswith("HIERARCH eso ins temp")
+                for c in fits[0].header.cards
+            )
 
 
 def test_hierarch_key_with_surrounding_spaces_normalized():
