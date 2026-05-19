@@ -55,9 +55,11 @@ fn bytes_per_element(letter: char) -> Option<usize> {
 }
 
 // Split a TFORM string like "8A", "1J", "3D", or "J" (default repeat 1)
-// into (repeat, letter).  Anything past the letter (e.g. the "(100)" in
-// "1PE(100)") is currently rejected by the caller for P/Q/X, so we stop
-// at the letter and report extra trailing junk as a parse error.
+// into (repeat, letter).  P and Q (variable-length array descriptors)
+// have their own trailing syntax `1PE(maxlen)` / `1QE(maxlen)`; we
+// accept it here without parsing the inner type/maxlen because the
+// caller rejects P/Q columns as not-yet-supported anyway.  Other letters
+// must not carry trailing characters.
 fn parse_tform(tform: &str, col_index: usize) -> PyResult<(usize, char)> {
     let trimmed = tform.trim();
     let (digits, rest) = trimmed
@@ -76,7 +78,7 @@ fn parse_tform(tform: &str, col_index: usize) -> PyResult<(usize, char)> {
             col_index, tform
         )))?
     };
-    if !trailing.trim().is_empty() {
+    if !trailing.trim().is_empty() && letter != 'P' && letter != 'Q' {
         return Err(PyValueError::new_err(format!(
             "column {}: TFORM='{}' has unsupported trailing modifier '{}'",
             col_index, tform, trailing
@@ -597,6 +599,55 @@ fn plan_runs(
     }
 }
 
+// Walk the run plan, doing one seek + one chunked sequential read per
+// run, invoking `on_row` once per row with (src_row_bytes, disk_row,
+// output_row).  The callback decides what to do with the bytes;
+// `process_runs` owns the file handle, the chunk buffer, and all the
+// run/chunk bookkeeping.  Shared by `read_table` (multi-column) and
+// `read_one_column` (single-column).
+fn process_runs<F>(
+    file_handle: &FileHandle,
+    runs: &[RunPlan],
+    data_offset: u64,
+    row_width: usize,
+    rows_per_chunk: usize,
+    mut on_row: F,
+) -> PyResult<()>
+where
+    F: FnMut(&[u8], usize, usize) -> PyResult<()>,
+{
+    let mut chunk_buf = vec![0u8; rows_per_chunk * row_width];
+    let mut guard = lock_file(file_handle)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+    for run in runs {
+        let run_offset_bytes =
+            data_offset + (run.start_disk_row * row_width) as u64;
+        f.seek(SeekFrom::Start(run_offset_bytes))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+        let mut local_offset = 0usize;
+        while local_offset < run.len {
+            let this_rows =
+                std::cmp::min(rows_per_chunk, run.len - local_offset);
+            f.read_exact(&mut chunk_buf[..this_rows * row_width])
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+            for r_local in 0..this_rows {
+                let in_run = local_offset + r_local;
+                let disk_row = run.start_disk_row + in_run;
+                let output_row = run.output_indices[in_run];
+                let src_row = &chunk_buf
+                    [r_local * row_width..(r_local + 1) * row_width];
+                on_row(src_row, disk_row, output_row)?;
+            }
+            local_offset += this_rows;
+        }
+    }
+    Ok(())
+}
+
 // Read a BINTABLE into a freshly-allocated numpy structured array of
 // native-endian dtype.  Returns the array.  The output shape is
 // `(n_selected_rows,)`, where the selection comes from `rows_arg`:
@@ -644,10 +695,7 @@ fn read_table(
     let itemsize: usize = arr_dtype.getattr("itemsize")?.extract()?;
     let field_layout = numpy_field_layout(py, &arr_dtype, &columns)?;
 
-    // Single reusable chunk buffer, sized to ~1 MiB worth of rows.
     let rows_per_chunk = std::cmp::max(1, READ_CHUNK_TARGET_BYTES / row_width);
-    let mut chunk_buf = vec![0u8; rows_per_chunk * row_width];
-
     let mut buf = RawBuffer::acquire_writable(&arr)?;
     if buf.len() != n_out * itemsize {
         return Err(PyValueError::new_err(format!(
@@ -657,48 +705,138 @@ fn read_table(
     }
     let out = buf.as_mut_slice();
 
-    let mut guard = lock_file(file_handle)?;
-    let f = guard.as_mut()
-        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-
-    for run in &runs {
-        let run_offset_bytes =
-            data_offset + (run.start_disk_row * row_width) as u64;
-        f.seek(SeekFrom::Start(run_offset_bytes))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-        let mut local_offset = 0usize;
-        while local_offset < run.len {
-            let this_rows =
-                std::cmp::min(rows_per_chunk, run.len - local_offset);
-            let chunk_bytes = this_rows * row_width;
-            f.read_exact(&mut chunk_buf[..chunk_bytes])
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-            // Convert rows from this chunk.  The disk row index is used
-            // only for error messages on A columns; the output row index
-            // is read from the run plan.
-            for r_local in 0..this_rows {
-                let in_run = local_offset + r_local;
-                let disk_row = run.start_disk_row + in_run;
-                let output_row = run.output_indices[in_run];
-
-                let src_row = &chunk_buf
-                    [r_local * row_width..(r_local + 1) * row_width];
-                let dst_row = &mut out
-                    [output_row * itemsize..(output_row + 1) * itemsize];
-
-                for (col_idx, col) in columns.iter().enumerate() {
-                    let (dst_off, dst_w) = field_layout[col_idx];
-                    let src = &src_row[col.byte_offset
-                        ..col.byte_offset + col.byte_width];
-                    let dst = &mut dst_row[dst_off..dst_off + dst_w];
-                    convert_column_cell(col, src, dst, disk_row)?;
-                }
+    process_runs(
+        file_handle, &runs, data_offset, row_width, rows_per_chunk,
+        |src_row, disk_row, output_row| {
+            let dst_row = &mut out
+                [output_row * itemsize..(output_row + 1) * itemsize];
+            for (col_idx, col) in columns.iter().enumerate() {
+                let (dst_off, dst_w) = field_layout[col_idx];
+                let src = &src_row[col.byte_offset
+                    ..col.byte_offset + col.byte_width];
+                let dst = &mut dst_row[dst_off..dst_off + dst_w];
+                convert_column_cell(col, src, dst, disk_row)?;
             }
-            local_offset += this_rows;
-        }
+            Ok(())
+        },
+    )?;
+
+    Ok(arr.unbind())
+}
+
+// Read one column of a BINTABLE into a freshly-allocated ndarray of
+// shape `(n_selected_rows,) + field_shape`.  Output is a plain ndarray,
+// not a structured array.
+//
+// `as_bytes` is meaningful only for A (character) columns: when true,
+// the on-disk bytes are placed into an S<n> field with no decoding,
+// null-truncation, or trailing-space stripping — exactly the bytes from
+// the file.  This is the escape hatch for rows that contain non-ASCII
+// data, which the default (strict) U decode would reject.  Rejected
+// with a clear error on any non-A column.
+//
+// `rows_arg` semantics are identical to `read_table`.
+fn read_one_column(
+    py: Python<'_>,
+    cards: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+    name: &str,
+    rows_arg: Option<&Bound<'_, PyAny>>,
+    as_bytes: bool,
+) -> PyResult<Py<PyAny>> {
+    let n_rows_total =
+        parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
+    let row_width =
+        parse_keyword(cards, "NAXIS1").unwrap_or(0).max(0) as usize;
+    let all_columns = parse_columns(cards)?;
+
+    let col = all_columns.iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+        .ok_or_else(|| {
+            let available: Vec<&str> =
+                all_columns.iter().map(|c| c.name.as_str()).collect();
+            PyValueError::new_err(format!(
+                "unknown column name: '{}'.  Available columns: {:?}",
+                name, available
+            ))
+        })?
+        .clone();
+
+    if as_bytes && col.tform_letter != 'A' {
+        return Err(PyValueError::new_err(format!(
+            "as_bytes=True is only meaningful for character (A) columns; \
+             column '{}' has TFORM type '{}'",
+            col.name, col.tform_letter
+        )));
     }
+
+    let (n_out, runs) = plan_runs(rows_arg, n_rows_total)?;
+
+    // Element dtype + per-row "field" shape (excluding the leading
+    // row axis).  For as_bytes, override the A-column U field with the
+    // same-length S field; otherwise reuse the structured-dtype builder
+    // helper so single-column shape matches the structured-field shape.
+    let (dtype_str, field_shape) = if as_bytes {
+        let str_len = match &col.tdim {
+            Some(tdim) => tdim[0],
+            None => col.repeat,
+        };
+        let array_shape: Vec<usize> = match &col.tdim {
+            Some(tdim) => tdim[1..].iter().rev().copied().collect(),
+            None => Vec::new(),
+        };
+        (format!("S{}", str_len), array_shape)
+    } else {
+        field_dtype_and_shape(&col)
+    };
+
+    let mut arr_shape: Vec<usize> = Vec::with_capacity(1 + field_shape.len());
+    arr_shape.push(n_out);
+    arr_shape.extend_from_slice(&field_shape);
+
+    let np = py.import("numpy")?;
+    let arr = np.call_method1("empty", (arr_shape, &dtype_str))?;
+
+    if n_out == 0 || row_width == 0 || col.byte_width == 0 {
+        return Ok(arr.unbind());
+    }
+
+    // dst_bytes_per_row is what numpy actually laid out; reading
+    // itemsize from the dtype (rather than recomputing) keeps us honest
+    // if numpy adds alignment we didn't anticipate.
+    let dt = arr.getattr("dtype")?;
+    let elem_size: usize = dt.getattr("itemsize")?.extract()?;
+    let elements_per_row: usize = field_shape.iter().product::<usize>().max(1);
+    let dst_bytes_per_row = elem_size * elements_per_row;
+
+    let rows_per_chunk = std::cmp::max(1, READ_CHUNK_TARGET_BYTES / row_width);
+    let mut buf = RawBuffer::acquire_writable(&arr)?;
+    if buf.len() != n_out * dst_bytes_per_row {
+        return Err(PyValueError::new_err(format!(
+            "numpy buffer size {} != expected {}",
+            buf.len(), n_out * dst_bytes_per_row
+        )));
+    }
+    let out = buf.as_mut_slice();
+
+    process_runs(
+        file_handle, &runs, data_offset, row_width, rows_per_chunk,
+        |src_row, disk_row, output_row| {
+            let src = &src_row[col.byte_offset
+                ..col.byte_offset + col.byte_width];
+            let dst_start = output_row * dst_bytes_per_row;
+            let dst = &mut out[dst_start..dst_start + dst_bytes_per_row];
+            if as_bytes {
+                // No decode, no null-truncate, no rstrip — give the
+                // caller exactly the bytes from disk.
+                dst.copy_from_slice(src);
+                Ok(())
+            } else {
+                convert_column_cell(&col, src, dst, disk_row)
+            }
+        },
+    )?;
 
     Ok(arr.unbind())
 }
@@ -761,5 +899,28 @@ impl TableHDU {
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
         read_table(py, &cards, data_offset, &super_.file, rows, columns)
+    }
+
+    // Read a single column into a plain (non-structured) ndarray of
+    // shape `(n_selected_rows,) + field_shape`.  rows= mirrors read()'s
+    // semantics.  `as_bytes=True` is meaningful only for A (character)
+    // columns; it returns the on-disk bytes in an S<n> field with no
+    // decode, no null-truncation, and no trailing-space strip — useful
+    // when a column has non-ASCII bytes that the default U decode would
+    // reject.
+    #[pyo3(signature = (name, *, rows=None, as_bytes=false))]
+    fn read_column(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        rows: Option<&Bound<'_, PyAny>>,
+        as_bytes: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_one_column(
+            py, &cards, data_offset, &super_.file, name, rows, as_bytes,
+        )
     }
 }
