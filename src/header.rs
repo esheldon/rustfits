@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    check_not_tainted, lock_file, FileHandle, FileLayout, HduOffsets, TaintFlag,
-    BLOCK_SIZE, CARD_SIZE,
+    check_not_tainted, lock_file, shift_file_tail_and_update_offsets,
+    FileHandle, FileLayout, HduOffsets, TaintFlag,
+    BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 
 // ===== card-level parse helpers =====
@@ -925,27 +926,48 @@ fn collect_update_actions(
 }
 
 // Rewrite the header on disk in place.  Cards are serialized to one or more
-// 2880-byte blocks; the resulting byte count must equal `header_block_count
-// * BLOCK_SIZE` (slack-only).  Offset state is read atomically once at the
-// top — concurrent grows are serialized by the file lock acquired below.
-// Taint semantics: pre-I/O failures don't taint; write_all/flush failures
-// do.  See CLAUDE.md "Tainted-header state".
+// 2880-byte blocks.  If the cards no longer fit in the currently reserved
+// blocks, the file tail is shifted forward to make room (see the "grow path"
+// branch below) and self's offsets are bumped accordingly; after that the
+// normal write proceeds into the now-larger reserved region.  Offset state
+// is read atomically — concurrent grows are serialized by the file lock
+// acquired below (and inside the shift helper).  Taint semantics: pre-I/O
+// failures don't taint; write_all/flush failures (and any mid-shift failure)
+// do.  See CLAUDE.md "Tainted-header state" and "Header overflow / grow".
 fn rewrite_header_to_disk(
     file_handle: &FileHandle,
     offsets: &HduOffsets,
+    layout: &FileLayout,
     cards: &[String],
     tainted: &TaintFlag,
 ) -> PyResult<()> {
     let header_offset = offsets.header_offset();
-    let header_block_count = offsets.header_block_count();
-    let max_cards = (header_block_count as usize) * 36;
+    let mut header_block_count = offsets.header_block_count();
+    let max_cards = (header_block_count as usize) * CARDS_PER_BLOCK;
+
+    // Grow path: cards no longer fit in the reserved blocks.  Insert
+    // (new_blocks - current_blocks) empty header blocks at this HDU's
+    // data_offset by shifting all subsequent bytes forward, then update
+    // self's header_block_count + data_offset.  shift_file_tail_and_update_offsets
+    // also bumps the header_offset / data_offset of every later HDU in
+    // `layout`, so previously-issued HDU and FITSHeader handles remain
+    // valid (they share Arc<HduOffsets> with the layout entry).
     if cards.len() > max_cards {
-        return Err(PyValueError::new_err(format!(
-            "header overflow: {} cards do not fit in {} block(s) (max {} cards); \
-             growing the header beyond its reserved blocks requires rewriting \
-             subsequent HDUs, which is not yet supported",
-            cards.len(), header_block_count, max_cards
-        )));
+        let needed_blocks =
+            ((cards.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK) as u64;
+        let delta_blocks = needed_blocks - header_block_count;
+        let delta_bytes = delta_blocks * BLOCK_SIZE as u64;
+        let data_offset = offsets.data_offset();
+
+        shift_file_tail_and_update_offsets(
+            file_handle, layout, data_offset, delta_bytes, tainted,
+        )?;
+
+        offsets.header_block_count
+            .fetch_add(delta_blocks, Ordering::Release);
+        offsets.data_offset
+            .fetch_add(delta_bytes, Ordering::Release);
+        header_block_count = needed_blocks;
     }
 
     let target_bytes = (header_block_count * BLOCK_SIZE as u64) as usize;
@@ -1265,6 +1287,7 @@ impl FITSHeader {
         rewrite_header_to_disk(
             &self.file,
             &self.offsets,
+            &self.layout,
             &new_cards,
             &self.tainted,
         )?;
@@ -1434,6 +1457,7 @@ impl FITSHeader {
         rewrite_header_to_disk(
             &self.file,
             &self.offsets,
+            &self.layout,
             &new_cards,
             &self.tainted,
         )?;
@@ -1468,6 +1492,7 @@ impl FITSHeader {
         rewrite_header_to_disk(
             &self.file,
             &self.offsets,
+            &self.layout,
             &new_cards,
             &self.tainted,
         )?;
@@ -1518,6 +1543,7 @@ impl FITSHeader {
         rewrite_header_to_disk(
             &self.file,
             &self.offsets,
+            &self.layout,
             &new_cards,
             &self.tainted,
         )?;
@@ -1583,6 +1609,7 @@ impl FITSHeaderEdit {
         rewrite_header_to_disk(
             &parent.file,
             &parent.offsets,
+            &parent.layout,
             &self.cards,
             &parent.tainted,
         )?;

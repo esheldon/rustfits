@@ -14,8 +14,10 @@ That gives us coverage of the rejection-behavior contract without needing
 to construct a real I/O failure.  The trigger code path itself
 (write_all/flush errors → set tainted) is reviewed by inspection.
 
-Pre-I/O failures (slack overflow, missing file, etc.) MUST NOT taint:
-those leave the on-disk file untouched and are not a recovery scenario.
+Pre-I/O failures (missing file, etc.) MUST NOT taint: those leave the
+on-disk file untouched and are not a recovery scenario.  Note: header
+overflow used to be a pre-I/O failure too, but is now absorbed by the
+file-rewrite (grow) path — see test_overflow_does_not_taint below.
 """
 
 import os
@@ -25,6 +27,9 @@ import contextlib
 import pytest
 
 import rustfits
+
+# 36 cards per 2880-byte FITS header block (BLOCK_SIZE / CARD_SIZE).
+CARDS_PER_BLOCK = 2880 // 80
 
 
 @contextlib.contextmanager
@@ -40,20 +45,23 @@ def _new_file(shape=(4, 6), dtype="i4"):
 
 
 def test_overflow_does_not_taint():
-    """Header overflow is a pre-I/O failure (caught by the slack check
-    before any bytes touch the disk).  It must NOT set the taint flag."""
+    """Header overflow is absorbed by the grow path: the file is shifted
+    and extended in place, all writes complete normally, and the taint
+    flag stays clear.  Only true mid-write I/O failures (write_all/flush
+    inside rewrite_header_to_disk, or any failure inside the shift loop)
+    should taint."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial = len(h.cards)
-            block_count = (initial + 35) // 36
-            slots_free = block_count * 36 - initial
+            block_count = (initial + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            slots_free = block_count * CARDS_PER_BLOCK - initial
             for i in range(slots_free):
                 h[f"PAD{i:04d}"] = i
-            with pytest.raises(ValueError):
-                h["OVERFLOW"] = 1   # overflow
+            h["OVERFLOW"] = 1   # triggers grow, succeeds
 
             # Subsequent reads still work — file is not tainted.
+            assert h["OVERFLOW"] == 1
             assert "PAD0000" in h
             assert h["PAD0000"] == 0
             # And subsequent legal writes work too.

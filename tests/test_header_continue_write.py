@@ -17,6 +17,10 @@ import pytest
 
 import rustfits
 
+# 36 cards per 2880-byte FITS header block (BLOCK_SIZE / CARD_SIZE).
+# Used in the slack-fill arithmetic below.
+CARDS_PER_BLOCK = 2880 // 80
+
 
 @contextlib.contextmanager
 def _new_file(shape=(4, 6), dtype="i4"):
@@ -324,29 +328,26 @@ def test_edit_rollback_discards_long_string_chain():
 
 
 # ============================================================================
-# Slack overflow with a long string
+# Long string spilling past reserved slack triggers the header grow path
 # ============================================================================
 
 
-def test_long_string_can_overflow_slack():
-    """The CONTINUE chain consumes one slack slot per card.  If the chain is
-    too long for the reserved header block(s), the write is rejected — and
-    in-memory + on-disk state remain consistent (write-disk-first)."""
+def test_long_string_triggers_header_grow():
+    """A CONTINUE chain too long for the reserved header block(s) triggers
+    the file-tail shift and grows the reserved region rather than failing."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial = len(h.cards)
-            block_count = (initial + 35) // 36
-            slots_free = block_count * 36 - initial
+            block_count = (initial + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            slots_free = block_count * CARDS_PER_BLOCK - initial
 
             # Build a value long enough to require more cards than the slack
             # supports.  ~67 chars per non-last card, so (slots_free + 5) * 67
-            # chars is comfortably over budget.
+            # chars is comfortably over budget — overflow triggers grow.
             big = "X" * (67 * (slots_free + 5))
 
-            with pytest.raises(ValueError):
-                h["LONG"] = big
-            # State unchanged.
-            assert "LONG" not in h
+            h["LONG"] = big
+            assert h["LONG"] == big
         with rustfits.FITS(fname, "r") as fits:
-            assert "LONG" not in fits[0].header
+            assert fits[0].header["LONG"] == big

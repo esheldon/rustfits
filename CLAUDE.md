@@ -12,26 +12,32 @@ exposes (`pub(crate)`) what neighboring modules actually import; everything
 else stays private to its file.
 
 - `src/lib.rs` — `#[pymodule]` init + `mod` declarations.  Nothing else.
-- `src/common.rs` — `FileHandle`, `TaintFlag`, `lock_file`,
-  `check_not_tainted`, `BLOCK_SIZE`/`CARD_SIZE`, `parse_keyword`.  Kept
-  intentionally tiny: file primitives and one shared parser, no domain
-  logic.
+- `src/common.rs` — `FileHandle`, `TaintFlag`, `HduOffsets`, `FileLayout`,
+  `lock_file`, `check_not_tainted`, `shift_file_tail_and_update_offsets`,
+  `BLOCK_SIZE`/`CARD_SIZE`/`CARDS_PER_BLOCK`, `parse_keyword`.  File
+  primitives plus the shared byte-shift helper that the header-grow path
+  (and the future image/table data-grow paths) all call into.
 - `src/header.rs` — `FITSHeader` and `FITSHeaderEdit` pyclasses plus every
   card-level helper (parsing, building, CONTINUE chains, HIERARCH,
-  commentary, protected keys, batched update, `rewrite_header_to_disk`).
-  Exports just the pyclasses, `FITSHeader::from_state`,
-  `py_is_protected_key`, and the card-builder formatters (`pad_to_card`,
-  `card_int`, `card_logical`, `card_string`) used by image-HDU creation.
-- `src/hdu.rs` — base `HDU` pyclass.  Fields are `pub(crate)` because
-  subclass `#[pymethods]` access them via `into_super()`.
+  commentary, protected keys, batched update, `rewrite_header_to_disk`
+  including the in-place file-grow branch).  Exports just the pyclasses,
+  `FITSHeader::from_state`, `py_is_protected_key`, and the card-builder
+  formatters (`pad_to_card`, `card_int`, `card_logical`, `card_string`)
+  used by image-HDU creation.
+- `src/hdu.rs` — base `HDU` pyclass.  Holds `Arc<HduOffsets>` (its own
+  shared-mutable offsets) and `Arc<FileLayout>` (for cross-HDU offset
+  updates during a grow); fields are `pub(crate)` because subclass
+  `#[pymethods]` access them via `into_super()`.
 - `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
   `RawBuffer`, bitpix conversions, shape parsing.  Only exports `ImageHDU`
   (+ `new`) and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
 - `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass stub.
 - `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub.
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
-  `validate_header` + `calculate_data_size`.  All free functions are
-  private to this file (only `FITS` is exported).
+  `validate_header` + `calculate_data_size`.  Owns the per-file
+  `Arc<FileLayout>` and pushes a new `Arc<HduOffsets>` into it for every
+  HDU that gets parsed or created.  All free functions are private to
+  this file (only `FITS` is exported).
 - `rustfits/` — the Python package; `_rust.so` is built into it by maturin.
 - `tests/` — pytest suite; tests pair same-handle and post-reopen
   assertions for mutations.
@@ -102,10 +108,15 @@ file wouldn't, and retrying would re-fire the same error.  Reversing the
 order makes any pre-I/O failure leave both states untouched and consistent.
 
 **Caveat (not yet fixed):** mid-write I/O failures inside
-`rewrite_header_to_disk` (e.g. ENOSPC partway through `write_all`/`flush`)
-can still leave the on-disk header partially overwritten.  The user gets an
-IOError and is expected to reopen the file to recover.  See "phase 2d
-hardening" below for the planned remediation.
+`rewrite_header_to_disk` or `shift_file_tail_and_update_offsets`
+(e.g. ENOSPC partway through `write_all`/`flush`, or during the chunked
+back-to-front copy of the file tail) can still leave the on-disk file
+partially overwritten.  The user gets an IOError naming the failure mode,
+the per-file taint flag is set, and the user is expected to close + reopen
+to recover.  An atomic temp-file-and-rename rewrite would be safer; it's
+not implemented because the in-place path matches the model of every
+other write in the codebase, and we have not yet seen mid-write failures
+in practice.
 
 ## Protected keywords
 
@@ -253,16 +264,50 @@ to signal "test plumbing, not API."  Used by `tests/test_header_taint.py`
 to verify rejection semantics without needing to produce a real I/O
 failure on the host filesystem.
 
-## Deferred (feature passes, not hardening)
+## Header overflow: in-place file grow
 
-These are user-facing features that have been intentionally left out of
-phase 2.  Implement only if real users hit them.
+When a header mutation would push past the currently reserved header
+blocks, `rewrite_header_to_disk` falls into the grow branch instead of
+raising.  The mechanics:
 
-1. **File-rewrite path for header overflow.** Currently overflow raises
-   ValueError ("header overflow: N cards do not fit in M block(s)...").
-   The slow-but-correct path: when overflowing, rewrite the whole file
-   from this HDU forward, growing the reserved header blocks.  This is
-   what cfitsio does internally.  Significant undertaking.
+1. Compute `delta_blocks = ceil(cards.len() / CARDS_PER_BLOCK) − current`
+   and `delta_bytes = delta_blocks * BLOCK_SIZE`.
+2. Call `shift_file_tail_and_update_offsets(file, layout, after_offset =
+   self.data_offset, delta_bytes, taint)` — this extends the file with
+   `set_len(original_len + delta)`, copies every byte from `after_offset
+   .. original_len` forward by `delta` (back-to-front, in 1 MiB chunks),
+   flushes, and then atomically bumps every `HduOffsets` whose
+   `header_offset >= after_offset` by `delta`.  Self's `header_offset` is
+   strictly less than `after_offset`, so self is not touched here.
+3. Bump self's `header_block_count += delta_blocks` and
+   `data_offset += delta_bytes` via `fetch_add`.
+4. Serialize the now-larger card list into the (now-larger) reserved
+   region with the normal write path.
+
+Because the shared `Arc<HduOffsets>` is co-owned by every HDU view and
+every FITSHeader view of that HDU, previously-issued handles transparently
+see the post-grow offsets — there is no stale-view problem and no need
+for the user to re-fetch via `fits[i]`.
+
+The back-to-front copy order is what makes the in-place shift safe with
+overlapping source and destination.  The argument is documented in detail
+in the doc-comment on `shift_file_tail_and_update_offsets` in `common.rs`.
+
+**Reuse for image/table data grow (not yet implemented).** When image
+extend (`ImageHDU.extend`) eventually grows non-last HDUs, and when
+table append/heap-grow lands, both will call the same
+`shift_file_tail_and_update_offsets` helper — image/table grow inserts
+bytes at `self.data_offset + self.data_size` instead of `self.data_offset`,
+and self's own offset record stays unchanged (only `header_block_count`
+is header-specific; data-section size is computed from the header by
+`calculate_data_size`).  This is the reason the shared-offsets refactor
+went in before the table writing work.
+
+**Taint semantics in the grow path:** pre-shift failures (file lock,
+metadata, `set_len`) do NOT taint — nothing on disk has moved yet.  Any
+failure inside the shift loop, the post-shift `flush`, or the subsequent
+header `write_all`/`flush` DOES taint, because the file may now be
+inconsistent.  See the `check_not_tainted` block above.
 
 ## Testing conventions
 

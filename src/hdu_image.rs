@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::common::{
     lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
-    BLOCK_SIZE, CARD_SIZE,
+    BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
 use crate::header::card_int;
@@ -734,7 +734,7 @@ fn round_up_to_block(n: u64) -> u64 {
 }
 
 fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
-    let num_blocks = (header.len() + 35) / 36;
+    let num_blocks = (header.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK;
     let total_size = num_blocks * BLOCK_SIZE;
     let mut out = Vec::with_capacity(total_size);
     for card in header {

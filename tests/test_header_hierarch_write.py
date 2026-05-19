@@ -24,6 +24,9 @@ import pytest
 
 import rustfits
 
+# 36 cards per 2880-byte FITS header block (BLOCK_SIZE / CARD_SIZE).
+CARDS_PER_BLOCK = 2880 // 80
+
 
 @contextlib.contextmanager
 def _new_file(shape=(4, 6), dtype="i4"):
@@ -568,22 +571,22 @@ def test_hierarch_comment_too_long_for_chain_rejected():
                 fits[0].header["ESO INS DESC"] = ("Z" * 200, "C" * 80)
 
 
-def test_hierarch_chain_can_overflow_slack():
-    """A chain too big for the reserved header blocks is rejected, and
-    in-memory + on-disk state remain consistent (write-disk-first)."""
+def test_hierarch_chain_triggers_header_grow():
+    """A HIERARCH chain too big for the reserved header blocks triggers
+    the file-tail shift and grows the reserved region rather than failing."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial = len(h.cards)
-            block_count = (initial + 35) // 36
-            slots_free = block_count * 36 - initial
+            block_count = (initial + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            slots_free = block_count * CARDS_PER_BLOCK - initial
 
             # First-card payload ~= 65 - len(key); continuation cards ~67.
-            # (slots_free + 5) * 60 chars is comfortably over budget.
+            # (slots_free + 5) * 60 chars is comfortably over budget — the
+            # grow path absorbs it.
             big = "X" * (60 * (slots_free + 5))
 
-            with pytest.raises(ValueError):
-                h["ESO INS DESC"] = big
-            assert "ESO INS DESC" not in h
+            h["ESO INS DESC"] = big
+            assert h["ESO INS DESC"] == big
         with rustfits.FITS(fname, "r") as fits:
-            assert "ESO INS DESC" not in fits[0].header
+            assert fits[0].header["ESO INS DESC"] == big

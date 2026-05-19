@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::common::{
     lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
-    BLOCK_SIZE, CARD_SIZE,
+    BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
@@ -176,7 +176,8 @@ fn parse_hdus_from_file(
 
         validate_header(&header_cards, hdus.is_empty())?;
 
-        let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
+        let num_header_blocks =
+            ((header_cards.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK) as u64;
         let header_size = num_header_blocks * BLOCK_SIZE as u64;
         let header_offset = offset;
         let data_offset = offset + header_size;

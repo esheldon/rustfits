@@ -5,7 +5,7 @@
     - Position semantics (existing key in place, new key before END)
     - Persistence across close/reopen
     - Case-insensitive keyword normalization
-    - Slack-only header overflow rejected
+    - Header overflow triggers the file-tail shift (grow) path
     - Commentary key assignment via subscript raises (use the dedicated
       add_comment/add_history/add_blank helpers instead).
 """
@@ -17,6 +17,9 @@ import contextlib
 import pytest
 
 import rustfits
+
+# 36 cards per 2880-byte FITS header block (BLOCK_SIZE / CARD_SIZE).
+CARDS_PER_BLOCK = 2880 // 80
 
 
 @contextlib.contextmanager
@@ -281,24 +284,24 @@ def test_long_keyword_promoted_to_hierarch():
 # --------------------------- Slack-only overflow ----------------------------
 
 
-def test_header_overflow_rejected():
-    """Adding cards beyond the reserved block(s) errors clearly rather than
-    silently relocating the data section."""
+def test_header_overflow_triggers_grow():
+    """One card past capacity triggers the file-tail shift and grows the
+    reserved header blocks; the new key lands on disk and round-trips
+    through close-and-reopen."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial_cards = len(h.cards)
-            block_count = (initial_cards + 35) // 36
-            # 36 cards per block; fill up to capacity, then one more should
-            # fail.
-            capacity = block_count * 36
+            block_count = (initial_cards + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            capacity = block_count * CARDS_PER_BLOCK
             slots_free = capacity - initial_cards
-            # Use up the available slack (without overflowing yet).
             for i in range(slots_free):
                 h[f"PAD{i:04d}"] = i
-            # One more is one too many.
-            with pytest.raises(ValueError):
-                h["OVERFLOW"] = 1
+            # One more triggers the grow path rather than raising.
+            h["OVERFLOW"] = 1
+            assert h["OVERFLOW"] == 1
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].header["OVERFLOW"] == 1
 
 
 # -------------------- Shared state across views --------------------
@@ -340,6 +343,6 @@ if __name__ == "__main__":
     test_delete_keeps_end_at_last_position()
     test_update_with_dict_value_comment_tuples()
     test_update_with_fitsheader_source_copies_comments()
-    test_header_overflow_rejected()
+    test_header_overflow_triggers_grow()
     test_two_header_views_share_state()
     print("smoke tests passed")

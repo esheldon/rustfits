@@ -19,6 +19,9 @@ import pytest
 
 import rustfits
 
+# 36 cards per 2880-byte FITS header block (BLOCK_SIZE / CARD_SIZE).
+CARDS_PER_BLOCK = 2880 // 80
+
 
 @contextlib.contextmanager
 def _new_file(shape=(4, 6), dtype="i4"):
@@ -166,23 +169,25 @@ def test_edit_setitem_after_commit_raises():
 # ------------------- batching is atomic on disk --------------------
 
 
-def test_edit_overflow_rejected_at_commit():
-    """If staged mutations would overflow the reserved block(s), the commit
-    raises — and because commit is at __exit__, the parent header is left
-    unchanged (the lock is taken only at commit time)."""
+def test_edit_overflow_triggers_grow_at_commit():
+    """When staged mutations exceed the reserved block(s), commit triggers
+    the file-tail shift, grows the reserved region, and lands every staged
+    key — there is no longer a slack-overflow error to roll back from."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             header = fits[0].header
             initial = len(header.cards)
-            block_count = (initial + 35) // 36
-            slots_free = block_count * 36 - initial
-            with pytest.raises(ValueError):
-                with header.edit() as h:
-                    for i in range(slots_free + 1):
-                        h[f"PAD{i:04d}"] = i
-            # Nothing committed.
+            block_count = (initial + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            slots_free = block_count * CARDS_PER_BLOCK - initial
+            with header.edit() as h:
+                for i in range(slots_free + 1):
+                    h[f"PAD{i:04d}"] = i
+            # All committed via the grow path.
             for i in range(slots_free + 1):
-                assert f"PAD{i:04d}" not in header
+                assert header[f"PAD{i:04d}"] == i
+        with rustfits.FITS(fname, "r") as fits:
+            for i in range(slots_free + 1):
+                assert fits[0].header[f"PAD{i:04d}"] == i
 
 
 def test_edit_position_semantics_match_setitem():
@@ -224,6 +229,6 @@ if __name__ == "__main__":
     test_edit_rolls_back_on_exception()
     test_edit_parent_unchanged_until_commit()
     test_edit_setitem_outside_with_raises()
-    test_edit_overflow_rejected_at_commit()
+    test_edit_overflow_triggers_grow_at_commit()
     test_edit_position_semantics_match_setitem()
     print("smoke tests passed")
