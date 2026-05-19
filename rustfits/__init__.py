@@ -7,4 +7,5 @@ from ._rust import (
     AsciiTableHDU,
     FITSHeader,
     FITSHeaderEdit,
+    is_protected_key,
 )

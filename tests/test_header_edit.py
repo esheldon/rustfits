@@ -190,10 +190,13 @@ def test_edit_position_semantics_match_setitem():
     immediately before END — same as outside a batch."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
+            # Seed a non-protected key so we have something to update in
+            # place (BITPIX et al. are protected and rejected).
+            fits[0].header["OBJECT"] = "M31"
             keys_before = list(fits[0].header)
             with fits[0].header.edit() as h:
-                h["BITPIX"] = 32
-                h["EXPTIME"] = 5
+                h["OBJECT"] = "NGC 224"   # update existing
+                h["EXPTIME"] = 5          # new key
             cards = fits[0].header.cards
             assert cards[-1].startswith("END")
             assert cards[-2].startswith("EXPTIME")

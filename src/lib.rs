@@ -546,6 +546,68 @@ fn is_hierarch_key(key: &str) -> bool {
     key.len() > 8 || key.contains(' ')
 }
 
+// Is this (post-normalization) key one that rustfits manages on the user's
+// behalf — i.e., one whose value is determined by the file's structure,
+// integrity contract, or compression layout, and which the user must NOT
+// mutate directly?  Used to reject __setitem__/__delitem__ on those keys
+// and to drive `FITSHeader::without_protected()`.
+//
+// Categories:
+//   - Image HDU structural: SIMPLE, XTENSION, EXTEND, BITPIX, NAXIS,
+//     NAXIS1..NAXIS999, PCOUNT, GCOUNT, END.
+//   - Binary table structural: TFIELDS, TFORMn, TDIMn, TTYPEn, TSCALn,
+//     TZEROn, TNULLn, THEAP.
+//   - ASCII table structural: TBCOLn (TFIELDS/TFORMn/TNULLn shared above).
+//   - Random groups: GROUPS, PTYPEn, PSCALn, PZEROn (PCOUNT/GCOUNT shared).
+//   - Tiled image compression: ZIMAGE, ZCMPTYPE, ZBITPIX, ZNAXIS,
+//     ZNAXIS1..ZNAXIS999, ZTILEn, ZNAMEn, ZVALn, ZSIMPLE, ZEXTEND, ZBLOCKED,
+//     ZPCOUNT, ZGCOUNT, ZHECKSUM, ZDATASUM, ZTENSION, ZQUANTIZ, ZDITHER0,
+//     ZMASKCMP, ZBLANK.
+//   - Integrity: CHECKSUM, DATASUM.
+//
+// Not protected (user metadata that's safe to write): EXTNAME, EXTVER,
+// EXTLEVEL, BUNIT, BSCALE, BZERO, OBJECT, EXPTIME, DATE-OBS, CTYPEn,
+// CRVALn, etc.  BUNIT/BSCALE/BZERO will need context-sensitive stripping
+// in `update()` when copying into a future table HDU (see CLAUDE.md).
+fn is_protected_key(key: &str) -> bool {
+    // Literal-match keys (no numeric suffix family).
+    const LITERAL_PROTECTED: &[&str] = &[
+        // Image HDU structural.
+        "SIMPLE", "XTENSION", "EXTEND", "BITPIX", "NAXIS",
+        "PCOUNT", "GCOUNT", "END",
+        // Binary table structural.
+        "TFIELDS", "THEAP",
+        // Random groups.
+        "GROUPS",
+        // Tiled image compression.
+        "ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS",
+        "ZSIMPLE", "ZEXTEND", "ZBLOCKED", "ZPCOUNT", "ZGCOUNT",
+        "ZHECKSUM", "ZDATASUM", "ZTENSION",
+        "ZQUANTIZ", "ZDITHER0", "ZMASKCMP", "ZBLANK",
+        // Integrity.
+        "CHECKSUM", "DATASUM",
+    ];
+    if LITERAL_PROTECTED.contains(&key) {
+        return true;
+    }
+    // Prefix + 1-or-more-digit suffix families.  Returns true for any key
+    // matching `<PREFIX><n>` where n is a non-empty all-digit suffix.
+    const INDEXED_PREFIXES: &[&str] = &[
+        "NAXIS",
+        "TFORM", "TDIM", "TTYPE", "TSCAL", "TZERO", "TNULL", "TBCOL",
+        "PTYPE", "PSCAL", "PZERO",
+        "ZNAXIS", "ZTILE", "ZNAME", "ZVAL",
+    ];
+    for prefix in INDEXED_PREFIXES {
+        if let Some(suffix) = key.strip_prefix(prefix) {
+            if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // Validate a (post-normalization) keyword for writing.  Standard keywords:
 // 1-8 ASCII chars from A-Z, 0-9, '-', '_'.  HIERARCH long keys: any length
 // (subject to fitting in an 80-char card), additionally allowing space,
@@ -943,6 +1005,29 @@ fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
         }
     }
     false
+}
+
+// Return a card list with protected-keyword cards (and their CONTINUE
+// chains) removed.  Used by `to_dict(skip_protected=True)` to expose the
+// non-managed subset of the header for inspection or copying.  Other card
+// kinds (COMMENT/HISTORY/blank/END/orphan CONTINUE) pass through unchanged.
+fn filter_protected_cards(cards: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < cards.len() {
+        let kw = keyword_of(&cards[i]);
+        match kw.as_deref() {
+            Some(k) if is_protected_key(k) => {
+                // Skip this card and any CONTINUE chain attached to it.
+                i = find_chain_end(cards, i);
+            }
+            _ => {
+                out.push(cards[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 // Parse the value side of `header[key] = value`.  Either a bare scalar or a
@@ -1412,9 +1497,19 @@ impl FITSHeader {
         self.snapshot()
     }
 
-    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+    // Return the header as a nested dict {key: {"value": ..., "comment": ...}}.
+    // When `skip_protected=True`, drop keys whose values rustfits manages
+    // (file structure, integrity, compression layout) so the result is safe
+    // to copy verbatim into another HDU's header.  See `is_protected_key`.
+    #[pyo3(signature = (skip_protected=false))]
+    fn to_dict(&self, py: Python<'_>, skip_protected: bool) -> PyResult<Py<PyDict>> {
         let cards = self.snapshot()?;
-        parse_header_dict(py, &cards)
+        if skip_protected {
+            let filtered = filter_protected_cards(&cards);
+            parse_header_dict(py, &filtered)
+        } else {
+            parse_header_dict(py, &cards)
+        }
     }
 
     // ---- mutation (phase 2a) ----
@@ -1431,6 +1526,14 @@ impl FITSHeader {
             return Err(PyValueError::new_err(format!(
                 "subscript assignment to commentary key '{}' is not supported; \
                  use add_comment(text) / add_history(text) / add_blank(text) to append",
+                key
+            )));
+        }
+        if is_protected_key(&key) {
+            return Err(PyValueError::new_err(format!(
+                "'{}' is a protected keyword managed by rustfits (file structure, \
+                 integrity, or compression layout) and cannot be set directly; \
+                 structural changes should go through the dedicated HDU APIs",
                 key
             )));
         }
@@ -1457,6 +1560,14 @@ impl FITSHeader {
     fn __delitem__(&self, key: &str) -> PyResult<()> {
         check_not_tainted(&self.tainted)?;
         let key = normalize_keyword(key);
+        if is_protected_key(&key) {
+            return Err(PyValueError::new_err(format!(
+                "'{}' is a protected keyword managed by rustfits and cannot be \
+                 deleted directly; structural changes should go through the \
+                 dedicated HDU APIs",
+                key
+            )));
+        }
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         let mut new_cards = guard.clone();
@@ -1651,6 +1762,14 @@ impl FITSHeaderEdit {
                 key
             )));
         }
+        if is_protected_key(&key) {
+            return Err(PyValueError::new_err(format!(
+                "'{}' is a protected keyword managed by rustfits (file structure, \
+                 integrity, or compression layout) and cannot be set directly; \
+                 structural changes should go through the dedicated HDU APIs",
+                key
+            )));
+        }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
         apply_setitem(&mut self.cards, &key, &value_obj, explicit_comment)
     }
@@ -1658,6 +1777,14 @@ impl FITSHeaderEdit {
     fn __delitem__(&mut self, key: &str) -> PyResult<()> {
         self.ensure_active()?;
         let key = normalize_keyword(key);
+        if is_protected_key(&key) {
+            return Err(PyValueError::new_err(format!(
+                "'{}' is a protected keyword managed by rustfits and cannot be \
+                 deleted directly; structural changes should go through the \
+                 dedicated HDU APIs",
+                key
+            )));
+        }
         let removed = if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             delete_commentary_cards(&mut self.cards, &key) > 0
         } else {
@@ -3440,6 +3567,17 @@ impl FITS {
     }
 }
 
+// Public predicate: does this keyword belong to the set rustfits manages
+// (file structure, integrity, compression layout)?  Useful for callers
+// writing their own copy-header loops who want to use the same rule
+// rustfits uses internally to reject __setitem__/__delitem__.  The check
+// is case-insensitive (the keyword is normalized to uppercase first).
+#[pyfunction]
+#[pyo3(name = "is_protected_key")]
+fn py_is_protected_key(key: &str) -> bool {
+    is_protected_key(&normalize_keyword(key))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FITS>()?;
@@ -3449,5 +3587,6 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsciiTableHDU>()?;
     m.add_class::<FITSHeader>()?;
     m.add_class::<FITSHeaderEdit>()?;
+    m.add_function(wrap_pyfunction!(py_is_protected_key, m)?)?;
     Ok(())
 }

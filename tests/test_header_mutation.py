@@ -123,10 +123,14 @@ def test_update_existing_key_preserves_position():
     """An update to an existing key keeps the card at its original index."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
+            # Seed a non-protected key, then verify mutating it preserves
+            # its position.  (Structural keys like BITPIX are protected and
+            # cannot be set directly — see test_header_protected.py.)
+            fits[0].header["OBJECT"] = "M31"
             keys_before = list(fits[0].header)
-            fits[0].header["BITPIX"] = 32   # update existing
+            fits[0].header["OBJECT"] = "NGC 224"   # update existing
             keys_after = list(fits[0].header)
-        # Same keys in the same order — only BITPIX's value changed.
+        # Same keys in the same order — only OBJECT's value changed.
         assert keys_before == keys_after
 
 

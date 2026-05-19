@@ -79,6 +79,54 @@ can still leave the on-disk header partially overwritten.  The user gets an
 IOError and is expected to reopen the file to recover.  See "phase 2d
 hardening" below for the planned remediation.
 
+## Protected keywords
+
+Some keywords represent state rustfits manages on the user's behalf —
+file structure, integrity contracts, or compression layout — and must
+not be mutated through `header[k] = v` or `del header[k]`.  The predicate
+`is_protected_key()` (lib.rs) covers:
+
+- **Image HDU structural:** `SIMPLE`, `XTENSION`, `EXTEND`, `BITPIX`,
+  `NAXIS`, `NAXIS1..NAXIS999`, `PCOUNT`, `GCOUNT`, `END`.
+- **Binary table structural:** `TFIELDS`, `TFORMn`, `TDIMn`, `TTYPEn`,
+  `TSCALn`, `TZEROn`, `TNULLn`, `THEAP`.
+- **ASCII table structural:** `TBCOLn` (plus the shared bintable keys).
+- **Random groups:** `GROUPS`, `PTYPEn`, `PSCALn`, `PZEROn` (plus PCOUNT/GCOUNT).
+- **Tiled image compression:** `ZIMAGE`, `ZCMPTYPE`, `ZBITPIX`, `ZNAXIS`,
+  `ZNAXISn`, `ZTILEn`, `ZNAMEn`, `ZVALn`, `ZSIMPLE`, `ZEXTEND`, `ZBLOCKED`,
+  `ZPCOUNT`, `ZGCOUNT`, `ZHECKSUM`, `ZDATASUM`, `ZTENSION`, `ZQUANTIZ`,
+  `ZDITHER0`, `ZMASKCMP`, `ZBLANK`.
+- **Integrity:** `CHECKSUM`, `DATASUM`.
+
+`__setitem__` and `__delitem__` (both on `FITSHeader` and `FITSHeaderEdit`)
+raise `ValueError` for any protected key.  `to_dict(skip_protected=True)`
+returns a filtered copy suitable for serialization or as a base for
+hand-copied updates.  `is_protected_key()` is also exposed at the Python
+module level for callers writing their own filter loops.
+
+Internal paths that legitimately update structural keys (e.g.
+`extend_image_hdu` updating `NAXISn`) operate on the cards `Vec` directly,
+not through `__setitem__`, so the guard doesn't break them.
+
+**Decided, not yet implemented:** `update()` from a FITSHeader source
+should silently skip protected keys.  The use case is "copy the metadata
+from this other HDU's header" — the destination already has its own
+correct structural/integrity/compression keys and they must not be
+clobbered.  Today `update()` from a FITSHeader copies everything; the
+destination's `apply_setitem` then raises on the first protected key,
+which is correct but unfriendly.  The skip belongs in
+`collect_update_triples`'s FITSHeader branch (filter via
+`is_protected_key` before pushing the triple).  Dict-source `update()`
+should continue to raise on protected keys (explicit hand-written keys
+are almost certainly a mistake, not an intent to be silently dropped).
+
+**Forward-looking (Tier 2, deferred until table writing lands):** the
+image-only metadata keys `BUNIT`, `BSCALE`, `BZERO` are *not* protected —
+they're fine to set on an image HDU — but they're meaningless on a table
+HDU.  When `update()` is extended to copy from one HDU to another, the
+destination's HDU type needs to be consulted: if the target is a table,
+these three keys should be stripped from the source.
+
 ## CONTINUE-chained string values
 
 Long string values (escaped length > 68 chars) auto-emit a CONTINUE chain:
