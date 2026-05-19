@@ -7,18 +7,46 @@ in this directory; humans should read it before making structural changes.
 
 ## Project structure
 
-- `src/lib.rs` — the entire Rust extension (single file by design, for now).
+The Rust extension is split into single-responsibility modules.  Each only
+exposes (`pub(crate)`) what neighboring modules actually import; everything
+else stays private to its file.
+
+- `src/lib.rs` — `#[pymodule]` init + `mod` declarations.  Nothing else.
+- `src/common.rs` — `FileHandle`, `TaintFlag`, `lock_file`,
+  `check_not_tainted`, `BLOCK_SIZE`/`CARD_SIZE`, `parse_keyword`.  Kept
+  intentionally tiny: file primitives and one shared parser, no domain
+  logic.
+- `src/header.rs` — `FITSHeader` and `FITSHeaderEdit` pyclasses plus every
+  card-level helper (parsing, building, CONTINUE chains, HIERARCH,
+  commentary, protected keys, batched update, `rewrite_header_to_disk`).
+  Exports just the pyclasses, `FITSHeader::from_state`,
+  `py_is_protected_key`, and the card-builder formatters (`pad_to_card`,
+  `card_int`, `card_logical`, `card_string`) used by image-HDU creation.
+- `src/hdu.rs` — base `HDU` pyclass.  Fields are `pub(crate)` because
+  subclass `#[pymethods]` access them via `into_super()`.
+- `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
+  `RawBuffer`, bitpix conversions, shape parsing.  Only exports `ImageHDU`
+  (+ `new`) and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
+- `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass stub.
+- `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub.
+- `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
+  `validate_header` + `calculate_data_size`.  All free functions are
+  private to this file (only `FITS` is exported).
 - `rustfits/` — the Python package; `_rust.so` is built into it by maturin.
-- `tests/` — pytest suite; tests pair same-handle and post-reopen assertions
-  for mutations.
+- `tests/` — pytest suite; tests pair same-handle and post-reopen
+  assertions for mutations.
 - Build: `maturin develop` (compiles the cdylib AND installs the editable
   wheel in one step — don't use bare `cargo build`).
+
+Visibility discipline: keep every helper `fn foo()` (private to its file).
+Promote to `pub(crate)` only when the compiler complains — the smaller
+module surface area is the whole point of the split.
 
 ## Axis order: numpy throughout, FITS only at the boundary
 
 FITS stores arrays with the fastest-varying axis (NAXIS1) first; numpy uses
 row-major order with the fastest-varying axis last.  `parse_image_hdu_shape`
-reverses once at the boundary (line ~1100); everything downstream
+(in `hdu_image.rs`) reverses once at the boundary; everything downstream
 (`row_major_strides`, `compute_strip_layout`, `read_image_slice`,
 `write_image_data`, `__getitem__` slicing) operates in numpy order.  Don't
 reverse again anywhere else.
@@ -84,7 +112,7 @@ hardening" below for the planned remediation.
 Some keywords represent state rustfits manages on the user's behalf —
 file structure, integrity contracts, or compression layout — and must
 not be mutated through `header[k] = v` or `del header[k]`.  The predicate
-`is_protected_key()` (lib.rs) covers:
+`is_protected_key()` (header.rs) covers:
 
 - **Image HDU structural:** `SIMPLE`, `XTENSION`, `EXTEND`, `BITPIX`,
   `NAXIS`, `NAXIS1..NAXIS999`, `PCOUNT`, `GCOUNT`, `END`.
