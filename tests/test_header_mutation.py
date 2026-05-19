@@ -265,11 +265,15 @@ def test_invalid_keyword_chars_rejected():
                 fits[0].header["BAD*KEY"] = 5
 
 
-def test_too_long_keyword_rejected():
+def test_long_keyword_promoted_to_hierarch():
+    """Keys longer than 8 characters are now written as HIERARCH cards
+    instead of being rejected (phase 2c).  Comprehensive HIERARCH behavior
+    is covered in tests/test_header_hierarch_write.py; this is a regression
+    guard against the old "reject long keys" contract from phase 2a."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
-            with pytest.raises(ValueError):
-                fits[0].header["TOOMANYCHARS"] = 5
+            fits[0].header["TOOMANYCHARS"] = 5
+            assert fits[0].header["TOOMANYCHARS"] == 5
 
 
 # --------------------------- Slack-only overflow ----------------------------

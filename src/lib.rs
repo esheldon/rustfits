@@ -518,27 +518,43 @@ fn parse_value_with_continue(
 // callers and upper-case before lookup or write, matching cfitsio/astropy/
 // fitsio behavior.  Applied uniformly across __getitem__/__setitem__/etc.
 fn normalize_keyword(key: &str) -> String {
-    key.to_ascii_uppercase()
+    key.trim().to_ascii_uppercase()
 }
 
-// Validate a (post-normalization) keyword for writing.  Phase 2a accepts
-// only standard FITS keywords: 1-8 ASCII chars, restricted to A-Z, 0-9,
-// '-', '_'.  HIERARCH long keys are deferred to phase 2b.
+// Does this (post-normalization) key require the HIERARCH convention?
+// Keys longer than 8 chars or containing spaces must use HIERARCH.
+fn is_hierarch_key(key: &str) -> bool {
+    key.len() > 8 || key.contains(' ')
+}
+
+// Validate a (post-normalization) keyword for writing.  Standard keywords:
+// 1-8 ASCII chars from A-Z, 0-9, '-', '_'.  HIERARCH long keys: any length
+// (subject to fitting in an 80-char card), additionally allowing space,
+// '.', '+'.  The literal "HIERARCH" is rejected — it's the convention
+// prefix, not a user key.
 fn validate_keyword(key: &str) -> PyResult<()> {
     if key.is_empty() {
         return Err(PyValueError::new_err("keyword cannot be empty"));
     }
-    if key.len() > 8 {
-        return Err(PyValueError::new_err(format!(
-            "keyword '{}' is longer than 8 characters; HIERARCH long keys are \
-             not yet supported on write", key
-        )));
+    if key == "HIERARCH" {
+        return Err(PyValueError::new_err(
+            "'HIERARCH' is not a valid user keyword; HIERARCH is the convention \
+             prefix for long keys — pass a longer key (>8 chars or containing spaces) instead"
+        ));
     }
+    let hierarch = is_hierarch_key(key);
     for c in key.chars() {
-        if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        let ok = c.is_ascii_uppercase()
+            || c.is_ascii_digit()
+            || c == '-'
+            || c == '_'
+            || (hierarch && (c == ' ' || c == '.' || c == '+'));
+        if !ok {
             return Err(PyValueError::new_err(format!(
-                "keyword '{}' contains invalid characters \
-                 (allowed: A-Z/a-z, 0-9, '-', '_')", key
+                "keyword '{}' contains invalid character '{}' \
+                 (standard keys allow A-Z/a-z, 0-9, '-', '_'; \
+                 HIERARCH long keys additionally allow ' ', '.', '+')",
+                key, c
             )));
         }
     }
@@ -558,14 +574,18 @@ fn extract_existing_comment(py: Python<'_>, cards: &[String], key: &str) -> Opti
 
 // Build the card(s) representing (key, value, comment).  Most types emit a
 // single card; string values longer than what fits in one card emit a
-// CONTINUE-chained sequence (1 keyword card + N CONTINUE cards).  Bool is
-// checked before int because Python bools are also ints (`extract::<i64>()`
-// succeeds on `True`).
+// CONTINUE-chained sequence.  HIERARCH long keys use a different card
+// layout and (in phase 2c) always emit exactly one card — CONTINUE-chained
+// HIERARCH long-string values are deferred.  Bool is checked before int
+// because Python bools are also ints (`extract::<i64>()` succeeds on `True`).
 fn build_card_from_value(
     key: &str,
     value: &Bound<'_, PyAny>,
     comment: &str,
 ) -> PyResult<Vec<String>> {
+    if is_hierarch_key(key) {
+        return Ok(vec![build_hierarch_card(key, value, comment)?]);
+    }
     if value.is_instance_of::<PyBool>() {
         let b: bool = value.extract()?;
         return Ok(vec![card_logical(key, b, comment)]);
@@ -582,6 +602,56 @@ fn build_card_from_value(
     Err(PyValueError::new_err(format!(
         "unsupported value type for key '{}'; supported types: bool, int, float, str", key
     )))
+}
+
+// Build a HIERARCH-format card for a long key.  Layout:
+//   HIERARCH <key> = <value>[ / <comment>]
+// String values: quoted, single quotes escaped (`'` -> `''`), padded to a
+// minimum of 8 chars inside the quotes (FITS convention).  Errors if the
+// resulting card exceeds 80 chars.
+fn build_hierarch_card(
+    key: &str,
+    value: &Bound<'_, PyAny>,
+    comment: &str,
+) -> PyResult<String> {
+    // Format the value side per type.  Bool first (Python bools are ints).
+    let value_str = if value.is_instance_of::<PyBool>() {
+        let b: bool = value.extract()?;
+        (if b { "T" } else { "F" }).to_string()
+    } else if let Ok(n) = value.extract::<i64>() {
+        format!("{}", n)
+    } else if let Ok(f) = value.extract::<f64>() {
+        format_fits_float(f)
+    } else if let Ok(s) = value.extract::<String>() {
+        let escaped = s.replace('\'', "''");
+        let padded = if escaped.len() < 8 {
+            format!("{:<8}", escaped)
+        } else {
+            escaped
+        };
+        format!("'{}'", padded)
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "unsupported value type for HIERARCH key '{}'; \
+             supported: bool, int, float, str", key
+        )));
+    };
+
+    let prefix = format!("HIERARCH {} = ", key);
+    let body = if comment.is_empty() {
+        format!("{}{}", prefix, value_str)
+    } else {
+        format!("{}{} / {}", prefix, value_str, comment)
+    };
+    if body.len() > CARD_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "HIERARCH card too long ({} chars) for key '{}'; \
+             shorten the key, value, or comment to fit in 80 chars \
+             (CONTINUE-on-write for HIERARCH long-string values is deferred)",
+            body.len(), key
+        )));
+    }
+    Ok(pad_to_card(&body))
 }
 
 // Does this card's value (parsed as a FITS string) end with `&`?  Returns
@@ -624,7 +694,8 @@ fn find_chain_end(cards: &[String], start: usize) -> usize {
 // chain's original position.  If `key` is not present, insert `new_cards`
 // just before END (or appended if there's no END card).  When updating an
 // existing key whose value is a CONTINUE-chained string, the entire chain
-// is removed before the new cards are inserted.
+// is removed before the new cards are inserted.  Matches HIERARCH cards
+// by their long key, not by the literal "HIERARCH" prefix.
 fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) {
     let normalized: Vec<String> = new_cards
         .into_iter()
@@ -633,12 +704,15 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) 
 
     let mut existing_start: Option<usize> = None;
     for i in 0..cards.len() {
-        let trimmed = cards[i].trim_end();
-        if trimmed.is_empty() {
+        let card_key = match keyword_of(&cards[i]) {
+            Some(k) => k,
+            None => continue,
+        };
+        // Skip structural / commentary / continuation cards — never match them.
+        if matches!(card_key.as_str(), "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
             continue;
         }
-        let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
-        if key_field.trim() == key {
+        if card_key == key {
             existing_start = Some(i);
             break;
         }
@@ -661,15 +735,17 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) 
 
 // Remove the first card matching `key`, plus any CONTINUE chain attached
 // to it (for long-string values).  Returns true iff at least one card was
-// removed.
+// removed.  Matches HIERARCH cards by their long key.
 fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
     for i in 0..cards.len() {
-        let trimmed = cards[i].trim_end();
-        if trimmed.is_empty() {
+        let card_key = match keyword_of(&cards[i]) {
+            Some(k) => k,
+            None => continue,
+        };
+        if matches!(card_key.as_str(), "END" | "COMMENT" | "HISTORY" | "" | "CONTINUE") {
             continue;
         }
-        let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
-        if key_field.trim() == key {
+        if card_key == key {
             let end = find_chain_end(cards, i);
             cards.drain(i..end);
             return true;
