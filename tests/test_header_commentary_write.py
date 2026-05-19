@@ -103,8 +103,14 @@ def test_new_comments_cluster_with_existing_ones():
         with _read_only(fname) as fits:
             cards_reopen = fits[0].header.cards
         for cards in (cards_same, cards_reopen):
-            idx1 = next(i for i, c in enumerate(cards) if c.startswith("COMMENT") and "first" in c)
-            idx2 = next(i for i, c in enumerate(cards) if c.startswith("COMMENT") and "second" in c)
+            idx1 = next(
+                i for i, c in enumerate(cards)
+                if c.startswith("COMMENT") and "first" in c
+            )
+            idx2 = next(
+                i for i, c in enumerate(cards)
+                if c.startswith("COMMENT") and "second" in c
+            )
             assert idx2 == idx1 + 1
 
 

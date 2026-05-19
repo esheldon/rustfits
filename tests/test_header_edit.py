@@ -78,7 +78,7 @@ def test_edit_supports_update_with_dict():
             assert hd.comment_of("C") == "with comment"
 
 
-# --------------------------- rollback on exception ----------------------------
+# -------------------- rollback on exception ----------------------
 
 
 def test_edit_rolls_back_on_exception():
@@ -97,7 +97,7 @@ def test_edit_rolls_back_on_exception():
             assert "EXPTIME" not in fits[0].header
 
 
-# --------------------------- staged-vs-parent reads ----------------------------
+# --------------------- staged-vs-parent reads ---------------------
 
 
 def test_edit_reads_show_staged_state():
@@ -166,7 +166,7 @@ def test_edit_setitem_after_commit_raises():
                 h["OTHER"] = 1
 
 
-# --------------------------- batching is atomic on disk ----------------------------
+# ------------------- batching is atomic on disk --------------------
 
 
 def test_edit_overflow_rejected_at_commit():
