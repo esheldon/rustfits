@@ -108,6 +108,36 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
     }
 }
 
+// Extract the EXTNAME string value from a card list, or None if there is no
+// EXTNAME card.  Used by FITS::__getitem__ to support string-keyed HDU
+// lookup; case-insensitive matching is the caller's responsibility.
+fn extract_extname(cards: &[String]) -> Option<String> {
+    for card in cards {
+        if card.len() < 9 { continue; }
+        if card[..8].trim() != "EXTNAME" { continue; }
+        if !card[8..].starts_with('=') { continue; }
+        let value_part = card[9..].trim_start();
+        if !value_part.starts_with('\'') { return None; }
+        let after_open = &value_part[1..];
+        let bytes = after_open.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                // `''` is the FITS escape for a single quote; skip both.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                let inner = &after_open[..i];
+                return Some(inner.replace("''", "'").trim_end().to_string());
+            }
+            i += 1;
+        }
+        return None;
+    }
+    None
+}
+
 // Walks the file from byte 0, extracting every HDU header and skipping over
 // each data section, returning the parsed HDU Python objects.  Each HDU is
 // constructed with its data-section byte offset and a clone of the file
@@ -468,13 +498,62 @@ impl FITS {
         Ok(())
     }
 
-    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
-        let len = self.hdus.len() as isize;
-        let idx = if index < 0 { len + index } else { index };
-        if idx < 0 || idx >= len {
-            return Err(PyValueError::new_err(format!("HDU index {} out of range", index)));
+    // Accept either an integer (positional, with Python-style negative
+    // indexing) or a string (EXTNAME lookup, case-insensitive).  A bool is
+    // rejected explicitly because Python's int/bool subclass relationship
+    // would otherwise let `fits[True]` resolve as `fits[1]`.
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        if key.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyValueError::new_err(
+                "FITS index must be int (HDU position) or str (EXTNAME); got bool",
+            ));
         }
-        Ok(self.hdus[idx as usize].clone_ref(py))
+        if let Ok(index) = key.extract::<isize>() {
+            let len = self.hdus.len() as isize;
+            let idx = if index < 0 { len + index } else { index };
+            if idx < 0 || idx >= len {
+                return Err(PyValueError::new_err(format!(
+                    "HDU index {} out of range", index
+                )));
+            }
+            return Ok(self.hdus[idx as usize].clone_ref(py));
+        }
+        // Accept str (incl. np.str_, which subclasses str) and bytes
+        // (incl. np.bytes_, which subclasses bytes).  FITS keyword and
+        // string values are restricted to printable ASCII by spec, so a
+        // non-ASCII byte sequence can't match anything and is rejected.
+        let name: Option<String> = if let Ok(s) = key.extract::<String>() {
+            Some(s)
+        } else if let Ok(b) = key.extract::<Vec<u8>>() {
+            if !b.iter().all(|c| c.is_ascii()) {
+                return Err(PyValueError::new_err(
+                    "FITS EXTNAME lookup key must be ASCII",
+                ));
+            }
+            Some(String::from_utf8(b).unwrap())
+        } else {
+            None
+        };
+        if let Some(name) = name {
+            let target = name.trim().to_ascii_uppercase();
+            for hdu_obj in &self.hdus {
+                let bound = hdu_obj.bind(py);
+                let hdu_ref = bound.cast::<HDU>()?.borrow();
+                let cards_guard = hdu_ref.header.lock()
+                    .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+                let matched = extract_extname(&cards_guard)
+                    .map(|s| s.trim().to_ascii_uppercase() == target)
+                    .unwrap_or(false);
+                drop(cards_guard);
+                if matched {
+                    return Ok(hdu_obj.clone_ref(py));
+                }
+            }
+            return Err(PyValueError::new_err(format!("no HDU named '{}'", name)));
+        }
+        Err(PyValueError::new_err(
+            "FITS index must be int (HDU position) or str/bytes (EXTNAME)",
+        ))
     }
 
     fn __enter__(slf: PyRef<Self>) -> PyRef<Self> {
