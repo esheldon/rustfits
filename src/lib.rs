@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyComplex, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyComplex, PyDict, PyEllipsis, PyList, PySlice, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::Bound;
@@ -511,25 +511,202 @@ fn parse_value_with_continue(
     Ok((value, comment))
 }
 
+// ====================== Mutation helpers (phase 2a) ======================
+
+// Normalize a user-supplied keyword to the canonical FITS form (ASCII upper).
+// Keywords in conforming FITS files are uppercase; we accept any case from
+// callers and upper-case before lookup or write, matching cfitsio/astropy/
+// fitsio behavior.  Applied uniformly across __getitem__/__setitem__/etc.
+fn normalize_keyword(key: &str) -> String {
+    key.to_ascii_uppercase()
+}
+
+// Validate a (post-normalization) keyword for writing.  Phase 2a accepts
+// only standard FITS keywords: 1-8 ASCII chars, restricted to A-Z, 0-9,
+// '-', '_'.  HIERARCH long keys are deferred to phase 2b.
+fn validate_keyword(key: &str) -> PyResult<()> {
+    if key.is_empty() {
+        return Err(PyValueError::new_err("keyword cannot be empty"));
+    }
+    if key.len() > 8 {
+        return Err(PyValueError::new_err(format!(
+            "keyword '{}' is longer than 8 characters; HIERARCH long keys are \
+             not yet supported on write", key
+        )));
+    }
+    for c in key.chars() {
+        if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+            return Err(PyValueError::new_err(format!(
+                "keyword '{}' contains invalid characters \
+                 (allowed: A-Z/a-z, 0-9, '-', '_')", key
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Pull the comment off the first existing card for `key`, if any.  Returns
+// None if the key is not present or the card has no comment.
+fn extract_existing_comment(cards: &[String], key: &str) -> Option<String> {
+    let (_idx, value_part) = find_card_for_key(cards, key)?;
+    let (_raw, comment) = split_value_comment(&value_part);
+    Some(comment)
+}
+
+// Build a complete 80-char card from (key, Python value, comment).  Type
+// dispatch: bool / int / float / str.  Bool is checked before int because
+// Python bools are also ints (`extract::<i64>()` succeeds on `True`).
+fn build_card_from_value(
+    key: &str,
+    value: &Bound<'_, PyAny>,
+    comment: &str,
+) -> PyResult<String> {
+    if value.is_instance_of::<PyBool>() {
+        let b: bool = value.extract()?;
+        return Ok(card_logical(key, b, comment));
+    }
+    if let Ok(n) = value.extract::<i64>() {
+        return Ok(card_int(key, n, comment));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        return Ok(card_float(key, f, comment));
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(card_string(key, &s, comment));
+    }
+    Err(PyValueError::new_err(format!(
+        "unsupported value type for key '{}'; supported types: bool, int, float, str", key
+    )))
+}
+
+// Replace the card for `key` if it exists; otherwise insert just before END
+// (or append if there's no END card).  `key` is assumed already normalized
+// to uppercase.
+fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_card: String) {
+    let normalized = new_card.trim_end().to_string();
+    for i in 0..cards.len() {
+        let trimmed = cards[i].trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+        if key_field.trim() == key {
+            cards[i] = normalized;
+            return;
+        }
+    }
+    let end_pos = cards.iter().position(|c| c.trim_end() == "END");
+    match end_pos {
+        Some(pos) => cards.insert(pos, normalized),
+        None => cards.push(normalized),
+    }
+}
+
+// Remove the first card matching `key`.  Returns true iff a card was removed.
+fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
+    for i in 0..cards.len() {
+        let trimmed = cards[i].trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+        if key_field.trim() == key {
+            cards.remove(i);
+            return true;
+        }
+    }
+    false
+}
+
+// Rewrite the header on disk in place.  Cards are serialized to one or more
+// 2880-byte blocks; the resulting byte count must equal `header_block_count
+// * BLOCK_SIZE` (slack-only).  If `cards` overflows the reserved blocks,
+// returns a clear error rather than relocating subsequent HDUs.
+fn rewrite_header_to_disk(
+    file_handle: &FileHandle,
+    header_offset: u64,
+    header_block_count: u64,
+    cards: &[String],
+) -> PyResult<()> {
+    let max_cards = (header_block_count as usize) * 36;
+    if cards.len() > max_cards {
+        return Err(PyValueError::new_err(format!(
+            "header overflow: {} cards do not fit in {} block(s) (max {} cards); \
+             growing the header beyond its reserved blocks requires rewriting \
+             subsequent HDUs, which is not yet supported",
+            cards.len(), header_block_count, max_cards
+        )));
+    }
+
+    let target_bytes = (header_block_count * BLOCK_SIZE as u64) as usize;
+    let mut bytes = Vec::with_capacity(target_bytes);
+    for card in cards {
+        let mut padded = card.clone();
+        if padded.len() < CARD_SIZE {
+            padded.push_str(&" ".repeat(CARD_SIZE - padded.len()));
+        } else if padded.len() > CARD_SIZE {
+            padded.truncate(CARD_SIZE);
+        }
+        bytes.extend_from_slice(padded.as_bytes());
+    }
+    while bytes.len() < target_bytes {
+        bytes.push(b' ');
+    }
+
+    let mut guard = lock_file(file_handle)?;
+    let f = guard.as_mut().ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(header_offset))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    f.write_all(&bytes)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    f.flush()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(())
+}
+
 #[pyclass]
 struct FITSHeader {
-    cards: Vec<String>,
+    // Shared with the owning HDU so mutations propagate back.  Reads take the
+    // lock briefly and clone (headers are tiny); writes take the lock for the
+    // duration of the rewrite.
+    cards: Arc<Mutex<Vec<String>>>,
+    // File handle + on-disk position needed to rewrite the header in place.
+    file: FileHandle,
+    header_offset: u64,
+    // Number of 2880-byte header blocks reserved on disk.  Mutations may
+    // grow or shrink the card list up to this block's worth of cards;
+    // overflow returns an error (file-rewrite path is deferred).
+    header_block_count: u64,
 }
 
 impl FITSHeader {
-    fn from_cards(cards: Vec<String>) -> Self {
-        FITSHeader { cards }
+    fn from_state(
+        cards: Arc<Mutex<Vec<String>>>,
+        file: FileHandle,
+        header_offset: u64,
+        header_block_count: u64,
+    ) -> Self {
+        FITSHeader { cards, file, header_offset, header_block_count }
+    }
+
+    fn snapshot(&self) -> PyResult<Vec<String>> {
+        let g = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        Ok(g.clone())
     }
 }
 
 #[pymethods]
 impl FITSHeader {
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        let key = normalize_keyword(key);
+        let cards = self.snapshot()?;
+
         // Commentary keys are returned as ordered lists of card texts.
-        let commentary_list = match key {
-            "COMMENT" => Some(collect_commentary_texts(&self.cards, "COMMENT")),
-            "HISTORY" => Some(collect_commentary_texts(&self.cards, "HISTORY")),
-            "" => Some(collect_blank_commentary_texts(&self.cards)),
+        let commentary_list = match key.as_str() {
+            "COMMENT" => Some(collect_commentary_texts(&cards, "COMMENT")),
+            "HISTORY" => Some(collect_commentary_texts(&cards, "HISTORY")),
+            "" => Some(collect_blank_commentary_texts(&cards)),
             _ => None,
         };
         if let Some(items) = commentary_list {
@@ -541,10 +718,10 @@ impl FITSHeader {
             return Ok(PyList::new(py, &items)?.into_any().unbind());
         }
 
-        match find_card_for_key(&self.cards, key) {
+        match find_card_for_key(&cards, &key) {
             Some((idx, value_part)) => {
                 let (value, _comment) =
-                    parse_value_with_continue(py, &self.cards, idx, &value_part)?;
+                    parse_value_with_continue(py, &cards, idx, &value_part)?;
                 Ok(value)
             }
             None => Err(pyo3::exceptions::PyKeyError::new_err(
@@ -553,37 +730,42 @@ impl FITSHeader {
         }
     }
 
-    fn __contains__(&self, key: &str) -> bool {
-        match key {
-            "COMMENT" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("COMMENT")),
-            "HISTORY" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("HISTORY")),
-            "" => self.cards.iter().any(|c| {
-                // Only blank cards with content count (pure padding doesn't).
+    fn __contains__(&self, key: &str) -> PyResult<bool> {
+        let key = normalize_keyword(key);
+        let cards = self.snapshot()?;
+        Ok(match key.as_str() {
+            "COMMENT" => cards.iter().any(|c| keyword_of(c).as_deref() == Some("COMMENT")),
+            "HISTORY" => cards.iter().any(|c| keyword_of(c).as_deref() == Some("HISTORY")),
+            "" => cards.iter().any(|c| {
                 let trimmed = c.trim_end();
                 trimmed.len() > 8 && trimmed[..8].trim().is_empty()
             }),
-            _ => find_card_for_key(&self.cards, key).is_some(),
-        }
+            _ => find_card_for_key(&cards, &key).is_some(),
+        })
     }
 
-    fn __len__(&self) -> usize {
-        unique_keys_in_order(&self.cards).len()
+    fn __len__(&self) -> PyResult<usize> {
+        let cards = self.snapshot()?;
+        Ok(unique_keys_in_order(&cards).len())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let keys = unique_keys_in_order(&slf.cards);
+        let cards = slf.snapshot()?;
+        let keys = unique_keys_in_order(&cards);
         let list = PyList::new(py, &keys)?;
         Ok(list.call_method0("__iter__")?.unbind())
     }
 
     fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let keys = unique_keys_in_order(&self.cards);
+        let cards = self.snapshot()?;
+        let keys = unique_keys_in_order(&cards);
         Ok(PyList::new(py, &keys)?.unbind())
     }
 
     fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let keys = unique_keys_in_order(&self.cards);
+        let cards = self.snapshot()?;
+        let keys = unique_keys_in_order(&cards);
         let mut values: Vec<Py<PyAny>> = Vec::with_capacity(keys.len());
         for k in &keys {
             values.push(self.__getitem__(py, k)?);
@@ -592,7 +774,8 @@ impl FITSHeader {
     }
 
     fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let keys = unique_keys_in_order(&self.cards);
+        let cards = self.snapshot()?;
+        let keys = unique_keys_in_order(&cards);
         let mut items: Vec<Py<PyAny>> = Vec::with_capacity(keys.len());
         for k in &keys {
             let v = self.__getitem__(py, k)?;
@@ -613,19 +796,18 @@ impl FITSHeader {
         }
     }
 
-    // Comment text associated with a single-card key.  Errors for the
-    // commentary keys COMMENT/HISTORY/blank — those don't have per-card
-    // comments in the usual sense.
     fn comment_of(&self, py: Python<'_>, key: &str) -> PyResult<String> {
-        if matches!(key, "COMMENT" | "HISTORY" | "") {
+        let key = normalize_keyword(key);
+        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(
                 "comment_of() is not defined for commentary keys (COMMENT/HISTORY/blank)"
             ));
         }
-        match find_card_for_key(&self.cards, key) {
+        let cards = self.snapshot()?;
+        match find_card_for_key(&cards, &key) {
             Some((idx, value_part)) => {
                 let (_value, comment) =
-                    parse_value_with_continue(py, &self.cards, idx, &value_part)?;
+                    parse_value_with_continue(py, &cards, idx, &value_part)?;
                 Ok(comment)
             }
             None => Err(pyo3::exceptions::PyKeyError::new_err(
@@ -634,29 +816,223 @@ impl FITSHeader {
         }
     }
 
-    // Raw 80-char card strings in on-disk order.
     #[getter]
-    fn cards(&self) -> Vec<String> {
-        self.cards.clone()
+    fn cards(&self) -> PyResult<Vec<String>> {
+        self.snapshot()
     }
 
-    // Structured snapshot of all keys with values and comments, matching the
-    // legacy `header_dict` shape.  Useful for serialization, test comparisons,
-    // and code that doesn't want to learn the FITSHeader class.
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        parse_header_dict(py, &self.cards)
+        let cards = self.snapshot()?;
+        parse_header_dict(py, &cards)
     }
 
-    fn __repr__(&self) -> String {
-        let n_unique = unique_keys_in_order(&self.cards).len();
-        format!(
+    // ---- mutation (phase 2a) ----
+
+    // Set or update a key.  `value` is either a bare scalar (bool/int/float/str)
+    // or a `(value, comment)` tuple.  Bare values preserve the existing
+    // comment if the key was already present.  Existing keys are updated in
+    // place (position preserved); new keys are inserted just before END.
+    // Each call auto-flushes — one disk rewrite per mutation.
+    fn __setitem__(&self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let key = normalize_keyword(key);
+        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            return Err(PyValueError::new_err(format!(
+                "setting commentary key '{}' is not yet supported \
+                 (see add_comment/add_history in phase 2b)", key
+            )));
+        }
+        validate_keyword(&key)?;
+
+        // Distinguish a bare value from a (value, comment) tuple.  A 2-tuple
+        // is treated as the latter; any other tuple shape is an error.
+        let (value_obj, explicit_comment) = if let Ok(tup) = value.cast::<PyTuple>() {
+            if tup.len() != 2 {
+                return Err(PyValueError::new_err(
+                    "tuple value must be (value, comment) — exactly 2 elements"
+                ));
+            }
+            let v = tup.get_item(0)?;
+            let c: String = tup.get_item(1)?.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "second element of (value, comment) tuple must be a string"
+                )
+            })?;
+            (v, Some(c))
+        } else {
+            (value.clone(), None)
+        };
+
+        // Lock cards, compute the new card text, mutate the Vec, write to
+        // disk — all under the cards lock so concurrent header views can't
+        // observe a half-applied mutation.
+        let mut guard = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let comment = explicit_comment.unwrap_or_else(|| {
+            extract_existing_comment(&guard, &key).unwrap_or_default()
+        });
+        let new_card = build_card_from_value(&key, &value_obj, &comment)?;
+        set_card_for_key(&mut guard, &key, new_card);
+        rewrite_header_to_disk(
+            &self.file,
+            self.header_offset,
+            self.header_block_count,
+            &guard,
+        )?;
+        Ok(())
+    }
+
+    fn __delitem__(&self, key: &str) -> PyResult<()> {
+        let key = normalize_keyword(key);
+        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            return Err(PyValueError::new_err(format!(
+                "deleting commentary key '{}' is not yet supported", key
+            )));
+        }
+        let mut guard = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        if !delete_card_for_key(&mut guard, &key) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("'{}' not in header", key)
+            ));
+        }
+        rewrite_header_to_disk(
+            &self.file,
+            self.header_offset,
+            self.header_block_count,
+            &guard,
+        )?;
+        Ok(())
+    }
+
+    // Bulk update from a mapping or another FITSHeader.  Performs all
+    // mutations under a single lock and disk rewrite.  Commentary keys
+    // (COMMENT/HISTORY/blank) in the source raise — they need explicit
+    // append/replace helpers (phase 2b).
+    //
+    // For a FITSHeader source we copy cards directly to preserve comments;
+    // for any other mapping we use `.items()`, where each value is either a
+    // bare scalar or a `(value, comment)` tuple.
+    fn update(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Build the (key, value, comment) triples we want to apply, without
+        // touching disk yet.
+        let mut triples: Vec<(String, Py<PyAny>, Option<String>)> = Vec::new();
+
+        if let Ok(src) = other.cast::<FITSHeader>() {
+            // Fast path: iterate the source's cards and copy key/value/comment.
+            let src_cards = src.borrow().snapshot()?;
+            for (i, card) in src_cards.iter().enumerate() {
+                let trimmed = card.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+                let kw_field_trimmed = key_field.trim();
+                if matches!(kw_field_trimmed, "END" | "CONTINUE") {
+                    continue;
+                }
+                if matches!(kw_field_trimmed, "COMMENT" | "HISTORY" | "") {
+                    return Err(PyValueError::new_err(format!(
+                        "source header contains commentary key '{}' which \
+                         update() does not yet support (deferred to phase 2b)",
+                        kw_field_trimmed
+                    )));
+                }
+                let kw = keyword_of(card).unwrap_or_default();
+                if kw.is_empty() {
+                    continue;
+                }
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let (value, comment) = parse_value_with_continue(
+                        py, &src_cards, i, &trimmed[eq_pos + 1..],
+                    )?;
+                    triples.push((kw, value, Some(comment)));
+                }
+            }
+        } else {
+            // Generic mapping path: require `.items()` -> iterable of pairs.
+            let items_call = other.call_method0("items").map_err(|_| {
+                PyValueError::new_err(
+                    "update() expects a FITSHeader or a mapping with .items()"
+                )
+            })?;
+            let iter = items_call.try_iter()?;
+            for item in iter {
+                let item = item?;
+                let pair = item.cast::<PyTuple>().map_err(|_| {
+                    PyValueError::new_err(
+                        "update() expects pairs of (key, value); got non-tuple"
+                    )
+                })?;
+                if pair.len() != 2 {
+                    return Err(PyValueError::new_err(
+                        "update() expects pairs of (key, value); got tuple of wrong length"
+                    ));
+                }
+                let k_raw: String = pair.get_item(0)?.extract()?;
+                let k = normalize_keyword(&k_raw);
+                if matches!(k.as_str(), "COMMENT" | "HISTORY" | "") {
+                    return Err(PyValueError::new_err(format!(
+                        "update() does not yet support commentary key '{}' \
+                         (deferred to phase 2b)", k
+                    )));
+                }
+                let val_obj = pair.get_item(1)?;
+                let (v, c) = if let Ok(tup) = val_obj.cast::<PyTuple>() {
+                    if tup.len() != 2 {
+                        return Err(PyValueError::new_err(
+                            "value tuple must be (value, comment) — exactly 2 elements"
+                        ));
+                    }
+                    let cstr: String = tup.get_item(1)?.extract().map_err(|_| {
+                        PyValueError::new_err(
+                            "second element of (value, comment) tuple must be a string"
+                        )
+                    })?;
+                    (tup.get_item(0)?.unbind(), Some(cstr))
+                } else {
+                    (val_obj.unbind(), None)
+                };
+                triples.push((k, v, c));
+            }
+        }
+
+        if triples.is_empty() {
+            return Ok(());
+        }
+
+        // Apply all mutations under a single cards lock + one disk rewrite.
+        let mut guard = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        for (k, v, explicit_comment) in &triples {
+            validate_keyword(k)?;
+            let comment = match explicit_comment {
+                Some(c) => c.clone(),
+                None => extract_existing_comment(&guard, k).unwrap_or_default(),
+            };
+            let new_card = build_card_from_value(k, v.bind(py), &comment)?;
+            set_card_for_key(&mut guard, k, new_card);
+        }
+        rewrite_header_to_disk(
+            &self.file,
+            self.header_offset,
+            self.header_block_count,
+            &guard,
+        )?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let cards = self.snapshot()?;
+        let n_unique = unique_keys_in_order(&cards).len();
+        Ok(format!(
             "<FITSHeader: {} unique keys, {} cards>",
-            n_unique, self.cards.len()
-        )
+            n_unique, cards.len()
+        ))
     }
 
-    fn __str__(&self) -> String {
-        self.cards.iter().map(|c| c.trim_end()).collect::<Vec<_>>().join("\n")
+    fn __str__(&self) -> PyResult<String> {
+        let cards = self.snapshot()?;
+        Ok(cards.iter().map(|c| c.trim_end()).collect::<Vec<_>>().join("\n"))
     }
 }
 
@@ -668,15 +1044,48 @@ impl FITSHeader {
 // direct Python instantiation is not supported.
 #[pyclass(subclass)]
 struct HDU {
-    header: Vec<String>,
+    // Shared with FITSHeader so mutations through the header view propagate
+    // back to the HDU's canonical card list (and any other readers).
+    header: Arc<Mutex<Vec<String>>>,
     index: usize,
+    // On-disk byte offset where this HDU's header begins.  Fixed for the HDU's
+    // lifetime; used by FITSHeader to rewrite header blocks in place.
+    header_offset: u64,
     data_offset: u64,
     file: FileHandle,
 }
 
 impl HDU {
-    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle) -> Self {
-        HDU { header, index, data_offset, file }
+    fn new(
+        header: Vec<String>,
+        index: usize,
+        header_offset: u64,
+        data_offset: u64,
+        file: FileHandle,
+    ) -> Self {
+        HDU {
+            header: Arc::new(Mutex::new(header)),
+            index,
+            header_offset,
+            data_offset,
+            file,
+        }
+    }
+
+    // Snapshot of the current header cards.  Takes the lock briefly, clones
+    // out, releases.  Internal readers should call this rather than holding
+    // the lock for the duration of (e.g.) a numpy allocation.
+    fn header_snapshot(&self) -> PyResult<Vec<String>> {
+        let g = self.header.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        Ok(g.clone())
+    }
+
+    // How many 2880-byte blocks the on-disk header occupies (fixed; equal to
+    // (data_offset - header_offset) / BLOCK_SIZE).  Used to enforce slack-only
+    // header mutations.
+    fn header_block_count(&self) -> u64 {
+        (self.data_offset - self.header_offset) / BLOCK_SIZE as u64
     }
 }
 
@@ -686,12 +1095,17 @@ impl HDU {
         format!("<HDU #{}>", self.index)
     }
 
-    // The header view.  Returns a fresh FITSHeader bound to a clone of the
-    // HDU's current cards.  Phase 2 will make this persistent so mutations
-    // on the returned object write back to the HDU; for now it is a snapshot.
+    // The header view.  Returns a FITSHeader that shares the HDU's card list,
+    // file handle, and on-disk position — mutations through the returned
+    // object propagate back to the HDU and write through to disk.
     #[getter]
     fn header(&self, py: Python<'_>) -> PyResult<Py<FITSHeader>> {
-        Py::new(py, FITSHeader::from_cards(self.header.clone()))
+        Py::new(py, FITSHeader::from_state(
+            Arc::clone(&self.header),
+            Arc::clone(&self.file),
+            self.header_offset,
+            self.header_block_count(),
+        ))
     }
 
     #[getter]
@@ -705,10 +1119,14 @@ impl HDU {
 struct ImageHDU;
 
 impl ImageHDU {
-    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
-        -> (Self, HDU)
-    {
-        (ImageHDU, HDU::new(header, index, data_offset, file))
+    fn new(
+        header: Vec<String>,
+        index: usize,
+        header_offset: u64,
+        data_offset: u64,
+        file: FileHandle,
+    ) -> (Self, HDU) {
+        (ImageHDU, HDU::new(header, index, header_offset, data_offset, file))
     }
 }
 
@@ -731,7 +1149,8 @@ impl ImageHDU {
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
         let super_: PyRef<HDU> = slf.into_super();
-        write_image_data(&super_.header, super_.data_offset, &super_.file, data, start)
+        let header_cards = super_.header_snapshot()?;
+        write_image_data(&header_cards, super_.data_offset, &super_.file, data, start)
     }
 
     // Read this HDU's entire data section into a newly-allocated numpy
@@ -739,7 +1158,8 @@ impl ImageHDU {
     // are swapped into host byte order in place.
     fn read(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_: PyRef<HDU> = slf.into_super();
-        read_image_data(py, &super_.header, super_.data_offset, &super_.file)
+        let header_cards = super_.header_snapshot()?;
+        read_image_data(py, &header_cards, super_.data_offset, &super_.file)
     }
 
     // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to fit
@@ -761,9 +1181,10 @@ impl ImageHDU {
         data: &Bound<'_, PyAny>,
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
-        let mut super_: PyRefMut<HDU> = slf.into_super();
+        let super_: PyRefMut<HDU> = slf.into_super();
 
-        let (bitpix, current_hdu_shape) = parse_image_hdu_shape(&super_.header)?;
+        let header_snapshot = super_.header_snapshot()?;
+        let (bitpix, current_hdu_shape) = parse_image_hdu_shape(&header_snapshot)?;
         let naxis = current_hdu_shape.len();
 
         // Validate dtype matches BITPIX up front so we don't touch the file
@@ -836,7 +1257,7 @@ impl ImageHDU {
         // No growth needed: fall through to a plain write.
         if new_hdu_shape == current_hdu_shape {
             return write_image_data(
-                &super_.header,
+                &header_snapshot,
                 super_.data_offset,
                 &super_.file,
                 data,
@@ -880,19 +1301,24 @@ impl ImageHDU {
             }
         }
 
-        // Phase 2: update the in-memory NAXISn card.
+        // Phase 2: update the in-memory NAXISn card under the lock.
         let naxisn_key = format!("NAXIS{}", naxis);
-        let card_idx = super_.header.iter()
-            .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
-            .ok_or_else(|| PyValueError::new_err(
-                format!("header missing {}", naxisn_key)
-            ))?;
         let new_card = card_int(
             &naxisn_key,
             new_hdu_shape[0] as i64,
             &format!("length of data axis {}", naxis),
         );
-        super_.header[card_idx] = new_card.trim_end().to_string();
+        let updated_header: Vec<String> = {
+            let mut g = super_.header.lock()
+                .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+            let card_idx = g.iter()
+                .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
+                .ok_or_else(|| PyValueError::new_err(
+                    format!("header missing {}", naxisn_key)
+                ))?;
+            g[card_idx] = new_card.trim_end().to_string();
+            g.clone()
+        };
 
         // Phase 3: rewrite the on-disk header block(s) so they match the new
         // NAXISn value.  After this, file and header are consistent.
@@ -901,7 +1327,7 @@ impl ImageHDU {
             let file = guard.as_mut()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
 
-            let header_bytes = serialize_header_to_disk_bytes(&super_.header);
+            let header_bytes = serialize_header_to_disk_bytes(&updated_header);
             let header_offset = data_offset - header_bytes.len() as u64;
             file.seek(SeekFrom::Start(header_offset))
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -915,7 +1341,7 @@ impl ImageHDU {
         // against the updated header (cheap) and uses the same byte-order /
         // buffer-protocol fast path as a normal write.
         write_image_data(
-            &super_.header,
+            &updated_header,
             data_offset,
             &super_.file,
             data,
@@ -934,9 +1360,10 @@ impl ImageHDU {
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let super_: PyRef<HDU> = slf.into_super();
-        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&super_.header)?;
+        let header_cards = super_.header_snapshot()?;
+        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
         let slices = normalize_slice_key(key, &hdu_shape)?;
-        read_image_slice(py, &super_.header, super_.data_offset, &super_.file, &slices)
+        read_image_slice(py, &header_cards, super_.data_offset, &super_.file, &slices)
     }
 }
 
@@ -1418,10 +1845,14 @@ fn write_image_data(
 struct TableHDU; // Binary table (BINTABLE)
 
 impl TableHDU {
-    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
-        -> (Self, HDU)
-    {
-        (TableHDU, HDU::new(header, index, data_offset, file))
+    fn new(
+        header: Vec<String>,
+        index: usize,
+        header_offset: u64,
+        data_offset: u64,
+        file: FileHandle,
+    ) -> (Self, HDU) {
+        (TableHDU, HDU::new(header, index, header_offset, data_offset, file))
     }
 }
 
@@ -1438,10 +1869,14 @@ impl TableHDU {
 struct AsciiTableHDU; // ASCII table (TABLE)
 
 impl AsciiTableHDU {
-    fn new(header: Vec<String>, index: usize, data_offset: u64, file: FileHandle)
-        -> (Self, HDU)
-    {
-        (AsciiTableHDU, HDU::new(header, index, data_offset, file))
+    fn new(
+        header: Vec<String>,
+        index: usize,
+        header_offset: u64,
+        data_offset: u64,
+        file: FileHandle,
+    ) -> (Self, HDU) {
+        (AsciiTableHDU, HDU::new(header, index, header_offset, data_offset, file))
     }
 }
 
@@ -1520,6 +1955,7 @@ fn parse_hdus_from_file(py: Python<'_>, handle: &FileHandle) -> PyResult<Vec<Py<
 
         let num_header_blocks = ((header_cards.len() + 35) / 36) as u64;
         let header_size = num_header_blocks * BLOCK_SIZE as u64;
+        let header_offset = offset;
         let data_offset = offset + header_size;
         let data_size = calculate_data_size(&header_cards);
 
@@ -1531,13 +1967,13 @@ fn parse_hdus_from_file(py: Python<'_>, handle: &FileHandle) -> PyResult<Vec<Py<
 
         let hdu_file = Arc::clone(handle);
         let hdu_py: Py<PyAny> = if is_image {
-            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
+            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
         } else if is_binary_table {
-            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
+            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
         } else if is_ascii_table {
-            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file))?.into()
+            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
         } else {
-            let h = HDU::new(header_cards.clone(), hdus.len(), data_offset, hdu_file);
+            let h = HDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file);
             Py::new(py, h)?.into()
         };
 
@@ -1598,6 +2034,34 @@ fn card_string(key: &str, value: &str, comment: &str) -> String {
     };
     let quoted = format!("'{}'", padded);
     let head = format!("{:<8}= {}", key, quoted);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    pad_to_card(&body)
+}
+
+// Format a float for the FITS value field, guaranteeing the result is
+// distinguishable from an integer (always contains either '.' or 'e'/'E').
+// Uses Rust's default Display which is round-trip safe for finite f64s.
+fn format_fits_float(value: f64) -> String {
+    if !value.is_finite() {
+        // NaN and infinity aren't in the FITS fixed-format float spec, but
+        // we don't reject them here — caller can validate if it cares.
+        return format!("{}", value);
+    }
+    let s = format!("{}", value);
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+fn card_float(key: &str, value: f64, comment: &str) -> String {
+    let formatted = format_fits_float(value);
+    let head = format!("{:<8}= {:>20}", key, formatted);
     let body = if comment.is_empty() {
         head
     } else {
@@ -2000,12 +2464,14 @@ impl FITS {
             ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
         };
 
-        let data_offset = {
+        let (header_offset, data_offset) = {
             let mut guard = lock_file(&self.file)?;
             let file = guard.as_mut()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
 
             file.seek(SeekFrom::End(0))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let header_start = file.stream_position()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             for c in &cards {
@@ -2032,7 +2498,7 @@ impl FITS {
             file.flush()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-            header_end
+            (header_start, header_end)
         };
 
         // Construct the matching ImageHDU in memory and append.  The parser
@@ -2046,6 +2512,7 @@ impl FITS {
             ImageHDU::new(
                 stored_cards,
                 self.hdus.len(),
+                header_offset,
                 data_offset,
                 Arc::clone(&self.file),
             ),
