@@ -618,6 +618,123 @@ fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
     false
 }
 
+// Parse the value side of `header[key] = value`.  Either a bare scalar or a
+// `(value, comment)` 2-tuple is accepted; any other tuple shape is an error.
+fn parse_setitem_value<'py>(
+    value: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Option<String>)> {
+    if let Ok(tup) = value.cast::<PyTuple>() {
+        if tup.len() != 2 {
+            return Err(PyValueError::new_err(
+                "tuple value must be (value, comment) — exactly 2 elements"
+            ));
+        }
+        let v = tup.get_item(0)?;
+        let c: String = tup.get_item(1)?.extract().map_err(|_| {
+            PyValueError::new_err(
+                "second element of (value, comment) tuple must be a string"
+            )
+        })?;
+        Ok((v, Some(c)))
+    } else {
+        Ok((value.clone(), None))
+    }
+}
+
+// Apply a single header set — validate + resolve comment + build card +
+// place it in `cards` (in-place or append-before-END).  Shared between the
+// auto-flush FITSHeader path and the batched FITSHeaderEdit path; neither
+// writes to disk here.  `key` is assumed normalized to uppercase.
+fn apply_setitem(
+    cards: &mut Vec<String>,
+    key: &str,
+    value: &Bound<'_, PyAny>,
+    explicit_comment: Option<String>,
+) -> PyResult<()> {
+    validate_keyword(key)?;
+    let comment = explicit_comment.unwrap_or_else(|| {
+        extract_existing_comment(cards, key).unwrap_or_default()
+    });
+    let new_card = build_card_from_value(key, value, &comment)?;
+    set_card_for_key(cards, key, new_card);
+    Ok(())
+}
+
+// Collect (key, value, explicit_comment) triples to apply from a source —
+// either a FITSHeader (cards are walked to preserve comments) or any object
+// with `.items()` returning (key, value-or-(value, comment)).  Commentary
+// keys in the source raise (deferred to phase 2c).
+fn collect_update_triples(
+    py: Python<'_>,
+    other: &Bound<'_, PyAny>,
+) -> PyResult<Vec<(String, Py<PyAny>, Option<String>)>> {
+    let mut triples: Vec<(String, Py<PyAny>, Option<String>)> = Vec::new();
+
+    if let Ok(src) = other.cast::<FITSHeader>() {
+        let src_cards = src.borrow().snapshot()?;
+        for (i, card) in src_cards.iter().enumerate() {
+            let trimmed = card.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+            let kw_field_trimmed = key_field.trim();
+            if matches!(kw_field_trimmed, "END" | "CONTINUE") {
+                continue;
+            }
+            if matches!(kw_field_trimmed, "COMMENT" | "HISTORY" | "") {
+                return Err(PyValueError::new_err(format!(
+                    "source header contains commentary key '{}' which \
+                     update() does not yet support (deferred)",
+                    kw_field_trimmed
+                )));
+            }
+            let kw = keyword_of(card).unwrap_or_default();
+            if kw.is_empty() {
+                continue;
+            }
+            if let Some(eq_pos) = trimmed.find('=') {
+                let (value, comment) = parse_value_with_continue(
+                    py, &src_cards, i, &trimmed[eq_pos + 1..],
+                )?;
+                triples.push((kw, value, Some(comment)));
+            }
+        }
+    } else {
+        let items_call = other.call_method0("items").map_err(|_| {
+            PyValueError::new_err(
+                "update() expects a FITSHeader or a mapping with .items()"
+            )
+        })?;
+        let iter = items_call.try_iter()?;
+        for item in iter {
+            let item = item?;
+            let pair = item.cast::<PyTuple>().map_err(|_| {
+                PyValueError::new_err(
+                    "update() expects pairs of (key, value); got non-tuple"
+                )
+            })?;
+            if pair.len() != 2 {
+                return Err(PyValueError::new_err(
+                    "update() expects pairs of (key, value); got tuple of wrong length"
+                ));
+            }
+            let k_raw: String = pair.get_item(0)?.extract()?;
+            let k = normalize_keyword(&k_raw);
+            if matches!(k.as_str(), "COMMENT" | "HISTORY" | "") {
+                return Err(PyValueError::new_err(format!(
+                    "update() does not yet support commentary key '{}' (deferred)", k
+                )));
+            }
+            let val_obj = pair.get_item(1)?;
+            let (v, c) = parse_setitem_value(&val_obj)?;
+            triples.push((k, v.unbind(), c));
+        }
+    }
+
+    Ok(triples)
+}
+
 // Rewrite the header on disk in place.  Cards are serialized to one or more
 // 2880-byte blocks; the resulting byte count must equal `header_block_count
 // * BLOCK_SIZE` (slack-only).  If `cards` overflows the reserved blocks,
@@ -838,46 +955,25 @@ impl FITSHeader {
         if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
                 "setting commentary key '{}' is not yet supported \
-                 (see add_comment/add_history in phase 2b)", key
+                 (see add_comment/add_history, deferred)", key
             )));
         }
-        validate_keyword(&key)?;
-
-        // Distinguish a bare value from a (value, comment) tuple.  A 2-tuple
-        // is treated as the latter; any other tuple shape is an error.
-        let (value_obj, explicit_comment) = if let Ok(tup) = value.cast::<PyTuple>() {
-            if tup.len() != 2 {
-                return Err(PyValueError::new_err(
-                    "tuple value must be (value, comment) — exactly 2 elements"
-                ));
-            }
-            let v = tup.get_item(0)?;
-            let c: String = tup.get_item(1)?.extract().map_err(|_| {
-                PyValueError::new_err(
-                    "second element of (value, comment) tuple must be a string"
-                )
-            })?;
-            (v, Some(c))
-        } else {
-            (value.clone(), None)
-        };
-
-        // Lock cards, compute the new card text, mutate the Vec, write to
-        // disk — all under the cards lock so concurrent header views can't
-        // observe a half-applied mutation.
+        let (value_obj, explicit_comment) = parse_setitem_value(value)?;
+        // Build the candidate card list on a clone, write to disk, only then
+        // commit the new state to the shared in-memory cards.  Order matters:
+        // if the disk write fails (e.g. header overflow), in-memory must not
+        // diverge from disk.
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let comment = explicit_comment.unwrap_or_else(|| {
-            extract_existing_comment(&guard, &key).unwrap_or_default()
-        });
-        let new_card = build_card_from_value(&key, &value_obj, &comment)?;
-        set_card_for_key(&mut guard, &key, new_card);
+        let mut new_cards = guard.clone();
+        apply_setitem(&mut new_cards, &key, &value_obj, explicit_comment)?;
         rewrite_header_to_disk(
             &self.file,
             self.header_offset,
             self.header_block_count,
-            &guard,
+            &new_cards,
         )?;
+        *guard = new_cards;
         Ok(())
     }
 
@@ -890,7 +986,8 @@ impl FITSHeader {
         }
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        if !delete_card_for_key(&mut guard, &key) {
+        let mut new_cards = guard.clone();
+        if !delete_card_for_key(&mut new_cards, &key) {
             return Err(pyo3::exceptions::PyKeyError::new_err(
                 format!("'{}' not in header", key)
             ));
@@ -899,8 +996,9 @@ impl FITSHeader {
             &self.file,
             self.header_offset,
             self.header_block_count,
-            &guard,
+            &new_cards,
         )?;
+        *guard = new_cards;
         Ok(())
     }
 
@@ -913,112 +1011,41 @@ impl FITSHeader {
     // for any other mapping we use `.items()`, where each value is either a
     // bare scalar or a `(value, comment)` tuple.
     fn update(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Build the (key, value, comment) triples we want to apply, without
-        // touching disk yet.
-        let mut triples: Vec<(String, Py<PyAny>, Option<String>)> = Vec::new();
-
-        if let Ok(src) = other.cast::<FITSHeader>() {
-            // Fast path: iterate the source's cards and copy key/value/comment.
-            let src_cards = src.borrow().snapshot()?;
-            for (i, card) in src_cards.iter().enumerate() {
-                let trimmed = card.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
-                let kw_field_trimmed = key_field.trim();
-                if matches!(kw_field_trimmed, "END" | "CONTINUE") {
-                    continue;
-                }
-                if matches!(kw_field_trimmed, "COMMENT" | "HISTORY" | "") {
-                    return Err(PyValueError::new_err(format!(
-                        "source header contains commentary key '{}' which \
-                         update() does not yet support (deferred to phase 2b)",
-                        kw_field_trimmed
-                    )));
-                }
-                let kw = keyword_of(card).unwrap_or_default();
-                if kw.is_empty() {
-                    continue;
-                }
-                if let Some(eq_pos) = trimmed.find('=') {
-                    let (value, comment) = parse_value_with_continue(
-                        py, &src_cards, i, &trimmed[eq_pos + 1..],
-                    )?;
-                    triples.push((kw, value, Some(comment)));
-                }
-            }
-        } else {
-            // Generic mapping path: require `.items()` -> iterable of pairs.
-            let items_call = other.call_method0("items").map_err(|_| {
-                PyValueError::new_err(
-                    "update() expects a FITSHeader or a mapping with .items()"
-                )
-            })?;
-            let iter = items_call.try_iter()?;
-            for item in iter {
-                let item = item?;
-                let pair = item.cast::<PyTuple>().map_err(|_| {
-                    PyValueError::new_err(
-                        "update() expects pairs of (key, value); got non-tuple"
-                    )
-                })?;
-                if pair.len() != 2 {
-                    return Err(PyValueError::new_err(
-                        "update() expects pairs of (key, value); got tuple of wrong length"
-                    ));
-                }
-                let k_raw: String = pair.get_item(0)?.extract()?;
-                let k = normalize_keyword(&k_raw);
-                if matches!(k.as_str(), "COMMENT" | "HISTORY" | "") {
-                    return Err(PyValueError::new_err(format!(
-                        "update() does not yet support commentary key '{}' \
-                         (deferred to phase 2b)", k
-                    )));
-                }
-                let val_obj = pair.get_item(1)?;
-                let (v, c) = if let Ok(tup) = val_obj.cast::<PyTuple>() {
-                    if tup.len() != 2 {
-                        return Err(PyValueError::new_err(
-                            "value tuple must be (value, comment) — exactly 2 elements"
-                        ));
-                    }
-                    let cstr: String = tup.get_item(1)?.extract().map_err(|_| {
-                        PyValueError::new_err(
-                            "second element of (value, comment) tuple must be a string"
-                        )
-                    })?;
-                    (tup.get_item(0)?.unbind(), Some(cstr))
-                } else {
-                    (val_obj.unbind(), None)
-                };
-                triples.push((k, v, c));
-            }
-        }
-
+        let triples = collect_update_triples(py, other)?;
         if triples.is_empty() {
             return Ok(());
         }
-
-        // Apply all mutations under a single cards lock + one disk rewrite.
+        // Stage all mutations on a working clone, write to disk, then
+        // commit — so any failure mid-update leaves the in-memory state
+        // consistent with what's on disk.
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let mut new_cards = guard.clone();
         for (k, v, explicit_comment) in &triples {
-            validate_keyword(k)?;
-            let comment = match explicit_comment {
-                Some(c) => c.clone(),
-                None => extract_existing_comment(&guard, k).unwrap_or_default(),
-            };
-            let new_card = build_card_from_value(k, v.bind(py), &comment)?;
-            set_card_for_key(&mut guard, k, new_card);
+            apply_setitem(&mut new_cards, k, v.bind(py), explicit_comment.clone())?;
         }
         rewrite_header_to_disk(
             &self.file,
             self.header_offset,
             self.header_block_count,
-            &guard,
+            &new_cards,
         )?;
+        *guard = new_cards;
         Ok(())
+    }
+
+    // Return a transactional edit handle.  Mutations on the handle stage in
+    // memory; on successful __exit__ they're committed to the parent header
+    // and disk in a single write.  An exception inside the `with` block
+    // discards the staged mutations.
+    fn edit(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<FITSHeaderEdit>> {
+        let snapshot = slf.bind(py).borrow().snapshot()?;
+        Py::new(py, FITSHeaderEdit {
+            parent: slf,
+            cards: snapshot,
+            entered: false,
+            committed: false,
+        })
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -1033,6 +1060,178 @@ impl FITSHeader {
     fn __str__(&self) -> PyResult<String> {
         let cards = self.snapshot()?;
         Ok(cards.iter().map(|c| c.trim_end()).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+// ====================== FITSHeaderEdit: transactional header edits ======================
+//
+// A FITSHeaderEdit is the value bound by `with header.edit() as h:`.  It owns
+// a snapshot of the parent FITSHeader's cards taken at edit() time; all
+// mutations on the handle stage into that snapshot, leaving the parent (and
+// the on-disk file) untouched.  On a successful __exit__ the snapshot is
+// committed back to the parent and written to disk in one rewrite; an
+// exception that escapes the `with` block discards the staged changes.
+//
+// Mutations outside a `with` block are rejected with a clear error so a
+// stale, never-committed handle cannot silently swallow user changes.
+#[pyclass]
+struct FITSHeaderEdit {
+    parent: Py<FITSHeader>,
+    cards: Vec<String>,    // staged state — owned, no locking needed
+    entered: bool,
+    committed: bool,
+}
+
+impl FITSHeaderEdit {
+    fn ensure_active(&self) -> PyResult<()> {
+        if !self.entered {
+            return Err(PyValueError::new_err(
+                "FITSHeaderEdit must be used inside a `with header.edit():` block"
+            ));
+        }
+        if self.committed {
+            return Err(PyValueError::new_err(
+                "FITSHeaderEdit has already been committed"
+            ));
+        }
+        Ok(())
+    }
+
+    // Push staged cards into the parent FITSHeader and write to disk.
+    // Called from __exit__; never invoked from Python directly.  Disk write
+    // happens first; if it fails (e.g. header overflow), the parent's
+    // in-memory cards are left untouched and stay consistent with disk.
+    fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
+        let parent = self.parent.bind(py).borrow();
+        let mut g = parent.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        rewrite_header_to_disk(
+            &parent.file,
+            parent.header_offset,
+            parent.header_block_count,
+            &self.cards,
+        )?;
+        *g = self.cards.clone();
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl FITSHeaderEdit {
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.entered = true;
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let was_entered = self.entered;
+        self.entered = false;
+        // Commit only if we actually entered, no exception escaped, and we
+        // haven't already committed.  Don't swallow the user's exception.
+        if was_entered && exc_type.is_none() && !self.committed {
+            self.commit_internal(py)?;
+            self.committed = true;
+        }
+        Ok(false)
+    }
+
+    fn __setitem__(&mut self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.ensure_active()?;
+        let key = normalize_keyword(key);
+        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            return Err(PyValueError::new_err(format!(
+                "setting commentary key '{}' is not yet supported (deferred)", key
+            )));
+        }
+        let (value_obj, explicit_comment) = parse_setitem_value(value)?;
+        apply_setitem(&mut self.cards, &key, &value_obj, explicit_comment)
+    }
+
+    fn __delitem__(&mut self, key: &str) -> PyResult<()> {
+        self.ensure_active()?;
+        let key = normalize_keyword(key);
+        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            return Err(PyValueError::new_err(format!(
+                "deleting commentary key '{}' is not yet supported (deferred)", key
+            )));
+        }
+        if !delete_card_for_key(&mut self.cards, &key) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("'{}' not in header", key)
+            ));
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.ensure_active()?;
+        let triples = collect_update_triples(py, other)?;
+        for (k, v, explicit_comment) in &triples {
+            apply_setitem(&mut self.cards, k, v.bind(py), explicit_comment.clone())?;
+        }
+        Ok(())
+    }
+
+    // Reads observe the staged state — what you'd see if you committed now.
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        let key = normalize_keyword(key);
+        let commentary_list = match key.as_str() {
+            "COMMENT" => Some(collect_commentary_texts(&self.cards, "COMMENT")),
+            "HISTORY" => Some(collect_commentary_texts(&self.cards, "HISTORY")),
+            "" => Some(collect_blank_commentary_texts(&self.cards)),
+            _ => None,
+        };
+        if let Some(items) = commentary_list {
+            if items.is_empty() {
+                return Err(pyo3::exceptions::PyKeyError::new_err(
+                    format!("'{}' not in header", key)
+                ));
+            }
+            return Ok(PyList::new(py, &items)?.into_any().unbind());
+        }
+        match find_card_for_key(&self.cards, &key) {
+            Some((idx, value_part)) => {
+                let (value, _comment) =
+                    parse_value_with_continue(py, &self.cards, idx, &value_part)?;
+                Ok(value)
+            }
+            None => Err(pyo3::exceptions::PyKeyError::new_err(
+                format!("'{}' not in header", key)
+            )),
+        }
+    }
+
+    fn __contains__(&self, key: &str) -> bool {
+        let key = normalize_keyword(key);
+        match key.as_str() {
+            "COMMENT" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("COMMENT")),
+            "HISTORY" => self.cards.iter().any(|c| keyword_of(c).as_deref() == Some("HISTORY")),
+            "" => self.cards.iter().any(|c| {
+                let trimmed = c.trim_end();
+                trimmed.len() > 8 && trimmed[..8].trim().is_empty()
+            }),
+            _ => find_card_for_key(&self.cards, &key).is_some(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let state = if self.committed {
+            "committed"
+        } else if self.entered {
+            "active"
+        } else {
+            "pending"
+        };
+        format!(
+            "<FITSHeaderEdit: {} cards, {}>",
+            self.cards.len(), state
+        )
     }
 }
 
@@ -2554,5 +2753,6 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TableHDU>()?;
     m.add_class::<AsciiTableHDU>()?;
     m.add_class::<FITSHeader>()?;
+    m.add_class::<FITSHeaderEdit>()?;
     Ok(())
 }
