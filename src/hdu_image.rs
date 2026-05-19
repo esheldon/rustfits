@@ -1,5 +1,6 @@
-// ImageHDU pyclass + image read/write/slicing helpers + RawBuffer + bitpix
-// conversions + image-shape parsing + image-data write/extend helpers.
+// ImageHDU pyclass + image read/write/slicing helpers + bitpix conversions
+// + image-shape parsing + image-data write/extend helpers.  RawBuffer and
+// byteswap_in_place live in common.rs (also used by the binary-table reader).
 
 use pyo3::prelude::*;
 use pyo3::types::{PyEllipsis, PySlice, PyTuple};
@@ -11,8 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    lock_file, parse_keyword, shift_file_tail_and_update_offsets, zero_fill_range,
-    FileHandle, FileLayout, HduOffsets, TaintFlag,
+    byteswap_in_place, lock_file, parse_keyword,
+    shift_file_tail_and_update_offsets, zero_fill_range,
+    FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
@@ -794,84 +796,6 @@ fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
         out.push(b' ');
     }
     out
-}
-
-fn byteswap_in_place(buf: &mut [u8], itemsize: usize) {
-    if itemsize <= 1 {
-        return;
-    }
-    for chunk in buf.chunks_exact_mut(itemsize) {
-        chunk.reverse();
-    }
-}
-
-// ===== RawBuffer: raw Py_buffer wrapper =====
-
-struct RawBuffer {
-    view: Box<pyo3::ffi::Py_buffer>,
-}
-
-impl RawBuffer {
-    fn acquire_with_flags(obj: &Bound<'_, PyAny>, flags: std::os::raw::c_int) -> PyResult<Self> {
-        let mut view: Box<pyo3::ffi::Py_buffer> =
-            Box::new(unsafe { std::mem::zeroed() });
-        let rc = unsafe {
-            pyo3::ffi::PyObject_GetBuffer(
-                obj.as_ptr(),
-                &mut *view as *mut _,
-                flags,
-            )
-        };
-        if rc != 0 {
-            return Err(PyErr::take(obj.py()).unwrap_or_else(|| {
-                PyValueError::new_err("buffer acquisition failed")
-            }));
-        }
-        Ok(RawBuffer { view })
-    }
-
-    fn acquire(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Self::acquire_with_flags(obj, pyo3::ffi::PyBUF_C_CONTIGUOUS)
-    }
-
-    fn acquire_writable(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Self::acquire_with_flags(
-            obj,
-            pyo3::ffi::PyBUF_C_CONTIGUOUS | pyo3::ffi::PyBUF_WRITABLE,
-        )
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.view.buf as *const u8,
-                self.view.len as usize,
-            )
-        }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.view.buf as *mut u8,
-                self.view.len as usize,
-            )
-        }
-    }
-
-    fn itemsize(&self) -> usize {
-        self.view.itemsize as usize
-    }
-
-    fn len(&self) -> usize {
-        self.view.len as usize
-    }
-}
-
-impl Drop for RawBuffer {
-    fn drop(&mut self) {
-        unsafe { pyo3::ffi::PyBuffer_Release(&mut *self.view) };
-    }
 }
 
 // Map a numpy short-code or long-name dtype string to a FITS BITPIX value.

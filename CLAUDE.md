@@ -14,9 +14,12 @@ else stays private to its file.
 - `src/lib.rs` — `#[pymodule]` init + `mod` declarations.  Nothing else.
 - `src/common.rs` — `FileHandle`, `TaintFlag`, `HduOffsets`, `FileLayout`,
   `lock_file`, `check_not_tainted`, `shift_file_tail_and_update_offsets`,
-  `BLOCK_SIZE`/`CARD_SIZE`/`CARDS_PER_BLOCK`, `parse_keyword`.  File
-  primitives plus the shared byte-shift helper that the header-grow path
-  (and the future image/table data-grow paths) all call into.
+  `zero_fill_range`, `BLOCK_SIZE`/`CARD_SIZE`/`CARDS_PER_BLOCK`,
+  `parse_keyword`, `parse_string_keyword`, `byteswap_in_place`,
+  `RawBuffer`.  File primitives plus the shared byte-shift helper that
+  the header-grow path (and the future image/table data-grow paths) all
+  call into, plus the Python-buffer-protocol wrapper used by both image
+  and table read/write to move bytes between disk and numpy storage.
 - `src/header.rs` — `FITSHeader` and `FITSHeaderEdit` pyclasses plus every
   card-level helper (parsing, building, CONTINUE chains, HIERARCH,
   commentary, protected keys, batched update, `rewrite_header_to_disk`
@@ -29,8 +32,8 @@ else stays private to its file.
   updates during a grow); fields are `pub(crate)` because subclass
   `#[pymethods]` access them via `into_super()`.
 - `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
-  `RawBuffer`, bitpix conversions, shape parsing.  Only exports `ImageHDU`
-  (+ `new`) and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
+  bitpix conversions, shape parsing.  Only exports `ImageHDU` (+ `new`)
+  and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
 - `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass stub.
 - `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub.
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +

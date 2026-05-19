@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
 use crate::common::{
-    lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    lock_file, parse_keyword, parse_string_keyword,
+    FileHandle, FileLayout, HduOffsets, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
@@ -106,36 +107,6 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
     } else {
         ((raw_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
     }
-}
-
-// Extract the EXTNAME string value from a card list, or None if there is no
-// EXTNAME card.  Used by FITS::__getitem__ to support string-keyed HDU
-// lookup; case-insensitive matching is the caller's responsibility.
-fn extract_extname(cards: &[String]) -> Option<String> {
-    for card in cards {
-        if card.len() < 9 { continue; }
-        if card[..8].trim() != "EXTNAME" { continue; }
-        if !card[8..].starts_with('=') { continue; }
-        let value_part = card[9..].trim_start();
-        if !value_part.starts_with('\'') { return None; }
-        let after_open = &value_part[1..];
-        let bytes = after_open.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                // `''` is the FITS escape for a single quote; skip both.
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                let inner = &after_open[..i];
-                return Some(inner.replace("''", "'").trim_end().to_string());
-            }
-            i += 1;
-        }
-        return None;
-    }
-    None
 }
 
 // Walks the file from byte 0, extracting every HDU header and skipping over
@@ -541,7 +512,7 @@ impl FITS {
                 let hdu_ref = bound.cast::<HDU>()?.borrow();
                 let cards_guard = hdu_ref.header.lock()
                     .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-                let matched = extract_extname(&cards_guard)
+                let matched = parse_string_keyword(&cards_guard, "EXTNAME")
                     .map(|s| s.trim().to_ascii_uppercase() == target)
                     .unwrap_or(false);
                 drop(cards_guard);

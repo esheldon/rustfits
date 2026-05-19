@@ -3,7 +3,7 @@
 // and image-shape paths.
 
 use pyo3::prelude::*;
-use pyo3::exceptions::PyIOError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -342,4 +342,127 @@ pub(crate) fn parse_keyword(cards: &[String], key: &str) -> Option<i64> {
         }
     }
     None
+}
+
+// Extract the string value for the given keyword from a card list.  The
+// card's keyword field (cols 1-8 trimmed) must match `key` exactly and col 9
+// must be `=`.  Inner `''` is unescaped to `'`, then trailing spaces are
+// stripped (per the FITS standard, trailing spaces in a string value are
+// not significant).  Returns None if there is no such card or the value
+// isn't a quoted string.
+pub(crate) fn parse_string_keyword(cards: &[String], key: &str) -> Option<String> {
+    for card in cards {
+        if card.len() < 9 { continue; }
+        if card[..8].trim() != key { continue; }
+        if !card[8..].starts_with('=') { continue; }
+        let value_part = card[9..].trim_start();
+        if !value_part.starts_with('\'') { return None; }
+        let after_open = &value_part[1..];
+        let bytes = after_open.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                // `''` is the FITS escape for a single quote; skip both.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                let inner = &after_open[..i];
+                return Some(inner.replace("''", "'").trim_end().to_string());
+            }
+            i += 1;
+        }
+        return None;
+    }
+    None
+}
+
+// Reverse each `itemsize`-byte chunk in place.  Used to convert FITS
+// big-endian numeric data to native little-endian after a raw read on
+// little-endian hosts.  No-op when itemsize <= 1.
+pub(crate) fn byteswap_in_place(buf: &mut [u8], itemsize: usize) {
+    if itemsize <= 1 {
+        return;
+    }
+    for chunk in buf.chunks_exact_mut(itemsize) {
+        chunk.reverse();
+    }
+}
+
+// ===== RawBuffer: raw Py_buffer wrapper =====
+//
+// Holds a contiguous, mutable byte view into a Python object that supports
+// the buffer protocol (numpy ndarrays, bytearrays, ...).  PyBuffer_Release
+// runs on drop.  Used by both image read/write and binary-table read to
+// move bytes between disk and numpy storage without going through Python
+// element-by-element.
+
+pub(crate) struct RawBuffer {
+    view: Box<pyo3::ffi::Py_buffer>,
+}
+
+impl RawBuffer {
+    fn acquire_with_flags(
+        obj: &Bound<'_, PyAny>,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<Self> {
+        let mut view: Box<pyo3::ffi::Py_buffer> =
+            Box::new(unsafe { std::mem::zeroed() });
+        let rc = unsafe {
+            pyo3::ffi::PyObject_GetBuffer(
+                obj.as_ptr(),
+                &mut *view as *mut _,
+                flags,
+            )
+        };
+        if rc != 0 {
+            return Err(PyErr::take(obj.py()).unwrap_or_else(|| {
+                PyValueError::new_err("buffer acquisition failed")
+            }));
+        }
+        Ok(RawBuffer { view })
+    }
+
+    pub(crate) fn acquire(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::acquire_with_flags(obj, pyo3::ffi::PyBUF_C_CONTIGUOUS)
+    }
+
+    pub(crate) fn acquire_writable(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::acquire_with_flags(
+            obj,
+            pyo3::ffi::PyBUF_C_CONTIGUOUS | pyo3::ffi::PyBUF_WRITABLE,
+        )
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.view.buf as *const u8,
+                self.view.len as usize,
+            )
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.view.buf as *mut u8,
+                self.view.len as usize,
+            )
+        }
+    }
+
+    pub(crate) fn itemsize(&self) -> usize {
+        self.view.itemsize as usize
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.view.len as usize
+    }
+}
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        unsafe { pyo3::ffi::PyBuffer_Release(&mut *self.view) };
+    }
 }
