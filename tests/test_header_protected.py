@@ -163,7 +163,9 @@ def test_failed_protected_setitem_leaves_state_unchanged():
 
 
 def test_to_dict_default_includes_protected_keys():
-    """Existing to_dict() behavior is unchanged when called without the flag."""
+    """
+    Existing to_dict() behavior is unchanged when called without the flag.
+    """
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             d = fits[0].header.to_dict()
