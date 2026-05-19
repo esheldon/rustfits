@@ -6,6 +6,7 @@ use pyo3::Bound;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Shared, mutable file handle.  FITS owns the master Arc, each HDU clones it.
 // `None` after close().
@@ -13,6 +14,24 @@ type FileHandle = Arc<Mutex<Option<std::fs::File>>>;
 
 fn lock_file(handle: &FileHandle) -> PyResult<MutexGuard<'_, Option<std::fs::File>>> {
     handle.lock().map_err(|_| PyIOError::new_err("file lock poisoned"))
+}
+
+// Per-FITS-file taint flag.  Set when a mid-write disk error inside
+// `rewrite_header_to_disk` may have left the on-disk header partially
+// overwritten.  Subsequent header / image reads and writes refuse with a
+// clear error until the file is closed and reopened.  One flag is shared
+// across all HDUs of the same file (and across all FITSHeader views).
+type TaintFlag = Arc<AtomicBool>;
+
+fn check_not_tainted(tainted: &TaintFlag) -> PyResult<()> {
+    if tainted.load(Ordering::Acquire) {
+        return Err(PyIOError::new_err(
+            "this FITS file is in an indeterminate state after a mid-write \
+             I/O failure; the on-disk header may be partially overwritten — \
+             close the FITS object and reopen the file to recover"
+        ));
+    }
+    Ok(())
 }
 
 const BLOCK_SIZE: usize = 2880;
@@ -888,11 +907,19 @@ fn collect_update_triples(
 // 2880-byte blocks; the resulting byte count must equal `header_block_count
 // * BLOCK_SIZE` (slack-only).  If `cards` overflows the reserved blocks,
 // returns a clear error rather than relocating subsequent HDUs.
+//
+// Taint semantics: a failure of the slack-overflow check, the file lock,
+// the closed-file check, or the initial `seek` leaves the on-disk file
+// untouched and is NOT a taint event.  A failure of `write_all` or `flush`
+// MAY have partially overwritten the header on disk, so we set the taint
+// flag and return a diagnostic error pointing the user at the recovery
+// path (close + reopen).
 fn rewrite_header_to_disk(
     file_handle: &FileHandle,
     header_offset: u64,
     header_block_count: u64,
     cards: &[String],
+    tainted: &TaintFlag,
 ) -> PyResult<()> {
     let max_cards = (header_block_count as usize) * 36;
     if cards.len() > max_cards {
@@ -921,12 +948,29 @@ fn rewrite_header_to_disk(
 
     let mut guard = lock_file(file_handle)?;
     let f = guard.as_mut().ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    // seek before any write: failure here does not modify the file.
     f.seek(SeekFrom::Start(header_offset))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    f.write_all(&bytes)
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    f.flush()
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    // write_all: a failure here may have written some bytes already.  Taint.
+    f.write_all(&bytes).map_err(|e| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "header write failed mid-stream: {}; \
+             the on-disk file may now be inconsistent — \
+             close this FITS object and reopen the file to recover",
+            e
+        ))
+    })?;
+    // flush: an OS-level flush failure means data is in flight.  Taint.
+    f.flush().map_err(|e| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "header flush failed: {}; \
+             the on-disk file may now be inconsistent — \
+             close this FITS object and reopen the file to recover",
+            e
+        ))
+    })?;
     Ok(())
 }
 
@@ -1030,6 +1074,10 @@ struct FITSHeader {
     // grow or shrink the card list up to this block's worth of cards;
     // overflow returns an error (file-rewrite path is deferred).
     header_block_count: u64,
+    // Shared per-file taint flag.  Set by `rewrite_header_to_disk` on a
+    // mid-write I/O failure; checked at the entry of every read and write
+    // method.  See `check_not_tainted`.
+    tainted: TaintFlag,
 }
 
 impl FITSHeader {
@@ -1038,11 +1086,13 @@ impl FITSHeader {
         file: FileHandle,
         header_offset: u64,
         header_block_count: u64,
+        tainted: TaintFlag,
     ) -> Self {
-        FITSHeader { cards, file, header_offset, header_block_count }
+        FITSHeader { cards, file, header_offset, header_block_count, tainted }
     }
 
     fn snapshot(&self) -> PyResult<Vec<String>> {
+        check_not_tainted(&self.tainted)?;
         let g = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         Ok(g.clone())
@@ -1052,6 +1102,7 @@ impl FITSHeader {
     // text, builds the new card(s), writes to disk first, then commits the
     // mutation to the in-memory cards.
     fn append_commentary(&self, keyword: &str, text: &str) -> PyResult<()> {
+        check_not_tainted(&self.tainted)?;
         validate_commentary_text(text)?;
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
@@ -1062,6 +1113,7 @@ impl FITSHeader {
             self.header_offset,
             self.header_block_count,
             &new_cards,
+            &self.tainted,
         )?;
         *guard = new_cards;
         Ok(())
@@ -1206,6 +1258,7 @@ impl FITSHeader {
     // place (position preserved); new keys are inserted just before END.
     // Each call auto-flushes — one disk rewrite per mutation.
     fn __setitem__(&self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        check_not_tainted(&self.tainted)?;
         let key = normalize_keyword(key);
         if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
@@ -1228,12 +1281,14 @@ impl FITSHeader {
             self.header_offset,
             self.header_block_count,
             &new_cards,
+            &self.tainted,
         )?;
         *guard = new_cards;
         Ok(())
     }
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
+        check_not_tainted(&self.tainted)?;
         let key = normalize_keyword(key);
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
@@ -1253,6 +1308,7 @@ impl FITSHeader {
             self.header_offset,
             self.header_block_count,
             &new_cards,
+            &self.tainted,
         )?;
         *guard = new_cards;
         Ok(())
@@ -1284,6 +1340,7 @@ impl FITSHeader {
     // for any other mapping we use `.items()`, where each value is either a
     // bare scalar or a `(value, comment)` tuple.
     fn update(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        check_not_tainted(&self.tainted)?;
         let triples = collect_update_triples(py, other)?;
         if triples.is_empty() {
             return Ok(());
@@ -1302,6 +1359,7 @@ impl FITSHeader {
             self.header_offset,
             self.header_block_count,
             &new_cards,
+            &self.tainted,
         )?;
         *guard = new_cards;
         Ok(())
@@ -1376,6 +1434,7 @@ impl FITSHeaderEdit {
     // in-memory cards are left untouched and stay consistent with disk.
     fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
         let parent = self.parent.bind(py).borrow();
+        check_not_tainted(&parent.tainted)?;
         let mut g = parent.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         rewrite_header_to_disk(
@@ -1383,6 +1442,7 @@ impl FITSHeaderEdit {
             parent.header_offset,
             parent.header_block_count,
             &self.cards,
+            &parent.tainted,
         )?;
         *g = self.cards.clone();
         Ok(())
@@ -1548,6 +1608,9 @@ struct HDU {
     header_offset: u64,
     data_offset: u64,
     file: FileHandle,
+    // Shared per-file taint flag (one clone of the same Arc across all HDUs
+    // of this FITS and across every FITSHeader / FITSHeaderEdit produced).
+    tainted: TaintFlag,
 }
 
 impl HDU {
@@ -1557,6 +1620,7 @@ impl HDU {
         header_offset: u64,
         data_offset: u64,
         file: FileHandle,
+        tainted: TaintFlag,
     ) -> Self {
         HDU {
             header: Arc::new(Mutex::new(header)),
@@ -1564,6 +1628,7 @@ impl HDU {
             header_offset,
             data_offset,
             file,
+            tainted,
         }
     }
 
@@ -1571,6 +1636,7 @@ impl HDU {
     // out, releases.  Internal readers should call this rather than holding
     // the lock for the duration of (e.g.) a numpy allocation.
     fn header_snapshot(&self) -> PyResult<Vec<String>> {
+        check_not_tainted(&self.tainted)?;
         let g = self.header.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         Ok(g.clone())
@@ -1600,7 +1666,18 @@ impl HDU {
             Arc::clone(&self.file),
             self.header_offset,
             self.header_block_count(),
+            Arc::clone(&self.tainted),
         ))
+    }
+
+    // Test-only hook: flip the taint flag without an actual disk failure.
+    // Used by the phase-2d test suite to verify the rejection-behavior
+    // contract (subsequent reads/writes raise with the diagnostic message)
+    // without needing to produce a real I/O failure on the host filesystem.
+    // The underscore prefix is the standard Python signal for "private,
+    // not part of the public API."
+    fn _force_taint(&self) {
+        self.tainted.store(true, Ordering::Release);
     }
 
     #[getter]
@@ -1620,8 +1697,12 @@ impl ImageHDU {
         header_offset: u64,
         data_offset: u64,
         file: FileHandle,
+        tainted: TaintFlag,
     ) -> (Self, HDU) {
-        (ImageHDU, HDU::new(header, index, header_offset, data_offset, file))
+        (
+            ImageHDU,
+            HDU::new(header, index, header_offset, data_offset, file, tainted),
+        )
     }
 }
 
@@ -2346,8 +2427,12 @@ impl TableHDU {
         header_offset: u64,
         data_offset: u64,
         file: FileHandle,
+        tainted: TaintFlag,
     ) -> (Self, HDU) {
-        (TableHDU, HDU::new(header, index, header_offset, data_offset, file))
+        (
+            TableHDU,
+            HDU::new(header, index, header_offset, data_offset, file, tainted),
+        )
     }
 }
 
@@ -2370,8 +2455,12 @@ impl AsciiTableHDU {
         header_offset: u64,
         data_offset: u64,
         file: FileHandle,
+        tainted: TaintFlag,
     ) -> (Self, HDU) {
-        (AsciiTableHDU, HDU::new(header, index, header_offset, data_offset, file))
+        (
+            AsciiTableHDU,
+            HDU::new(header, index, header_offset, data_offset, file, tainted),
+        )
     }
 }
 
@@ -2389,7 +2478,11 @@ impl AsciiTableHDU {
 // each data section, returning the parsed HDU Python objects.  Each HDU is
 // constructed with its data-section byte offset and a clone of the file
 // handle so that write-back methods can locate themselves on disk.
-fn parse_hdus_from_file(py: Python<'_>, handle: &FileHandle) -> PyResult<Vec<Py<PyAny>>> {
+fn parse_hdus_from_file(
+    py: Python<'_>,
+    handle: &FileHandle,
+    tainted: &TaintFlag,
+) -> PyResult<Vec<Py<PyAny>>> {
     let mut guard = lock_file(handle)?;
     let file = guard.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
@@ -2461,14 +2554,27 @@ fn parse_hdus_from_file(py: Python<'_>, handle: &FileHandle) -> PyResult<Vec<Py<
         let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
 
         let hdu_file = Arc::clone(handle);
+        let hdu_taint = Arc::clone(tainted);
         let hdu_py: Py<PyAny> = if is_image {
-            Py::new(py, ImageHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
+            Py::new(py, ImageHDU::new(
+                header_cards.clone(), hdus.len(),
+                header_offset, data_offset, hdu_file, hdu_taint,
+            ))?.into()
         } else if is_binary_table {
-            Py::new(py, TableHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
+            Py::new(py, TableHDU::new(
+                header_cards.clone(), hdus.len(),
+                header_offset, data_offset, hdu_file, hdu_taint,
+            ))?.into()
         } else if is_ascii_table {
-            Py::new(py, AsciiTableHDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file))?.into()
+            Py::new(py, AsciiTableHDU::new(
+                header_cards.clone(), hdus.len(),
+                header_offset, data_offset, hdu_file, hdu_taint,
+            ))?.into()
         } else {
-            let h = HDU::new(header_cards.clone(), hdus.len(), header_offset, data_offset, hdu_file);
+            let h = HDU::new(
+                header_cards.clone(), hdus.len(),
+                header_offset, data_offset, hdu_file, hdu_taint,
+            );
             Py::new(py, h)?.into()
         };
 
@@ -2932,6 +3038,9 @@ struct FITS {
     filename: String,
     file: FileHandle,
     hdus: Vec<Py<PyAny>>,
+    // Per-file taint flag (see TaintFlag).  Owned here; cloned into every
+    // HDU and FITSHeader so a mid-write failure anywhere taints the lot.
+    tainted: TaintFlag,
 }
 
 #[pymethods]
@@ -2954,12 +3063,14 @@ impl FITS {
             .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filename, e)))?;
 
         let handle: FileHandle = Arc::new(Mutex::new(Some(file)));
-        let hdus = parse_hdus_from_file(py, &handle)?;
+        let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
+        let hdus = parse_hdus_from_file(py, &handle, &tainted)?;
 
         Ok(FITS {
             filename,
             file: handle,
             hdus,
+            tainted,
         })
     }
 
@@ -3130,6 +3241,7 @@ impl FITS {
                 header_offset,
                 data_offset,
                 Arc::clone(&self.file),
+                Arc::clone(&self.tainted),
             ),
         )?.into();
         self.hdus.push(new_hdu);
