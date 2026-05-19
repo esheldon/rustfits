@@ -1,17 +1,19 @@
 // Base HDU pyclass — shared parent of ImageHDU, TableHDU, AsciiTableHDU.
 //
-// HDUs hold a clone of the FITS file handle plus the byte offset of their
-// data section, enabling write-back methods on subclasses (e.g.
-// ImageHDU.write).  `#[new]` is intentionally omitted: instances are
-// constructed only via FITS internals (which know the file handle and
-// offset).
+// HDUs hold a clone of the FITS file handle plus shared offset state
+// (HduOffsets + FileLayout) so write-back methods on subclasses can locate
+// themselves on disk *and* react when an earlier HDU's grow shifts them
+// forward.  `#[new]` is intentionally omitted: instances are constructed
+// only via FITS internals.
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyIOError;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
-use crate::common::{check_not_tainted, FileHandle, TaintFlag, BLOCK_SIZE};
+use crate::common::{
+    check_not_tainted, FileHandle, FileLayout, HduOffsets, TaintFlag,
+};
 use crate::header::FITSHeader;
 
 #[pyclass(subclass)]
@@ -20,8 +22,9 @@ pub(crate) struct HDU {
     // back to the HDU's canonical card list (and any other readers).
     pub(crate) header: Arc<Mutex<Vec<String>>>,
     pub(crate) index: usize,
-    pub(crate) header_offset: u64,
-    pub(crate) data_offset: u64,
+    // Shared with FITSHeader and FITS so grows update everyone in lockstep.
+    pub(crate) offsets: Arc<HduOffsets>,
+    pub(crate) layout: Arc<FileLayout>,
     pub(crate) file: FileHandle,
     pub(crate) tainted: TaintFlag,
 }
@@ -30,16 +33,16 @@ impl HDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
-        header_offset: u64,
-        data_offset: u64,
+        offsets: Arc<HduOffsets>,
+        layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
     ) -> Self {
         HDU {
             header: Arc::new(Mutex::new(header)),
             index,
-            header_offset,
-            data_offset,
+            offsets,
+            layout,
             file,
             tainted,
         }
@@ -52,10 +55,6 @@ impl HDU {
         let g = self.header.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         Ok(g.clone())
-    }
-
-    pub(crate) fn header_block_count(&self) -> u64 {
-        (self.data_offset - self.header_offset) / BLOCK_SIZE as u64
     }
 }
 
@@ -70,8 +69,8 @@ impl HDU {
         Py::new(py, FITSHeader::from_state(
             Arc::clone(&self.header),
             Arc::clone(&self.file),
-            self.header_offset,
-            self.header_block_count(),
+            Arc::clone(&self.offsets),
+            Arc::clone(&self.layout),
             Arc::clone(&self.tainted),
         ))
     }

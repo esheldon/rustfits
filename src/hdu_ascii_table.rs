@@ -3,8 +3,9 @@
 // surfaced as their own type rather than as a bare HDU.
 
 use pyo3::prelude::*;
+use std::sync::Arc;
 
-use crate::common::{FileHandle, TaintFlag};
+use crate::common::{FileHandle, FileLayout, HduOffsets, TaintFlag};
 use crate::hdu::HDU;
 
 #[pyclass(extends = HDU)]
@@ -14,14 +15,14 @@ impl AsciiTableHDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
-        header_offset: u64,
-        data_offset: u64,
+        offsets: Arc<HduOffsets>,
+        layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
             AsciiTableHDU,
-            HDU::new(header, index, header_offset, data_offset, file, tainted),
+            HDU::new(header, index, offsets, layout, file, tainted),
         )
     }
 }

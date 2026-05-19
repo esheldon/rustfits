@@ -5,11 +5,70 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyIOError;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Shared, mutable file handle.  FITS owns the master Arc, each HDU clones it.
 // `None` after close().
 pub(crate) type FileHandle = Arc<Mutex<Option<std::fs::File>>>;
+
+// Per-HDU byte offsets stored as atomics so they can be mutated in place
+// when a header (or, later, an image/table data section) grows and shifts
+// subsequent HDUs forward in the file.  Each HDU and each FITSHeader view
+// holds an Arc to the same record, so updates here are visible everywhere.
+//
+// Invariant: `data_offset == header_offset + header_block_count * BLOCK_SIZE`
+// at all times.  Mutators must update both fields atomically *together* under
+// the file lock (the file lock is the serialization point for grow operations,
+// so a single writer is guaranteed; readers tolerate transient inconsistency
+// only because no read happens concurrently with a grow — the same file lock
+// gates both).
+pub(crate) struct HduOffsets {
+    pub(crate) header_offset: AtomicU64,
+    pub(crate) header_block_count: AtomicU64,
+    pub(crate) data_offset: AtomicU64,
+}
+
+impl HduOffsets {
+    pub(crate) fn new(
+        header_offset: u64,
+        header_block_count: u64,
+        data_offset: u64,
+    ) -> Arc<Self> {
+        Arc::new(HduOffsets {
+            header_offset: AtomicU64::new(header_offset),
+            header_block_count: AtomicU64::new(header_block_count),
+            data_offset: AtomicU64::new(data_offset),
+        })
+    }
+
+    pub(crate) fn header_offset(&self) -> u64 {
+        self.header_offset.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn header_block_count(&self) -> u64 {
+        self.header_block_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn data_offset(&self) -> u64 {
+        self.data_offset.load(Ordering::Acquire)
+    }
+}
+
+// File-wide layout: the per-HDU offset records for every HDU in order.
+// Shared between FITS (which appends on create_image_hdu) and every HDU /
+// FITSHeader (which walks subsequent HDUs during a grow).  The Mutex
+// protects the Vec itself; individual HduOffsets are lock-free atomics.
+pub(crate) struct FileLayout {
+    pub(crate) hdus: Mutex<Vec<Arc<HduOffsets>>>,
+}
+
+impl FileLayout {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(FileLayout {
+            hdus: Mutex::new(Vec::new()),
+        })
+    }
+}
 
 pub(crate) fn lock_file(
     handle: &FileHandle,

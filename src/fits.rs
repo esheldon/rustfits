@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
 use crate::common::{
-    lock_file, parse_keyword, FileHandle, TaintFlag, BLOCK_SIZE, CARD_SIZE,
+    lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    BLOCK_SIZE, CARD_SIZE,
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
@@ -114,6 +115,7 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
 fn parse_hdus_from_file(
     py: Python<'_>,
     handle: &FileHandle,
+    layout: &Arc<FileLayout>,
     tainted: &TaintFlag,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let mut guard = lock_file(handle)?;
@@ -186,27 +188,37 @@ fn parse_hdus_from_file(
         let is_binary_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'BINTABLE'"));
         let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
 
+        let hdu_offsets = HduOffsets::new(
+            header_offset, num_header_blocks, data_offset,
+        );
+        {
+            let mut layout_guard = layout.hdus.lock()
+                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+            layout_guard.push(Arc::clone(&hdu_offsets));
+        }
+
         let hdu_file = Arc::clone(handle);
+        let hdu_layout = Arc::clone(layout);
         let hdu_taint = Arc::clone(tainted);
         let hdu_py: Py<PyAny> = if is_image {
             Py::new(py, ImageHDU::new(
                 header_cards.clone(), hdus.len(),
-                header_offset, data_offset, hdu_file, hdu_taint,
+                hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_binary_table {
             Py::new(py, TableHDU::new(
                 header_cards.clone(), hdus.len(),
-                header_offset, data_offset, hdu_file, hdu_taint,
+                hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_ascii_table {
             Py::new(py, AsciiTableHDU::new(
                 header_cards.clone(), hdus.len(),
-                header_offset, data_offset, hdu_file, hdu_taint,
+                hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else {
             let h = HDU::new(
                 header_cards.clone(), hdus.len(),
-                header_offset, data_offset, hdu_file, hdu_taint,
+                hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             );
             Py::new(py, h)?.into()
         };
@@ -230,6 +242,10 @@ pub(crate) struct FITS {
     filename: String,
     file: FileHandle,
     hdus: Vec<Py<PyAny>>,
+    // Shared with every HDU and FITSHeader; the upcoming grow path will
+    // walk this to update offsets of subsequent HDUs in lockstep.  Owned
+    // here, cloned into each HDU at construction.
+    layout: Arc<FileLayout>,
     // Per-file taint flag (see TaintFlag).  Owned here; cloned into every
     // HDU and FITSHeader so a mid-write failure anywhere taints the lot.
     tainted: TaintFlag,
@@ -256,12 +272,14 @@ impl FITS {
 
         let handle: FileHandle = Arc::new(Mutex::new(Some(file)));
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
-        let hdus = parse_hdus_from_file(py, &handle, &tainted)?;
+        let layout = FileLayout::new();
+        let hdus = parse_hdus_from_file(py, &handle, &layout, &tainted)?;
 
         Ok(FITS {
             filename,
             file: handle,
             hdus,
+            layout,
             tainted,
         })
     }
@@ -422,13 +440,24 @@ impl FITS {
         let stored_cards: Vec<String> = cards.iter()
             .map(|c| c.trim_end().to_string())
             .collect();
+
+        let header_block_count = (data_offset - header_offset) / BLOCK_SIZE as u64;
+        let hdu_offsets = HduOffsets::new(
+            header_offset, header_block_count, data_offset,
+        );
+        {
+            let mut layout_guard = self.layout.hdus.lock()
+                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+            layout_guard.push(Arc::clone(&hdu_offsets));
+        }
+
         let new_hdu: Py<PyAny> = Py::new(
             py,
             ImageHDU::new(
                 stored_cards,
                 self.hdus.len(),
-                header_offset,
-                data_offset,
+                hdu_offsets,
+                Arc::clone(&self.layout),
                 Arc::clone(&self.file),
                 Arc::clone(&self.tainted),
             ),

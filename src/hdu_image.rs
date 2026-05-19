@@ -6,9 +6,11 @@ use pyo3::types::{PyEllipsis, PySlice, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::Bound;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use crate::common::{
-    lock_file, parse_keyword, FileHandle, TaintFlag, BLOCK_SIZE, CARD_SIZE,
+    lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    BLOCK_SIZE, CARD_SIZE,
 };
 use crate::hdu::HDU;
 use crate::header::card_int;
@@ -20,14 +22,14 @@ impl ImageHDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
-        header_offset: u64,
-        data_offset: u64,
+        offsets: Arc<HduOffsets>,
+        layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
             ImageHDU,
-            HDU::new(header, index, header_offset, data_offset, file, tainted),
+            HDU::new(header, index, offsets, layout, file, tainted),
         )
     }
 }
@@ -48,13 +50,13 @@ impl ImageHDU {
     ) -> PyResult<()> {
         let super_: PyRef<HDU> = slf.into_super();
         let header_cards = super_.header_snapshot()?;
-        write_image_data(&header_cards, super_.data_offset, &super_.file, data, start)
+        write_image_data(&header_cards, super_.offsets.data_offset(), &super_.file, data, start)
     }
 
     fn read(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_: PyRef<HDU> = slf.into_super();
         let header_cards = super_.header_snapshot()?;
-        read_image_data(py, &header_cards, super_.data_offset, &super_.file)
+        read_image_data(py, &header_cards, super_.offsets.data_offset(), &super_.file)
     }
 
     // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to
@@ -136,7 +138,7 @@ impl ImageHDU {
         if new_hdu_shape == current_hdu_shape {
             return write_image_data(
                 &header_snapshot,
-                super_.data_offset,
+                super_.offsets.data_offset(),
                 &super_.file,
                 data,
                 Some(start_for_write),
@@ -149,7 +151,7 @@ impl ImageHDU {
         let current_padded = round_up_to_block(current_data_size);
         let new_padded = round_up_to_block(new_data_size);
 
-        let data_offset = super_.data_offset;
+        let data_offset = super_.offsets.data_offset();
         let current_hdu_end = data_offset + current_padded;
         let new_hdu_end = data_offset + new_padded;
 
@@ -226,7 +228,7 @@ impl ImageHDU {
         let header_cards = super_.header_snapshot()?;
         let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
         let slices = normalize_slice_key(key, &hdu_shape)?;
-        read_image_slice(py, &header_cards, super_.data_offset, &super_.file, &slices)
+        read_image_slice(py, &header_cards, super_.offsets.data_offset(), &super_.file, &slices)
     }
 }
 

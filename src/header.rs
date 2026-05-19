@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    check_not_tainted, lock_file, FileHandle, TaintFlag, BLOCK_SIZE, CARD_SIZE,
+    check_not_tainted, lock_file, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    BLOCK_SIZE, CARD_SIZE,
 };
 
 // ===== card-level parse helpers =====
@@ -925,15 +926,18 @@ fn collect_update_actions(
 
 // Rewrite the header on disk in place.  Cards are serialized to one or more
 // 2880-byte blocks; the resulting byte count must equal `header_block_count
-// * BLOCK_SIZE` (slack-only).  Taint semantics: pre-I/O failures don't
-// taint; write_all/flush failures do.  See CLAUDE.md "Tainted-header state".
+// * BLOCK_SIZE` (slack-only).  Offset state is read atomically once at the
+// top — concurrent grows are serialized by the file lock acquired below.
+// Taint semantics: pre-I/O failures don't taint; write_all/flush failures
+// do.  See CLAUDE.md "Tainted-header state".
 fn rewrite_header_to_disk(
     file_handle: &FileHandle,
-    header_offset: u64,
-    header_block_count: u64,
+    offsets: &HduOffsets,
     cards: &[String],
     tainted: &TaintFlag,
 ) -> PyResult<()> {
+    let header_offset = offsets.header_offset();
+    let header_block_count = offsets.header_block_count();
     let max_cards = (header_block_count as usize) * 36;
     if cards.len() > max_cards {
         return Err(PyValueError::new_err(format!(
@@ -1223,20 +1227,25 @@ fn build_string_value_cards(key: &str, value: &str, comment: &str) -> PyResult<V
 pub(crate) struct FITSHeader {
     cards: Arc<Mutex<Vec<String>>>,
     file: FileHandle,
-    header_offset: u64,
-    header_block_count: u64,
-    tainted: TaintFlag,
+    // Shared with the parent HDU and FITS; mutated by grow operations so
+    // post-grow reads land at the correct disk offsets.
+    pub(crate) offsets: Arc<HduOffsets>,
+    // Held for the upcoming grow path (phase 2) which needs to walk all
+    // HDUs to shift their offsets after the byte tail moves.
+    #[allow(dead_code)]
+    pub(crate) layout: Arc<FileLayout>,
+    pub(crate) tainted: TaintFlag,
 }
 
 impl FITSHeader {
     pub(crate) fn from_state(
         cards: Arc<Mutex<Vec<String>>>,
         file: FileHandle,
-        header_offset: u64,
-        header_block_count: u64,
+        offsets: Arc<HduOffsets>,
+        layout: Arc<FileLayout>,
         tainted: TaintFlag,
     ) -> Self {
-        FITSHeader { cards, file, header_offset, header_block_count, tainted }
+        FITSHeader { cards, file, offsets, layout, tainted }
     }
 
     fn snapshot(&self) -> PyResult<Vec<String>> {
@@ -1255,8 +1264,7 @@ impl FITSHeader {
         append_commentary_to_cards(&mut new_cards, keyword, text);
         rewrite_header_to_disk(
             &self.file,
-            self.header_offset,
-            self.header_block_count,
+            &self.offsets,
             &new_cards,
             &self.tainted,
         )?;
@@ -1425,8 +1433,7 @@ impl FITSHeader {
         apply_setitem(&mut new_cards, &key, &value_obj, explicit_comment)?;
         rewrite_header_to_disk(
             &self.file,
-            self.header_offset,
-            self.header_block_count,
+            &self.offsets,
             &new_cards,
             &self.tainted,
         )?;
@@ -1460,8 +1467,7 @@ impl FITSHeader {
         }
         rewrite_header_to_disk(
             &self.file,
-            self.header_offset,
-            self.header_block_count,
+            &self.offsets,
             &new_cards,
             &self.tainted,
         )?;
@@ -1511,8 +1517,7 @@ impl FITSHeader {
         }
         rewrite_header_to_disk(
             &self.file,
-            self.header_offset,
-            self.header_block_count,
+            &self.offsets,
             &new_cards,
             &self.tainted,
         )?;
@@ -1577,8 +1582,7 @@ impl FITSHeaderEdit {
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         rewrite_header_to_disk(
             &parent.file,
-            parent.header_offset,
-            parent.header_block_count,
+            &parent.offsets,
             &self.cards,
             &parent.tainted,
         )?;
