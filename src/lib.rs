@@ -593,6 +593,13 @@ fn build_card_from_value(
     if let Ok(n) = value.extract::<i64>() {
         return Ok(vec![card_int(key, n, comment)]);
     }
+    // PyComplex check before f64: Python complex doesn't extract as f64
+    // (no implicit complex->float coercion), but being explicit avoids
+    // surprising failure modes if pyo3 ever adds such a coercion.
+    if value.is_instance_of::<PyComplex>() {
+        let c = value.cast::<PyComplex>()?;
+        return Ok(vec![card_complex(key, c.real(), c.imag(), comment)?]);
+    }
     if let Ok(f) = value.extract::<f64>() {
         return Ok(vec![card_float(key, f, comment)]);
     }
@@ -600,7 +607,8 @@ fn build_card_from_value(
         return build_string_value_cards(key, &s, comment);
     }
     Err(PyValueError::new_err(format!(
-        "unsupported value type for key '{}'; supported types: bool, int, float, str", key
+        "unsupported value type for key '{}'; \
+         supported types: bool, int, float, complex, str", key
     )))
 }
 
@@ -614,12 +622,16 @@ fn build_hierarch_card(
     value: &Bound<'_, PyAny>,
     comment: &str,
 ) -> PyResult<String> {
-    // Format the value side per type.  Bool first (Python bools are ints).
+    // Format the value side per type.  Bool first (Python bools are ints);
+    // PyComplex before f64 (Python complex doesn't coerce to float).
     let value_str = if value.is_instance_of::<PyBool>() {
         let b: bool = value.extract()?;
         (if b { "T" } else { "F" }).to_string()
     } else if let Ok(n) = value.extract::<i64>() {
         format!("{}", n)
+    } else if value.is_instance_of::<PyComplex>() {
+        let c = value.cast::<PyComplex>()?;
+        format!("({}, {})", format_fits_float(c.real()), format_fits_float(c.imag()))
     } else if let Ok(f) = value.extract::<f64>() {
         format_fits_float(f)
     } else if let Ok(s) = value.extract::<String>() {
@@ -633,7 +645,7 @@ fn build_hierarch_card(
     } else {
         return Err(PyValueError::new_err(format!(
             "unsupported value type for HIERARCH key '{}'; \
-             supported: bool, int, float, str", key
+             supported: bool, int, float, complex, str", key
         )));
     };
 
@@ -2551,6 +2563,30 @@ fn card_float(key: &str, value: f64, comment: &str) -> String {
         format!("{} / {}", head, comment)
     };
     pad_to_card(&body)
+}
+
+// FITS complex literal: `(real, imag)`.  Components are formatted the same
+// way as standalone floats (so `D` exponent and special values like nan/inf
+// are handled identically).  Errors if the resulting card exceeds 80 chars
+// — complex literals can be wide and silent truncation would corrupt the
+// imaginary half.
+fn card_complex(key: &str, real: f64, imag: f64, comment: &str) -> PyResult<String> {
+    let r = format_fits_float(real);
+    let i = format_fits_float(imag);
+    let value_str = format!("({}, {})", r, i);
+    let head = format!("{:<8}= {}", key, value_str);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    if body.len() > CARD_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "complex card too long ({} chars) for key '{}'; \
+             shorten the comment", body.len(), key
+        )));
+    }
+    Ok(pad_to_card(&body))
 }
 
 // Build the card sequence for a string value, applying the FITS Long Strings
