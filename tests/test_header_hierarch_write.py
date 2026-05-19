@@ -67,7 +67,9 @@ def test_multi_word_key_writes_hierarch():
             def check(hd):
                 assert hd["ESO INS TEMP"] == 12.5
                 cards = hd.cards
-                assert any(c.startswith("HIERARCH ESO INS TEMP") for c in cards)
+                assert any(
+                    c.startswith("HIERARCH ESO INS TEMP") for c in cards
+                )
 
             _check_both(fname, fits, check)
 
@@ -97,7 +99,9 @@ def test_hierarch_with_int_value():
 
             def check(hd):
                 v = hd["ESO INS TEMP"]
-                assert v == 42 and isinstance(v, int) and not isinstance(v, bool)
+                assert (
+                    v == 42 and isinstance(v, int) and not isinstance(v, bool)
+                )
 
             _check_both(fname, fits, check)
 
@@ -174,7 +178,10 @@ def test_lowercase_hierarch_key_uppercased():
             assert fits[0].header["eso ins temp"] == 12.5
             assert fits[0].header["Eso Ins Temp"] == 12.5
             # On disk, the card is uppercase.
-            assert any(c.startswith("HIERARCH ESO INS TEMP") for c in fits[0].header.cards)
+            assert any(
+                c.startswith("HIERARCH ESO INS TEMP")
+                for c in fits[0].header.cards
+            )
         with rustfits.FITS(fname, "r") as fits:
             assert fits[0].header["ESO INS TEMP"] == 12.5
 
@@ -230,7 +237,9 @@ def test_hierarch_delete():
             def check(hd):
                 assert "ESO INS TEMP" not in hd
                 # No leftover HIERARCH card.
-                assert not any(c.startswith("HIERARCH ESO INS TEMP") for c in hd.cards)
+                assert not any(
+                    c.startswith("HIERARCH ESO INS TEMP") for c in hd.cards
+                )
 
             _check_both(fname, fits, check)
 
@@ -337,12 +346,17 @@ def test_hierarch_card_too_long_rejected():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(ValueError):
-                # 60-char key + long string value definitely won't fit in 80 chars.
-                fits[0].header["A B C D E F G H I J K L M N O P Q R S T U V W X Y Z"] = "X" * 50
+                # 60-char key + long string value definitely won't fit in 80
+                # chars.
+                fits[0].header[
+                    "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z"
+                ] = "X" * 50
 
 
 def test_hierarch_invalid_chars_rejected():
-    """HIERARCH allows extra chars (space, '.', '+') but still rejects others."""
+    """
+    HIERARCH allows extra chars (space, '.', '+') but still rejects others.
+    """
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(ValueError):
