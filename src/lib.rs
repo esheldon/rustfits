@@ -545,45 +545,93 @@ fn validate_keyword(key: &str) -> PyResult<()> {
     Ok(())
 }
 
-// Pull the comment off the first existing card for `key`, if any.  Returns
-// None if the key is not present or the card has no comment.
-fn extract_existing_comment(cards: &[String], key: &str) -> Option<String> {
-    let (_idx, value_part) = find_card_for_key(cards, key)?;
-    let (_raw, comment) = split_value_comment(&value_part);
-    Some(comment)
+// Pull the comment off the first existing card for `key`, if any.  Walks
+// the CONTINUE chain (if the key's value is a `&`-terminated string) so a
+// long-string value's chained comment is preserved on update.  Returns
+// None if the key is not present.
+fn extract_existing_comment(py: Python<'_>, cards: &[String], key: &str) -> Option<String> {
+    let (idx, value_part) = find_card_for_key(cards, key)?;
+    parse_value_with_continue(py, cards, idx, &value_part)
+        .ok()
+        .map(|(_, c)| c)
 }
 
-// Build a complete 80-char card from (key, Python value, comment).  Type
-// dispatch: bool / int / float / str.  Bool is checked before int because
-// Python bools are also ints (`extract::<i64>()` succeeds on `True`).
+// Build the card(s) representing (key, value, comment).  Most types emit a
+// single card; string values longer than what fits in one card emit a
+// CONTINUE-chained sequence (1 keyword card + N CONTINUE cards).  Bool is
+// checked before int because Python bools are also ints (`extract::<i64>()`
+// succeeds on `True`).
 fn build_card_from_value(
     key: &str,
     value: &Bound<'_, PyAny>,
     comment: &str,
-) -> PyResult<String> {
+) -> PyResult<Vec<String>> {
     if value.is_instance_of::<PyBool>() {
         let b: bool = value.extract()?;
-        return Ok(card_logical(key, b, comment));
+        return Ok(vec![card_logical(key, b, comment)]);
     }
     if let Ok(n) = value.extract::<i64>() {
-        return Ok(card_int(key, n, comment));
+        return Ok(vec![card_int(key, n, comment)]);
     }
     if let Ok(f) = value.extract::<f64>() {
-        return Ok(card_float(key, f, comment));
+        return Ok(vec![card_float(key, f, comment)]);
     }
     if let Ok(s) = value.extract::<String>() {
-        return Ok(card_string(key, &s, comment));
+        return build_string_value_cards(key, &s, comment);
     }
     Err(PyValueError::new_err(format!(
         "unsupported value type for key '{}'; supported types: bool, int, float, str", key
     )))
 }
 
-// Replace the card for `key` if it exists; otherwise insert just before END
-// (or append if there's no END card).  `key` is assumed already normalized
-// to uppercase.
-fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_card: String) {
-    let normalized = new_card.trim_end().to_string();
+// Does this card's value (parsed as a FITS string) end with `&`?  Returns
+// false for non-string values and non-card text.  Used to walk CONTINUE
+// chains during updates.
+fn card_value_ends_with_amp(card: &str) -> bool {
+    let trimmed = card.trim_end();
+    let value_part: &str = if trimmed.starts_with("CONTINUE") {
+        if trimmed.len() > 8 { &trimmed[8..] } else { return false; }
+    } else if let Some(eq_pos) = trimmed.find('=') {
+        &trimmed[eq_pos + 1..]
+    } else {
+        return false;
+    };
+    let (raw, _) = split_value_comment(value_part);
+    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        let inner = &raw[1..raw.len() - 1];
+        return inner.ends_with('&');
+    }
+    false
+}
+
+// Given that cards[start] is the first card for some key, walk forward as
+// long as the previous card has a `&`-terminated string value AND the next
+// card has keyword field "CONTINUE".  Returns the index one past the last
+// card in the chain.  Always returns at least start + 1.
+fn find_chain_end(cards: &[String], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < cards.len() && card_value_ends_with_amp(&cards[end - 1]) {
+        let next = cards[end].trim_end();
+        if !next.starts_with("CONTINUE") {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+// Replace the chain of cards for `key` with `new_cards`, preserving the
+// chain's original position.  If `key` is not present, insert `new_cards`
+// just before END (or appended if there's no END card).  When updating an
+// existing key whose value is a CONTINUE-chained string, the entire chain
+// is removed before the new cards are inserted.
+fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) {
+    let normalized: Vec<String> = new_cards
+        .into_iter()
+        .map(|c| c.trim_end().to_string())
+        .collect();
+
+    let mut existing_start: Option<usize> = None;
     for i in 0..cards.len() {
         let trimmed = cards[i].trim_end();
         if trimmed.is_empty() {
@@ -591,18 +639,29 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_card: String) {
         }
         let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
         if key_field.trim() == key {
-            cards[i] = normalized;
-            return;
+            existing_start = Some(i);
+            break;
         }
     }
-    let end_pos = cards.iter().position(|c| c.trim_end() == "END");
-    match end_pos {
-        Some(pos) => cards.insert(pos, normalized),
-        None => cards.push(normalized),
+
+    match existing_start {
+        Some(start) => {
+            let end = find_chain_end(cards, start);
+            cards.splice(start..end, normalized);
+        }
+        None => {
+            let end_pos = cards
+                .iter()
+                .position(|c| c.trim_end() == "END")
+                .unwrap_or(cards.len());
+            cards.splice(end_pos..end_pos, normalized);
+        }
     }
 }
 
-// Remove the first card matching `key`.  Returns true iff a card was removed.
+// Remove the first card matching `key`, plus any CONTINUE chain attached
+// to it (for long-string values).  Returns true iff at least one card was
+// removed.
 fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
     for i in 0..cards.len() {
         let trimmed = cards[i].trim_end();
@@ -611,7 +670,8 @@ fn delete_card_for_key(cards: &mut Vec<String>, key: &str) -> bool {
         }
         let key_field = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
         if key_field.trim() == key {
-            cards.remove(i);
+            let end = find_chain_end(cards, i);
+            cards.drain(i..end);
             return true;
         }
     }
@@ -652,11 +712,12 @@ fn apply_setitem(
     explicit_comment: Option<String>,
 ) -> PyResult<()> {
     validate_keyword(key)?;
-    let comment = explicit_comment.unwrap_or_else(|| {
-        extract_existing_comment(cards, key).unwrap_or_default()
-    });
-    let new_card = build_card_from_value(key, value, &comment)?;
-    set_card_for_key(cards, key, new_card);
+    let comment = match explicit_comment {
+        Some(c) => c,
+        None => extract_existing_comment(value.py(), cards, key).unwrap_or_default(),
+    };
+    let new_cards = build_card_from_value(key, value, &comment)?;
+    set_card_for_key(cards, key, new_cards);
     Ok(())
 }
 
@@ -2414,6 +2475,102 @@ fn card_float(key: &str, value: f64, comment: &str) -> String {
         format!("{} / {}", head, comment)
     };
     pad_to_card(&body)
+}
+
+// Build the card sequence for a string value, applying the FITS Long Strings
+// CONTINUE convention when necessary.  Most strings produce a single card;
+// values longer than what fits in one card produce a chain of cards each
+// with payload up to 67 chars (with `&` continuation marker) plus a final
+// card without `&`.  Comments are placed on the final card; if the comment
+// is too long to fit there, an error is raised (no truncation).
+fn build_string_value_cards(key: &str, value: &str, comment: &str) -> PyResult<Vec<String>> {
+    let escaped = value.replace('\'', "''");
+
+    // How many payload chars fit on the LAST card (which has no `&`).
+    // Layout: prefix(10) + `'` + payload + `'` [+ ` / ` + comment] ≤ 80.
+    //   - prefix is 10 chars for both first ("KEYWORD = ") and CONTINUE
+    //     ("CONTINUE  ").
+    //   - Without comment: payload ≤ 68.
+    //   - With comment of length C: payload ≤ 65 − C (i.e. 80 − 12 − 3 − C).
+    let max_last_payload: usize = if comment.is_empty() {
+        68
+    } else {
+        if comment.len() >= 65 {
+            return Err(PyValueError::new_err(format!(
+                "comment is too long ({} chars) to fit in a FITS card alongside a string value; \
+                 max comment length is 64 chars for CONTINUE-chained values",
+                comment.len()
+            )));
+        }
+        65 - comment.len()
+    };
+
+    // Single-card fast path: the whole (escaped) value fits along with the
+    // comment.  Delegate to the existing single-card builder.
+    if escaped.len() <= max_last_payload {
+        return Ok(vec![card_string(key, value, comment)]);
+    }
+
+    // Multi-card CONTINUE path.  Iterate the escaped bytes, emitting chunks
+    // of up to 67 chars on non-last cards and up to max_last_payload on the
+    // last card.  Avoid splitting a `''` quote-escape across cards (the
+    // boundary check below).
+    let bytes = escaped.as_bytes();
+    let total = bytes.len();
+    let mut cards: Vec<String> = Vec::new();
+    let mut pos = 0;
+
+    while pos < total {
+        let remaining = total - pos;
+        let mut take;
+        let is_last;
+        if remaining <= max_last_payload {
+            take = remaining;
+            is_last = true;
+        } else {
+            // Leave at least `max_last_payload` bytes for the final chunk so
+            // it can fit the comment.
+            take = (remaining - max_last_payload).min(67);
+            is_last = false;
+
+            // Avoid splitting a `''` escape: if the chunk would end at the
+            // first `'` of a pair, back off by one.
+            while take > 0 && pos + take < total {
+                if bytes[pos + take - 1] == b'\'' && bytes[pos + take] == b'\'' {
+                    take -= 1;
+                } else {
+                    break;
+                }
+            }
+            // Corner: if backoff drove `take` to 0 (escaped value begins
+            // with a quote pair), include the whole pair.  Inner-string
+            // length stays well below 67 in that case.
+            if take == 0 {
+                take = 2;
+            }
+        }
+
+        let inner = std::str::from_utf8(&bytes[pos..pos + take]).unwrap();
+        let is_first = cards.is_empty();
+
+        let card = if is_first {
+            // First card: KEYWORD = '<inner>&' (non-last branch only, since
+            // the single-card path is handled by the early return above).
+            format!("{:<8}= '{}&'", key, inner)
+        } else if is_last {
+            if comment.is_empty() {
+                format!("CONTINUE  '{}'", inner)
+            } else {
+                format!("CONTINUE  '{}' / {}", inner, comment)
+            }
+        } else {
+            format!("CONTINUE  '{}&'", inner)
+        };
+        cards.push(pad_to_card(&card));
+        pos += take;
+    }
+
+    Ok(cards)
 }
 
 // ====================== Helpers for writing image data ======================
