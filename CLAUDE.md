@@ -103,34 +103,50 @@ Find/set/delete match HIERARCH cards via `keyword_of`, which returns the
 long-key for HIERARCH cards.  CONTINUE-chained HIERARCH long-string values
 are deferred.
 
-## Phase 2d: header-mutation hardening (deferred)
+## Tainted-header state on mid-write I/O failure
 
-The following remediation items target rare failure modes that current code
-propagates as errors but doesn't recover from.  None of them are user-facing
-features.
+A per-file `Arc<AtomicBool>` is created in `FITS::new`, cloned into every
+HDU (and from there into every `FITSHeader` view).  When `rewrite_header_to_disk`'s
+`write_all` or `flush` fails, the file is partially overwritten and the
+in-memory cards are still pre-mutation — they have diverged.  Setting the
+taint flag (`tainted.store(true, Ordering::Release)`) makes every
+subsequent read or write on any view of the file refuse with a diagnostic
+`IOError` that names the inconsistency and tells the user to close +
+reopen.
 
-1. **"Tainted" header state.** Set a flag on the HDU (or on FITSHeader) when
-   a mid-write disk error occurs in `rewrite_header_to_disk`.  Subsequent
-   reads/writes refuse until the file is reopened.  Prevents users from
-   continuing to operate on a header whose disk image is uncertain.
+Where the check fires (`check_not_tainted` at the top of each):
+- `HDU::header_snapshot` — picks up image reads/writes that go through it.
+- `FITSHeader::snapshot` — picks up most header reads (`__getitem__`,
+  `__contains__`, `__iter__`, `keys`, `to_dict`, etc.).
+- `FITSHeader::__setitem__`, `__delitem__`, `update`, `append_commentary`,
+  and `FITSHeaderEdit::commit_internal` — the mutation entry points.
 
-2. **Diagnostic error message on mid-write failure.** Currently
-   `rewrite_header_to_disk` propagates the bare OS error string from
-   `write_all`/`flush`.  Wrap these with a hint like "header write failed
-   mid-stream; the file may be in an inconsistent state — close and reopen
-   to recover."
+Pre-I/O failures (slack-overflow check, file-lock, closed-file, initial
+`seek`) leave the file untouched and MUST NOT taint.  The split is enforced
+inside `rewrite_header_to_disk`: only `write_all` and `flush` errors set
+the flag.  Recovery is via close+reopen; the flag is per-handle, not
+per-file-on-disk.
 
-3. **CONTINUE-on-write for HIERARCH long-string values.** Currently
+Testing hook: `HDU._force_taint()` flips the flag directly.  Underscored
+to signal "test plumbing, not API."  Used by `tests/test_header_taint.py`
+to verify rejection semantics without needing to produce a real I/O
+failure on the host filesystem.
+
+## Deferred (feature passes, not hardening)
+
+These are user-facing features that have been intentionally left out of
+phase 2.  Implement only if real users hit them.
+
+1. **CONTINUE-on-write for HIERARCH long-string values.** Currently
    `build_hierarch_card` errors if the resulting card exceeds 80 chars.
-   Astropy supports CONTINUE for HIERARCH; we could too.  Rare in real
-   data; defer until requested.
+   Astropy supports CONTINUE-chained HIERARCH; we could too.  Rare in
+   practice.
 
-4. **File-rewrite path for header overflow.** Currently overflow raises
+2. **File-rewrite path for header overflow.** Currently overflow raises
    ValueError ("header overflow: N cards do not fit in M block(s)...").
-   The slow-but-correct path: when overflowing, rewrite the whole file from
-   this HDU forward, growing the reserved header blocks.  This is what
-   cfitsio does internally.  Significant undertaking; only implement if
-   real users hit the limit.
+   The slow-but-correct path: when overflowing, rewrite the whole file
+   from this HDU forward, growing the reserved header blocks.  This is
+   what cfitsio does internally.  Significant undertaking.
 
 ## Testing conventions
 
