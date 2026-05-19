@@ -169,17 +169,28 @@ def test_extend_dtype_mismatch_rejected_before_any_change():
         assert os.path.getsize(fname) == size_before
 
 
-def test_extend_non_last_hdu_rejected():
-    """An HDU with other HDUs after it on disk cannot grow yet."""
+def test_extend_non_last_hdu_shifts_subsequent_data():
+    """An HDU with other HDUs after it on disk can now grow: the file tail
+    is shifted forward and the subsequent HDU's data must round-trip
+    unchanged."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_image_hdu(dtype="i4", dims=(3, 4), extname="first")
             fits.create_image_hdu(dtype="f8", dims=(2, 5), extname="second")
+            # Seed the second HDU so we can verify it survives the shift.
+            second_arr = np.arange(2 * 5, dtype="f8").reshape(2, 5) + 0.5
+            fits.hdus[1].write(second_arr)
 
-            new = np.zeros((2, 4), dtype="i4")
-            with pytest.raises(ValueError, match="extending non-last"):
-                fits.hdus[0].extend(new)
+            new = np.arange(2 * 4, dtype="i4").reshape(2, 4) + 100
+            fits.hdus[0].extend(new)
+            assert fits.hdus[0].header["NAXIS2"] == 5  # 3 + 2
+            # Subsequent HDU still readable.
+            np.testing.assert_array_equal(fits.hdus[1].read(), second_arr)
+
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits.hdus[0].header["NAXIS2"] == 5
+            np.testing.assert_array_equal(fits.hdus[1].read(), second_arr)
 
 
 def test_extend_last_hdu_when_multiple_works():

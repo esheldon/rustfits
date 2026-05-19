@@ -268,6 +268,65 @@ pub(crate) fn shift_file_tail_and_update_offsets(
     Ok(())
 }
 
+// Zero-fill `[start..start+len)` in the file, chunked.  The caller is
+// responsible for having grown the file to cover this range (e.g. via
+// shift_file_tail_and_update_offsets, which `set_len`s up to new_len).
+// Mid-write failures taint — by the time we're here, an earlier shift has
+// already mutated the file layout and any inconsistency means the file is
+// not safely reopenable without close+reopen.
+//
+// Used by the image-extend grow path: after shift_file_tail relocates the
+// next HDU(s) forward, the gap [old_end_of_self_data .. old_end + delta)
+// contains the original first delta bytes of the shifted tail (see the
+// "back-to-front copy" argument in shift_file_tail's doc-comment); we
+// must overwrite those bytes with zeros so reading the now-grown image
+// returns FITS-conforming padding rather than stray header bytes.
+pub(crate) fn zero_fill_range(
+    file_handle: &FileHandle,
+    start: u64,
+    len: u64,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut guard = lock_file(file_handle)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(start)).map_err(|e| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "seek failed during zero-fill: {}; \
+             the on-disk file is inconsistent — \
+             close this FITS object and reopen the file to recover", e
+        ))
+    })?;
+    const CHUNK: usize = 1 << 20;
+    let buf = vec![0u8; CHUNK];
+    let mut remaining = len as usize;
+    while remaining > 0 {
+        let n = std::cmp::min(remaining, CHUNK);
+        f.write_all(&buf[..n]).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "write failed during zero-fill: {}; \
+                 the on-disk file is inconsistent — \
+                 close this FITS object and reopen the file to recover", e
+            ))
+        })?;
+        remaining -= n;
+    }
+    f.flush().map_err(|e| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "flush failed after zero-fill: {}; \
+             the on-disk file may be inconsistent — \
+             close this FITS object and reopen the file to recover", e
+        ))
+    })?;
+    Ok(())
+}
+
 // Strict match: the keyword field in cols 1-8 (trimmed) must equal `key`, and
 // col 9 must be `=`.  This avoids the trap that `starts_with("NAXIS")` would
 // also match `NAXIS1`, `NAXIS2`, etc.

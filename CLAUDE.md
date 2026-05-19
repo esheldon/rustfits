@@ -325,15 +325,46 @@ The back-to-front copy order is what makes the in-place shift safe with
 overlapping source and destination.  The argument is documented in detail
 in the doc-comment on `shift_file_tail_and_update_offsets` in `common.rs`.
 
-**Reuse for image/table data grow (not yet implemented).** When image
-extend (`ImageHDU.extend`) eventually grows non-last HDUs, and when
-table append/heap-grow lands, both will call the same
-`shift_file_tail_and_update_offsets` helper — image/table grow inserts
-bytes at `self.data_offset + self.data_size` instead of `self.data_offset`,
-and self's own offset record stays unchanged (only `header_block_count`
-is header-specific; data-section size is computed from the header by
-`calculate_data_size`).  This is the reason the shared-offsets refactor
-went in before the table writing work.
+## Image overflow: in-place data-section grow
+
+`ImageHDU.extend` uses the same `shift_file_tail_and_update_offsets`
+primitive when growing an HDU that is not the last on disk.  The
+mechanics differ from header grow only in *where* bytes are inserted
+and *what* the caller updates on self:
+
+1. Compute `delta = new_padded - current_padded` (block-rounded new
+   data size minus block-rounded old data size).
+2. If `file_len > current_hdu_end` (non-last HDU): call
+   `shift_file_tail_and_update_offsets(file, layout,
+   after_offset = self.data_offset + current_padded, delta, taint)`.
+   Then `zero_fill_range(file, after_offset, delta, taint)` to overwrite
+   the gap left behind (the first `delta` bytes of the shifted tail,
+   which contain stray bytes from the old next-HDU's header).
+3. Else (last HDU): just `set_len(new_hdu_end)` — the OS zero-extends,
+   no shift needed.
+4. Update self's `NAXISn` card in memory (clone-then-replace, disk-write-
+   before-commit ordering).  Self's `HduOffsets` are **unchanged**: only
+   the data section grew, header_offset/data_offset/header_block_count
+   are all the same.
+5. Write the updated header to self.header_offset.
+6. `write_image_data` writes the new rows.
+
+Because data-section grow doesn't touch self's offsets, the helper's
+"update everyone with header_offset >= after_offset" rule still skips
+self (self.header_offset < self.data_offset <= after_offset) — only
+later HDUs shift.  The shared `Arc<HduOffsets>` model gives the same
+transparent post-grow handles as the header-grow path.
+
+**Taint semantics in image grow:** same as header grow — failures inside
+the shift loop, zero-fill, header write, or image-data write all taint
+because the file layout has been mutated by then.  Pre-shift failures
+(file lock, metadata) do not taint.
+
+**Still pending — table data grow.** When `TableHDU.append` /
+heap-grow lands, it will call the same primitives with
+`after_offset = self.data_offset + self.data_size` (data_size computed
+from the header by `calculate_data_size`).  Self's offsets stay
+unchanged just like image grow.
 
 **Taint semantics in the grow path:** pre-shift failures (file lock,
 metadata, `set_len`) do NOT taint — nothing on disk has moved yet.  Any

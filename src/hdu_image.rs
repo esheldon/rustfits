@@ -8,8 +8,11 @@ use pyo3::Bound;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
+use std::sync::atomic::Ordering;
+
 use crate::common::{
-    lock_file, parse_keyword, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    lock_file, parse_keyword, shift_file_tail_and_update_offsets, zero_fill_range,
+    FileHandle, FileLayout, HduOffsets, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
@@ -60,8 +63,13 @@ impl ImageHDU {
     }
 
     // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to
-    // fit the data being written, then write it.  See CLAUDE.md for the
-    // last-HDU constraint and the multi-phase write order.
+    // fit the data being written, then write it.  For HDUs that are not the
+    // last on disk, the file tail (every byte from this HDU's data-section
+    // end to EOF) is shifted forward to make room and every later HDU's
+    // offsets are bumped in lockstep, so any previously-issued handles
+    // remain valid (same shared-Arc model as the header-grow path).  See
+    // CLAUDE.md "Header overflow: in-place file grow" for the shared
+    // shift_file_tail_and_update_offsets primitive.
     #[pyo3(signature = (data, start=None))]
     fn extend(
         slf: PyRefMut<'_, Self>,
@@ -155,68 +163,104 @@ impl ImageHDU {
         let current_hdu_end = data_offset + current_padded;
         let new_hdu_end = data_offset + new_padded;
 
-        {
-            let mut guard = lock_file(&super_.file)?;
-            let file = guard.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-
-            let file_len = file.metadata()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len();
-            if file_len != current_hdu_end {
-                return Err(PyValueError::new_err(format!(
-                    "cannot extend HDU #{}: file_size ({}) != HDU end ({}); \
-                     extending non-last HDUs is not yet supported",
-                    super_.index, file_len, current_hdu_end
-                )));
-            }
-
-            if new_hdu_end > current_hdu_end {
+        // Dispatch by whether this HDU is the last thing on disk.  Last HDU:
+        // just set_len (zero-extends).  Non-last: shift the tail forward to
+        // make room, then zero-fill the gap (which contains the original
+        // first delta bytes of the shifted tail — see shift_file_tail's
+        // doc-comment).  Both branches end with the file sized to hold the
+        // new HDU; the subsequent header+data writes treat the cases the same.
+        if new_hdu_end > current_hdu_end {
+            let delta = new_hdu_end - current_hdu_end;
+            let file_len = {
+                let guard = lock_file(&super_.file)?;
+                let file = guard.as_ref()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                file.metadata()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .len()
+            };
+            if file_len > current_hdu_end {
+                shift_file_tail_and_update_offsets(
+                    &super_.file, &super_.layout,
+                    current_hdu_end, delta, &super_.tainted,
+                )?;
+                zero_fill_range(
+                    &super_.file, current_hdu_end, delta, &super_.tainted,
+                )?;
+            } else {
+                let mut guard = lock_file(&super_.file)?;
+                let file = guard.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
                 file.set_len(new_hdu_end)
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
             }
         }
 
+        // Disk-write-before-commit: build the candidate cards on a clone,
+        // write to disk under the file lock (taint on mid-write failure),
+        // and only commit the in-memory cards on success.  Holding the
+        // cards lock across the header write keeps any concurrent reader
+        // from seeing the new-on-disk / old-in-memory mismatch.
         let naxisn_key = format!("NAXIS{}", naxis);
         let new_card = card_int(
             &naxisn_key,
             new_hdu_shape[0] as i64,
             &format!("length of data axis {}", naxis),
         );
-        let updated_header: Vec<String> = {
-            let mut g = super_.header.lock()
-                .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-            let card_idx = g.iter()
-                .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
-                .ok_or_else(|| PyValueError::new_err(
-                    format!("header missing {}", naxisn_key)
-                ))?;
-            g[card_idx] = new_card.trim_end().to_string();
-            g.clone()
-        };
+        let mut cards_guard = super_.header.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let mut new_cards = cards_guard.clone();
+        let card_idx = new_cards.iter()
+            .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
+            .ok_or_else(|| PyValueError::new_err(
+                format!("header missing {}", naxisn_key)
+            ))?;
+        new_cards[card_idx] = new_card.trim_end().to_string();
 
         {
             let mut guard = lock_file(&super_.file)?;
             let file = guard.as_mut()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
 
-            let header_bytes = serialize_header_to_disk_bytes(&updated_header);
+            let header_bytes = serialize_header_to_disk_bytes(&new_cards);
             let header_offset = data_offset - header_bytes.len() as u64;
             file.seek(SeekFrom::Start(header_offset))
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            file.write_all(&header_bytes)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            file.flush()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            file.write_all(&header_bytes).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "header write failed mid-stream during extend: {}; \
+                     the on-disk file may be inconsistent — \
+                     close this FITS object and reopen the file to recover", e
+                ))
+            })?;
+            file.flush().map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "header flush failed during extend: {}; \
+                     the on-disk file may be inconsistent — \
+                     close this FITS object and reopen the file to recover", e
+                ))
+            })?;
         }
 
+        *cards_guard = new_cards.clone();
+        drop(cards_guard);
+
+        // Image-data write completes the extend.  A failure here leaves
+        // the on-disk header advertising the new shape but the file's
+        // data section partly stale or unwritten — taint so the user is
+        // forced to reopen rather than reading inconsistent bytes.
         write_image_data(
-            &updated_header,
+            &new_cards,
             data_offset,
             &super_.file,
             data,
             Some(start_for_write),
-        )
+        ).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            e
+        })
     }
 
     fn __getitem__(
