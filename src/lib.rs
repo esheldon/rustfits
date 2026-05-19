@@ -1110,6 +1110,15 @@ fn collect_update_triples(
             if kw.is_empty() {
                 continue;
             }
+            // Silently skip keys rustfits manages on the user's behalf.  The
+            // common use case is copying metadata from another HDU's header —
+            // the destination already has its own correct structural,
+            // integrity, and compression keys, and they must not be clobbered.
+            // (Dict-source update() still raises on protected keys: an
+            // explicit hand-written key is almost certainly a mistake.)
+            if is_protected_key(&normalize_keyword(&kw)) {
+                continue;
+            }
             if let Some(eq_pos) = trimmed.find('=') {
                 let (value, comment) = parse_value_with_continue(
                     py, &src_cards, i, &trimmed[eq_pos + 1..],
@@ -1143,6 +1152,19 @@ fn collect_update_triples(
                     "update() does not accept commentary key '{}'; \
                      use add_comment(text) / add_history(text) / \
                      add_blank(text) to append commentary cards",
+                    k
+                )));
+            }
+            // Dict-source update() rejects protected keys: an explicit
+            // hand-written key like BITPIX or CHECKSUM is almost certainly
+            // a mistake, not an intent to be silently dropped.  (FITSHeader
+            // sources silently skip them — see the branch above.)
+            if is_protected_key(&k) {
+                return Err(PyValueError::new_err(format!(
+                    "'{}' is a protected keyword managed by rustfits (file \
+                     structure, integrity, or compression layout) and cannot \
+                     be set via update(); structural changes should go \
+                     through the dedicated HDU APIs",
                     k
                 )));
             }

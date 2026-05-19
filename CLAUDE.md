@@ -108,17 +108,18 @@ Internal paths that legitimately update structural keys (e.g.
 `extend_image_hdu` updating `NAXISn`) operate on the cards `Vec` directly,
 not through `__setitem__`, so the guard doesn't break them.
 
-**Decided, not yet implemented:** `update()` from a FITSHeader source
-should silently skip protected keys.  The use case is "copy the metadata
-from this other HDU's header" — the destination already has its own
-correct structural/integrity/compression keys and they must not be
-clobbered.  Today `update()` from a FITSHeader copies everything; the
-destination's `apply_setitem` then raises on the first protected key,
-which is correct but unfriendly.  The skip belongs in
-`collect_update_triples`'s FITSHeader branch (filter via
-`is_protected_key` before pushing the triple).  Dict-source `update()`
-should continue to raise on protected keys (explicit hand-written keys
-are almost certainly a mistake, not an intent to be silently dropped).
+`update()` policy on protected keys is split by source type, both
+enforced in `collect_update_triples`:
+
+- **FITSHeader source:** silently skips protected keys.  The use case is
+  "copy the metadata from this other HDU's header" — the destination
+  already has its own correct structural/integrity/compression keys and
+  they must not be clobbered.  The filter is in the FITSHeader branch,
+  applied right after `keyword_of` extracts the keyword from each card.
+- **Dict (mapping) source:** raises `ValueError` on any protected key.
+  An explicit hand-written `{"BITPIX": 32}` in user code is almost
+  certainly a mistake, not an intent to be silently dropped.  The whole
+  update is rejected wholesale (no partial commit).
 
 **Forward-looking (Tier 2, deferred until table writing lands):** the
 image-only metadata keys `BUNIT`, `BSCALE`, `BZERO` are *not* protected —
