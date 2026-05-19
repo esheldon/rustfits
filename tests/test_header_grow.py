@@ -22,7 +22,6 @@ import tempfile
 import contextlib
 
 import numpy as np
-import pytest
 
 import rustfits
 
@@ -87,9 +86,9 @@ def test_grow_one_card_past_boundary_same_handle_and_reopen():
             slots_free = _slack_capacity(h)
             for i in range(slots_free):
                 h[f"PAD{i:04d}"] = i
-            old_blocks = (len(h.cards) + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            old_blocks = (len(h.cards) + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK  # noqa
             h["TRIGGER"] = "grow"
-            new_blocks = (len(h.cards) + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            new_blocks = (len(h.cards) + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK  # noqa
             assert new_blocks > old_blocks
             assert h["TRIGGER"] == "grow"
         with rustfits.FITS(fname, "r") as fits:

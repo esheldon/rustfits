@@ -292,7 +292,7 @@ def test_header_overflow_triggers_grow():
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial_cards = len(h.cards)
-            block_count = (initial_cards + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
+            block_count = (initial_cards + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK  # noqa
             capacity = block_count * CARDS_PER_BLOCK
             slots_free = capacity - initial_cards
             for i in range(slots_free):

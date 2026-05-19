@@ -19,8 +19,6 @@ import os
 import tempfile
 import contextlib
 
-import pytest
-
 import rustfits
 
 
@@ -58,7 +56,9 @@ def test_all_lowercase_hierarch_preserves_lowercase():
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["eso tel airm start"] = 1.42
             cards = fits[0].header.cards
-            assert any(c.startswith("HIERARCH eso tel airm start") for c in cards)
+            assert any(
+                c.startswith("HIERARCH eso tel airm start") for c in cards
+            )
 
 
 def test_uppercase_hierarch_still_uppercase_on_disk():
@@ -139,12 +139,18 @@ def test_update_existing_key_keeps_original_spelling():
             h["ESO TEL AIRM START"] = 2.0   # same key, different case
             cards = h.cards
             # Original spelling preserved; new value committed.
-            assert any(c.startswith("HIERARCH Eso Tel Airm Start") for c in cards)
-            assert not any(c.startswith("HIERARCH ESO TEL AIRM START") for c in cards)
+            assert any(
+                c.startswith("HIERARCH Eso Tel Airm Start") for c in cards
+            )
+            assert not any(
+                c.startswith("HIERARCH ESO TEL AIRM START") for c in cards
+            )
             assert h["ESO TEL AIRM START"] == 2.0
         with rustfits.FITS(fname, "r") as fits:
             cards = fits[0].header.cards
-            assert any(c.startswith("HIERARCH Eso Tel Airm Start") for c in cards)
+            assert any(
+                c.startswith("HIERARCH Eso Tel Airm Start") for c in cards
+            )
             assert fits[0].header["eso tel airm start"] == 2.0
 
 
@@ -155,7 +161,9 @@ def test_dict_update_preserves_user_case_on_new_key():
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header.update({"Eso Ins Det1 Gain": 1.5})
             cards = fits[0].header.cards
-            assert any(c.startswith("HIERARCH Eso Ins Det1 Gain") for c in cards)
+            assert any(
+                c.startswith("HIERARCH Eso Ins Det1 Gain") for c in cards
+            )
 
 
 def test_dict_update_existing_key_keeps_spelling():
@@ -188,7 +196,9 @@ def test_extra_internal_spaces_collapsed_on_write():
             fits[0].header["Eso  Ins   Det1 Gain"] = 1.5
             cards = fits[0].header.cards
             # Exactly single spaces between words on disk.
-            assert any(c.startswith("HIERARCH Eso Ins Det1 Gain") for c in cards)
+            assert any(
+                c.startswith("HIERARCH Eso Ins Det1 Gain") for c in cards
+            )
             # Lookup matches both the canonical form and the as-written form.
             assert fits[0].header["ESO INS DET1 GAIN"] == 1.5
             assert fits[0].header["Eso  Ins  Det1  Gain"] == 1.5

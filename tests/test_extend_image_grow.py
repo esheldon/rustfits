@@ -23,7 +23,6 @@ import tempfile
 import contextlib
 
 import numpy as np
-import pytest
 
 import rustfits
 
