@@ -23,7 +23,9 @@ import rustfits
 
 @contextlib.contextmanager
 def _new_file(shape=(4, 6), dtype="i4"):
-    """Create a fresh single-HDU file with the given shape/dtype, yield path."""
+    """
+    Create a fresh single-HDU file with the given shape/dtype, yield path.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "h.fits")
         with rustfits.FITS(fname, "w+") as fits:
@@ -37,7 +39,7 @@ def _reopen(fname):
     return fits, fits[0].header
 
 
-# --------------------------- __setitem__: bare value ----------------------------
+# ----------------------- __setitem__: bare value ------------------------
 
 
 def test_set_new_int_key_and_persist():
@@ -75,7 +77,7 @@ def test_set_new_bool_key():
             assert fits[0].header["DOPHOT"] is True
 
 
-# --------------------------- __setitem__: (value, comment) tuple ----------------------------
+# -------- __setitem__: (value, comment) tuple -------
 
 
 def test_set_with_comment_tuple():
@@ -131,7 +133,9 @@ def test_update_existing_key_preserves_position():
 
 
 def test_new_key_inserted_before_end():
-    """A brand-new key lands just before END (so END remains last in the file)."""
+    """
+    A brand-new key lands just before END (so END remains last in the file).
+    """
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["EXPTIME"] = 5
@@ -141,7 +145,7 @@ def test_new_key_inserted_before_end():
         assert cards[-2].startswith("EXPTIME")
 
 
-# --------------------------- __delitem__ ----------------------------
+# -------------------------- __delitem__ ---------------------------
 
 
 def test_delete_key_and_persist():
@@ -192,7 +196,7 @@ def test_update_with_dict_value_comment_tuples():
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header.update({
                 "EXPTIME": (5.0, "exposure (s)"),
-                "OBJECT":  ("M31",  "target"),
+                "OBJECT":  ("M31", "target"),
             })
         with rustfits.FITS(fname, "r") as fits:
             h = fits[0].header
@@ -209,7 +213,7 @@ def test_update_with_commentary_key_raises():
                 fits[0].header.update({"COMMENT": "no good"})
 
 
-# --------------------------- update(): FITSHeader source ----------------------------
+# ----------------- update(): FITSHeader source --------------------
 
 
 def test_update_with_fitsheader_source_copies_comments():
@@ -217,7 +221,7 @@ def test_update_with_fitsheader_source_copies_comments():
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["EXPTIME"] = (5.0, "exposure (s)")
-            a[0].header["OBJECT"]  = ("M31", "target")
+            a[0].header["OBJECT"] = ("M31", "target")
         with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header)
         with rustfits.FITS(b_name, "r") as b:
@@ -279,7 +283,8 @@ def test_header_overflow_rejected():
             h = fits[0].header
             initial_cards = len(h.cards)
             block_count = (initial_cards + 35) // 36
-            # 36 cards per block; fill up to capacity, then one more should fail.
+            # 36 cards per block; fill up to capacity, then one more should
+            # fail.
             capacity = block_count * 36
             slots_free = capacity - initial_cards
             # Use up the available slack (without overflowing yet).
@@ -290,7 +295,7 @@ def test_header_overflow_rejected():
                 h["OVERFLOW"] = 1
 
 
-# --------------------------- Shared state across views ----------------------------
+# -------------------- Shared state across views --------------------
 
 
 def test_two_header_views_share_state():
@@ -304,7 +309,7 @@ def test_two_header_views_share_state():
             assert h2["EXPTIME"] == 5
 
 
-# --------------------------- Auto-flush per mutation ----------------------------
+# ------------------- Auto-flush per mutation ---------------------
 
 
 def test_each_setitem_persists_independently():
