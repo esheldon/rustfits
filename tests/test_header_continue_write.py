@@ -129,7 +129,10 @@ def test_chain_uses_keyword_then_continue_cards():
             def check(hd):
                 cards = hd.cards
                 # Find the LONG card.
-                first_idx = next(i for i, c in enumerate(cards) if c.startswith("LONG"))
+                first_idx = next(
+                    i for i, c in enumerate(cards)
+                    if c.startswith("LONG")
+                )
                 # All cards immediately after, until the chain ends, must be
                 # CONTINUE cards.
                 chain = [cards[first_idx]]
@@ -257,8 +260,12 @@ def test_new_chain_lands_before_end():
                 cards = hd.cards
                 assert cards[-1].startswith("END")
                 # The chain occupies the last few cards before END.
-                first_idx = next(i for i, c in enumerate(cards) if c.startswith("LONG"))
-                # Every card from first_idx to second-to-last is part of the chain.
+                first_idx = next(
+                    i for i, c in enumerate(cards)
+                    if c.startswith("LONG")
+                )
+                # Every card from first_idx to second-to-last is part of the
+                # chain.
                 for card in cards[first_idx + 1:-1]:
                     assert card.startswith("CONTINUE")
 
@@ -309,7 +316,8 @@ def test_edit_rollback_discards_long_string_chain():
 
             def check(hd):
                 assert "LONG" not in hd
-                # No orphaned CONTINUE cards from the staged but uncommitted chain.
+                # No orphaned CONTINUE cards from the staged but uncommitted
+                # chain.
                 assert not any(c.startswith("CONTINUE") for c in hd.cards)
 
             _check_both(fname, fits, check)
