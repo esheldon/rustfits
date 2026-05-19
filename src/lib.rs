@@ -781,6 +781,93 @@ fn rewrite_header_to_disk(
     Ok(())
 }
 
+// ====================== Commentary write helpers (phase 2c) ======================
+
+// Validate text destined for a commentary card.  Per the FITS standard,
+// every byte in a header card must be printable ASCII (0x20-0x7E).
+fn validate_commentary_text(text: &str) -> PyResult<()> {
+    for c in text.chars() {
+        let b = c as u32;
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(PyValueError::new_err(format!(
+                "commentary text contains non-printable character (0x{:02X}); \
+                 FITS restricts cards to ASCII 0x20-0x7E", b
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Build one or more commentary cards for the given keyword.  Text longer
+// than 72 chars (cols 9-80) is split across multiple cards each carrying
+// the same keyword — FITS has no CONTINUE convention for COMMENT/HISTORY.
+// `keyword` is "COMMENT", "HISTORY", or "" (blank-keyword commentary).
+fn make_commentary_cards(keyword: &str, text: &str) -> Vec<String> {
+    let max_text = CARD_SIZE - 8; // 72
+    let prefix = if keyword.is_empty() {
+        "        ".to_string()
+    } else {
+        format!("{:<8}", keyword)
+    };
+    if text.is_empty() {
+        return vec![pad_to_card(&prefix)];
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(max_text));
+    for chunk in bytes.chunks(max_text) {
+        // Safe: validate_commentary_text confirmed ASCII printable; ASCII
+        // chunks are valid UTF-8.
+        let chunk_str = std::str::from_utf8(chunk).unwrap_or("");
+        out.push(pad_to_card(&format!("{}{}", prefix, chunk_str)));
+    }
+    out
+}
+
+// Does this card match the commentary keyword?  "" means blank-keyword
+// commentary (cols 1-8 all spaces with content in cols 9-80).
+fn card_matches_commentary_keyword(card: &str, keyword: &str) -> bool {
+    let trimmed = card.trim_end();
+    if keyword.is_empty() {
+        trimmed.len() > 8 && trimmed[..8].trim().is_empty()
+    } else {
+        if trimmed.is_empty() {
+            return false;
+        }
+        let kf = if trimmed.len() >= 8 { &trimmed[..8] } else { trimmed };
+        kf.trim() == keyword
+    }
+}
+
+// Append commentary cards to `cards`.  Position: immediately after the last
+// existing card with the same commentary keyword; if none exists, just
+// before END (or appended if no END card is present).
+fn append_commentary_to_cards(cards: &mut Vec<String>, keyword: &str, text: &str) {
+    let new_cards = make_commentary_cards(keyword, text);
+    let mut last_match: Option<usize> = None;
+    for (i, card) in cards.iter().enumerate() {
+        if card_matches_commentary_keyword(card, keyword) {
+            last_match = Some(i);
+        }
+    }
+    let pos = match last_match {
+        Some(i) => i + 1,
+        None => cards.iter()
+            .position(|c| c.trim_end() == "END")
+            .unwrap_or(cards.len()),
+    };
+    for (offset, card) in new_cards.into_iter().enumerate() {
+        cards.insert(pos + offset, card.trim_end().to_string());
+    }
+}
+
+// Remove all cards matching the commentary keyword.  Returns how many were
+// removed (0 means the key was absent).
+fn delete_commentary_cards(cards: &mut Vec<String>, keyword: &str) -> usize {
+    let before = cards.len();
+    cards.retain(|card| !card_matches_commentary_keyword(card, keyword));
+    before - cards.len()
+}
+
 #[pyclass]
 struct FITSHeader {
     // Shared with the owning HDU so mutations propagate back.  Reads take the
@@ -810,6 +897,25 @@ impl FITSHeader {
         let g = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         Ok(g.clone())
+    }
+
+    // Shared body for add_comment / add_history / add_blank.  Validates the
+    // text, builds the new card(s), writes to disk first, then commits the
+    // mutation to the in-memory cards.
+    fn append_commentary(&self, keyword: &str, text: &str) -> PyResult<()> {
+        validate_commentary_text(text)?;
+        let mut guard = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let mut new_cards = guard.clone();
+        append_commentary_to_cards(&mut new_cards, keyword, text);
+        rewrite_header_to_disk(
+            &self.file,
+            self.header_offset,
+            self.header_block_count,
+            &new_cards,
+        )?;
+        *guard = new_cards;
+        Ok(())
     }
 }
 
@@ -954,8 +1060,9 @@ impl FITSHeader {
         let key = normalize_keyword(key);
         if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
-                "setting commentary key '{}' is not yet supported \
-                 (see add_comment/add_history, deferred)", key
+                "subscript assignment to commentary key '{}' is not supported; \
+                 use add_comment(text) / add_history(text) / add_blank(text) to append",
+                key
             )));
         }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
@@ -979,15 +1086,15 @@ impl FITSHeader {
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
         let key = normalize_keyword(key);
-        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
-            return Err(PyValueError::new_err(format!(
-                "deleting commentary key '{}' is not yet supported", key
-            )));
-        }
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         let mut new_cards = guard.clone();
-        if !delete_card_for_key(&mut new_cards, &key) {
+        let removed = if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            delete_commentary_cards(&mut new_cards, &key) > 0
+        } else {
+            delete_card_for_key(&mut new_cards, &key)
+        };
+        if !removed {
             return Err(pyo3::exceptions::PyKeyError::new_err(
                 format!("'{}' not in header", key)
             ));
@@ -1000,6 +1107,23 @@ impl FITSHeader {
         )?;
         *guard = new_cards;
         Ok(())
+    }
+
+    // Append a COMMENT card.  Long text auto-splits across multiple cards
+    // (FITS has no CONTINUE convention for commentary keys).
+    fn add_comment(&self, text: &str) -> PyResult<()> {
+        self.append_commentary("COMMENT", text)
+    }
+
+    // Append a HISTORY card.  Long text auto-splits across multiple cards.
+    fn add_history(&self, text: &str) -> PyResult<()> {
+        self.append_commentary("HISTORY", text)
+    }
+
+    // Append a blank-keyword commentary card (cols 1-8 blank).  Long text
+    // auto-splits across multiple cards.
+    fn add_blank(&self, text: &str) -> PyResult<()> {
+        self.append_commentary("", text)
     }
 
     // Bulk update from a mapping or another FITSHeader.  Performs all
@@ -1146,7 +1270,9 @@ impl FITSHeaderEdit {
         let key = normalize_keyword(key);
         if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             return Err(PyValueError::new_err(format!(
-                "setting commentary key '{}' is not yet supported (deferred)", key
+                "subscript assignment to commentary key '{}' is not supported; \
+                 use add_comment(text) / add_history(text) / add_blank(text) to append",
+                key
             )));
         }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
@@ -1156,16 +1282,37 @@ impl FITSHeaderEdit {
     fn __delitem__(&mut self, key: &str) -> PyResult<()> {
         self.ensure_active()?;
         let key = normalize_keyword(key);
-        if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
-            return Err(PyValueError::new_err(format!(
-                "deleting commentary key '{}' is not yet supported (deferred)", key
-            )));
-        }
-        if !delete_card_for_key(&mut self.cards, &key) {
+        let removed = if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
+            delete_commentary_cards(&mut self.cards, &key) > 0
+        } else {
+            delete_card_for_key(&mut self.cards, &key)
+        };
+        if !removed {
             return Err(pyo3::exceptions::PyKeyError::new_err(
                 format!("'{}' not in header", key)
             ));
         }
+        Ok(())
+    }
+
+    fn add_comment(&mut self, text: &str) -> PyResult<()> {
+        self.ensure_active()?;
+        validate_commentary_text(text)?;
+        append_commentary_to_cards(&mut self.cards, "COMMENT", text);
+        Ok(())
+    }
+
+    fn add_history(&mut self, text: &str) -> PyResult<()> {
+        self.ensure_active()?;
+        validate_commentary_text(text)?;
+        append_commentary_to_cards(&mut self.cards, "HISTORY", text);
+        Ok(())
+    }
+
+    fn add_blank(&mut self, text: &str) -> PyResult<()> {
+        self.ensure_active()?;
+        validate_commentary_text(text)?;
+        append_commentary_to_cards(&mut self.cards, "", text);
         Ok(())
     }
 
