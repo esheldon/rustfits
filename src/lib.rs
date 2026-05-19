@@ -991,7 +991,10 @@ fn apply_setitem(
 // Collect (key, value, explicit_comment) triples to apply from a source —
 // either a FITSHeader (cards are walked to preserve comments) or any object
 // with `.items()` returning (key, value-or-(value, comment)).  Commentary
-// keys in the source raise (deferred to phase 2c).
+// keys (COMMENT/HISTORY/blank) raise by design: they aren't single-valued,
+// so there's no unambiguous append-vs-replace meaning for update(); users
+// route those through the dedicated add_comment/add_history/add_blank
+// helpers, matching the same rule applied to subscript assignment.
 fn collect_update_triples(
     py: Python<'_>,
     other: &Bound<'_, PyAny>,
@@ -1012,8 +1015,9 @@ fn collect_update_triples(
             }
             if matches!(kw_field_trimmed, "COMMENT" | "HISTORY" | "") {
                 return Err(PyValueError::new_err(format!(
-                    "source header contains commentary key '{}' which \
-                     update() does not yet support (deferred)",
+                    "source header contains commentary key '{}' which update() \
+                     does not accept; use add_comment(text) / add_history(text) \
+                     / add_blank(text) to append commentary cards",
                     kw_field_trimmed
                 )));
             }
@@ -1051,7 +1055,10 @@ fn collect_update_triples(
             let k = normalize_keyword(&k_raw);
             if matches!(k.as_str(), "COMMENT" | "HISTORY" | "") {
                 return Err(PyValueError::new_err(format!(
-                    "update() does not yet support commentary key '{}' (deferred)", k
+                    "update() does not accept commentary key '{}'; \
+                     use add_comment(text) / add_history(text) / \
+                     add_blank(text) to append commentary cards",
+                    k
                 )));
             }
             let val_obj = pair.get_item(1)?;

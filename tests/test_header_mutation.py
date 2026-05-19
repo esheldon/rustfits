@@ -1,4 +1,4 @@
-"""Phase 2a tests for FITSHeader mutation:
+"""Tests for FITSHeader mutation basics:
     - __setitem__ (bare value and (value, comment) tuple)
     - __delitem__
     - update() from dict, mapping, FITSHeader source
@@ -6,10 +6,8 @@
     - Persistence across close/reopen
     - Case-insensitive keyword normalization
     - Slack-only header overflow rejected
-    - Commentary keys raise
-
-Phase 2b features (CONTINUE-on-write, complex values, commentary append) are
-deferred and are NOT tested here.
+    - Commentary key assignment via subscript raises (use the dedicated
+      add_comment/add_history/add_blank helpers instead).
 """
 
 import os

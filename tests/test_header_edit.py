@@ -9,9 +9,6 @@ Verifies that:
     - The handle rejects mutations outside a `with` and after commit.
     - update() and __delitem__ behave the same as on FITSHeader, but
       batched.
-
-Phase 2b feature set: still no CONTINUE-on-write, no complex values, no
-commentary-append helpers — those are deferred.
 """
 
 import os
