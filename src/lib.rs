@@ -1073,18 +1073,49 @@ fn apply_setitem(
     Ok(())
 }
 
-// Collect (key, value, explicit_comment) triples to apply from a source —
-// either a FITSHeader (cards are walked to preserve comments) or any object
-// with `.items()` returning (key, value-or-(value, comment)).  Commentary
-// keys (COMMENT/HISTORY/blank) raise by design: they aren't single-valued,
-// so there's no unambiguous append-vs-replace meaning for update(); users
-// route those through the dedicated add_comment/add_history/add_blank
-// helpers, matching the same rule applied to subscript assignment.
-fn collect_update_triples(
+// One staged change produced by `collect_update_actions`.  Used by both the
+// regular and edit()-batched update() paths.
+enum UpdateAction {
+    // A keyword-value assignment (the common case).  `explicit_comment`
+    // mirrors `apply_setitem`'s third arg: `Some("")` means "use empty",
+    // `None` means "preserve any existing comment on this key".
+    SetKey {
+        key: String,
+        value: Py<PyAny>,
+        explicit_comment: Option<String>,
+    },
+    // An append of a single commentary card (only ever emitted by the
+    // FITSHeader branch when `copy_commentary=true`).  Verbatim per source
+    // card — if the source split a long commentary across N cards, we
+    // append N cards in order.
+    AppendCommentary { keyword: String, text: String },
+}
+
+// Collect the actions to apply from a source — either a FITSHeader (cards
+// are walked to preserve comments) or any object with `.items()` returning
+// (key, value-or-(value, comment)).
+//
+// Commentary key policy:
+//   - FITSHeader source: if `copy_commentary=true`, append each commentary
+//     card verbatim to the destination; otherwise silently skip.  Silent
+//     skip (rather than raise) matches how we treat protected keys from a
+//     header source — the common case is "copy structured metadata from
+//     this other header" and forcing the caller to write try/except (or
+//     pre-filter commentary cards) just to make that work would be hostile.
+//   - Dict (mapping) source: always raise on COMMENT/HISTORY/blank.  An
+//     explicit hand-written commentary key is ambiguous (single value vs
+//     append?), almost certainly a mistake; the `copy_commentary` flag is
+//     meaningful only for header-to-header copy.
+//
+// Protected-key policy:
+//   - FITSHeader source: silently skip.
+//   - Dict source: raise.
+fn collect_update_actions(
     py: Python<'_>,
     other: &Bound<'_, PyAny>,
-) -> PyResult<Vec<(String, Py<PyAny>, Option<String>)>> {
-    let mut triples: Vec<(String, Py<PyAny>, Option<String>)> = Vec::new();
+    copy_commentary: bool,
+) -> PyResult<Vec<UpdateAction>> {
+    let mut actions: Vec<UpdateAction> = Vec::new();
 
     if let Ok(src) = other.cast::<FITSHeader>() {
         let src_cards = src.borrow().snapshot()?;
@@ -1099,12 +1130,23 @@ fn collect_update_triples(
                 continue;
             }
             if matches!(kw_field_trimmed, "COMMENT" | "HISTORY" | "") {
-                return Err(PyValueError::new_err(format!(
-                    "source header contains commentary key '{}' which update() \
-                     does not accept; use add_comment(text) / add_history(text) \
-                     / add_blank(text) to append commentary cards",
-                    kw_field_trimmed
-                )));
+                if copy_commentary {
+                    // Extract text from cols 9-80 (or end-of-card), strip
+                    // trailing pad spaces.  One append per source card —
+                    // preserves the source's exact split into cards.
+                    let text = if card.len() > 8 {
+                        card[8..].trim_end().to_string()
+                    } else {
+                        String::new()
+                    };
+                    actions.push(UpdateAction::AppendCommentary {
+                        keyword: kw_field_trimmed.to_string(),
+                        text,
+                    });
+                }
+                // Default (copy_commentary=false): silently skip — see the
+                // policy comment on this fn.
+                continue;
             }
             let kw = keyword_of(card).unwrap_or_default();
             if kw.is_empty() {
@@ -1123,7 +1165,11 @@ fn collect_update_triples(
                 let (value, comment) = parse_value_with_continue(
                     py, &src_cards, i, &trimmed[eq_pos + 1..],
                 )?;
-                triples.push((kw, value, Some(comment)));
+                actions.push(UpdateAction::SetKey {
+                    key: kw,
+                    value,
+                    explicit_comment: Some(comment),
+                });
             }
         }
     } else {
@@ -1170,11 +1216,15 @@ fn collect_update_triples(
             }
             let val_obj = pair.get_item(1)?;
             let (v, c) = parse_setitem_value(&val_obj)?;
-            triples.push((k, v.unbind(), c));
+            actions.push(UpdateAction::SetKey {
+                key: k,
+                value: v.unbind(),
+                explicit_comment: c,
+            });
         }
     }
 
-    Ok(triples)
+    Ok(actions)
 }
 
 // Rewrite the header on disk in place.  Cards are serialized to one or more
@@ -1632,17 +1682,27 @@ impl FITSHeader {
     }
 
     // Bulk update from a mapping or another FITSHeader.  Performs all
-    // mutations under a single lock and disk rewrite.  Commentary keys
-    // (COMMENT/HISTORY/blank) in the source raise — they need explicit
-    // append/replace helpers (phase 2b).
+    // mutations under a single lock and disk rewrite.
     //
     // For a FITSHeader source we copy cards directly to preserve comments;
-    // for any other mapping we use `.items()`, where each value is either a
-    // bare scalar or a `(value, comment)` tuple.
-    fn update(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+    // for any other mapping we use `.items()`, where each value is either
+    // a bare scalar or a `(value, comment)` tuple.
+    //
+    // Commentary cards (COMMENT/HISTORY/blank) in a FITSHeader source are
+    // appended verbatim to the destination when `copy_commentary=True`;
+    // by default they raise so that repeated update() calls don't silently
+    // accumulate duplicated provenance.  Dict-source commentary keys
+    // always raise regardless of the flag.
+    #[pyo3(signature = (other, *, copy_commentary=false))]
+    fn update(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        copy_commentary: bool,
+    ) -> PyResult<()> {
         check_not_tainted(&self.tainted)?;
-        let triples = collect_update_triples(py, other)?;
-        if triples.is_empty() {
+        let actions = collect_update_actions(py, other, copy_commentary)?;
+        if actions.is_empty() {
             return Ok(());
         }
         // Stage all mutations on a working clone, write to disk, then
@@ -1651,8 +1711,18 @@ impl FITSHeader {
         let mut guard = self.cards.lock()
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         let mut new_cards = guard.clone();
-        for (k, v, explicit_comment) in &triples {
-            apply_setitem(&mut new_cards, k, v.bind(py), explicit_comment.clone())?;
+        for action in &actions {
+            match action {
+                UpdateAction::SetKey { key, value, explicit_comment } => {
+                    apply_setitem(
+                        &mut new_cards, key, value.bind(py),
+                        explicit_comment.clone(),
+                    )?;
+                }
+                UpdateAction::AppendCommentary { keyword, text } => {
+                    append_commentary_to_cards(&mut new_cards, keyword, text);
+                }
+            }
         }
         rewrite_header_to_disk(
             &self.file,
@@ -1841,11 +1911,27 @@ impl FITSHeaderEdit {
         Ok(())
     }
 
-    fn update(&mut self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(signature = (other, *, copy_commentary=false))]
+    fn update(
+        &mut self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+        copy_commentary: bool,
+    ) -> PyResult<()> {
         self.ensure_active()?;
-        let triples = collect_update_triples(py, other)?;
-        for (k, v, explicit_comment) in &triples {
-            apply_setitem(&mut self.cards, k, v.bind(py), explicit_comment.clone())?;
+        let actions = collect_update_actions(py, other, copy_commentary)?;
+        for action in &actions {
+            match action {
+                UpdateAction::SetKey { key, value, explicit_comment } => {
+                    apply_setitem(
+                        &mut self.cards, key, value.bind(py),
+                        explicit_comment.clone(),
+                    )?;
+                }
+                UpdateAction::AppendCommentary { keyword, text } => {
+                    append_commentary_to_cards(&mut self.cards, keyword, text);
+                }
+            }
         }
         Ok(())
     }

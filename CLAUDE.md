@@ -109,7 +109,7 @@ Internal paths that legitimately update structural keys (e.g.
 not through `__setitem__`, so the guard doesn't break them.
 
 `update()` policy on protected keys is split by source type, both
-enforced in `collect_update_triples`:
+enforced in `collect_update_actions`:
 
 - **FITSHeader source:** silently skips protected keys.  The use case is
   "copy the metadata from this other HDU's header" — the destination
@@ -120,6 +120,43 @@ enforced in `collect_update_triples`:
   An explicit hand-written `{"BITPIX": 32}` in user code is almost
   certainly a mistake, not an intent to be silently dropped.  The whole
   update is rejected wholesale (no partial commit).
+
+## update() and commentary cards
+
+Commentary keys (COMMENT, HISTORY, blank) are handled in parallel to
+protected keys but with an opt-in carry-over via the keyword-only
+`copy_commentary: bool = False` arg on `FITSHeader.update()` and
+`FITSHeaderEdit.update()`:
+
+- **FITSHeader source, `copy_commentary=False` (default):** silently skip
+  commentary cards.  Matches the protected-key skip rule — the common
+  case is "copy structured metadata from this other header" and forcing
+  the caller to write try/except just to make that work would be hostile.
+- **FITSHeader source, `copy_commentary=True`:** append each commentary
+  card verbatim, one append per source card (a long commentary that the
+  source split across N cards stays split as N cards in the destination).
+  No deduplication — see "design notes" below.
+- **Dict source:** always raises on `COMMENT`/`HISTORY`/`""` (blank),
+  regardless of `copy_commentary`.  The flag is meaningful only for
+  header-to-header copy; an explicit `"COMMENT"` in a hand-written dict
+  is ambiguous and almost certainly a mistake.
+
+Design notes:
+
+- **No dedup against the destination.** Tempting but ultimately broken:
+  multi-card commentary would be partially matched (skipping card 1 while
+  appending cards 2+3 leaves a corrupted entry), and HISTORY collisions
+  often refer to different things (e.g. two "Bias subtracted" lines about
+  different bias frames).  HISTORY is also an append-only audit trail per
+  the FITS standard, so duplicate-on-rerun is arguably the right behavior.
+  The user opts in once per source for the metadata-copy workflow.
+- **Mechanically:** `collect_update_actions` returns a `Vec<UpdateAction>`
+  where each entry is `SetKey { key, value, explicit_comment }` or
+  `AppendCommentary { keyword, text }`.  Both `FITSHeader::update` and
+  `FITSHeaderEdit::update` walk the list and dispatch via match — set
+  actions go through `apply_setitem`, commentary actions through
+  `append_commentary_to_cards`.  Same disk-write-before-commit ordering
+  as every other mutation path.
 
 **Forward-looking (Tier 2, deferred until table writing lands):** the
 image-only metadata keys `BUNIT`, `BSCALE`, `BZERO` are *not* protected —
