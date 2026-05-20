@@ -375,6 +375,82 @@ failure inside the shift loop, the post-shift `flush`, or the subsequent
 header `write_all`/`flush` DOES taint, because the file may now be
 inconsistent.  See the `check_not_tainted` block above.
 
+## Binary table read TODO
+
+Snapshot of what's still missing for BINTABLE reading, ordered by what
+seems most useful next.  Cross off as features land; revisit ordering
+when new use cases show up.
+
+**Currently supported.**  Fixed L/B/I/J/K/A/E/D/C/M/X (with TDIM
+reshape on numeric and X).  Variable-length P/Q descriptors with inner
+L/B/I/J/K/A/E/D/C/M (Object dtype, one ndarray per row; A as str or
+`as_bytes` bytes).  THEAP respected.  TSCAL/TZERO scaling on default
+(unsigned-int trick → matching unsigned dtype, general → f8;
+`scale=False` opt-out).  `rows=` / `columns=` subsets + `__getitem__`
+column-subset objects.
+
+**Likely high-value next steps**
+
+1. **TNULLn sentinel** — integer columns can carry a "no data" value
+   in TNULLn.  fitsio promotes those rows to NaN / a masked array;
+   right now rustfits returns the raw sentinel integer like any other
+   value.  Pick a representation (masked array vs NaN vs separate
+   mask, behind a kwarg) before implementing.
+
+2. **Variable-length P/Q with `repeat > 1`** — currently rejected.
+   Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor
+   means N descriptors per row, each pointing at its own heap cell.
+   Field dtype would need to be an Object array of shape `(repeat,)`
+   per row, or some other reshape — decide before coding.
+
+3. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
+   a P/Q column would mean "reshape each heap cell to these dims",
+   which is useful for VLA-of-images.  Each cell still uses the
+   inner element type; the reshape is just on the ndarray after
+   the heap read.
+
+4. **Variable-length P/QX (bit array in heap)** — rejected (inner X).
+   Niche.  Heap bytes are the same MSB-packed format as fixed X;
+   the heap-side unpacker would mirror `convert_x_cell`.
+
+5. **`max_size`-style read for variable columns** — fitsio offers a
+   mode where each variable cell becomes a fixed-size N-D array
+   padded to the largest cell.  Explicitly deferred (user request);
+   noted here so we don't forget.
+
+**Convenience / API surface**
+
+6. **`hdu[5]` returning a single record** — currently rejected because
+   `__getitem__` requires a slice or iterable of ints.  Natural
+   Python-ism (matches numpy structured-array indexing); should
+   return a 0-d record / np.void.
+
+7. **`hdu.nrows`, `len(hdu)`, `hdu.colnames`** — small accessors.
+   Today the equivalents are `len(hdu.dtype)` (column count), reading
+   NAXIS2 from the header, and `hdu.dtype.names`.
+
+8. **`TUNITn`** — column-units metadata.  Probably attach to
+   `dtype.metadata`; expose via a `.units` accessor or similar.
+   Informational only; doesn't affect read semantics.
+
+9. **`TDISPn`** — display format hint.  Informational; lower
+   priority than TUNIT.
+
+10. **Better `__repr__` for `TableHDU`** — currently just shows the
+    HDU index.  Showing nrows + column names is more useful.
+
+**Probably not worth chasing yet**
+
+- **Compressed BINTABLE (tile-compressed tables, ZTABLE)** — large,
+  separate spec.  Image tile compression (`ZIMAGE`) is the more
+  commonly-needed sibling and isn't done either; do that first.
+- **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format, vanishingly
+  rare in new files.
+- **Memory-mapped reads** — chunked sequential I/O already keeps peak
+  RSS at ~1 MiB above the output array, so the motivation is weak.
+- **Streaming / row-iterator API** — for tables that don't fit in RAM.
+  No user has asked yet; add when one does.
+
 ## Testing conventions
 
 For any mutation test, verify the outcome through **both**:
