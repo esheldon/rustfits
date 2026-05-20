@@ -1,4 +1,5 @@
-"""Tests for FITSHeader mutation basics:
+"""
+Tests for FITSHeader mutation basics:
     - __setitem__ (bare value and (value, comment) tuple)
     - __delitem__
     - update() from dict, mapping, FITSHeader source
@@ -271,7 +272,8 @@ def test_invalid_keyword_chars_rejected():
 
 
 def test_long_keyword_promoted_to_hierarch():
-    """Keys longer than 8 characters are now written as HIERARCH cards
+    """
+    Keys longer than 8 characters are now written as HIERARCH cards
     instead of being rejected (phase 2c).  Comprehensive HIERARCH behavior
     is covered in tests/test_header_hierarch_write.py; this is a regression
     guard against the old "reject long keys" contract from phase 2a."""
@@ -285,7 +287,8 @@ def test_long_keyword_promoted_to_hierarch():
 
 
 def test_header_overflow_triggers_grow():
-    """One card past capacity triggers the file-tail shift and grows the
+    """
+    One card past capacity triggers the file-tail shift and grows the
     reserved header blocks; the new key lands on disk and round-trips
     through close-and-reopen."""
     with _new_file() as fname:

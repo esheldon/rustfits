@@ -1,4 +1,5 @@
-"""Tests for ImageHDU.__getitem__: numpy-style sliced reads.
+"""
+Tests for ImageHDU.__getitem__: numpy-style sliced reads.
 
 Covers integer indexing (with axis dropping), slice indexing (with and
 without step), Ellipsis, multi-axis combinations, error cases, and a
@@ -19,7 +20,8 @@ import rustfits
 
 
 def _make_test_image(fname, shape, dtype="f8"):
-    """Create a FITS file with one image HDU filled with arange data,
+    """
+    Create a FITS file with one image HDU filled with arange data,
     returning the in-memory reference array."""
     reference = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
     with rustfits.FITS(fname, "w+") as fits:
@@ -83,7 +85,8 @@ def test_negative_int_index():
 
 
 def test_int_on_fast_axis_drops_axis():
-    """Int index on the *fast* numpy axis (== FITS NAXIS1).  Requires the
+    """
+    Int index on the *fast* numpy axis (== FITS NAXIS1).  Requires the
     engine to do one read per outer position rather than a single strip."""
     shape = (10, 20)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -135,7 +138,8 @@ def test_slice_2d_subregion():
 
 
 def test_step_on_slow_axis():
-    """Step on the *slow* axis: each output row reads a full contiguous
+    """
+    Step on the *slow* axis: each output row reads a full contiguous
     strip; the outer iteration skips every other row."""
     shape = (10, 20)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -148,7 +152,8 @@ def test_step_on_slow_axis():
 
 
 def test_step_on_fast_axis():
-    """Step on the *fast* axis: strip coalescing stops at the fast axis,
+    """
+    Step on the *fast* axis: strip coalescing stops at the fast axis,
     so each strided element is read individually."""
     shape = (10, 20)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -260,7 +265,8 @@ def test_empty_slice_on_fast_axis():
 
 
 def test_slice_past_end_clamps():
-    """Slice bounds past the end of the axis are clamped by Python's
+    """
+    Slice bounds past the end of the axis are clamped by Python's
     slice.indices, matching numpy behavior."""
     shape = (10, 20)
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,4 +1,5 @@
-"""Tests for FITS.create_image_hdu.
+"""
+Tests for FITS.create_image_hdu.
 
 Verifies:
     - first call creates a primary image HDU (SIMPLE/EXTEND); subsequent
@@ -114,7 +115,8 @@ def test_zero_dim_rejected():
 
 
 def test_roundtrip_via_reopen():
-    """Write a primary image, close, reopen read-only, verify the parser
+    """
+    Write a primary image, close, reopen read-only, verify the parser
     can re-read what we wrote and finds the data section in the right place
     (a misaligned data section would corrupt the HDU offset for any later
     extension).
@@ -143,7 +145,8 @@ def test_roundtrip_via_reopen():
 
 
 def test_data_section_padded_and_zero():
-    """File on disk must have the data section padded to a 2880-byte boundary
+    """
+    File on disk must have the data section padded to a 2880-byte boundary
     and filled with zeros (allocated via sparse extension)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
@@ -175,7 +178,8 @@ def test_naxis0_has_no_data_section():
 
 
 def test_extname_with_embedded_quote():
-    """Single quotes inside EXTNAME must be doubled per the FITS standard,
+    """
+    Single quotes inside EXTNAME must be doubled per the FITS standard,
     and the round-trip must recover the original string."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")

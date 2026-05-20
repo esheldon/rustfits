@@ -1,4 +1,5 @@
-"""Top-level convenience functions.
+"""
+Top-level convenience functions.
 
 Thin wrappers around the FITS / HDU API for the most common
 "just give me the data" patterns.  Currently:
@@ -14,7 +15,8 @@ from ._rust import FITS, ImageHDU, TableHDU
 
 def read(filename, ext=None, *, rows=None, columns=None,
          scale=True, mask_null=False, header=False):
-    """Open `filename`, read data from one HDU, and return it.
+    """
+    Open `filename`, read data from one HDU, and return it.
 
     Parameters
     ----------

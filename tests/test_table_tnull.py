@@ -1,4 +1,5 @@
-"""Tests for TNULLn integer-sentinel masking on BINTABLE reads.
+"""
+Tests for TNULLn integer-sentinel masking on BINTABLE reads.
 
 `mask_null=True` returns a numpy.ma.MaskedArray with per-element masks
 set wherever a stored integer equals the column's TNULLn.  Compare is
@@ -49,7 +50,8 @@ def _write_bintable(path, ext_cards, data_bytes):
 
 
 def _bintable_cards(naxis1, naxis2, fields, extras=None):
-    """Minimal BINTABLE header cards + optional extras.
+    """
+    Minimal BINTABLE header cards + optional extras.
 
     `fields` is a list of (ttype, tform, optional tdim) tuples.  `extras`
     is a list of fully-formed card strings inserted before END.
@@ -93,7 +95,8 @@ def _tzero_card(col_index, value):
 
 
 def test_default_returns_plain_ndarray():
-    """Without mask_null=True the result is a regular structured array,
+    """
+    Without mask_null=True the result is a regular structured array,
     even when TNULL is set and rows hit it."""
     fields = [("X", "1I")]
     data = struct.pack(">hhh", 10, -32768, 30)
@@ -171,7 +174,8 @@ def test_tnull_byte_basic():
 
 
 def test_tnull_no_sentinel_hit():
-    """TNULLn declared in header but no row matches: mask all-False but
+    """
+    TNULLn declared in header but no row matches: mask all-False but
     the result is still a MaskedArray (consistent return type)."""
     fields = [("X", "1J")]
     data = struct.pack(">iii", 1, 2, 3)
@@ -186,7 +190,8 @@ def test_tnull_no_sentinel_hit():
 
 
 def test_mask_null_true_with_no_tnull_anywhere():
-    """mask_null=True on a table where no column declares TNULL.  Result
+    """
+    mask_null=True on a table where no column declares TNULL.  Result
     is MaskedArray; nothing is masked.
 
     Note: for STRUCTURED arrays numpy.ma always materializes a bool
@@ -207,7 +212,8 @@ def test_mask_null_true_with_no_tnull_anywhere():
 
 
 def test_tnull_silently_ignored_for_float_column():
-    """TNULL on an E (float) column has no meaning per the FITS spec
+    """
+    TNULL on an E (float) column has no meaning per the FITS spec
     and is silently ignored: no row is masked even with mask_null=True.
     """
     fields = [("X", "1E")]
@@ -228,7 +234,8 @@ def test_tnull_silently_ignored_for_float_column():
 
 
 def test_tnull_per_field_isolation():
-    """Multi-column: TNULL set only on one int field; other fields'
+    """
+    Multi-column: TNULL set only on one int field; other fields'
     masks stay all-False even when their values happen to coincide
     with the masked column's sentinel."""
     fields = [("A", "1J"), ("B", "1J"), ("C", "1D")]
@@ -254,7 +261,8 @@ def test_tnull_per_field_isolation():
 
 
 def test_tnull_with_unsigned_int_trick():
-    """I + TZERO=32768 produces u2 output (unsigned trick).  Mask is
+    """
+    I + TZERO=32768 produces u2 output (unsigned trick).  Mask is
     computed against the STORED i2 sentinel — independent of scaling."""
     # Stored values: [0, -32768, 32767, -32768] → physical u2:
     # [32768, 0, 65535, 0]
@@ -292,7 +300,8 @@ def test_tnull_with_general_scaling():
 
 
 def test_tnull_scale_false():
-    """scale=False returns raw stored ints.  mask_null still masks the
+    """
+    scale=False returns raw stored ints.  mask_null still masks the
     sentinel rows since the compare is in stored space anyway."""
     data = struct.pack(">hhh", 5, -1, 10)
     fields = [("X", "1I")]
@@ -334,7 +343,8 @@ def test_tnull_repeat_gt_1_per_element():
 
 
 def test_tnull_with_tdim_reshape():
-    """6J with TDIM=(3,2) → per-row shape (2, 3) (reversed TDIM).
+    """
+    6J with TDIM=(3,2) → per-row shape (2, 3) (reversed TDIM).
     Mask reshapes alongside the data."""
     fields = [("X", "6J", "(3,2)")]
     rows = b""
@@ -365,7 +375,8 @@ def test_tnull_with_tdim_reshape():
 
 
 def test_tnull_with_rows_subset():
-    """rows= subset: mask is aligned with the output (user-requested)
+    """
+    rows= subset: mask is aligned with the output (user-requested)
     order, not the on-disk order."""
     fields = [("X", "1J")]
     rows = struct.pack(">5i", 10, -1, 30, -1, 50)
@@ -400,7 +411,8 @@ def test_tnull_with_columns_subset():
 
 
 def test_read_column_tnull_basic():
-    """read_column with mask_null=True on an int col with TNULL → plain
+    """
+    read_column with mask_null=True on an int col with TNULL → plain
     MaskedArray (not structured)."""
     fields = [("X", "1J")]
     data = struct.pack(">iii", 7, -1, 9)
@@ -431,7 +443,8 @@ def test_read_column_tnull_default_off():
 
 
 def test_read_column_tnull_no_tnull():
-    """read_column with mask_null=True on a col without TNULL: returns
+    """
+    read_column with mask_null=True on a col without TNULL: returns
     a MaskedArray with nomask (consistent type, zero overhead)."""
     fields = [("X", "1D")]
     data = struct.pack(">ddd", 1.0, 2.0, 3.0)
@@ -446,7 +459,8 @@ def test_read_column_tnull_no_tnull():
 
 
 def test_read_column_tnull_multi_element():
-    """read_column with mask_null=True on a 3J col → MaskedArray shape
+    """
+    read_column with mask_null=True on a 3J col → MaskedArray shape
     (n_rows, 3) with per-element mask."""
     fields = [("X", "3J")]
     rows = (
@@ -486,7 +500,8 @@ def _vla_with_tnull_cards():
 
 
 def test_vla_tnull_mask_null_true_raises():
-    """VLA + TNULL + mask_null=True is not yet supported and must error
+    """
+    VLA + TNULL + mask_null=True is not yet supported and must error
     cleanly before any I/O."""
     cards, data = _vla_with_tnull_cards()
     with tempfile.TemporaryDirectory() as tmp:
@@ -500,7 +515,8 @@ def test_vla_tnull_mask_null_true_raises():
 
 
 def test_vla_tnull_mask_null_false_ok():
-    """VLA with TNULL in header is fine to read when mask_null=False
+    """
+    VLA with TNULL in header is fine to read when mask_null=False
     (the default).  Result is the usual Object-dtype column."""
     cards, data = _vla_with_tnull_cards()
     with tempfile.TemporaryDirectory() as tmp:

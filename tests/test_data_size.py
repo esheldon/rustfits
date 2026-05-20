@@ -1,4 +1,5 @@
-"""Tests for HDU data-unit size calculation.
+"""
+Tests for HDU data-unit size calculation.
 
 The FITS formula is:
 
@@ -34,7 +35,8 @@ def _pad_block(b):
 
 
 def test_pcount_used_for_bintable_heap():
-    """A BINTABLE declares PCOUNT=5000 (variable-length heap).  The reader
+    """
+    A BINTABLE declares PCOUNT=5000 (variable-length heap).  The reader
     must add PCOUNT to the row-array size, otherwise it lands inside the
     heap when searching for the next HDU."""
     primary_cards = [
@@ -85,7 +87,8 @@ def test_pcount_used_for_bintable_heap():
 
 
 def test_gcount_multiplies_data_size():
-    """A header with GCOUNT=2 must produce a data unit twice as large as
+    """
+    A header with GCOUNT=2 must produce a data unit twice as large as
     GCOUNT=1 would imply, even with PCOUNT=0.  Constructs an artificial
     header where this difference crosses a 2880-byte block boundary."""
     primary_cards = [
@@ -137,7 +140,8 @@ def test_gcount_multiplies_data_size():
 
 
 def test_image_hdu_unaffected_by_defaults():
-    """An image HDU without PCOUNT/GCOUNT keywords must still compute the
+    """
+    An image HDU without PCOUNT/GCOUNT keywords must still compute the
     same data size as before (GCOUNT defaults to 1, PCOUNT to 0)."""
     primary_cards = [
         _card("SIMPLE  =                    T"),

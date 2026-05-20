@@ -1,4 +1,5 @@
-"""Tests for ImageHDU.extend on HDUs that are NOT the last on disk.
+"""
+Tests for ImageHDU.extend on HDUs that are NOT the last on disk.
 
 When an image-extend grows the data section of an HDU with other HDUs
 after it, the file tail is shifted forward via the same primitive used
@@ -96,7 +97,8 @@ def test_extend_middle_image_shifts_only_later_hdus():
 
 
 def test_old_hdu_handle_sees_post_extend_offsets():
-    """An HDU reference captured BEFORE the extend on an earlier HDU
+    """
+    An HDU reference captured BEFORE the extend on an earlier HDU
     must still read correctly afterward — the Arc<HduOffsets> is shared."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -131,7 +133,8 @@ def test_old_fitsheader_handle_sees_post_extend_offsets():
 
 
 def test_extend_grows_multiple_blocks_in_one_call():
-    """A single extend can push the data section across many 2880-byte
+    """
+    A single extend can push the data section across many 2880-byte
     block boundaries.  Verify both grown data and subsequent HDU."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -155,7 +158,8 @@ def test_extend_grows_multiple_blocks_in_one_call():
 
 
 def test_extend_zero_fills_gap_before_new_data():
-    """Extend with a start past the current end leaves a gap between the
+    """
+    Extend with a start past the current end leaves a gap between the
     old data and the new rows.  After the shift, the gap must read as
     zero — the bytes shifted out of place must not leak back as data."""
     with _new_three_image_hdus() as (fname, arrays):
@@ -203,7 +207,8 @@ def test_two_sequential_extends_on_middle_hdu_compose():
 
 
 def test_extend_within_existing_padding_does_not_shift_tail():
-    """If the new data still fits in the currently-padded last block,
+    """
+    If the new data still fits in the currently-padded last block,
     no file shift is required — only the in-block bytes change.  The
     test exercises the path where new_padded == current_padded."""
     with tempfile.TemporaryDirectory() as tmpdir:

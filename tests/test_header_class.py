@@ -1,4 +1,5 @@
-"""Tests for the FITSHeader mapping protocol.
+"""
+Tests for the FITSHeader mapping protocol.
 
 Covers iteration order, len, keys/values/items, get(), cards, to_dict(),
 __contains__, and the string repr/str.  Uses a hand-crafted file with a

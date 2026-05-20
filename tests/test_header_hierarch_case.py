@@ -1,4 +1,5 @@
-"""Case-preservation tests for HIERARCH long keys (ESO convention).
+"""
+Case-preservation tests for HIERARCH long keys (ESO convention).
 
 Contract:
   - On WRITE, the user's case is preserved verbatim on disk (only internal
@@ -73,7 +74,8 @@ def test_uppercase_hierarch_still_uppercase_on_disk():
 
 
 def test_standard_short_key_still_uppercased_on_disk():
-    """The case-preservation rule applies ONLY to HIERARCH.  A standard
+    """
+    The case-preservation rule applies ONLY to HIERARCH.  A standard
     8-char key in lowercase is still uppercased on disk (FITS standard)."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -129,7 +131,8 @@ def test_delete_is_case_insensitive():
 
 
 def test_update_existing_key_keeps_original_spelling():
-    """Setting an existing HIERARCH key with a different-case spelling
+    """
+    Setting an existing HIERARCH key with a different-case spelling
     must KEEP the original card's spelling — value changes, key text
     on disk does not."""
     with _new_file() as fname:
@@ -155,7 +158,8 @@ def test_update_existing_key_keeps_original_spelling():
 
 
 def test_dict_update_preserves_user_case_on_new_key():
-    """For brand-new keys via update(dict), the user's case from the
+    """
+    For brand-new keys via update(dict), the user's case from the
     dict literal is preserved on disk."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -167,7 +171,8 @@ def test_dict_update_preserves_user_case_on_new_key():
 
 
 def test_dict_update_existing_key_keeps_spelling():
-    """update(dict) on an existing HIERARCH key keeps the existing
+    """
+    update(dict) on an existing HIERARCH key keeps the existing
     card's spelling, regardless of dict-side case."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -187,7 +192,8 @@ def test_dict_update_existing_key_keeps_spelling():
 
 
 def test_extra_internal_spaces_collapsed_on_write():
-    """ESO convention is single-space separators between words.  User
+    """
+    ESO convention is single-space separators between words.  User
     input with multiple spaces is collapsed at write time.  (Non-space
     whitespace like tab is still rejected by validate_keyword — keywords
     must be space-separated per the convention.)"""
@@ -224,7 +230,8 @@ def test_keys_returns_storage_form():
 
 
 def test_long_string_value_with_mixed_case_hierarch_key():
-    """The CONTINUE-chained HIERARCH first card must carry the user's
+    """
+    The CONTINUE-chained HIERARCH first card must carry the user's
     case in the keyword position."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

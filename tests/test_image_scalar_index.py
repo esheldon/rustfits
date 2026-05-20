@@ -1,4 +1,5 @@
-"""Tests for `image_hdu[i, j, ...]` returning a numpy scalar when
+"""
+Tests for `image_hdu[i, j, ...]` returning a numpy scalar when
 every axis is integer-indexed.
 
 Matches numpy semantics: each integer index reduces a dimension; if
@@ -17,7 +18,8 @@ import rustfits
 
 
 def _make_image(tmpdir, dtype, dims, fill=None):
-    """Create a FITS file with one image HDU populated with arange()
+    """
+    Create a FITS file with one image HDU populated with arange()
     data so each pixel is easy to predict.  Returns the file path."""
     fname = os.path.join(tmpdir, "img.fits")
     n = int(np.prod(dims))
@@ -36,7 +38,8 @@ def _make_image(tmpdir, dtype, dims, fill=None):
 
 
 def test_2d_all_int_returns_scalar():
-    """`hdu[i, j]` on a 2-D image returns a numpy scalar matching the
+    """
+    `hdu[i, j]` on a 2-D image returns a numpy scalar matching the
     BITPIX dtype."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, arr = _make_image(tmp, "f8", (3, 5))
@@ -85,7 +88,8 @@ def test_3d_all_int_returns_scalar():
     ],
 )
 def test_scalar_dtype_matches_bitpix(dtype, np_scalar_type):
-    """The scalar returned for `hdu[i, j]` is the numpy type matching
+    """
+    The scalar returned for `hdu[i, j]` is the numpy type matching
     the image's BITPIX."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_image(tmp, dtype, (2, 2))
@@ -100,7 +104,8 @@ def test_scalar_dtype_matches_bitpix(dtype, np_scalar_type):
 
 
 def test_partial_indexing_returns_ndarray():
-    """`hdu[i]` on a 2-D image reduces only the first axis → 1-D
+    """
+    `hdu[i]` on a 2-D image reduces only the first axis → 1-D
     ndarray (the row), NOT a scalar."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, arr = _make_image(tmp, "f4", (3, 5))
@@ -123,7 +128,8 @@ def test_slice_int_mix_returns_ndarray():
 
 
 def test_length_one_slice_returns_ndarray():
-    """`hdu[5:6, 6:7]` (all length-1 slices) returns a shape-(1,1)
+    """
+    `hdu[5:6, 6:7]` (all length-1 slices) returns a shape-(1,1)
     ndarray, NOT a scalar — slices preserve the axis even when their
     length is 1."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -151,7 +157,8 @@ def test_negative_indices_scalar():
 
 
 def test_out_of_range_raises():
-    """Out-of-range int raises (IndexError per the existing axis
+    """
+    Out-of-range int raises (IndexError per the existing axis
     bounds check)."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_image(tmp, "f4", (3, 4))
@@ -168,7 +175,8 @@ def test_out_of_range_raises():
 
 
 def test_ellipsis_plus_int_returns_ndarray():
-    """`hdu[..., i]` on a 2-D image still leaves one axis → 1-D
+    """
+    `hdu[..., i]` on a 2-D image still leaves one axis → 1-D
     ndarray.  Not all axes are int."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, arr = _make_image(tmp, "f4", (3, 4))

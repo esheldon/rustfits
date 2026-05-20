@@ -1,4 +1,5 @@
-"""Tests for the FITS header parser's handling of:
+"""
+Tests for the FITS header parser's handling of:
 
     - HIERARCH long keywords
     - `''` escape inside string values

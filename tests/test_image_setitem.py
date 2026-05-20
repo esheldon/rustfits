@@ -1,4 +1,5 @@
-"""Tests for `image_hdu[key] = value` write via __setitem__.
+"""
+Tests for `image_hdu[key] = value` write via __setitem__.
 
 Symmetric with __getitem__: anything `img[key]` reads, `img[key] = v`
 writes.  RHS is either a scalar (broadcast) or a shape-matching
@@ -15,7 +16,8 @@ import rustfits
 
 
 def _new_image(tmpdir, dtype, dims, fill=0):
-    """Create a fresh FITS file with a zero-filled image HDU, return
+    """
+    Create a fresh FITS file with a zero-filled image HDU, return
     the path.  Caller reopens in r+ mode to write."""
     fname = os.path.join(tmpdir, "img.fits")
     with rustfits.FITS(fname, "w+") as fits:
@@ -186,7 +188,8 @@ def test_setitem_scalar_broadcast_slice():
 
 
 def test_setitem_zero_d_ndarray_broadcasts():
-    """A 0-d numpy ndarray RHS is treated as a scalar broadcast
+    """
+    A 0-d numpy ndarray RHS is treated as a scalar broadcast
     (matches numpy semantics; np.ndim == 0)."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _new_image(tmp, "f4", (3, 3))
@@ -215,7 +218,8 @@ def test_setitem_numpy_scalar_broadcast():
     ["u1", "i2", "i4", "i8", "f4", "f8"],
 )
 def test_setitem_roundtrip_all_dtypes(dtype):
-    """For every supported BITPIX dtype, an array written via
+    """
+    For every supported BITPIX dtype, an array written via
     `__setitem__` reads back identically."""
     data = np.arange(15, dtype=dtype).reshape(3, 5)
     if np.issubdtype(data.dtype, np.signedinteger):
@@ -264,7 +268,8 @@ def test_setitem_out_of_range_index_raises():
 
 
 def test_setitem_scalar_overflow_raises():
-    """A scalar broadcast value that's out of range for the dtype
+    """
+    A scalar broadcast value that's out of range for the dtype
     raises (extract::<u8>(300) → OverflowError; extract::<i16>(99999)
     → OverflowError)."""
     with tempfile.TemporaryDirectory() as tmp:

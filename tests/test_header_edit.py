@@ -1,4 +1,5 @@
-"""Tests for the FITSHeaderEdit context-manager batching API.
+"""
+Tests for the FITSHeaderEdit context-manager batching API.
 
 Verifies that:
     - Mutations inside a `with header.edit():` block stage in memory and
@@ -82,7 +83,8 @@ def test_edit_supports_update_with_dict():
 
 
 def test_edit_rolls_back_on_exception():
-    """If an exception escapes the with-block, staged mutations are
+    """
+    If an exception escapes the with-block, staged mutations are
     discarded — the on-disk file and parent header are unchanged."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -113,7 +115,8 @@ def test_edit_reads_show_staged_state():
 
 
 def test_edit_parent_unchanged_until_commit():
-    """During the batch, the parent FITSHeader still shows the pre-batch
+    """
+    During the batch, the parent FITSHeader still shows the pre-batch
     state — committing only happens on __exit__."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -130,7 +133,8 @@ def test_edit_parent_unchanged_until_commit():
 
 
 def test_edit_setitem_outside_with_raises():
-    """Trying to use the handle without entering the `with` is an error
+    """
+    Trying to use the handle without entering the `with` is an error
     (otherwise the user would silently lose data)."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -170,7 +174,8 @@ def test_edit_setitem_after_commit_raises():
 
 
 def test_edit_overflow_triggers_grow_at_commit():
-    """When staged mutations exceed the reserved block(s), commit triggers
+    """
+    When staged mutations exceed the reserved block(s), commit triggers
     the file-tail shift, grows the reserved region, and lands every staged
     key — there is no longer a slack-overflow error to roll back from."""
     with _new_file() as fname:
@@ -191,7 +196,8 @@ def test_edit_overflow_triggers_grow_at_commit():
 
 
 def test_edit_position_semantics_match_setitem():
-    """An update to an existing key keeps its position; new keys land
+    """
+    An update to an existing key keeps its position; new keys land
     immediately before END — same as outside a batch."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

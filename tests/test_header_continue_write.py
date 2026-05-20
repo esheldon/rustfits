@@ -1,4 +1,5 @@
-"""Phase 2c, step 2: CONTINUE-on-write for long string values.
+"""
+Phase 2c, step 2: CONTINUE-on-write for long string values.
 
 When a string value's FITS-escaped length exceeds 68 chars (or fits in 68
 but the comment wouldn't), the writer auto-splits it across one keyword
@@ -32,7 +33,8 @@ def _new_file(shape=(4, 6), dtype="i4"):
 
 
 def _check_both(fname, fits, predicate):
-    """Run `predicate(header)` on the live-handle header, then on a fresh
+    """
+    Run `predicate(header)` on the live-handle header, then on a fresh
     reopen.  Used by tests where the same assertion holds in both views."""
     predicate(fits[0].header)
     with rustfits.FITS(fname, "r") as fits2:
@@ -123,7 +125,8 @@ def test_long_string_round_trip_with_comment():
 
 
 def test_chain_uses_keyword_then_continue_cards():
-    """Inspect the on-disk card layout: first card begins with KEYWORD,
+    """
+    Inspect the on-disk card layout: first card begins with KEYWORD,
     each subsequent card begins with CONTINUE."""
     with _new_file() as fname:
         s = "Z" * 200
@@ -186,7 +189,8 @@ def test_long_string_with_embedded_quotes_round_trips():
 
 
 def test_replacing_chain_with_short_string_removes_extra_cards():
-    """Overwrite a long value with a short one — the CONTINUE cards must
+    """
+    Overwrite a long value with a short one — the CONTINUE cards must
     all go, not just the first card of the chain."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -207,7 +211,8 @@ def test_replacing_chain_with_short_string_removes_extra_cards():
 
 
 def test_replacing_chain_with_longer_chain():
-    """Overwrite a 200-char value with a 400-char value — new chain replaces
+    """
+    Overwrite a 200-char value with a 400-char value — new chain replaces
     old, no leftovers."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -333,7 +338,8 @@ def test_edit_rollback_discards_long_string_chain():
 
 
 def test_long_string_triggers_header_grow():
-    """A CONTINUE chain too long for the reserved header block(s) triggers
+    """
+    A CONTINUE chain too long for the reserved header block(s) triggers
     the file-tail shift and grows the reserved region rather than failing."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

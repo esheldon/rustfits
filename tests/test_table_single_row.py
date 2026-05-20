@@ -1,4 +1,5 @@
-"""Tests for `hdu[5]` returning a single record from a TableHDU.
+"""
+Tests for `hdu[5]` returning a single record from a TableHDU.
 
 `hdu[i]` is the natural Python-ism that matches `structured_arr[i]`:
 returns a 0-d numpy record (np.void), with field access yielding
@@ -129,7 +130,8 @@ def test_single_row_out_of_range_raises():
 
 
 def test_single_row_bool_rejected():
-    """Bool key must NOT silently route to int (Python bool is a
+    """
+    Bool key must NOT silently route to int (Python bool is a
     subclass of int)."""
     fields = [("X", "1J")]
     rows_data = struct.pack(">i", 0)
@@ -161,7 +163,8 @@ def test_single_row_float_rejected():
 
 
 def test_single_row_array_column_field_shape():
-    """A repeat>1 column's field on a single record is a numpy
+    """
+    A repeat>1 column's field on a single record is a numpy
     ndarray of the cell shape."""
     fields = [("VEC", "3J")]
     rows_data = struct.pack(">6i", 1, 2, 3, 10, 20, 30)
@@ -192,7 +195,8 @@ def test_single_row_tdim_column_field_shape():
 
 
 def test_single_row_vla_column_field():
-    """A VLA column field on a single record yields the inner ndarray
+    """
+    A VLA column field on a single record yields the inner ndarray
     (the Object cell)."""
     # Build a 1PJ column with two rows, varying heap-cell sizes.
     descriptors = struct.pack(">ii", 3, 0) + struct.pack(">ii", 2, 12)
@@ -223,7 +227,8 @@ def test_single_row_vla_column_field():
 
 
 def test_length_one_list_still_returns_array():
-    """hdu[[5]] (length-1 list) still goes through the Rows path and
+    """
+    hdu[[5]] (length-1 list) still goes through the Rows path and
     returns a shape-(1,) structured array, not np.void.  Confirms the
     new single-int path doesn't accidentally hijack iterables."""
     fields = [("X", "1J")]
@@ -260,7 +265,8 @@ def test_length_one_slice_still_returns_array():
 
 
 def test_single_row_accepts_numpy_int():
-    """numpy integer scalars are accepted as the index, returning the
+    """
+    numpy integer scalars are accepted as the index, returning the
     same np.void as a Python int would."""
     fields = [("X", "1J")]
     rows_data = struct.pack(">3i", 10, 20, 30)

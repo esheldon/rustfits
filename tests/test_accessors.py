@@ -1,4 +1,5 @@
-"""Tests for HDU accessor properties.
+"""
+Tests for HDU accessor properties.
 
 Base HDU:           extname, extver, has_data
 ImageHDU:           shape, dtype, ndim, size, bitpix, __len__

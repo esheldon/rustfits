@@ -1,4 +1,5 @@
-"""Tests for column-units (TUNITn) on TableHDU and image-units
+"""
+Tests for column-units (TUNITn) on TableHDU and image-units
 (BUNIT) on ImageHDU.
 
 Units are purely informational — they don't affect read/write.  Two
@@ -19,7 +20,8 @@ BLOCK = 2880
 
 
 def _show(r):
-    """Print the repr the test is asserting on, with a separator
+    """
+    Print the repr the test is asserting on, with a separator
     and leading newline so pytest -s -v output is readable."""
     print()
     print("-" * 70)
@@ -102,7 +104,8 @@ def _tunit_card(col_index, value):
 
 
 def test_units_accessor_with_tunit():
-    """TUNIT1 set → units dict carries the value; the unaffected
+    """
+    TUNIT1 set → units dict carries the value; the unaffected
     column maps to None."""
     fields = [("flux", "1E"), ("name", "8A")]
     extras = [_tunit_card(1, "Jy")]
@@ -216,7 +219,8 @@ def test_repr_no_unit_no_parens():
 
 
 def test_repr_mixed_units_and_no_units():
-    """Some columns have units, others don't — only the ones with
+    """
+    Some columns have units, others don't — only the ones with
     TUNIT show the parens block."""
     fields = [("flux", "1E"), ("name", "8A"), ("count", "1J")]
     extras = [

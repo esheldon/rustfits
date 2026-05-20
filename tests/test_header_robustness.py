@@ -1,4 +1,5 @@
-"""Robustness / correctness tests for FITS header parsing.
+"""
+Robustness / correctness tests for FITS header parsing.
 
 Covers:
     - parse_keyword('NAXIS') must not match NAXIS1, NAXIS2, ... even when
@@ -50,7 +51,8 @@ def _write_two_hdus(fname, cards1, cards2):
 
 
 def test_naxis_keyword_not_matched_by_naxis1():
-    """parse_keyword('NAXIS') must not match a NAXIS1 card listed before NAXIS.
+    """
+    parse_keyword('NAXIS') must not match a NAXIS1 card listed before NAXIS.
 
     Constructs a malformed-order header where NAXIS1 appears first.  With a
     lenient `starts_with` match, the data-size calculation would use 99

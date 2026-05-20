@@ -1,4 +1,5 @@
-"""Tests for the file-rewrite (grow) path that fires when a header
+"""
+Tests for the file-rewrite (grow) path that fires when a header
 mutation needs more cards than the currently reserved blocks can hold.
 
 Before the grow path landed, overflowing the reserved blocks raised
@@ -47,7 +48,8 @@ def _new_single_hdu(shape=(4, 6), dtype="i4"):
 
 @contextlib.contextmanager
 def _new_three_image_hdus():
-    """Three image HDUs with distinct shapes/dtypes and recognisable data.
+    """
+    Three image HDUs with distinct shapes/dtypes and recognisable data.
     Returns (fname, [arr0, arr1, arr2])."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "multi.fits")
@@ -65,7 +67,8 @@ def _new_three_image_hdus():
 
 
 def _slack_capacity(header):
-    """Return slots_free = number of cards that can still be added before
+    """
+    Return slots_free = number of cards that can still be added before
     the next write spills past the currently reserved-block boundary."""
     initial = len(header.cards)
     block_count = (initial + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK
@@ -78,7 +81,8 @@ def _slack_capacity(header):
 
 
 def test_grow_one_card_past_boundary_same_handle_and_reopen():
-    """The simplest case: fill the slack, then push one card past — same
+    """
+    The simplest case: fill the slack, then push one card past — same
     handle sees the new key, and a fresh reopen confirms persistence."""
     with _new_single_hdu() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -116,7 +120,8 @@ def test_grow_by_many_cards_in_one_setitem():
 
 
 def test_grow_primary_preserves_subsequent_hdu_data():
-    """Grow HDU 0's header.  HDUs 1 and 2 (which got shifted forward in
+    """
+    Grow HDU 0's header.  HDUs 1 and 2 (which got shifted forward in
     the file) must still read back as the same bytes."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -137,7 +142,8 @@ def test_grow_primary_preserves_subsequent_hdu_data():
 
 
 def test_grow_middle_hdu_preserves_neighbours():
-    """Grow HDU 1's header.  HDU 0 stays put (it's before the insertion
+    """
+    Grow HDU 1's header.  HDU 0 stays put (it's before the insertion
     point); HDU 2 shifts forward.  Both must still read correctly."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -158,7 +164,8 @@ def test_grow_middle_hdu_preserves_neighbours():
 
 
 def test_grow_last_hdu_no_tail_to_shift():
-    """Grow the LAST HDU's header.  There's nothing past it, so the
+    """
+    Grow the LAST HDU's header.  There's nothing past it, so the
     shift loop has zero iterations — only the file-extend path runs."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -183,7 +190,8 @@ def test_grow_last_hdu_no_tail_to_shift():
 
 
 def test_old_hdu_handle_sees_post_grow_offsets():
-    """A HDU reference issued BEFORE the grow must transparently read
+    """
+    A HDU reference issued BEFORE the grow must transparently read
     the right data afterward — the Arc<HduOffsets> shared with the
     layout is updated in place."""
     with _new_three_image_hdus() as (fname, arrays):
@@ -257,7 +265,8 @@ def test_grow_inside_edit_commit():
 
 
 def test_grow_triggered_by_add_comment():
-    """COMMENT cards are also routed through rewrite_header_to_disk and
+    """
+    COMMENT cards are also routed through rewrite_header_to_disk and
     can therefore trigger the grow path."""
     with _new_single_hdu() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -294,7 +303,8 @@ def test_grow_triggered_by_update_from_dict():
 
 
 def test_two_sequential_grows_compose():
-    """Grow twice in a row — both grows must successfully shift the
+    """
+    Grow twice in a row — both grows must successfully shift the
     file tail and update layout offsets."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:
@@ -326,7 +336,8 @@ def test_two_sequential_grows_compose():
 
 
 def test_image_slice_after_grow_returns_correct_bytes():
-    """Slice-read a post-grow HDU and compare against the expected
+    """
+    Slice-read a post-grow HDU and compare against the expected
     sub-array to make sure offsets + strides line up."""
     with _new_three_image_hdus() as (fname, arrays):
         with rustfits.FITS(fname, "r+") as fits:

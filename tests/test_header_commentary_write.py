@@ -1,4 +1,5 @@
-"""Phase 2c, step 1: commentary-key write API.
+"""
+Phase 2c, step 1: commentary-key write API.
 
 Each test verifies its assertion through BOTH:
     - the same FITS handle that did the mutation (same-handle / in-memory
@@ -92,7 +93,8 @@ def test_multiple_comments_in_order():
 
 
 def test_new_comments_cluster_with_existing_ones():
-    """The second add_comment lands immediately after the first one — even
+    """
+    The second add_comment lands immediately after the first one — even
     if other keys have been added in between."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -313,7 +315,8 @@ def test_del_comment_inside_edit_batch():
 
 
 def test_edit_batch_rollback_keeps_comments_unchanged():
-    """A failed edit block leaves the parent header — including its
+    """
+    A failed edit block leaves the parent header — including its
     commentary — unchanged."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -366,7 +369,8 @@ def test_regular_setitem_still_works_alongside_commentary():
 
 
 def test_update_default_silently_skips_commentary_in_source():
-    """Default: copy_commentary=False.  Commentary cards in a FITSHeader
+    """
+    Default: copy_commentary=False.  Commentary cards in a FITSHeader
     source are silently dropped (parallels how protected keys are handled
     from a FITSHeader source).  No exception, no leaked HISTORY/COMMENT."""
     with _new_file() as a_name, _new_file() as b_name:
@@ -389,7 +393,8 @@ def test_update_default_silently_skips_commentary_in_source():
 
 
 def test_update_copy_commentary_appends_history_and_comment():
-    """With copy_commentary=True, COMMENT and HISTORY cards in the source
+    """
+    With copy_commentary=True, COMMENT and HISTORY cards in the source
     are appended verbatim to the destination."""
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
@@ -424,7 +429,8 @@ def test_update_copy_commentary_appends_blank_commentary():
 
 
 def test_update_copy_commentary_preserves_source_card_split():
-    """A long commentary that the source split across multiple cards stays
+    """
+    A long commentary that the source split across multiple cards stays
     split — one append per source card, no concatenation."""
     long_text = "X" * 200   # splits into 72 + 72 + 56 = 3 cards
     with _new_file() as a_name, _new_file() as b_name:
@@ -447,7 +453,8 @@ def test_update_copy_commentary_preserves_source_card_split():
 
 
 def test_update_copy_commentary_repeated_calls_accumulate():
-    """Documented hazard: calling update(..., copy_commentary=True) twice
+    """
+    Documented hazard: calling update(..., copy_commentary=True) twice
     duplicates the source's commentary in the destination.  This is by
     design — that's why the default is False and no deduplication is done.
     Users who want a one-shot copy should opt in once."""
@@ -462,7 +469,8 @@ def test_update_copy_commentary_repeated_calls_accumulate():
 
 
 def test_update_copy_commentary_coexists_with_dest_commentary():
-    """Source commentary is appended after the destination's existing
+    """
+    Source commentary is appended after the destination's existing
     commentary cards (cluster-with-same-keyword position rule)."""
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
@@ -476,7 +484,8 @@ def test_update_copy_commentary_coexists_with_dest_commentary():
 
 
 def test_update_dict_source_still_raises_on_commentary():
-    """Dict source's COMMENT/HISTORY keys raise regardless of the flag —
+    """
+    Dict source's COMMENT/HISTORY keys raise regardless of the flag —
     the flag is meaningful only for header-to-header copy.  An explicit
     `"COMMENT"` in a dict is almost certainly a mistake (single value vs
     append is ambiguous), so we reject it loudly."""
@@ -491,7 +500,8 @@ def test_update_dict_source_still_raises_on_commentary():
 
 
 def test_update_copy_commentary_inside_edit_batch():
-    """copy_commentary=True works inside header.edit() and commits
+    """
+    copy_commentary=True works inside header.edit() and commits
     atomically with the rest of the staged changes."""
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
@@ -508,7 +518,8 @@ def test_update_copy_commentary_inside_edit_batch():
 
 
 def test_update_default_silently_skips_commentary_inside_edit_batch():
-    """Edit-batched update() with default copy_commentary=False also
+    """
+    Edit-batched update() with default copy_commentary=False also
     silently skips commentary — parallel to the non-batched path."""
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
@@ -524,7 +535,8 @@ def test_update_default_silently_skips_commentary_inside_edit_batch():
 
 
 def test_update_copy_commentary_edit_rollback_discards_appends():
-    """An exception inside the edit() block discards both staged set-key
+    """
+    An exception inside the edit() block discards both staged set-key
     actions and staged commentary appends."""
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:

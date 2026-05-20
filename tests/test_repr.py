@@ -1,4 +1,5 @@
-"""Tests for the multi-line, fitsio-style __repr__ on FITS and HDU objects.
+"""
+Tests for the multi-line, fitsio-style __repr__ on FITS and HDU objects.
 
 The reprs are designed for interactive REPL use: typing `fits` + Enter
 calls __repr__, so the rich display has to live there (not in __str__).
@@ -23,7 +24,8 @@ BLOCK = 2880
 
 
 def _show(r):
-    """Print the repr that the surrounding test is asserting on.
+    """
+    Print the repr that the surrounding test is asserting on.
 
     The assertions do the precise machine check; this lets a human
     also eyeball the rendered repr (spacing, alignment, wording).
@@ -52,7 +54,8 @@ def _pad_to_block(b):
 
 
 def _write_file(path, *parts):
-    """Write a FITS file from a sequence of (cards, data_bytes) tuples,
+    """
+    Write a FITS file from a sequence of (cards, data_bytes) tuples,
     one per HDU (cards already includes END)."""
     with open(path, "wb") as f:
         for cards, data in parts:
@@ -123,7 +126,8 @@ def _bintable_ext(naxis1, naxis2, fields, extras=()):
 
 
 def _ascii_table_ext(naxis1, naxis2, extras=()):
-    """Minimal ASCII table extension cards.  We don't try to make this
+    """
+    Minimal ASCII table extension cards.  We don't try to make this
     actually readable as a table — just enough to be parsed as an
     AsciiTableHDU so we can repr it."""
     cards = [
@@ -147,7 +151,8 @@ def _ascii_table_ext(naxis1, naxis2, extras=()):
 
 
 def test_fits_repr_image_only_default_mode():
-    """Primary-only file opened with default mode ('r').  Repr shows
+    """
+    Primary-only file opened with default mode ('r').  Repr shows
     file, mode, and the single IMAGE_HDU line."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "img.fits")
@@ -166,7 +171,8 @@ def test_fits_repr_image_only_default_mode():
 
 
 def test_fits_repr_image_and_table():
-    """Primary image + binary table extension with EXTNAME.  Repr
+    """
+    Primary image + binary table extension with EXTNAME.  Repr
     shows both HDU lines in order, BINARY_TBL row carries the EXTNAME.
     """
     with tempfile.TemporaryDirectory() as tmp:
@@ -192,7 +198,8 @@ def test_fits_repr_image_and_table():
 
 
 def test_fits_repr_ascii_table_label():
-    """ASCII table extension shows 'ASCII_TBL' in the FITS-level
+    """
+    ASCII table extension shows 'ASCII_TBL' in the FITS-level
     table."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "ascii.fits")
@@ -217,7 +224,8 @@ def test_fits_repr_mode_rplus():
 
 
 def test_fits_repr_closed_file():
-    """After close() the repr shows 'status: closed' and skips the
+    """
+    After close() the repr shows 'status: closed' and skips the
     per-HDU table."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "closed.fits")
@@ -236,7 +244,8 @@ def test_fits_repr_closed_file():
 
 
 def test_image_repr_f8_2d():
-    """BITPIX=-64 + dims = (4, 3) → 'data type: f8' and numpy-order
+    """
+    BITPIX=-64 + dims = (4, 3) → 'data type: f8' and numpy-order
     dims [3, 4] (FITS NAXIS1=4 is the fastest axis → trailing in
     numpy)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -330,7 +339,8 @@ def test_table_repr_basic_scalar_columns():
 
 
 def test_table_repr_repeat_array():
-    """3J column shows 'array[3]'.  Column name uses mixed case to
+    """
+    3J column shows 'array[3]'.  Column name uses mixed case to
     also confirm case is preserved in the repr."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -346,7 +356,8 @@ def test_table_repr_repeat_array():
 
 
 def test_table_repr_tdim_array():
-    """6J + TDIM=(3,2) shows array[2,3] (numpy axis order, slowest
+    """
+    6J + TDIM=(3,2) shows array[2,3] (numpy axis order, slowest
     first)."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -379,7 +390,8 @@ def test_table_repr_vla():
 
 
 def test_table_repr_unsigned_int_trick_dtype():
-    """A column with TSCAL=1, TZERO=32768 (the I→u2 unsigned trick)
+    """
+    A column with TSCAL=1, TZERO=32768 (the I→u2 unsigned trick)
     shows the scaled dtype (u2) in the repr, not the raw on-disk i2."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -402,7 +414,8 @@ def test_table_repr_unsigned_int_trick_dtype():
 
 
 def test_table_repr_character_column():
-    """8A column shows 'U8' (one string of length 8 per cell).
+    """
+    8A column shows 'U8' (one string of length 8 per cell).
     Column name uses CamelCase to also confirm case preservation."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -436,7 +449,8 @@ def test_table_repr_with_extname():
 
 
 def test_table_repr_mixed_columns_alignment():
-    """Columns of different name lengths align to the longest name.
+    """
+    Columns of different name lengths align to the longest name.
     Names cover lower / Mixed / snake_case to also confirm the repr
     preserves the column-name case verbatim."""
     fields = [
@@ -474,7 +488,8 @@ def test_table_repr_mixed_columns_alignment():
 
 
 def test_table_repr_preserves_column_case():
-    """FITS allows arbitrary case in TTYPE values.  Confirm the repr
+    """
+    FITS allows arbitrary case in TTYPE values.  Confirm the repr
     shows column names verbatim — no normalization to upper/lower."""
     fields = [
         ("lowerCase", "1J"),

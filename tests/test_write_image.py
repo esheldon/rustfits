@@ -1,4 +1,5 @@
-"""Tests for ImageHDU.write.
+"""
+Tests for ImageHDU.write.
 
 Covers:
     - full overwrite (data shape matches HDU shape, start defaults to origin)
@@ -31,7 +32,8 @@ def _make_file_with_image(tmpdir, dtype, dims, extname="img"):
 
 
 def _read_image_bytes(fname, hdu_index=0):
-    """Read the on-disk data section bytes for the given HDU.  Returns the
+    """
+    Read the on-disk data section bytes for the given HDU.  Returns the
     raw bytes (length = product(dims) * bpp, NOT padded to 2880)."""
     with rustfits.FITS(fname, "r") as fits:
         hd = fits.hdus[hdu_index].header
@@ -83,7 +85,8 @@ def test_full_write_roundtrip_i4():
 
 
 def test_full_write_u1_zero_copy():
-    """uint8 has no byte order — the write path is zero-copy.  Verify the
+    """
+    uint8 has no byte order — the write path is zero-copy.  Verify the
     bytes land verbatim."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "u1", (4, 6))
@@ -185,7 +188,8 @@ def test_partial_write_3d():
 
 
 def test_partial_write_full_inner_axis_coalesces():
-    """When the fast axis fully spans the HDU, the strip coalesces into a
+    """
+    When the fast axis fully spans the HDU, the strip coalesces into a
     single larger contiguous write per outer step; the result must still be
     correct (exercises compute_strip_layout's coalescing)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -247,7 +251,8 @@ def test_negative_start_rejected():
 
 
 def test_non_contiguous_rejected():
-    """A non-C-contiguous array (here, a transpose) must be rejected with
+    """
+    A non-C-contiguous array (here, a transpose) must be rejected with
     a hint about np.ascontiguousarray."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f8", (4, 4))
@@ -264,7 +269,8 @@ def test_non_contiguous_rejected():
 
 
 def test_write_to_extension_hdu():
-    """Writes addressed via hdus[1] must land in the second HDU's data
+    """
+    Writes addressed via hdus[1] must land in the second HDU's data
     section, not the primary's."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")

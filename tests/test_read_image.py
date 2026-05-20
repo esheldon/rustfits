@@ -1,4 +1,5 @@
-"""Tests for ImageHDU.read.
+"""
+Tests for ImageHDU.read.
 
 Covers:
     - round-trip write -> read across all supported dtypes
@@ -81,7 +82,8 @@ def test_read_3d():
 
 
 def test_read_fresh_hdu_returns_zeros():
-    """create_image_hdu zero-fills the data section (sparse).  read() must
+    """
+    create_image_hdu zero-fills the data section (sparse).  read() must
     surface those zeros."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
@@ -98,7 +100,8 @@ def test_read_fresh_hdu_returns_zeros():
 
 
 def test_read_result_is_native_endian():
-    """Returned dtype must be native — that's the byte order downstream
+    """
+    Returned dtype must be native — that's the byte order downstream
     numpy operations are fastest on."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
@@ -117,7 +120,8 @@ def test_read_result_is_native_endian():
 
 
 def test_read_values_correct_after_byteswap():
-    """Sanity check: write known values, read back, confirm numpy interprets
+    """
+    Sanity check: write known values, read back, confirm numpy interprets
     them correctly (this would fail if the byte-swap on read was missed)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
@@ -164,7 +168,8 @@ def test_read_multi_hdu_file():
 
 
 def test_read_after_partial_write():
-    """After a partial write, read must return the full HDU with the sub-
+    """
+    After a partial write, read must return the full HDU with the sub-
     region updated and the rest still zero (from create_image_hdu)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")

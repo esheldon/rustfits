@@ -1,4 +1,5 @@
-"""Phase 2c, step 3: HIERARCH-on-write for long keywords.
+"""
+Phase 2c, step 3: HIERARCH-on-write for long keywords.
 
 Long keywords (>8 chars or containing spaces) are written as HIERARCH cards:
 
@@ -176,7 +177,8 @@ def test_hierarch_string_with_embedded_quote():
 
 
 def test_lowercase_hierarch_key_preserves_case_on_disk():
-    """HIERARCH keys are case-preserving on disk per the ESO convention.
+    """
+    HIERARCH keys are case-preserving on disk per the ESO convention.
     A lowercase key writes a lowercase card; lookup is case-insensitive
     so all case variants still find the same value."""
     with _new_file() as fname:
@@ -354,7 +356,8 @@ def test_literal_hierarch_keyword_rejected():
 
 
 def test_hierarch_non_string_card_too_long_rejected():
-    """Non-string HIERARCH values can't chain, so a key + framing + value +
+    """
+    Non-string HIERARCH values can't chain, so a key + framing + value +
     comment that doesn't fit in 80 chars is rejected."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -399,7 +402,8 @@ def test_hierarch_dot_and_plus_allowed():
 
 
 def test_hierarch_short_string_emits_single_card():
-    """A HIERARCH string that fits in one card stays a single card (no
+    """
+    A HIERARCH string that fits in one card stays a single card (no
     CONTINUE)."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -466,7 +470,8 @@ def test_hierarch_long_string_with_embedded_quotes_round_trips():
 
 
 def test_hierarch_chain_layout_starts_hierarch_then_continue():
-    """On-disk layout: first card has the HIERARCH prefix; the rest are
+    """
+    On-disk layout: first card has the HIERARCH prefix; the rest are
     standard CONTINUE cards."""
     with _new_file() as fname:
         s = "Z" * 200
@@ -494,7 +499,8 @@ def test_hierarch_chain_layout_starts_hierarch_then_continue():
 
 
 def test_replacing_hierarch_chain_with_short_string_removes_extras():
-    """Overwriting a chained HIERARCH value with a short one removes the
+    """
+    Overwriting a chained HIERARCH value with a short one removes the
     whole chain, not just the first card."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -579,7 +585,8 @@ def test_hierarch_comment_too_long_for_chain_rejected():
 
 
 def test_hierarch_chain_triggers_header_grow():
-    """A HIERARCH chain too big for the reserved header blocks triggers
+    """
+    A HIERARCH chain too big for the reserved header blocks triggers
     the file-tail shift and grows the reserved region rather than failing."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

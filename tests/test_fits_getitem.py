@@ -1,4 +1,5 @@
-"""Tests for FITS.__getitem__ accepting str (EXTNAME) in addition to int.
+"""
+Tests for FITS.__getitem__ accepting str (EXTNAME) in addition to int.
 
 Contract:
   - fits[i] with int (incl. negatives) still works as positional indexing.
@@ -97,7 +98,8 @@ def test_string_lookup_missing_raises():
 
 
 def test_string_lookup_primary_without_extname_not_findable():
-    """The primary HDU created without extname has no EXTNAME card and is
+    """
+    The primary HDU created without extname has no EXTNAME card and is
     not addressable by name."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname, "r") as fits:
@@ -120,7 +122,8 @@ def test_string_lookup_supports_extend_on_named_hdu():
 
 
 def test_bytes_lookup_works():
-    """Plain bytes objects are accepted; FITS spec restricts EXTNAME to
+    """
+    Plain bytes objects are accepted; FITS spec restricts EXTNAME to
     printable ASCII so this is well-defined."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname, "r") as fits:
@@ -139,7 +142,8 @@ def test_numpy_str_lookup_works():
 
 
 def test_numpy_bytes_lookup_works():
-    """np.bytes_ (S dtype) is a bytes subclass — accepted via the bytes
+    """
+    np.bytes_ (S dtype) is a bytes subclass — accepted via the bytes
     fallback."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname, "r") as fits:
@@ -162,7 +166,8 @@ def test_non_ascii_bytes_rejected():
 
 
 def test_bool_rejected_explicitly():
-    """Without the explicit bool check, Python's bool-is-int relationship
+    """
+    Without the explicit bool check, Python's bool-is-int relationship
     would silently make fits[True] mean fits[1]."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname, "r") as fits:
@@ -182,7 +187,8 @@ def test_other_key_types_rejected():
 
 
 def test_list_of_small_ints_not_treated_as_bytes_extname():
-    """Regression: PyO3's extract::<Vec<u8>>() accepts any iterable of
+    """
+    Regression: PyO3's extract::<Vec<u8>>() accepts any iterable of
     small ints, so without explicit PyBytes type-instance checking,
     `fits[[5, 0, 2]]` would silently route to an EXTNAME lookup of
     a 3-byte control-char string.  Must reject as an unknown key
@@ -194,7 +200,8 @@ def test_list_of_small_ints_not_treated_as_bytes_extname():
 
 
 def test_numpy_int_array_not_treated_as_bytes_extname():
-    """Same regression — numpy arrays of small ints are iterable and
+    """
+    Same regression — numpy arrays of small ints are iterable and
     each element is u8-extractable."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname, "r") as fits:
@@ -225,7 +232,8 @@ def test_duplicate_extname_returns_first():
 
 
 def test_iter_yields_all_hdus_in_order():
-    """`for hdu in fits` walks the HDUs in file order, matching
+    """
+    `for hdu in fits` walks the HDUs in file order, matching
     `for hdu in fits.hdus`."""
     with _three_hdus() as fname:
         with rustfits.FITS(fname) as fits:

@@ -1,4 +1,5 @@
-"""Tests for ImageHDU.extend.
+"""
+Tests for ImageHDU.extend.
 
 Covers:
     - default start places new data at the end of the slow axis (grows by
@@ -31,7 +32,8 @@ def _make_file_with_image(tmpdir, dtype, dims, name="t.fits", extname="img"):
 
 
 def test_extend_default_start_grows_slow_axis():
-    """With no start, new data is appended along numpy axis 0; existing data
+    """
+    With no start, new data is appended along numpy axis 0; existing data
     is preserved and the slow axis grows by data.shape[0]."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f8", (5, 20))
@@ -84,7 +86,8 @@ def test_extend_1d_default_start():
 
 
 def test_extend_explicit_start_with_growth():
-    """Explicit start past the current slow-axis end; the HDU grows to
+    """
+    Explicit start past the current slow-axis end; the HDU grows to
     accommodate."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f4", (3, 4))
@@ -97,7 +100,8 @@ def test_extend_explicit_start_with_growth():
 
 
 def test_extend_with_gap_zero_filled():
-    """Explicit start past the end with a gap: rows between the old end and
+    """
+    Explicit start past the end with a gap: rows between the old end and
     the start of the new data must read back as zeros (set_len sparse-fills
     the gap)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -123,7 +127,8 @@ def test_extend_with_gap_zero_filled():
 
 
 def test_extend_no_growth_falls_through_to_write():
-    """When start + data shape fits the existing HDU, extend should behave
+    """
+    When start + data shape fits the existing HDU, extend should behave
     like write — no header change, no file growth."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f4", (5, 4))
@@ -141,7 +146,8 @@ def test_extend_no_growth_falls_through_to_write():
 
 
 def test_extend_inner_axis_growth_rejected():
-    """Attempting to grow an inner (fast) axis is rejected — only the slow
+    """
+    Attempting to grow an inner (fast) axis is rejected — only the slow
     axis may grow."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f4", (3, 4))
@@ -170,7 +176,8 @@ def test_extend_dtype_mismatch_rejected_before_any_change():
 
 
 def test_extend_non_last_hdu_shifts_subsequent_data():
-    """An HDU with other HDUs after it on disk can now grow: the file tail
+    """
+    An HDU with other HDUs after it on disk can now grow: the file tail
     is shifted forward and the subsequent HDU's data must round-trip
     unchanged."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -216,7 +223,8 @@ def test_extend_last_hdu_when_multiple_works():
 
 
 def test_extend_crosses_block_boundary():
-    """Growth that pushes the data section into a new 2880-byte block must
+    """
+    Growth that pushes the data section into a new 2880-byte block must
     bump the file size; the new region must be zero-filled."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_file_with_image(tmpdir, "f8", (300, 1))

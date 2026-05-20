@@ -1,4 +1,5 @@
-"""Phase 2d: tainted-header state on mid-write I/O failure.
+"""
+Phase 2d: tainted-header state on mid-write I/O failure.
 
 When a write_all or flush inside rewrite_header_to_disk fails, the on-disk
 file may be partially overwritten.  We set a per-file taint flag that
@@ -45,7 +46,8 @@ def _new_file(shape=(4, 6), dtype="i4"):
 
 
 def test_overflow_does_not_taint():
-    """Header overflow is absorbed by the grow path: the file is shifted
+    """
+    Header overflow is absorbed by the grow path: the file is shifted
     and extended in place, all writes complete normally, and the taint
     flag stays clear.  Only true mid-write I/O failures (write_all/flush
     inside rewrite_header_to_disk, or any failure inside the shift loop)
@@ -100,7 +102,8 @@ def test_tainted_writes_refuse():
 
 
 def test_tainted_image_read_refuses():
-    """The taint check lives in HDU.header_snapshot, which image reads
+    """
+    The taint check lives in HDU.header_snapshot, which image reads
     also go through — so image I/O is rejected too."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -133,7 +136,8 @@ def test_tainted_iter_and_contains_refuse():
 
 
 def test_tainted_edit_refuses_on_entry():
-    """Starting an edit batch on a tainted file should fail at edit()
+    """
+    Starting an edit batch on a tainted file should fail at edit()
     (which goes through snapshot()), not silently allow staging."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -162,7 +166,8 @@ def test_taint_visible_through_other_views():
 
 
 def test_reopen_after_taint_works():
-    """Tainting is per-handle.  A fresh FITS object on the same file
+    """
+    Tainting is per-handle.  A fresh FITS object on the same file
     starts with a clean flag and operates normally."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -179,7 +184,8 @@ def test_reopen_after_taint_works():
 
 
 def test_diagnostic_message_is_actionable():
-    """The error message should tell the user what's wrong AND how to
+    """
+    The error message should tell the user what's wrong AND how to
     recover (close + reopen)."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

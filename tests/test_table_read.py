@@ -1,4 +1,5 @@
-"""Tests for BINTABLE read API (read + read_column).
+"""
+Tests for BINTABLE read API (read + read_column).
 
 We build BINTABLE files by hand at the byte level so we control exactly
 what's on disk — no library's write-side cleansing interferes with
@@ -49,7 +50,8 @@ def _write_bintable(path, ext_cards, data_bytes):
 
 
 def _bintable_cards(naxis1, naxis2, fields):
-    """Minimal BINTABLE header cards.  `fields` is a list of
+    """
+    Minimal BINTABLE header cards.  `fields` is a list of
     (ttype, tform, optional tdim) tuples."""
     cards = [
         "XTENSION= 'BINTABLE'",
@@ -76,7 +78,8 @@ def _bintable_cards(naxis1, naxis2, fields):
 
 
 def test_read_all_basic_numeric_types():
-    """Cover B / I / J / K / E / D round-trip + endian swap.
+    """
+    Cover B / I / J / K / E / D round-trip + endian swap.
 
     Demonstrates the default-mode form: FITS(fname) opens for reading
     just like the built-in open(fname).  Most read-only tests in this
@@ -175,7 +178,8 @@ def test_read_all_single_char_a_column():
 
 
 def test_tdim_numeric_transpose_orientation():
-    """TFORM='6D' TDIM='(2,3)' (2 fast, 3 slow) → numpy shape (3,2).
+    """
+    TFORM='6D' TDIM='(2,3)' (2 fast, 3 slow) → numpy shape (3,2).
     On-disk linear order is FORTRAN; numpy reads in row-major; the
     result is the transpose of the FITS-convention matrix."""
     fields = [("M", "6D", "(2,3)")]
@@ -196,7 +200,8 @@ def test_tdim_numeric_transpose_orientation():
 
 
 def test_tdim_a_column_string_array():
-    """TFORM='20A' TDIM='(4,5)' = 5 strings of length 4 per row.
+    """
+    TFORM='20A' TDIM='(4,5)' = 5 strings of length 4 per row.
     Numpy field is U4 shape (5,)."""
     fields = [("WORDS", "20A", "(4,5)")]
     row = b"abcdABCDefghEFGHijkl"   # 5 strings of 4 chars
@@ -455,7 +460,8 @@ def test_read_column_unknown_name_lists_available():
 
 
 def _file_with_dirty_strings(tmp):
-    """A column with rows that exercise null truncation, rstrip, and
+    """
+    A column with rows that exercise null truncation, rstrip, and
     a non-ASCII byte (Latin-1 'é' = 0xE9) in row 1."""
     names = [
         b"good    ",          # 4 chars + 4 spaces
@@ -501,7 +507,8 @@ def test_a_column_all_null_is_empty_string():
 
 
 def test_a_column_strict_ascii_error_message():
-    """Error names the column, the disk row, the byte, the position,
+    """
+    Error names the column, the disk row, the byte, the position,
     and points at read_column(..., as_bytes=True) as the escape."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _file_with_dirty_strings(tmp)
@@ -516,7 +523,8 @@ def test_a_column_strict_ascii_error_message():
 
 
 def test_a_column_strict_error_via_full_table_read():
-    """A non-ASCII A column also blows up the full table read; the
+    """
+    A non-ASCII A column also blows up the full table read; the
     error is the same."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _file_with_dirty_strings(tmp)
@@ -535,7 +543,8 @@ def test_a_column_strict_succeeds_when_skipping_bad_row():
 
 
 def test_a_column_as_bytes_returns_raw():
-    """as_bytes=True returns the on-disk bytes byte-for-byte (no
+    """
+    as_bytes=True returns the on-disk bytes byte-for-byte (no
     decode, no truncate, no rstrip; numpy S<n> strips only trailing
     NULL bytes per its dtype semantics)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -564,7 +573,8 @@ def test_as_bytes_rejected_on_non_character_column():
 
 
 def test_variable_length_repeat_gt_1_rejected():
-    """Multi-descriptor variable columns (e.g. '2PE') aren't supported
+    """
+    Multi-descriptor variable columns (e.g. '2PE') aren't supported
     yet."""
     fields = [("VLA", "2PE(100)")]
     with tempfile.TemporaryDirectory() as tmp:
@@ -599,7 +609,8 @@ def test_x_full_byte_two_rows():
 
 
 def test_x_scalar_1x():
-    """1X = single bit per row.  Shape () (scalar bool) — consistent
+    """
+    1X = single bit per row.  Shape () (scalar bool) — consistent
     with the rest of the dtype convention (repeat==1, no TDIM)."""
     rows = bytes([0b10000000, 0b00000000])
     fields = [("F", "1X")]
@@ -613,7 +624,8 @@ def test_x_scalar_1x():
 
 
 def test_x_partial_byte_padding_bits_ignored():
-    """7X = 7 bits in 1 byte; the 8th (low) bit is padding and must
+    """
+    7X = 7 bits in 1 byte; the 8th (low) bit is padding and must
     not appear in the unpacked output."""
     rows = bytes([0b10101011])  # last 1 is padding
     fields = [("F", "7X")]
@@ -644,7 +656,8 @@ def test_x_multi_byte_with_partial_last_byte():
 
 
 def test_x_with_tdim_reshape():
-    """TDIM='(2,3)' over '6X' should reshape each cell to numpy shape
+    """
+    TDIM='(2,3)' over '6X' should reshape each cell to numpy shape
     (3, 2) using the same FORTRAN-to-numpy transpose rule as numeric
     TDIM."""
     # 6 bits packed MSB-first: bits b0..b5 (b5 is the 6th bit).
@@ -695,7 +708,8 @@ def test_x_rows_subset():
 
 
 def test_x_mixed_with_other_columns():
-    """X alongside fixed numeric — both must come out correctly in the
+    """
+    X alongside fixed numeric — both must come out correctly in the
     same structured array."""
     # row 0: ID=10, FLAGS bits = [T,F,T,F,T,F,T,F] = 0b10101010
     # row 1: ID=20, FLAGS bits = [F,T,F,T,F,T,F,T] = 0b01010101
@@ -750,7 +764,8 @@ def test_x_dtype_property_matches_read():
 
 
 def test_dtype_property_matches_read_output():
-    """TableHDU.dtype should equal the dtype of the array read()
+    """
+    TableHDU.dtype should equal the dtype of the array read()
     returns."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _three_col_file(tmp)
@@ -829,7 +844,8 @@ def test_getitem_slice_reversed():
 
 
 def test_getitem_list_in_user_order():
-    """Returned rows must be in the user's requested order, not on-disk
+    """
+    Returned rows must be in the user's requested order, not on-disk
     order — that's what the run-planner's output_indices is for."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _ten_row_file(tmp)
@@ -864,7 +880,8 @@ def test_getitem_negative_indices_in_list():
 
 
 def test_getitem_duplicates_deduped_preserving_first_order():
-    """Matches read(rows=) dedup behavior: duplicates dropped, first
+    """
+    Matches read(rows=) dedup behavior: duplicates dropped, first
     occurrence wins the position in the output."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _ten_row_file(tmp)
@@ -918,7 +935,8 @@ def test_getitem_bad_key_type_raises():
 
 
 def test_getitem_on_string_columns():
-    """Make sure A-column decode goes through __getitem__ just like
+    """
+    Make sure A-column decode goes through __getitem__ just like
     through read()."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _ten_row_file(tmp)
@@ -1110,7 +1128,8 @@ def test_getitem_mixed_types_in_sequence_rejected():
 
 
 def test_getitem_dispatch_int_list_still_rows():
-    """[int, int, ...] must stay on the rows path even after we added
+    """
+    [int, int, ...] must stay on the rows path even after we added
     column-name dispatch — this is the regression case for the
     Vec<u8>::extract foot-gun (a list of small ints would have silently
     decoded as a 'bytes column name')."""
@@ -1132,7 +1151,8 @@ def test_getitem_dispatch_numpy_int_array_still_rows():
 
 
 def test_getitem_bytearray_not_treated_as_column_name():
-    """bytearray is not a `bytes` subclass; the explicit type-instance
+    """
+    bytearray is not a `bytes` subclass; the explicit type-instance
     check excludes it.  It is also not an int-iterable in our
     classifier's eyes, so it errors via the iterable path."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -1146,7 +1166,8 @@ def test_getitem_bytearray_not_treated_as_column_name():
 
 
 def test_getitem_single_column_bad_rows_type():
-    """A SingleColumnSubset still requires slice or iterable-of-int for
+    """
+    A SingleColumnSubset still requires slice or iterable-of-int for
     rows; bare float should raise."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = _three_col_file(tmp)
@@ -1169,7 +1190,8 @@ def test_getitem_multi_column_bad_rows_type():
 
 
 def _write_var_table(path, fields, descriptors, heap, theap=None):
-    """Build a BINTABLE file with a variable-length column.
+    """
+    Build a BINTABLE file with a variable-length column.
 
     `fields` is the usual list of (ttype, tform) tuples; the variable
     column's TFORM is e.g. '1PE(maxlen)'.  `descriptors` are the raw
@@ -1325,7 +1347,8 @@ def test_var_complex_c8():
 
 
 def test_var_empty_cell_is_empty_ndarray():
-    """A descriptor with nelements=0 should yield a 0-length ndarray
+    """
+    A descriptor with nelements=0 should yield a 0-length ndarray
     (not None, not a scalar), so downstream code can unconditionally
     index into the cell."""
     descriptors = struct.pack(">ii", 0, 0)
@@ -1368,7 +1391,8 @@ def test_var_rows_subset():
 
 
 def test_var_mixed_with_fixed_columns():
-    """A row has a fixed J and a variable PE; both must come out
+    """
+    A row has a fixed J and a variable PE; both must come out
     correctly into the same structured array."""
     descriptors = b""
     for nelem, off, ident in [(2, 0, 10), (3, 8, 11), (1, 20, 12)]:
@@ -1398,7 +1422,8 @@ def test_var_mixed_with_fixed_columns():
 
 
 def test_var_columns_subset_excludes_variable():
-    """columns= without the variable column should not need any heap
+    """
+    columns= without the variable column should not need any heap
     reads (and skipping is harmless when the heap is unreadable)."""
     descriptors = b""
     for ident in [10, 11]:
@@ -1443,7 +1468,8 @@ def test_var_columns_subset_includes_variable():
 
 
 def test_var_theap_keyword_respected():
-    """THEAP says the heap starts at a non-default offset (i.e. there's
+    """
+    THEAP says the heap starts at a non-default offset (i.e. there's
     a gap between the main rows and the heap)."""
     descriptors = struct.pack(">ii", 2, 0)
     gap = b"\x00" * 20
@@ -1478,7 +1504,8 @@ def test_var_dtype_property_object():
 
 
 def test_var_negative_nelements_raises():
-    """A bad descriptor (nelements < 0) is a corrupt file; reject with
+    """
+    A bad descriptor (nelements < 0) is a corrupt file; reject with
     a clear error rather than crashing."""
     descriptors = struct.pack(">ii", -1, 0)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1490,7 +1517,8 @@ def test_var_negative_nelements_raises():
 
 
 def test_var_aliased_heap_offset_allowed():
-    """Two rows pointing at the same heap region must each get their
+    """
+    Two rows pointing at the same heap region must each get their
     own ndarray (correct + safe — no shared mutability)."""
     descriptors = (
         struct.pack(">ii", 2, 0)
@@ -1510,7 +1538,8 @@ def test_var_aliased_heap_offset_allowed():
 
 
 def test_var_tdim_on_p_rejected():
-    """TDIM on a P column is not yet supported; reject at parse
+    """
+    TDIM on a P column is not yet supported; reject at parse
     time."""
     fields = [("VLA", "1PE(10)", "(2,5)")]
     with tempfile.TemporaryDirectory() as tmp:
@@ -1559,7 +1588,8 @@ def test_var_inner_x_rejected():
 
 
 def _bintable_with_scaling(naxis1, naxis2, fields, tscals_tzeros):
-    """Like _bintable_cards but inserts TSCAL/TZERO cards.
+    """
+    Like _bintable_cards but inserts TSCAL/TZERO cards.
 
     `tscals_tzeros` is a dict {col_index_1based: (tscal_str, tzero_str)}.
     Each value is the literal numeric string to write into the card.
@@ -1680,7 +1710,8 @@ def test_scaling_tscal_only():
 
 
 def test_scaling_tzero_only_nontrick():
-    """TZERO set to a non-trick value → general scaling, not unsigned
+    """
+    TZERO set to a non-trick value → general scaling, not unsigned
     trick.  E.g. TZERO=100 on i32."""
     data = struct.pack(">iii", -10, 0, 10)
     fields = [("X", "1J")]
@@ -1730,7 +1761,8 @@ def test_scaling_read_column_scale_false():
 
 
 def test_scaling_defaults_no_change():
-    """A column with default TSCAL=1 and TZERO=0 (or missing) gives
+    """
+    A column with default TSCAL=1 and TZERO=0 (or missing) gives
     the same dtype and values regardless of scale=True/False."""
     data = struct.pack(">iii", 1, 2, 3)
     fields = [("X", "1J")]
@@ -1774,7 +1806,8 @@ def test_scaling_on_complex_raises():
 
 
 def test_scaling_on_complex_scale_false_ok():
-    """scale=False bypasses scaling — even C/M with TSCAL/TZERO set
+    """
+    scale=False bypasses scaling — even C/M with TSCAL/TZERO set
     should read without error."""
     data = struct.pack(">ff", 1.0, 2.0)
     fields = [("Z", "1C")]

@@ -1,4 +1,5 @@
-"""Phase 2c, step 4: complex value support in header writes.
+"""
+Phase 2c, step 4: complex value support in header writes.
 
 FITS complex literal: `(real, imag)`.  Components are serialized via the
 same float formatter as plain floats, so D/E exponents and special values
@@ -62,7 +63,8 @@ def test_complex_with_comment():
 
 
 def test_complex_integer_components():
-    """Components are stored as floats per the FITS spec, so an integer
+    """
+    Components are stored as floats per the FITS spec, so an integer
     complex round-trips as complex(3.0, 4.0)."""
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

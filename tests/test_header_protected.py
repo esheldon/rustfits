@@ -1,4 +1,5 @@
-"""Tests for protected-keyword handling.
+"""
+Tests for protected-keyword handling.
 
 Protected keywords are those rustfits manages on the user's behalf — file
 structure (NAXIS family, BITPIX, SIMPLE, ...), integrity (CHECKSUM,
@@ -192,7 +193,8 @@ def test_to_dict_skip_protected_drops_structural_keys():
 
 
 def test_to_dict_skip_protected_drops_continue_chain():
-    """A protected key with a CONTINUE-chained value gets its whole chain
+    """
+    A protected key with a CONTINUE-chained value gets its whole chain
     removed (the orphan CONTINUE cards must NOT leak through)."""
     # We can't easily create a protected key with a real CONTINUE chain
     # from the public API (the writer would reject it).  Instead, write a
@@ -226,7 +228,8 @@ def test_to_dict_skip_protected_keeps_commentary():
 
 
 def test_update_from_fitsheader_silently_skips_protected_keys():
-    """Copying a header from one HDU to another must drop protected keys
+    """
+    Copying a header from one HDU to another must drop protected keys
     (NAXIS/BITPIX/etc. of the source) so the destination's own structural
     state is preserved.  User metadata still copies through."""
     with _new_file(shape=(4, 6), dtype="i4") as a_name, \
@@ -251,7 +254,8 @@ def test_update_from_fitsheader_silently_skips_protected_keys():
 
 
 def test_update_from_fitsheader_skips_checksum_and_datasum():
-    """CHECKSUM/DATASUM are integrity contracts on the destination — they
+    """
+    CHECKSUM/DATASUM are integrity contracts on the destination — they
     must not be copied from a source header."""
     with _new_file() as a_name, _new_file() as b_name:
         # Inject CHECKSUM/DATASUM into a's cards by closing+writing through
@@ -268,7 +272,8 @@ def test_update_from_fitsheader_skips_checksum_and_datasum():
 
 
 def test_update_from_dict_still_raises_on_protected_key():
-    """Dict-source update() must continue to raise: explicit hand-written
+    """
+    Dict-source update() must continue to raise: explicit hand-written
     protected keys are almost certainly a mistake, not an intent to be
     silently dropped."""
     with _new_file() as fname:

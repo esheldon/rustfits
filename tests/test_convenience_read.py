@@ -1,4 +1,5 @@
-"""Tests for `rustfits.read()` (top-level convenience wrapper).
+"""
+Tests for `rustfits.read()` (top-level convenience wrapper).
 
 Covers the auto-skip-to-first-HDU-with-data default, ext selectors
 by int and EXTNAME, table kwarg pass-through (rows / columns / scale /
@@ -99,7 +100,8 @@ def test_read_default_picks_image_when_primary_has_data():
 
 
 def test_read_default_skips_empty_primary_to_find_table():
-    """Empty primary HDU followed by a BINTABLE → the table is
+    """
+    Empty primary HDU followed by a BINTABLE → the table is
     returned (default ext= None picks the first HDU with data)."""
     rows = struct.pack(">3i", 10, 20, 30)
     fields = [("X", "1J")]
@@ -159,7 +161,8 @@ def test_read_ext_by_index():
 
 
 def test_read_ext_by_extname():
-    """ext=str does case-insensitive EXTNAME lookup (matches FITS
+    """
+    ext=str does case-insensitive EXTNAME lookup (matches FITS
     __getitem__)."""
     rows = struct.pack(">2i", 7, 8)
     with tempfile.TemporaryDirectory() as tmp:
@@ -185,7 +188,8 @@ def test_read_ext_by_extname():
 
 
 def test_read_explicit_ext_returns_empty_data():
-    """When ext is given explicitly, the empty HDU is read anyway —
+    """
+    When ext is given explicitly, the empty HDU is read anyway —
     only the auto-pick path errors on no-data."""
     primary = _primary_no_data()
     with tempfile.TemporaryDirectory() as tmp:
@@ -240,7 +244,8 @@ def test_read_passes_columns_kwarg():
 
 
 def test_read_passes_scale_false():
-    """scale=False reaches the read path: unsigned-int-trick column
+    """
+    scale=False reaches the read path: unsigned-int-trick column
     comes back as raw i2 instead of u2."""
     rows = struct.pack(">3h", -32768, 0, 32767)
     extras = [
@@ -282,7 +287,8 @@ def test_read_passes_mask_null_true():
 
 
 def test_read_header_true_returns_tuple():
-    """header=True returns (data, FITSHeader); inspecting the header
+    """
+    header=True returns (data, FITSHeader); inspecting the header
     works after the file is closed (the FITSHeader holds its own
     snapshot of cards)."""
     rows = struct.pack(">i", 42)
@@ -318,7 +324,8 @@ def test_read_no_hdu_with_data_raises():
 
 
 def test_read_unsupported_hdu_type_raises():
-    """ASCII table HDUs don't have a read API yet — wrapper rejects
+    """
+    ASCII table HDUs don't have a read API yet — wrapper rejects
     cleanly when the user picks one explicitly."""
     primary = _primary_no_data()
     ascii_ext = [
