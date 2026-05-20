@@ -341,6 +341,35 @@ impl ImageHDU {
             Ok(arr_py)
         }
     }
+
+    // Symmetric write surface for __getitem__.  Same slice parser, so
+    // anything `img[key]` reads, `img[key] = value` writes.
+    //
+    // RHS forms:
+    //   - Python int / float, numpy scalar, or 0-d ndarray
+    //     (`np.ndim(value) == 0`) → broadcast: every pixel in the
+    //     selection gets this value.
+    //   - numpy ndarray with `shape == img[key].shape`, dtype
+    //     matching BITPIX → write elementwise.
+    //
+    // No general numpy broadcasting (scalar-only).  Dtype is strict;
+    // convert with `.astype(...)` if you need to.  Mid-write I/O
+    // failures taint the file (close + reopen to recover).
+    fn __setitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_: PyRef<HDU> = slf.into_super();
+        let header_cards = super_.header_snapshot()?;
+        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
+        let slices = normalize_slice_key(key, &hdu_shape)?;
+        write_image_slice(
+            py, &header_cards, super_.offsets.data_offset(),
+            &super_.file, &slices, value, &super_.tainted,
+        )
+    }
 }
 
 // Allocate a numpy array sized + typed to this HDU and fill it with the
@@ -751,6 +780,204 @@ fn write_image_data(
     file.flush()
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
+    Ok(())
+}
+
+// Encode a Python scalar (int/float, numpy scalar, or 0-d ndarray)
+// into FITS on-disk bytes (big-endian) for the given BITPIX.  Out-of-
+// range values fail the relevant `extract::<...>()` with OverflowError;
+// type mismatches (e.g. float -> int dtype) fail with TypeError.
+// Both surface unmodified to the caller, which is what we want.
+fn scalar_to_be_bytes(value: &Bound<'_, PyAny>, bitpix: i32) -> PyResult<Vec<u8>> {
+    Ok(match bitpix {
+        8 => {
+            let v: u8 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        16 => {
+            let v: i16 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        32 => {
+            let v: i32 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        64 => {
+            let v: i64 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        -32 => {
+            let v: f32 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        -64 => {
+            let v: f64 = value.extract()?;
+            v.to_be_bytes().to_vec()
+        }
+        _ => return Err(PyValueError::new_err(format!(
+            "unsupported BITPIX {}", bitpix
+        ))),
+    })
+}
+
+// Slice-based image write: the __setitem__ companion to
+// `read_image_slice`.  Walks the file using the same strip layout as
+// the read path (compute_read_strip_layout handles stepped slices by
+// moving them into the outer iteration), writing one strip per outer
+// step.  RHS is either a scalar (Python int/float, numpy scalar, or
+// 0-d ndarray — broadcast to every selected pixel) or a numpy ndarray
+// whose shape exactly matches the slice's output shape and whose
+// dtype matches BITPIX.  Failures inside the seek/write/flush loop
+// set the per-file taint flag because the data section may now be
+// inconsistent — recovery is via close+reopen.
+fn write_image_slice(
+    py: Python<'_>,
+    header: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+    slices: &[AxisSlice],
+    rhs: &Bound<'_, PyAny>,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bpp = (bitpix.abs() / 8) as u64;
+    let bpp_usize = bpp as usize;
+    let naxis = hdu_shape.len();
+
+    // The slice's output shape (in numpy axis order) — what an
+    // equivalent read would return.  Used for RHS shape validation.
+    let output_shape: Vec<u64> = slices.iter()
+        .filter(|s| !s.is_int)
+        .map(|s| s.count)
+        .collect();
+
+    let total_pixels: u64 = slices.iter().map(|s| s.count).product();
+    if total_pixels == 0 {
+        return Ok(());
+    }
+
+    let (outer_axes, strip_pixels) =
+        compute_read_strip_layout(&hdu_shape, slices);
+    let strip_bytes = (strip_pixels as usize) * bpp_usize;
+
+    // Discriminate scalar from ndarray via `numpy.ndim`.  This returns
+    // 0 for Python int/float, numpy scalars, AND 0-d ndarrays — exactly
+    // the broadcast cases.  Higher ndim is treated as an ndarray RHS
+    // whose shape must match output_shape exactly.
+    let np = py.import("numpy")?;
+    let rhs_ndim: usize = np.call_method1("ndim", (rhs,))?.extract()?;
+    let is_scalar = rhs_ndim == 0;
+
+    // Source bytes in big-endian (disk) layout.  For scalar broadcast
+    // we build a one-strip buffer and reuse it; for ndarray we copy +
+    // byteswap the whole thing once and slice strip-by-strip below.
+    let (source_bytes, per_strip): (Vec<u8>, bool) = if is_scalar {
+        let pixel_bytes = scalar_to_be_bytes(rhs, bitpix)?;
+        let mut strip = Vec::with_capacity(strip_bytes);
+        for _ in 0..strip_pixels {
+            strip.extend_from_slice(&pixel_bytes);
+        }
+        (strip, false)
+    } else {
+        let rhs_shape: Vec<u64> = rhs.getattr("shape")?.extract()?;
+        if rhs_shape != output_shape {
+            return Err(PyValueError::new_err(format!(
+                "RHS shape {:?} does not match indexed output shape {:?}",
+                rhs_shape, output_shape,
+            )));
+        }
+        let dtype = rhs.getattr("dtype")?;
+        let kind: String = dtype.getattr("kind")?.extract()?;
+        let itemsize: u64 = dtype.getattr("itemsize")?.extract()?;
+        let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
+        if kind != expected_kind || itemsize != expected_size {
+            return Err(PyValueError::new_err(format!(
+                "RHS dtype ({}{}) does not match HDU BITPIX={} \
+                 (expected {}{})",
+                kind, itemsize, bitpix, expected_kind, expected_size,
+            )));
+        }
+        let dtype_str: String = dtype.getattr("str")?.extract()?;
+        let needs_swap = if bpp_usize == 1 {
+            false
+        } else {
+            match dtype_str.chars().next() {
+                Some('>') | Some('|') => false,
+                Some('<') => true,
+                Some('=') => !cfg!(target_endian = "big"),
+                _ => return Err(PyValueError::new_err(format!(
+                    "unrecognized dtype byteorder in '{}'", dtype_str
+                ))),
+            }
+        };
+        let buffer = RawBuffer::acquire(rhs).map_err(|e| {
+            PyValueError::new_err(format!(
+                "RHS must be a C-contiguous numpy array \
+                 (try np.ascontiguousarray): {}", e
+            ))
+        })?;
+        let mut bytes = buffer.as_slice().to_vec();
+        if needs_swap {
+            byteswap_in_place(&mut bytes, bpp_usize);
+        }
+        (bytes, true)
+    };
+
+    // Outer iteration mirrors the read path exactly: walk strided
+    // outer axes, seek to the file position for each strip, write the
+    // strip.  Inner axes (always step=1 by the strip layout's
+    // construction) contribute a fixed `inner_start_pixels` offset
+    // that doesn't change across iterations.
+    let hdu_strides = row_major_strides(&hdu_shape);
+    let outer_count: u64 = slices[..outer_axes].iter()
+        .map(|s| s.count)
+        .product();
+    let inner_start_pixels: u64 = (outer_axes..naxis)
+        .map(|k| slices[k].start * hdu_strides[k])
+        .sum();
+
+    let mut output_offset: usize = 0;
+    let mut iter_idx = vec![0u64; outer_axes];
+
+    let mut guard = lock_file(file_handle)?;
+    let file = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+    let taint_io = |e: std::io::Error| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(e.to_string())
+    };
+
+    for _ in 0..outer_count {
+        let mut dst_pixel: u64 = inner_start_pixels;
+        for k in 0..outer_axes {
+            let dst_axis_idx =
+                slices[k].start + iter_idx[k] * slices[k].step;
+            dst_pixel += dst_axis_idx * hdu_strides[k];
+        }
+        let file_pos = data_offset + dst_pixel * bpp;
+
+        file.seek(SeekFrom::Start(file_pos)).map_err(taint_io)?;
+        let src = if per_strip {
+            &source_bytes[output_offset..output_offset + strip_bytes]
+        } else {
+            &source_bytes[..]
+        };
+        file.write_all(src).map_err(taint_io)?;
+        if per_strip {
+            output_offset += strip_bytes;
+        }
+
+        for axis in (0..outer_axes).rev() {
+            iter_idx[axis] += 1;
+            if iter_idx[axis] < slices[axis].count {
+                break;
+            }
+            iter_idx[axis] = 0;
+        }
+    }
+
+    file.flush().map_err(taint_io)?;
     Ok(())
 }
 

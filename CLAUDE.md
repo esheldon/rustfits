@@ -402,7 +402,15 @@ and `hdu[i:i+1]` which still return shape-(1,) structured arrays.
 Image HDUs follow the same numpy rule for their pixel grid:
 `image_hdu[i, j, ...]` with an integer on every axis returns a
 numpy scalar of the BITPIX dtype; mixed slice + int still returns
-an ndarray.
+an ndarray.  Image write via `__setitem__` is symmetric with the
+read: anything `image_hdu[key]` reads, `image_hdu[key] = value`
+writes.  RHS is either a scalar (Python int/float, numpy scalar,
+or 0-d ndarray — broadcast across the selection) or a shape-matching
+ndarray with dtype matching BITPIX.  Stepped slices are supported
+(falls into per-pixel writes via the same strip-layout walk as the
+read path).  Mid-write I/O failures taint the file (close + reopen
+to recover).  The existing `ImageHDU.write(data, start=...)` still
+works for explicit-start writes.
 
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
@@ -444,19 +452,14 @@ against `nomask`.
 
 **Convenience / API surface**
 
-6. **`__setitem__` for write** — the symmetric write surface to the
-   existing `__getitem__` read path, for both tables and images.
-   Sketch:
+6. **`__setitem__` for TableHDU** — image `__setitem__` is done; the
+   table side still needs the symmetric write surface.  Sketch:
      - `table_hdu[5] = scalar_record`        (whole-row write)
      - `table_hdu[3:5] = [r1, r2]`           (slice / iterable write)
      - `table_hdu[10:20] = struct_arr`       (bulk structured-array write)
-     - `image_hdu[i, j] = 1`                 (scalar pixel)
-     - `image_hdu[3:5] = data`               (slice write)
-   This subsumes / generalizes the existing `ImageHDU.write(data,
-   start=...)` and would be the natural place for a future
-   `TableHDU.write(rows=..., ...)` to land.  Decide whether the
-   indexing form coexists with the explicit `.write()` calls or
-   replaces them.
+   Natural place for a future `TableHDU.write(rows=..., ...)` to
+   land — decide whether the indexing form coexists with that or
+   replaces it.
 
 7. **`hdu.nrows`, `len(hdu)`, `hdu.colnames`** — small accessors.
    Today the equivalents are `len(hdu.dtype)` (column count), reading
