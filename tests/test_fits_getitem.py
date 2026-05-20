@@ -221,6 +221,41 @@ def test_duplicate_extname_returns_first():
             assert hdu.header["NAXIS1"] == 3
 
 
+# ---------------- iteration ----------------
+
+
+def test_iter_yields_all_hdus_in_order():
+    """`for hdu in fits` walks the HDUs in file order, matching
+    `for hdu in fits.hdus`."""
+    with _three_hdus() as fname:
+        with rustfits.FITS(fname) as fits:
+            via_iter = list(fits)
+            via_hdus = list(fits.hdus)
+            assert len(via_iter) == 3
+            assert via_iter == via_hdus
+
+
+def test_iter_single_hdu_file():
+    """File with only a primary HDU iterates once."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "p.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(dtype="f4", dims=[2, 2])
+        with rustfits.FITS(fname) as fits:
+            n = 0
+            for hdu in fits:
+                n += 1
+                assert hdu is fits[0]
+            assert n == 1
+
+
+def test_iter_len_matches():
+    """len(fits) == number of HDUs yielded by iteration."""
+    with _three_hdus() as fname:
+        with rustfits.FITS(fname) as fits:
+            assert len(fits) == sum(1 for _ in fits)
+
+
 if __name__ == "__main__":
     test_int_indexing_unchanged()
     test_negative_int_indexing_unchanged()
@@ -240,4 +275,7 @@ if __name__ == "__main__":
     test_list_of_small_ints_not_treated_as_bytes_extname()
     test_numpy_int_array_not_treated_as_bytes_extname()
     test_duplicate_extname_returns_first()
+    test_iter_yields_all_hdus_in_order()
+    test_iter_single_hdu_file()
+    test_iter_len_matches()
     print("all tests passed")

@@ -50,7 +50,7 @@ def read(filename, ext=None, *, rows=None, columns=None,
     with FITS(filename, "r") as fits:
         if ext is None:
             chosen = None
-            for hdu in fits.hdus:
+            for hdu in fits:
                 if hdu.has_data:
                     chosen = hdu
                     break

@@ -383,6 +383,13 @@ impl FITS {
         self.hdus.len()
     }
 
+    // Make FITS iterable: `for hdu in fits` walks the HDUs in file
+    // order, same as `for hdu in fits.hdus`.  Matches fitsio's API.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = PyList::new(py, &self.hdus)?;
+        Ok(list.try_iter()?.into_any().unbind())
+    }
+
     // Create a new image HDU.  `dtype` follows numpy short-code convention
     // (e.g. 'f8', 'i4').  `dims` is the array shape in numpy (row-major)
     // order and is reversed internally to produce FITS NAXISn.  The first
