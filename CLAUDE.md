@@ -396,6 +396,9 @@ column name → unit string or None) and shown in the repr; BUNIT
 exposed at the image level via `ImageHDU.unit` and the image-info
 repr line.  Informational only — no consumer in the read/write path.
 `rows=` / `columns=` subsets + `__getitem__` column-subset objects.
+Bare-int indexing `hdu[i]` returns a 0-d numpy record (np.void),
+matching `structured_arr[i]` semantics — distinct from `hdu[[i]]`
+and `hdu[i:i+1]` which still return shape-(1,) structured arrays.
 
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
@@ -437,14 +440,9 @@ against `nomask`.
 
 **Convenience / API surface**
 
-6. **`hdu[5]` returning a single record** — currently rejected because
-   `__getitem__` requires a slice or iterable of ints.  Natural
-   Python-ism (matches numpy structured-array indexing); should
-   return a 0-d record / np.void.
-
-   Worth doing as a read/write pair: once `hdu[5]` reads a scalar,
-   `__setitem__` becomes the natural write surface for both tables
-   and images.  Sketch:
+6. **`__setitem__` for write** — the symmetric write surface to the
+   existing `__getitem__` read path, for both tables and images.
+   Sketch:
      - `table_hdu[5] = scalar_record`        (whole-row write)
      - `table_hdu[3:5] = [r1, r2]`           (slice / iterable write)
      - `table_hdu[10:20] = struct_arr`       (bulk structured-array write)

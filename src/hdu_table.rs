@@ -1998,6 +1998,26 @@ impl TableHDU {
                     /* scale = */ true, /* mask_null = */ false,
                 )
             }
+            TableKey::SingleRow(idx) => {
+                let pyref = slf.borrow();
+                let super_ = pyref.into_super();
+                let cards = super_.header_snapshot()?;
+                let data_offset = super_.offsets.data_offset();
+                // Wrap idx in a single-element list so resolve_rows
+                // handles negative-index normalization and range
+                // validation the same way it does for `hdu[[idx]]`.
+                let one = PyList::new(py, [idx])?;
+                let arr_py = read_table(
+                    py, &cards, data_offset, &super_.file,
+                    Some(one.as_any()), None,
+                    /* scale = */ true, /* mask_null = */ false,
+                )?;
+                // arr is shape (1,); index [0] yields numpy's 0-d
+                // record (np.void), matching `structured_arr[i]`
+                // semantics for the user.
+                let arr_bound = arr_py.bind(py);
+                Ok(arr_bound.get_item(0)?.unbind())
+            }
             TableKey::SingleColumn(name) => {
                 let hdu_py: Py<TableHDU> = slf.clone().unbind();
                 Ok(Py::new(py, SingleColumnSubset { hdu: hdu_py, name })?
@@ -2014,9 +2034,13 @@ impl TableHDU {
 
 // What kind of selection the user passed to TableHDU.__getitem__.
 // `Rows` covers both slices and integer iterables: in both cases the
-// key flows through to read_table unchanged.
+// key flows through to read_table unchanged.  `SingleRow` is the
+// bare-integer case (`hdu[5]`); read_table still does the I/O but
+// the result is unwrapped to a numpy 0-d record (np.void) before
+// returning, matching `structured_arr[i]` semantics.
 enum TableKey {
     Rows,
+    SingleRow(i64),
     SingleColumn(String),
     MultiColumns(Vec<String>),
 }
@@ -2052,6 +2076,7 @@ fn try_extract_column_name(obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
 
 // Inspect the __getitem__ key and decide which path to take.  Rules:
 //   - PySlice                            → Rows  (read flowing path)
+//   - bare int (not bool)                → SingleRow (np.void scalar)
 //   - single str/bytes/np.str_/np.bytes_ → SingleColumn
 //   - non-empty iterable
 //       first element string-like        → MultiColumns
@@ -2066,9 +2091,18 @@ fn classify_table_key(key: &Bound<'_, PyAny>) -> PyResult<TableKey> {
     if let Some(name) = try_extract_column_name(key)? {
         return Ok(TableKey::SingleColumn(name));
     }
+    // Bare integer (not bool — Python bool is a subclass of int and
+    // would otherwise sneak through).  Float/non-int Python objects
+    // are rejected by extract::<i64>.
+    if !key.is_instance_of::<PyBool>() {
+        if let Ok(idx) = key.extract::<i64>() {
+            return Ok(TableKey::SingleRow(idx));
+        }
+    }
     let iter = key.try_iter().map_err(|_| PyValueError::new_err(
-        "TableHDU[key] requires a slice, a str/bytes column name, \
-         an iterable of ints (rows), or an iterable of str/bytes (columns)"
+        "TableHDU[key] requires a slice, an int (row index), a \
+         str/bytes column name, an iterable of ints (rows), or an \
+         iterable of str/bytes (columns)"
     ))?;
     let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
     if items.is_empty() {
