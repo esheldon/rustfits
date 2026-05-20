@@ -74,10 +74,16 @@ def test_roundtrip_single_column_dtype(field_dtype):
 def test_roundtrip_multi_column_mixed_dtypes():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
-        dt = np.dtype([
-            ("id", "i4"), ("flux", "f8"), ("snr", "f4"),
-            ("flag", "u1"), ("idx16", "i2"), ("idx64", "i8"),
-        ])
+        dt = np.dtype(
+            [
+                ("id", "i4"),
+                ("flux", "f8"),
+                ("snr", "f4"),
+                ("flag", "u1"),
+                ("idx16", "i2"),
+                ("idx64", "i8"),
+            ]
+        )
         arr = _make_arr(dt, n=11)
 
         with rustfits.FITS(fname, "w+") as fits:
@@ -196,8 +202,7 @@ def test_extname_extver():
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4")])
         with rustfits.FITS(fname, "w+") as fits:
-            fits.create_table_hdu(dt, nrows=0,
-                                  extname="MYTABLE", extver=7)
+            fits.create_table_hdu(dt, nrows=0, extname="MYTABLE", extver=7)
             assert fits[1].header["EXTNAME"] == "MYTABLE"
             assert fits[1].header["EXTVER"] == 7
 
@@ -214,7 +219,8 @@ def test_units_kwarg_round_trips():
         dt = np.dtype([("flux", "f4"), ("snr", "f4"), ("id", "i4")])
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_table_hdu(
-                dt, nrows=0,
+                dt,
+                nrows=0,
                 units={"flux": "Jy", "snr": "1"},
             )
             u = fits[1].units
@@ -282,24 +288,6 @@ def test_dtype_with_no_fields_rejected():
         with rustfits.FITS(fname, "w+") as fits:
             with pytest.raises(ValueError, match="structured"):
                 fits.create_table_hdu("f4", nrows=3)
-
-
-def test_unsupported_dtype_rejected_unsigned_wide():
-    """Phase 1b will add u2/u4/u8 via the unsigned-int trick; for now
-    they're rejected with a 'Phase 1b' message."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = os.path.join(tmpdir, "t.fits")
-        with rustfits.FITS(fname, "w+") as fits:
-            with pytest.raises(ValueError, match="Phase 1b"):
-                fits.create_table_hdu([("x", "u4")], nrows=1)
-
-
-def test_unsupported_dtype_rejected_bool():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = os.path.join(tmpdir, "t.fits")
-        with rustfits.FITS(fname, "w+") as fits:
-            with pytest.raises(ValueError, match="Phase 1b"):
-                fits.create_table_hdu([("x", "?")], nrows=1)
 
 
 def test_unsupported_dtype_rejected_string():
@@ -391,11 +379,10 @@ def test_getitem_and_read_column_round_trip():
 
         with rustfits.FITS(fname) as fits:
             np.testing.assert_array_equal(
-                fits[1].read_column("flux"), arr["flux"])
-            np.testing.assert_array_equal(
-                fits[1][2:5]["id"], arr["id"][2:5])
-            np.testing.assert_array_equal(
-                fits[1]["flux"][:], arr["flux"])
+                fits[1].read_column("flux"), arr["flux"]
+            )
+            np.testing.assert_array_equal(fits[1][2:5]["id"], arr["id"][2:5])
+            np.testing.assert_array_equal(fits[1]["flux"][:], arr["flux"])
 
 
 def test_larger_table_exercises_strip_loop():

@@ -1182,6 +1182,18 @@ pub(crate) fn card_int(key: &str, value: i64, comment: &str) -> String {
     pad_to_card(&body)
 }
 
+// u64 variant for TZERO=2^63 (the u8 unsigned-int trick), which
+// overflows i64.  Format is identical to card_int otherwise.
+pub(crate) fn card_uint(key: &str, value: u64, comment: &str) -> String {
+    let head = format!("{:<8}= {:>20}", key, value);
+    let body = if comment.is_empty() {
+        head
+    } else {
+        format!("{} / {}", head, comment)
+    };
+    pad_to_card(&body)
+}
+
 pub(crate) fn card_logical(key: &str, value: bool, comment: &str) -> String {
     let v = if value { "T" } else { "F" };
     let head = format!("{:<8}= {:>20}", key, v);

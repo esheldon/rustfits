@@ -32,7 +32,7 @@ use crate::common::{
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
-use crate::header::{card_int, card_string, pad_to_card};
+use crate::header::{card_int, card_string, card_uint, pad_to_card};
 
 // All the per-column metadata needed downstream.  byte_offset is the
 // offset of this column's bytes within a single row; byte_width is the
@@ -1783,60 +1783,76 @@ fn read_one_column(
 }
 
 // ===========================================================================
-// Write side (Phase 1 MVP): scalar numeric BINTABLE columns
+// Write side (Phase 1a + 1b): scalar numeric BINTABLE columns
 // ===========================================================================
 //
-// The MVP supports scalar fields with numpy kind/itemsize in {i2, i4, i8,
-// u1, f4, f8}.  Per the Table Write Roadmap in CLAUDE.md, follow-up
-// commits add the unsigned-int trick (1b), bool/complex (1b), subarrays
-// + TDIM (1c), strings (1d), and dict / list+names input forms (1e).
+// Phase 1a (MVP) added scalar i2/i4/i8/u1/f4/f8 with Identity (byteswap-
+// only) transforms.  Phase 1b adds:
+//   - u2/u4/u8 → I/J/K + TZERO=2^(n-1) (unsigned-int trick).  Write
+//     transform: byteswap, then XOR the top bit of the high byte
+//     (equivalent to subtracting 2^(n-1) in two's-complement).
+//   - b1 (numpy bool) → L (FITS logical).  Per-byte: 0 → 0x46 ('F'),
+//     nonzero → 0x54 ('T').  No byteswap.
+//   - c8 / c16 → C / M.  Identity transform; byteswap_unit() returns
+//     4 / 8 so the existing per-half byteswap is correct.
+//
+// Per the Table Write Roadmap in CLAUDE.md, subsequent commits add
+// subarrays + TDIM (1c), strings (1d), and dict / list+names input
+// forms (1e).
 //
 // Performance model: when the input numpy structured dtype's field
-// offsets exactly match the HDU's on-disk column offsets (the MVP
-// guarantees this via validate), the per-strip fill is one bulk memcpy
-// from `src_bytes` into the strip buffer, followed by per-column
-// in-place byteswap.  Slow-path (per-column strided copies + transforms)
-// returns when later phases let inputs deviate from the on-disk layout.
+// offsets exactly match the HDU's on-disk column offsets (1a/1b
+// guarantee this via validate — all 1b transforms preserve byte widths),
+// the per-strip fill is one bulk memcpy from `src_bytes` into the strip
+// buffer, followed by per-column in-place transform.  Slow-path (per-
+// column strided copies) returns when 1d lets inputs deviate from the
+// on-disk layout.
 
 // Per-column metadata derived from the user's numpy structured dtype at
 // create_table_hdu time, used to emit the BINTABLE header cards.
+// `tzero` is Some only when the column uses the unsigned-int trick (its
+// value is the power-of-two offset added on read to recover the
+// unsigned interpretation).
 struct WriteColumn {
     name: String,
     tform_letter: char,
     repeat: usize,
     byte_width: usize,
+    tzero: Option<u64>,
     tunit: Option<String>,
 }
 
-// Returns (tform_letter, element_bytes) for one scalar numpy field.
-// MVP-restricted set; future commits extend the match.
+// Returns (tform_letter, element_bytes, optional TZERO for unsigned
+// trick) for one scalar numpy field.
 fn classify_scalar_numpy_field(
     field_dtype: &Bound<'_, PyAny>,
     col_name: &str,
-) -> PyResult<(char, usize)> {
+) -> PyResult<(char, usize, Option<u64>)> {
     let kind: String = field_dtype.getattr("kind")?.extract()?;
     let itemsize: usize = field_dtype.getattr("itemsize")?.extract()?;
     let err = |reason: &str| PyValueError::new_err(format!(
         "column '{}': numpy dtype kind '{}' itemsize {} — {}",
         col_name, kind, itemsize, reason));
     match (kind.as_str(), itemsize) {
-        ("i", 2) => Ok(('I', 2)),
-        ("i", 4) => Ok(('J', 4)),
-        ("i", 8) => Ok(('K', 8)),
-        ("u", 1) => Ok(('B', 1)),
-        ("f", 4) => Ok(('E', 4)),
-        ("f", 8) => Ok(('D', 8)),
+        ("i", 2) => Ok(('I', 2, None)),
+        ("i", 4) => Ok(('J', 4, None)),
+        ("i", 8) => Ok(('K', 8, None)),
+        ("u", 1) => Ok(('B', 1, None)),
+        ("u", 2) => Ok(('I', 2, Some(1u64 << 15))),
+        ("u", 4) => Ok(('J', 4, Some(1u64 << 31))),
+        ("u", 8) => Ok(('K', 8, Some(1u64 << 63))),
+        ("f", 4) => Ok(('E', 4, None)),
+        ("f", 8) => Ok(('D', 8, None)),
+        ("c", 8) => Ok(('C', 8, None)),
+        ("c", 16) => Ok(('M', 16, None)),
+        ("b", 1) => Ok(('L', 1, None)),
         ("i", 1) => Err(err(
             "int8 has no native FITS BINTABLE code (deferred)")),
-        ("u", 2) | ("u", 4) | ("u", 8) => Err(err(
-            "uint > 1 byte requires the unsigned-int trick (Phase 1b)")),
-        ("b", 1) => Err(err("bool → L conversion is Phase 1b")),
-        ("c", _) => Err(err("complex (C/M) is Phase 1b")),
         ("S", _) | ("U", _) => Err(err("string (A) columns are Phase 1d")),
         ("f", 2) => Err(err("float16 has no FITS BINTABLE code")),
         _ => Err(err(
-            "unsupported numpy dtype for create_table_hdu MVP \
-             (supported: i2/i4/i8/u1/f4/f8 scalar fields)")),
+            "unsupported numpy dtype \
+             (supported: i2/i4/i8/u1/u2/u4/u8/f4/f8/c8/c16/b1 scalar fields)")),
     }
 }
 
@@ -1870,7 +1886,7 @@ fn dtype_to_write_columns(
                 "column '{}': subarray fields are Phase 1c (not yet supported)",
                 name)));
         }
-        let (tform_letter, elem_bytes) =
+        let (tform_letter, elem_bytes, tzero) =
             classify_scalar_numpy_field(&field_dtype, name)?;
         let repeat = 1usize;
         let byte_width = elem_bytes * repeat;
@@ -1883,6 +1899,7 @@ fn dtype_to_write_columns(
             tform_letter,
             repeat,
             byte_width,
+            tzero,
             tunit,
         });
     }
@@ -1922,6 +1939,11 @@ fn build_bintable_header_cards(
             &format!("TTYPE{}", n), &col.name, "label for column"));
         cards.push(card_string(
             &format!("TFORM{}", n), &tform, "data format of column"));
+        if let Some(tz) = col.tzero {
+            cards.push(card_uint(
+                &format!("TZERO{}", n), tz,
+                "offset for unsigned integer (unsigned-int trick)"));
+        }
         if let Some(unit) = &col.tunit {
             cards.push(card_string(
                 &format!("TUNIT{}", n), unit, "physical unit of column"));
@@ -1952,18 +1974,125 @@ pub(crate) fn normalize_and_build_table_header(
     Ok((cards, row_width))
 }
 
+// Per-column transform applied during the strip-by-strip write.  All
+// variants preserve byte width (so the post-bulk-copy layout still
+// matches the FITS row layout) — they differ only in how each cell's
+// bytes are mutated in place after the bulk copy.
+#[derive(Debug, Clone, Copy)]
+enum WriteTransform {
+    // Per-element byteswap by `elem_w` bytes.  `elem_w==1` is a no-op
+    // (covers B/u1 and the byteswap step of L; L's value mapping
+    // happens in BoolToLogical).  Complex types use elem_w==4 (C) or
+    // elem_w==8 (M) so real/imag halves swap independently.
+    Identity { elem_w: usize, num_elems: usize },
+    // u2/u4/u8 unsigned-int trick: byteswap, then XOR top bit of the
+    // resulting high byte (equivalent to subtracting 2^(n-1) in two's
+    // complement so the stored value is the signed-int representation
+    // matching the column's TZERO).
+    UnsignedXor { elem_w: usize, num_elems: usize },
+    // numpy bool (1 byte 0/1) → FITS L (1 byte ASCII 'T'=0x54 or
+    // 'F'=0x46).  Per-byte over `num_bytes`.  No byteswap needed.
+    BoolToLogical { num_bytes: usize },
+}
+
+// Resolve the per-column write transform given the on-disk column
+// (tform_letter + tzero) and the input numpy field's (kind, itemsize).
+// Rejects mismatches with a message naming both sides.
+fn column_transform(
+    col: &Column,
+    input_kind: &str,
+    input_size: usize,
+) -> PyResult<WriteTransform> {
+    // Natural (no-scaling) input dtype per FITS letter; swap_unit is
+    // the per-element byteswap width (== bytes_per_element for most,
+    // half-element for complex).
+    let (nat_kind, nat_size, swap_unit) = match col.tform_letter {
+        'L' => ("b", 1, 1),
+        'B' => ("u", 1, 1),
+        'I' => ("i", 2, 2),
+        'J' => ("i", 4, 4),
+        'K' => ("i", 8, 8),
+        'E' => ("f", 4, 4),
+        'D' => ("f", 8, 8),
+        'C' => ("c", 8, 4),
+        'M' => ("c", 16, 8),
+        c => return Err(PyValueError::new_err(format!(
+            "column '{}': unsupported TFORM letter '{}' on write",
+            col.name, c))),
+    };
+    let num_elems = col.byte_width / swap_unit;
+
+    // BoolToLogical: input is numpy bool and column is L.
+    if col.tform_letter == 'L' {
+        if input_kind == "b" && input_size == 1 {
+            return Ok(WriteTransform::BoolToLogical { num_bytes: num_elems });
+        }
+        return Err(PyValueError::new_err(format!(
+            "column '{}' (L): expected numpy bool input, got kind '{}' \
+             itemsize {}", col.name, input_kind, input_size)));
+    }
+
+    // Unsigned-int trick: column letter + TZERO matches one of the
+    // power-of-two offsets, and TSCAL is 1.
+    let unsigned_trick = col.tscal == 1.0 && matches!(
+        (col.tform_letter, col.tzero),
+        ('I', t) if t == 32768.0
+    ) || col.tscal == 1.0 && matches!(
+        (col.tform_letter, col.tzero),
+        ('J', t) if t == 2147483648.0
+    ) || col.tscal == 1.0 && matches!(
+        (col.tform_letter, col.tzero),
+        ('K', t) if t == 9223372036854775808.0
+    );
+    if unsigned_trick {
+        if input_kind == "u" && input_size == nat_size {
+            return Ok(WriteTransform::UnsignedXor {
+                elem_w: swap_unit, num_elems,
+            });
+        }
+        return Err(PyValueError::new_err(format!(
+            "column '{}' ({} + TZERO unsigned-int trick): expected u{} \
+             input, got kind '{}' itemsize {}",
+            col.name, col.tform_letter, nat_size * 8,
+            input_kind, input_size)));
+    }
+
+    // Natural mapping: input matches the no-scaling expected dtype.
+    if input_kind == nat_kind && input_size == nat_size
+        && col.tscal == 1.0 && col.tzero == 0.0
+    {
+        return Ok(WriteTransform::Identity {
+            elem_w: swap_unit, num_elems,
+        });
+    }
+
+    // Other scaling on the column (general TSCAL/TZERO) is read-only
+    // for now — write-side support has no implementation yet.
+    if col.tscal != 1.0 || col.tzero != 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "column '{}' has TSCAL/TZERO scaling other than the unsigned-\
+             int trick; writing scaled columns is not yet supported",
+            col.name)));
+    }
+    Err(PyValueError::new_err(format!(
+        "column '{}' ({}): expected input dtype kind '{}' itemsize {}, \
+         got kind '{}' itemsize {}",
+        col.name, col.tform_letter, nat_kind, nat_size,
+        input_kind, input_size)))
+}
+
 // Validate the input ndarray's structured dtype against the HDU's
-// on-disk columns.  MVP: same field count, same names in same order,
-// per-field width equal to column byte_width, AND src_itemsize equal
-// to row_width with each field at the column's byte_offset (i.e. the
-// in-memory layout matches FITS row layout exactly modulo endianness).
-// Phase 1e will relax this and route mismatches through a slow-path
-// per-column strided copy.
+// on-disk columns, returning the per-column WriteTransform vector.
+// Checks: same field count, same names in same order, per-field
+// width equal to column byte_width (all Phase 1b transforms preserve
+// width), src_itemsize equal to row_width, each field at the column's
+// byte_offset (no padding/reordering).  Phase 1e will relax these and
+// route mismatches through a slow per-column strided fill.
 fn validate_write_layout(
     input_dtype: &Bound<'_, PyAny>,
     columns: &[Column],
     row_width: usize,
-) -> PyResult<()> {
+) -> PyResult<Vec<WriteTransform>> {
     let names_attr = input_dtype.getattr("names")?;
     if names_attr.is_none() {
         return Err(PyValueError::new_err(
@@ -1977,6 +2106,7 @@ fn validate_write_layout(
             names.len(), columns.len())));
     }
     let fields = input_dtype.getattr("fields")?;
+    let mut transforms = Vec::with_capacity(columns.len());
     for (i, (input_name, col)) in names.iter().zip(columns.iter()).enumerate() {
         if input_name != &col.name {
             return Err(PyValueError::new_err(format!(
@@ -2001,6 +2131,9 @@ fn validate_write_layout(
                  reordered fields, which is Phase 1e", input_name,
                 src_offset, col.byte_offset)));
         }
+        let input_kind: String =
+            field_dtype.getattr("kind")?.extract()?;
+        transforms.push(column_transform(col, &input_kind, src_size)?);
     }
     let input_itemsize: usize = input_dtype.getattr("itemsize")?.extract()?;
     if input_itemsize != row_width {
@@ -2008,16 +2141,17 @@ fn validate_write_layout(
             "TableHDU.write: input dtype itemsize {} does not match table \
              row_width {}", input_itemsize, row_width)));
     }
-    Ok(())
+    Ok(transforms)
 }
 
-// Strip-based bulk write into the table's data section.  MVP fast path:
-// per strip, one memcpy of `chunk * row_width` source bytes into the
-// strip buffer, then per-column in-place byteswap; the input layout
-// already matches the FITS row layout modulo endianness (validate step
-// enforces this).  Peak memory ~1 MiB regardless of nrows.
+// Strip-based bulk write into the table's data section.  Per strip,
+// one memcpy of `chunk * row_width` source bytes into the strip buffer
+// (input layout matches FITS row layout modulo per-element transforms,
+// validated upstream), then per-column in-place transform dispatch.
+// Peak memory ~1 MiB regardless of nrows.
 fn write_table_data(
     columns: &[Column],
+    transforms: &[WriteTransform],
     file: &FileHandle,
     data_offset: u64,
     nrows: usize,
@@ -2045,22 +2179,43 @@ fn write_table_data(
         if want < strip_buf.len() {
             strip_buf.truncate(want);
         }
-        // Bulk copy the strip's source bytes into the buffer.  Source
-        // layout matches destination layout exactly (validated).
+        // Bulk copy the strip's source bytes into the buffer.
         let src_start = row_start * row_width;
         strip_buf.copy_from_slice(&src_bytes[src_start..src_start + want]);
-        // Per-column in-place byteswap.  Columns with element width 1
-        // (B / u1) are skipped — no swap needed.  Slice::reverse() flips
-        // byte order over the element width.
-        for col in columns {
-            let elem_w = byteswap_unit(col.tform_letter);
-            if elem_w == 1 { continue; }
-            let elem_count = col.byte_width / elem_w;
-            for r in 0..chunk {
-                let row_off = r * row_width + col.byte_offset;
-                for e in 0..elem_count {
-                    let beg = row_off + e * elem_w;
-                    strip_buf[beg..beg + elem_w].reverse();
+        // Per-column in-place transform dispatch.
+        for (col, transform) in columns.iter().zip(transforms.iter()) {
+            match *transform {
+                WriteTransform::Identity { elem_w, num_elems } => {
+                    if elem_w == 1 { continue; }
+                    for r in 0..chunk {
+                        let row_off = r * row_width + col.byte_offset;
+                        for e in 0..num_elems {
+                            let beg = row_off + e * elem_w;
+                            strip_buf[beg..beg + elem_w].reverse();
+                        }
+                    }
+                }
+                WriteTransform::UnsignedXor { elem_w, num_elems } => {
+                    // Byteswap, then flip the top bit of the now-high
+                    // byte (byte 0 of each big-endian element).
+                    for r in 0..chunk {
+                        let row_off = r * row_width + col.byte_offset;
+                        for e in 0..num_elems {
+                            let beg = row_off + e * elem_w;
+                            strip_buf[beg..beg + elem_w].reverse();
+                            strip_buf[beg] ^= 0x80;
+                        }
+                    }
+                }
+                WriteTransform::BoolToLogical { num_bytes } => {
+                    for r in 0..chunk {
+                        let row_off = r * row_width + col.byte_offset;
+                        for b in 0..num_bytes {
+                            let pos = row_off + b;
+                            strip_buf[pos] =
+                                if strip_buf[pos] == 0 { b'F' } else { b'T' };
+                        }
+                    }
                 }
             }
         }
@@ -2397,7 +2552,8 @@ impl TableHDU {
                 "TableHDU.write: data must be a numpy ndarray"));
         }
         let input_dtype = data.getattr("dtype")?;
-        validate_write_layout(&input_dtype, &columns, row_width)?;
+        let transforms = validate_write_layout(
+            &input_dtype, &columns, row_width)?;
         let data_len: usize = data.len()?;
         if data_len != nrows {
             return Err(PyValueError::new_err(format!(
@@ -2421,8 +2577,8 @@ impl TableHDU {
                  expected {}", src_bytes.len(), expected_bytes)));
         }
         write_table_data(
-            &columns, &super_.file, data_offset, nrows, row_width,
-            src_bytes, &super_.tainted,
+            &columns, &transforms, &super_.file, data_offset, nrows,
+            row_width, src_bytes, &super_.tainted,
         )
     }
 }
