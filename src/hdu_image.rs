@@ -65,6 +65,7 @@ impl ImageHDU {
         shape.reverse();  // numpy axis order: slowest first.
         let dtype = bitpix_to_native_dtype(bitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
+        let bunit = parse_string_keyword(&cards, "BUNIT");
 
         let mut out = String::new();
         out.push_str(&format!("  file: {}\n", super_.filename));
@@ -76,7 +77,20 @@ impl ImageHDU {
         out.push_str("  image info:\n");
         out.push_str(&format!("    data type: {}\n", dtype));
         out.push_str(&format!("    dims: {:?}\n", shape));
+        if let Some(u) = bunit {
+            out.push_str(&format!("    unit: {}\n", u));
+        }
         Ok(out)
+    }
+
+    // BUNIT header value (e.g. "Jy", "counts/s"), or None when unset.
+    // Purely informational; nothing in the read/write path consumes
+    // it.  Mirrors TableHDU.units (per-column) at the image level.
+    #[getter]
+    fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_string_keyword(&cards, "BUNIT"))
     }
 
     #[pyo3(signature = (data, start=None))]

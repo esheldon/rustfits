@@ -391,8 +391,11 @@ B/I/J/K columns via `mask_null=True` (opt-in): returns
 `numpy.ma.MaskedArray` with per-field bool mask; compare is in
 stored-int space (pre-scaling) so it composes correctly with all
 TSCAL/TZERO paths.  VLA columns with TNULL are rejected up-front when
-`mask_null=True`.  `rows=` / `columns=` subsets + `__getitem__`
-column-subset objects.
+`mask_null=True`.  TUNITn surfaced via `TableHDU.units` (dict mapping
+column name → unit string or None) and shown in the repr; BUNIT
+exposed at the image level via `ImageHDU.unit` and the image-info
+repr line.  Informational only — no consumer in the read/write path.
+`rows=` / `columns=` subsets + `__getitem__` column-subset objects.
 
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
@@ -443,15 +446,8 @@ against `nomask`.
    Today the equivalents are `len(hdu.dtype)` (column count), reading
    NAXIS2 from the header, and `hdu.dtype.names`.
 
-8. **`TUNITn`** — column-units metadata.  Probably attach to
-   `dtype.metadata`; expose via a `.units` accessor or similar.
-   Informational only; doesn't affect read semantics.
-
-9. **`TDISPn`** — display format hint.  Informational; lower
-   priority than TUNIT.
-
-10. **Better `__repr__` for `TableHDU`** — currently just shows the
-    HDU index.  Showing nrows + column names is more useful.
+8. **`TDISPn`** — display format hint.  Informational, similar
+   shape to TUNIT but rarely used.
 
 **Probably not worth chasing yet**
 

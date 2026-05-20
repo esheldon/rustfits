@@ -20,7 +20,7 @@
 // (P/Q with inner X).
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyList, PySlice, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PySlice, PyString, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -69,6 +69,10 @@ pub(crate) struct Column {
     // space, before TSCAL/TZERO, so this value is the raw on-disk
     // sentinel regardless of any scaling.
     pub(crate) tnull: Option<i64>,
+    // TUNITn column units string (e.g. "Jy", "deg", "s").  Purely
+    // informational; nothing in the read/write path consumes it.
+    // Surfaced via TableHDU.units and shown in the repr.
+    pub(crate) tunit: Option<String>,
 }
 
 // Bytes per single element for each supported TFORM letter.  'A' is 1
@@ -507,6 +511,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
             } else {
                 None
             };
+            let tunit = parse_string_keyword(cards, &format!("TUNIT{}", i));
             Column {
                 name,
                 tform_letter: inner,
@@ -518,6 +523,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 tscal,
                 tzero,
                 tnull,
+                tunit,
             }
         } else {
             // X is a bit column: `repeat` is the bit count and the
@@ -564,6 +570,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
             } else {
                 None
             };
+            let tunit = parse_string_keyword(cards, &format!("TUNIT{}", i));
             Column {
                 name,
                 tform_letter: letter,
@@ -575,6 +582,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 tscal,
                 tzero,
                 tnull,
+                tunit,
             }
         };
         offset += column.byte_width;
@@ -1862,6 +1870,9 @@ impl TableHDU {
             if let Some(shape) = shape_str {
                 out.push_str(&format!("  {}", shape));
             }
+            if let Some(unit) = &col.tunit {
+                out.push_str(&format!("  ({})", unit));
+            }
             out.push('\n');
         }
         Ok(out)
@@ -1878,6 +1889,22 @@ impl TableHDU {
         let cards = super_.header_snapshot()?;
         let columns = parse_columns(&cards)?;
         build_numpy_dtype(py, &columns, /* scale = */ true)
+    }
+
+    // Column-units dict: maps column name (case preserved) to the
+    // TUNITn string, or None when TUNITn is unset for that column.
+    // Informational only — nothing in the read path consumes units.
+    // Dict preserves the on-disk column order.
+    #[getter]
+    fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let columns = parse_columns(&cards)?;
+        let dict = PyDict::new(py);
+        for col in &columns {
+            dict.set_item(&col.name, col.tunit.as_deref())?;
+        }
+        Ok(dict.unbind())
     }
 
     // Read the table into a numpy structured array of native-endian
