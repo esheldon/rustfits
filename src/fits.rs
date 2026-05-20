@@ -4,7 +4,7 @@
 // it uses.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
 use std::fs::OpenOptions;
@@ -19,7 +19,7 @@ use crate::common::{
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
-use crate::hdu_table::TableHDU;
+use crate::hdu_table::{normalize_and_build_table_header, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, pad_to_card};
 
@@ -533,6 +533,175 @@ impl FITS {
         )?.into();
         self.hdus.push(new_hdu);
 
+        Ok(())
+    }
+
+    // Create a new BINTABLE extension HDU.  `dtype` is either a
+    // numpy.dtype OR a "descr" list of tuples (any form numpy.dtype()
+    // accepts) — it is normalized internally to a structured dtype.
+    // `nrows` (default 0) is the row count to allocate in the data
+    // section; subsequent TableHDU.write(arr) currently requires
+    // len(arr) == nrows.
+    //
+    // If the file has no HDUs yet, an empty primary image
+    // (SIMPLE=T, NAXIS=0) is automatically written first so that the
+    // BINTABLE can land as an extension — the FITS standard forbids
+    // BINTABLE as the primary HDU.
+    //
+    // MVP supports scalar fields with i2/i4/i8/u1/f4/f8 dtypes.
+    // Subsequent commits add the unsigned-int trick (u2/u4/u8),
+    // bool/complex, subarray fields, strings, and dict/list+names
+    // input forms.  See the Table Write Roadmap in CLAUDE.md.
+    #[pyo3(signature = (
+        dtype, nrows=0, *, extname=None, extver=None, units=None
+    ))]
+    fn create_table_hdu(
+        &mut self,
+        py: Python<'_>,
+        dtype: &Bound<'_, PyAny>,
+        nrows: i64,
+        extname: Option<String>,
+        extver: Option<i64>,
+        units: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        if nrows < 0 {
+            return Err(PyValueError::new_err(format!(
+                "create_table_hdu: nrows must be >= 0, got {}", nrows)));
+        }
+        let (table_cards, row_width) = normalize_and_build_table_header(
+            py, dtype, nrows, extname.as_deref(), extver, units,
+        )?;
+        let table_header_bytes_len = table_cards.len() * CARD_SIZE;
+        let table_pad =
+            (BLOCK_SIZE - table_header_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
+        let data_size = (nrows as u64).saturating_mul(row_width);
+        let data_padded = if data_size == 0 {
+            0
+        } else {
+            ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+                * BLOCK_SIZE as u64
+        };
+
+        // Compose the empty primary header up front so all writes can
+        // happen inside one file-lock acquisition.
+        let primary_cards: Option<Vec<String>> = if self.hdus.is_empty() {
+            Some(vec![
+                card_logical("SIMPLE", true, "file conforms to FITS standard"),
+                card_int("BITPIX", 8, "8-bit bytes"),
+                card_int("NAXIS", 0, "number of data axes"),
+                card_logical("EXTEND", true,
+                             "FITS dataset may contain extensions"),
+                pad_to_card("END"),
+            ])
+        } else {
+            None
+        };
+
+        // Writes: primary (if any), then BINTABLE header (padded), then
+        // zero-allocate the data section via set_len.  All in one lock.
+        let (primary_loc, table_loc) = {
+            let mut guard = lock_file(&self.file)?;
+            let file = guard.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            file.seek(SeekFrom::End(0))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+            let primary_loc = if let Some(ref p_cards) = primary_cards {
+                let p_start = file.stream_position()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                for c in p_cards {
+                    file.write_all(c.as_bytes())
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                }
+                let p_bytes_len = p_cards.len() * CARD_SIZE;
+                let p_pad = (BLOCK_SIZE - p_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
+                if p_pad > 0 {
+                    file.write_all(&vec![b' '; p_pad])
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                }
+                let p_end = file.stream_position()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let p_blocks = (p_end - p_start) / BLOCK_SIZE as u64;
+                Some((p_start, p_blocks, p_end))
+            } else {
+                None
+            };
+
+            let t_start = file.stream_position()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            for c in &table_cards {
+                file.write_all(c.as_bytes())
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+            if table_pad > 0 {
+                file.write_all(&vec![b' '; table_pad])
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+            let t_header_end = file.stream_position()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            if data_padded > 0 {
+                let new_len = t_header_end + data_padded;
+                file.set_len(new_len)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                file.seek(SeekFrom::Start(new_len))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+            file.flush()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let t_blocks = (t_header_end - t_start) / BLOCK_SIZE as u64;
+            (primary_loc, (t_start, t_blocks, t_header_end))
+        };
+
+        // Trim trailing whitespace on stored cards to match what the
+        // parser would yield on a re-read (canonical in-memory form).
+        let trim = |cards: &[String]| -> Vec<String> {
+            cards.iter().map(|c| c.trim_end().to_string()).collect()
+        };
+
+        if let (Some(p_cards), Some((p_start, p_blocks, p_end)))
+            = (primary_cards.as_ref(), primary_loc)
+        {
+            let p_arc = HduOffsets::new(p_start, p_blocks, p_end);
+            {
+                let mut lg = self.layout.hdus.lock()
+                    .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+                lg.push(Arc::clone(&p_arc));
+            }
+            let img: Py<PyAny> = Py::new(
+                py,
+                ImageHDU::new(
+                    trim(p_cards),
+                    self.hdus.len(),
+                    self.filename.clone(),
+                    p_arc,
+                    Arc::clone(&self.layout),
+                    Arc::clone(&self.file),
+                    Arc::clone(&self.tainted),
+                ),
+            )?.into();
+            self.hdus.push(img);
+        }
+
+        let (t_start, t_blocks, t_end) = table_loc;
+        let t_arc = HduOffsets::new(t_start, t_blocks, t_end);
+        {
+            let mut lg = self.layout.hdus.lock()
+                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+            lg.push(Arc::clone(&t_arc));
+        }
+        let tab: Py<PyAny> = Py::new(
+            py,
+            TableHDU::new(
+                trim(&table_cards),
+                self.hdus.len(),
+                self.filename.clone(),
+                t_arc,
+                Arc::clone(&self.layout),
+                Arc::clone(&self.file),
+                Arc::clone(&self.tainted),
+            ),
+        )?.into();
+        self.hdus.push(tab);
         Ok(())
     }
 

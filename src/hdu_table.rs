@@ -22,14 +22,17 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PySlice, PyString, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::common::{
-    lock_file, parse_keyword, parse_keyword_float, parse_string_keyword,
+    check_not_tainted, lock_file, parse_keyword, parse_keyword_float,
+    parse_string_keyword,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
+use crate::header::{card_int, card_string, pad_to_card};
 
 // All the per-column metadata needed downstream.  byte_offset is the
 // offset of this column's bytes within a single row; byte_width is the
@@ -1779,6 +1782,303 @@ fn read_one_column(
     }
 }
 
+// ===========================================================================
+// Write side (Phase 1 MVP): scalar numeric BINTABLE columns
+// ===========================================================================
+//
+// The MVP supports scalar fields with numpy kind/itemsize in {i2, i4, i8,
+// u1, f4, f8}.  Per the Table Write Roadmap in CLAUDE.md, follow-up
+// commits add the unsigned-int trick (1b), bool/complex (1b), subarrays
+// + TDIM (1c), strings (1d), and dict / list+names input forms (1e).
+//
+// Performance model: when the input numpy structured dtype's field
+// offsets exactly match the HDU's on-disk column offsets (the MVP
+// guarantees this via validate), the per-strip fill is one bulk memcpy
+// from `src_bytes` into the strip buffer, followed by per-column
+// in-place byteswap.  Slow-path (per-column strided copies + transforms)
+// returns when later phases let inputs deviate from the on-disk layout.
+
+// Per-column metadata derived from the user's numpy structured dtype at
+// create_table_hdu time, used to emit the BINTABLE header cards.
+struct WriteColumn {
+    name: String,
+    tform_letter: char,
+    repeat: usize,
+    byte_width: usize,
+    tunit: Option<String>,
+}
+
+// Returns (tform_letter, element_bytes) for one scalar numpy field.
+// MVP-restricted set; future commits extend the match.
+fn classify_scalar_numpy_field(
+    field_dtype: &Bound<'_, PyAny>,
+    col_name: &str,
+) -> PyResult<(char, usize)> {
+    let kind: String = field_dtype.getattr("kind")?.extract()?;
+    let itemsize: usize = field_dtype.getattr("itemsize")?.extract()?;
+    let err = |reason: &str| PyValueError::new_err(format!(
+        "column '{}': numpy dtype kind '{}' itemsize {} — {}",
+        col_name, kind, itemsize, reason));
+    match (kind.as_str(), itemsize) {
+        ("i", 2) => Ok(('I', 2)),
+        ("i", 4) => Ok(('J', 4)),
+        ("i", 8) => Ok(('K', 8)),
+        ("u", 1) => Ok(('B', 1)),
+        ("f", 4) => Ok(('E', 4)),
+        ("f", 8) => Ok(('D', 8)),
+        ("i", 1) => Err(err(
+            "int8 has no native FITS BINTABLE code (deferred)")),
+        ("u", 2) | ("u", 4) | ("u", 8) => Err(err(
+            "uint > 1 byte requires the unsigned-int trick (Phase 1b)")),
+        ("b", 1) => Err(err("bool → L conversion is Phase 1b")),
+        ("c", _) => Err(err("complex (C/M) is Phase 1b")),
+        ("S", _) | ("U", _) => Err(err("string (A) columns are Phase 1d")),
+        ("f", 2) => Err(err("float16 has no FITS BINTABLE code")),
+        _ => Err(err(
+            "unsupported numpy dtype for create_table_hdu MVP \
+             (supported: i2/i4/i8/u1/f4/f8 scalar fields)")),
+    }
+}
+
+// Walk a numpy structured dtype, emit per-column write specs in field
+// order.  MVP rejects subarray fields and any dtype outside the scalar
+// numeric set classify_scalar_numpy_field allows.
+fn dtype_to_write_columns(
+    dtype: &Bound<'_, PyAny>,
+    units: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Vec<WriteColumn>> {
+    let names_attr = dtype.getattr("names")?;
+    if names_attr.is_none() {
+        return Err(PyValueError::new_err(
+            "create_table_hdu: dtype must be a numpy structured dtype \
+             with named fields (got a plain dtype)"));
+    }
+    let names: Vec<String> = names_attr.extract()?;
+    if names.is_empty() {
+        return Err(PyValueError::new_err(
+            "create_table_hdu: dtype has no fields"));
+    }
+    let fields = dtype.getattr("fields")?;
+    let mut out = Vec::with_capacity(names.len());
+    for name in &names {
+        let entry = fields.get_item(name.as_str())?;
+        let entry_tup = entry.cast::<PyTuple>()?;
+        let field_dtype = entry_tup.get_item(0)?;
+        let subdtype = field_dtype.getattr("subdtype")?;
+        if !subdtype.is_none() {
+            return Err(PyValueError::new_err(format!(
+                "column '{}': subarray fields are Phase 1c (not yet supported)",
+                name)));
+        }
+        let (tform_letter, elem_bytes) =
+            classify_scalar_numpy_field(&field_dtype, name)?;
+        let repeat = 1usize;
+        let byte_width = elem_bytes * repeat;
+        let tunit = units.and_then(|d| {
+            d.get_item(name.as_str()).ok().flatten()
+                .and_then(|v| v.extract::<String>().ok())
+        });
+        out.push(WriteColumn {
+            name: name.clone(),
+            tform_letter,
+            repeat,
+            byte_width,
+            tunit,
+        });
+    }
+    Ok(out)
+}
+
+// Build the BINTABLE header card sequence (structural keys + EXTNAME/
+// EXTVER if given + per-column TTYPEn/TFORMn/TUNITn + END).  Padding to
+// the BLOCK_SIZE boundary happens at write time in create_table_hdu.
+fn build_bintable_header_cards(
+    write_columns: &[WriteColumn],
+    nrows: i64,
+    extname: Option<&str>,
+    extver: Option<i64>,
+) -> Vec<String> {
+    let row_width: usize = write_columns.iter().map(|c| c.byte_width).sum();
+    let mut cards: Vec<String> = Vec::new();
+    cards.push(card_string("XTENSION", "BINTABLE", "binary table extension"));
+    cards.push(card_int("BITPIX", 8, "8-bit bytes"));
+    cards.push(card_int("NAXIS", 2, "2-dimensional binary table"));
+    cards.push(card_int("NAXIS1", row_width as i64, "width of table in bytes"));
+    cards.push(card_int("NAXIS2", nrows, "number of rows in table"));
+    cards.push(card_int("PCOUNT", 0, "size of special data area"));
+    cards.push(card_int("GCOUNT", 1, "one data group (required keyword)"));
+    cards.push(card_int(
+        "TFIELDS", write_columns.len() as i64, "number of columns"));
+    if let Some(name) = extname {
+        cards.push(card_string("EXTNAME", name, "name of this HDU"));
+    }
+    if let Some(ver) = extver {
+        cards.push(card_int("EXTVER", ver, "extension version"));
+    }
+    for (i, col) in write_columns.iter().enumerate() {
+        let n = i + 1;
+        let tform = format!("{}{}", col.repeat, col.tform_letter);
+        cards.push(card_string(
+            &format!("TTYPE{}", n), &col.name, "label for column"));
+        cards.push(card_string(
+            &format!("TFORM{}", n), &tform, "data format of column"));
+        if let Some(unit) = &col.tunit {
+            cards.push(card_string(
+                &format!("TUNIT{}", n), unit, "physical unit of column"));
+        }
+    }
+    cards.push(pad_to_card("END"));
+    cards
+}
+
+// Used by FITS.create_table_hdu: the user-facing entry takes a PyAny
+// that may be a numpy.dtype OR a descr list of tuples.  Normalize
+// through numpy.dtype(), then emit cards.  Returns (cards, row_width).
+pub(crate) fn normalize_and_build_table_header(
+    py: Python<'_>,
+    dtype_in: &Bound<'_, PyAny>,
+    nrows: i64,
+    extname: Option<&str>,
+    extver: Option<i64>,
+    units: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(Vec<String>, u64)> {
+    let np = py.import("numpy")?;
+    let np_dtype = np.getattr("dtype")?.call1((dtype_in,))?;
+    let write_columns = dtype_to_write_columns(&np_dtype, units)?;
+    let row_width: u64 = write_columns.iter()
+        .map(|c| c.byte_width as u64).sum();
+    let cards = build_bintable_header_cards(
+        &write_columns, nrows, extname, extver);
+    Ok((cards, row_width))
+}
+
+// Validate the input ndarray's structured dtype against the HDU's
+// on-disk columns.  MVP: same field count, same names in same order,
+// per-field width equal to column byte_width, AND src_itemsize equal
+// to row_width with each field at the column's byte_offset (i.e. the
+// in-memory layout matches FITS row layout exactly modulo endianness).
+// Phase 1e will relax this and route mismatches through a slow-path
+// per-column strided copy.
+fn validate_write_layout(
+    input_dtype: &Bound<'_, PyAny>,
+    columns: &[Column],
+    row_width: usize,
+) -> PyResult<()> {
+    let names_attr = input_dtype.getattr("names")?;
+    if names_attr.is_none() {
+        return Err(PyValueError::new_err(
+            "TableHDU.write: input must be a structured ndarray with \
+             named fields"));
+    }
+    let names: Vec<String> = names_attr.extract()?;
+    if names.len() != columns.len() {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: input has {} columns, table has {}",
+            names.len(), columns.len())));
+    }
+    let fields = input_dtype.getattr("fields")?;
+    for (i, (input_name, col)) in names.iter().zip(columns.iter()).enumerate() {
+        if input_name != &col.name {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: column {} name '{}' does not match table \
+                 column '{}'", i, input_name, col.name)));
+        }
+        let entry = fields.get_item(input_name.as_str())?;
+        let entry_tup = entry.cast::<PyTuple>()?;
+        let field_dtype = entry_tup.get_item(0)?;
+        let src_offset: usize = entry_tup.get_item(1)?.extract()?;
+        let src_size: usize = field_dtype.getattr("itemsize")?.extract()?;
+        if src_size != col.byte_width {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: column '{}' input field width {} bytes does \
+                 not match table column width {} bytes",
+                input_name, src_size, col.byte_width)));
+        }
+        if src_offset != col.byte_offset {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: column '{}' input field offset {} does not \
+                 match table column offset {} — input dtype has padding or \
+                 reordered fields, which is Phase 1e", input_name,
+                src_offset, col.byte_offset)));
+        }
+    }
+    let input_itemsize: usize = input_dtype.getattr("itemsize")?.extract()?;
+    if input_itemsize != row_width {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: input dtype itemsize {} does not match table \
+             row_width {}", input_itemsize, row_width)));
+    }
+    Ok(())
+}
+
+// Strip-based bulk write into the table's data section.  MVP fast path:
+// per strip, one memcpy of `chunk * row_width` source bytes into the
+// strip buffer, then per-column in-place byteswap; the input layout
+// already matches the FITS row layout modulo endianness (validate step
+// enforces this).  Peak memory ~1 MiB regardless of nrows.
+fn write_table_data(
+    columns: &[Column],
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    src_bytes: &[u8],
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if nrows == 0 {
+        return Ok(());
+    }
+    let strip_target_bytes: usize = 1 << 20;
+    let strip_nrows = (strip_target_bytes / row_width.max(1)).max(1).min(nrows);
+    let mut strip_buf: Vec<u8> = vec![0u8; strip_nrows * row_width];
+
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(data_offset))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+    let mut row_start = 0usize;
+    while row_start < nrows {
+        let chunk = (nrows - row_start).min(strip_nrows);
+        let want = chunk * row_width;
+        if want < strip_buf.len() {
+            strip_buf.truncate(want);
+        }
+        // Bulk copy the strip's source bytes into the buffer.  Source
+        // layout matches destination layout exactly (validated).
+        let src_start = row_start * row_width;
+        strip_buf.copy_from_slice(&src_bytes[src_start..src_start + want]);
+        // Per-column in-place byteswap.  Columns with element width 1
+        // (B / u1) are skipped — no swap needed.  Slice::reverse() flips
+        // byte order over the element width.
+        for col in columns {
+            let elem_w = byteswap_unit(col.tform_letter);
+            if elem_w == 1 { continue; }
+            let elem_count = col.byte_width / elem_w;
+            for r in 0..chunk {
+                let row_off = r * row_width + col.byte_offset;
+                for e in 0..elem_count {
+                    let beg = row_off + e * elem_w;
+                    strip_buf[beg..beg + elem_w].reverse();
+                }
+            }
+        }
+        if let Err(e) = f.write_all(&strip_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during table write: {}", e)));
+        }
+        row_start += chunk;
+    }
+    if let Err(e) = f.flush() {
+        tainted.store(true, Ordering::Release);
+        return Err(PyIOError::new_err(format!(
+            "flush error during table write: {}", e)));
+    }
+    Ok(())
+}
+
 #[pyclass(extends = HDU)]
 pub(crate) struct TableHDU;
 
@@ -2066,6 +2366,64 @@ impl TableHDU {
                     .into())
             }
         }
+    }
+
+    // Bulk-write a structured numpy ndarray into this table's data
+    // section.  MVP requires the input dtype to match the HDU's
+    // columns field-for-field (same names, same order, same per-field
+    // widths, no padding/reordering), and `len(data)` to equal NAXIS2
+    // exactly.  Per-field bytes are byteswapped from native to FITS
+    // big-endian during the strip-by-strip write.
+    //
+    // Future commits relax these constraints (Phase 1b: unsigned trick
+    // and bool/complex; Phase 1c: subarrays; Phase 1d: strings;
+    // Phase 1e: dict / list+names input + field-order normalization).
+    fn write(slf: PyRef<'_, Self>, py: Python<'_>,
+             data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        check_not_tainted(&super_.tainted)?;
+        let cards = super_.header_snapshot()?;
+        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize;
+        let row_width = parse_keyword(&cards, "NAXIS1").unwrap_or(0).max(0) as usize;
+        let columns = parse_columns(&cards)?;
+        let data_offset = super_.offsets.data_offset();
+
+        // Reject non-ndarray input early so the user gets a useful error
+        // before any dtype introspection.
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        if !data.is_instance(&ndarray)? {
+            return Err(PyValueError::new_err(
+                "TableHDU.write: data must be a numpy ndarray"));
+        }
+        let input_dtype = data.getattr("dtype")?;
+        validate_write_layout(&input_dtype, &columns, row_width)?;
+        let data_len: usize = data.len()?;
+        if data_len != nrows {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: input has {} rows but table NAXIS2={}",
+                data_len, nrows)));
+        }
+        let flags = data.getattr("flags")?;
+        let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+        if !c_contig {
+            return Err(PyValueError::new_err(
+                "TableHDU.write: input ndarray must be C-contiguous"));
+        }
+        let buf = RawBuffer::acquire(data)?;
+        let src_bytes = buf.as_slice();
+        let expected_bytes = data_len.checked_mul(row_width)
+            .ok_or_else(|| PyValueError::new_err(
+                "input size overflow"))?;
+        if src_bytes.len() < expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: source buffer length {} smaller than \
+                 expected {}", src_bytes.len(), expected_bytes)));
+        }
+        write_table_data(
+            &columns, &super_.file, data_offset, nrows, row_width,
+            src_bytes, &super_.tainted,
+        )
     }
 }
 
