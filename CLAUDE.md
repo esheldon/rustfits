@@ -487,6 +487,76 @@ against `nomask`.
 - **Streaming / row-iterator API** — for tables that don't fit in RAM.
   No user has asked yet; add when one does.
 
+## Table write roadmap
+
+Plan for getting table creation + writing on par with the image side.
+Reading is mature; writing has zero coverage (no `create_table_hdu`,
+no `TableHDU.write`, no `TableHDU.__setitem__`, no `TableHDU.extend`).
+The image side has all four and the patterns translate directly.
+
+**Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
+for everything else.
+- `FITS.create_table_hdu(dtype, nrows=0, *, extname=None, extver=None,
+  units=None)` — maps a numpy structured dtype to TFORMn / TDIMn /
+  TUNITn cards, writes the header block, allocates `nrows * row_width`
+  zero-filled bytes.
+- `TableHDU.write(data)` — dtype-checked, byteswapped bulk overwrite.
+- Scope: fixed-width columns only (B/I/J/K/A/E/D/L/C/M, plus subarray
+  fields via numpy `(T, shape)`).  No VLA, no `X` bit columns, no
+  ASCII tables.
+
+**Phase 2 — `TableHDU.__setitem__`.**  TODO #6 in the read TODO list.
+Symmetric with `__getitem__`:
+- `hdu[i] = record`         (single row)
+- `hdu[a:b] = arr`          (slice)
+- `hdu["col"] = arr`        (whole-column write across all rows)
+- maybe `hdu[i, "col"] = scalar` (single cell)
+Reuses Phase 1's byteswap + I/O infrastructure.
+
+**Phase 3 — `TableHDU.extend()`.**  Append rows; mirrors
+`ImageHDU.extend`.  Grows NAXIS2 in the header, grows the data
+section, uses `shift_file_tail_and_update_offsets` for non-last HDUs.
+
+**Phase 4 — VLA columns on write.**  Genuinely harder than 1–3.
+`create_table_hdu` accepts numpy Object columns; emits `1Pt(maxlen)`
+TFORMs.  Per-row heap append + descriptor write; THEAP + PCOUNT
+bookkeeping.
+
+**Phase 5 — out of scope.**  ASCII tables (rare in modern files);
+adding / removing columns from existing tables (header rewriting
++ byte shuffling); extending a non-last HDU with VLA columns
+(composition of Phases 3 + 4 — tackle if it ever comes up).
+
+### Design decisions to settle at Phase 1 detail-design time
+
+These were sketched during planning but not formally chosen.  Worth
+re-checking before code goes in.
+
+1. **Column-spec API.**  Recommendation: numpy structured dtype
+   carries the structural part (names, dtypes, subarray shapes);
+   separate kwargs (`units=dict`, future `tnull=dict`) carry the
+   FITS-specific metadata numpy can't express.  Matches fitsio.
+
+2. **`write()` vs `__setitem__` labor split.**  Recommendation:
+   `__setitem__` is canonical (handles all the indexing); `write(arr)`
+   is sugar for `hdu[:] = arr`.  Keeps the byteswap + strip-write
+   loop in one place.  Implementation order is still 1 → 2 since
+   Phase 1 ships a usable write API before the indexing surface is
+   built.
+
+3. **`nrows=` default.**  Recommendation: 0.  `write(arr)` then sets
+   the size from the input array.  Explicit `nrows=N` for users who
+   want pre-allocated zero rows to fill via `__setitem__`.
+
+4. **Unsigned-int trick on write.**  Symmetric round-trip: when the
+   user gives `u2`/`u4`/`u8`, emit `I`/`J`/`K` + TZERO=2^(n-1).  Same
+   convention the read side already uses.
+
+5. **`X` (bit) columns on write.**  Numpy `bool` would naturally map
+   to `L` (one byte per bool, not bit-packed).  To get true `X` the
+   user has to ask explicitly somehow.  Probably defer X-write past
+   Phase 1.
+
 ## Testing conventions
 
 For any mutation test, verify the outcome through **both**:
