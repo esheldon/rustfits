@@ -269,7 +269,9 @@ def test_image_ndim():
     """ndim is len(shape)."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
-        _write_file(fname, (_image_primary(-32, [2, 3, 4]), bytes(2 * 3 * 4 * 4)))
+        _write_file(
+            fname, (_image_primary(-32, [2, 3, 4]), bytes(2 * 3 * 4 * 4))
+        )
         with rustfits.FITS(fname) as fits:
             assert fits[0].ndim == 3
 
