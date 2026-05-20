@@ -21,7 +21,7 @@ mod fits;
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
-use crate::hdu_table::TableHDU;
+use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::fits::FITS;
 
@@ -31,6 +31,8 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HDU>()?;
     m.add_class::<ImageHDU>()?;
     m.add_class::<TableHDU>()?;
+    m.add_class::<ColumnSubset>()?;
+    m.add_class::<SingleColumnSubset>()?;
     m.add_class::<AsciiTableHDU>()?;
     m.add_class::<FITSHeader>()?;
     m.add_class::<FITSHeaderEdit>()?;

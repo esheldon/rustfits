@@ -11,7 +11,7 @@
 // simple): X (bit, packed), P/Q (variable-length array descriptors).
 
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyList, PySlice, PyString, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -924,18 +924,215 @@ impl TableHDU {
         )
     }
 
-    // hdu[key] is shorthand for hdu.read(rows=key).  `key` may be a slice
-    // (hdu[20:100:2]) or any iterable of ints (hdu[[2, 5, 8]],
-    // hdu[np.array([0, 3, 9])], hdu[(1, 2, 3)]).  Column subsetting
-    // (hdu[columns][rows]) is intentionally not yet supported.
+    // hdu[key] dispatches based on what `key` looks like:
+    //
+    //   slice or iterable-of-int → reads rows now, returns ndarray
+    //     (equivalent to hdu.read(rows=key))
+    //   single str/bytes/np.str_/np.bytes_ → returns a SingleColumnSubset
+    //     (no read; user must add [rows] to trigger read_column)
+    //   iterable-of-str/bytes → returns a ColumnSubset
+    //     (no read; user must add [rows] to trigger read with columns=)
+    //
+    // Specifying a column or columns alone never invokes I/O — only rows
+    // do.  Empty sequences are rejected as ambiguous.
     fn __getitem__(
-        slf: PyRef<'_, Self>,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
+        let kind = classify_table_key(key)?;
+        match kind {
+            TableKey::Rows => {
+                let pyref = slf.borrow();
+                let super_ = pyref.into_super();
+                let cards = super_.header_snapshot()?;
+                let data_offset = super_.offsets.data_offset();
+                read_table(
+                    py, &cards, data_offset, &super_.file, Some(key), None,
+                )
+            }
+            TableKey::SingleColumn(name) => {
+                let hdu_py: Py<TableHDU> = slf.clone().unbind();
+                Ok(Py::new(py, SingleColumnSubset { hdu: hdu_py, name })?
+                    .into())
+            }
+            TableKey::MultiColumns(names) => {
+                let hdu_py: Py<TableHDU> = slf.clone().unbind();
+                Ok(Py::new(py, ColumnSubset { hdu: hdu_py, columns: names })?
+                    .into())
+            }
+        }
+    }
+}
+
+// What kind of selection the user passed to TableHDU.__getitem__.
+// `Rows` covers both slices and integer iterables: in both cases the
+// key flows through to read_table unchanged.
+enum TableKey {
+    Rows,
+    SingleColumn(String),
+    MultiColumns(Vec<String>),
+}
+
+// Try to extract `obj` as a string-like column name: str, bytes,
+// numpy.str_, or numpy.bytes_.  Returns Ok(None) for anything else.
+//
+// Type checks are explicit (PyString / PyBytes instance checks) rather
+// than relying on extract::<String>() / extract::<Vec<u8>>() — the
+// latter is generic over iterables, so a Python list of small ints
+// like [2, 0] would silently succeed as Vec<u8>=[2,0] and be
+// mis-routed to a column lookup with control-char "name".
+fn try_extract_column_name(obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if obj.is_instance_of::<PyBool>() {
+        return Ok(None);
+    }
+    if obj.is_instance_of::<PyString>() {
+        // numpy.str_ is a str subclass, so this catches it too.
+        return Ok(Some(obj.extract::<String>()?));
+    }
+    if obj.is_instance_of::<PyBytes>() {
+        // numpy.bytes_ is a bytes subclass, so this catches it too.
+        let b: Vec<u8> = obj.extract()?;
+        if !b.iter().all(|c| c.is_ascii()) {
+            return Err(PyValueError::new_err(
+                "bytes-like column name contains non-ASCII bytes",
+            ));
+        }
+        return Ok(Some(String::from_utf8(b).unwrap()));
+    }
+    Ok(None)
+}
+
+// Inspect the __getitem__ key and decide which path to take.  Rules:
+//   - PySlice                            → Rows  (read flowing path)
+//   - single str/bytes/np.str_/np.bytes_ → SingleColumn
+//   - non-empty iterable
+//       first element string-like        → MultiColumns
+//       first element int-like           → Rows
+//       mixed or unknown                 → ValueError
+//   - empty iterable                     → ValueError (ambiguous)
+//   - anything else                      → ValueError
+fn classify_table_key(key: &Bound<'_, PyAny>) -> PyResult<TableKey> {
+    if key.is_instance_of::<PySlice>() {
+        return Ok(TableKey::Rows);
+    }
+    if let Some(name) = try_extract_column_name(key)? {
+        return Ok(TableKey::SingleColumn(name));
+    }
+    let iter = key.try_iter().map_err(|_| PyValueError::new_err(
+        "TableHDU[key] requires a slice, a str/bytes column name, \
+         an iterable of ints (rows), or an iterable of str/bytes (columns)"
+    ))?;
+    let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
+    if items.is_empty() {
+        return Err(PyValueError::new_err(
+            "TableHDU[key] received an empty sequence (ambiguous: rows \
+             or columns?); pass a non-empty selection or use read() with \
+             explicit rows=/columns="
+        ));
+    }
+    let first = &items[0];
+    if let Some(_) = try_extract_column_name(first)? {
+        let names: Vec<String> = items.iter()
+            .map(|i| try_extract_column_name(i)?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "TableHDU[key] sequence mixes column names and \
+                     non-string elements; pass all str/bytes (columns) \
+                     or all int (rows)"
+                )
+            }))
+            .collect::<PyResult<_>>()?;
+        Ok(TableKey::MultiColumns(names))
+    } else if !first.is_instance_of::<PyBool>() && first.extract::<i64>().is_ok() {
+        // Defer per-element validation to resolve_rows; we only need to
+        // route here.
+        Ok(TableKey::Rows)
+    } else {
+        Err(PyValueError::new_err(
+            "TableHDU[key] sequence elements must be all int (rows) or \
+             all str/bytes (columns)"
+        ))
+    }
+}
+
+// Returned by hdu[col] for a single str/bytes column name.  Holds onto
+// the parent TableHDU via Py<TableHDU> (a refcount bump) so the read
+// can re-borrow it; carries the column name verbatim (case preserved,
+// matching is case-insensitive at read time).
+#[pyclass]
+pub(crate) struct SingleColumnSubset {
+    hdu: Py<TableHDU>,
+    name: String,
+}
+
+#[pymethods]
+impl SingleColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        Ok(format!(
+            "<TableColumn '{}' of HDU #{}>",
+            self.name, super_.index(),
+        ))
+    }
+
+    // [rows] triggers the actual read.  `rows` may be a slice or any
+    // iterable of ints (negative supported), with semantics matching
+    // TableHDU.read_column(rows=...).
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
-        read_table(py, &cards, data_offset, &super_.file, Some(key), None)
+        read_one_column(
+            py, &cards, data_offset, &super_.file,
+            &self.name, Some(rows), false,
+        )
+    }
+}
+
+// Returned by hdu[[col1, col2, ...]] for an iterable of column names.
+// Same Py<TableHDU> hold-onto-parent pattern as SingleColumnSubset.
+#[pyclass]
+pub(crate) struct ColumnSubset {
+    hdu: Py<TableHDU>,
+    columns: Vec<String>,
+}
+
+#[pymethods]
+impl ColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        Ok(format!(
+            "<TableColumns {:?} of HDU #{}>",
+            self.columns, super_.index(),
+        ))
+    }
+
+    // [rows] triggers the actual read.  `rows` may be a slice or any
+    // iterable of ints (negative supported), with semantics matching
+    // TableHDU.read(rows=..., columns=...).
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_table(
+            py, &cards, data_offset, &super_.file,
+            Some(rows), Some(self.columns.clone()),
+        )
     }
 }

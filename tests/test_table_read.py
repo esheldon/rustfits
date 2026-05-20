@@ -762,6 +762,241 @@ def test_getitem_on_string_columns():
             assert a["ID"].tolist() == [1002, 1000]
 
 
+# ---------------------------------------------------------------------------
+# __getitem__ column subsets: hdu[col] / hdu[[cols]] do NOT read; the
+# subsequent [rows] does.
+# ---------------------------------------------------------------------------
+
+
+def test_getitem_single_column_returns_subset_no_read():
+    """hdu['col'] returns a SingleColumnSubset; no I/O yet."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            sub = fits[1]["ID"]
+            assert "TableColumn" in repr(sub)
+            assert "ID" in repr(sub)
+
+
+def test_getitem_single_column_then_slice():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1]["ID"][:]
+            assert a.tolist() == [100, 101, 102]
+
+
+def test_getitem_single_column_then_rows_list():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1]["MASS"][[2, 0]]
+            assert a.tolist() == [3.5, 1.5]
+
+
+def test_getitem_single_column_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1]["id"][:]
+            assert a.tolist() == [100, 101, 102]
+
+
+def test_getitem_single_column_bytes_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][b"ID"][:]
+            assert a.tolist() == [100, 101, 102]
+
+
+def test_getitem_single_column_numpy_str_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][np.str_("ID")][:]
+            assert a.tolist() == [100, 101, 102]
+
+
+def test_getitem_single_column_numpy_bytes_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][np.bytes_(b"ID")][:]
+            assert a.tolist() == [100, 101, 102]
+
+
+def test_getitem_single_column_unknown_lists_available():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="unknown column"):
+                fits[1]["BOGUS"][:]
+
+
+def test_getitem_single_column_matches_read_column():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1]["MASS"][[0, 2]]
+            b = fits[1].read_column("MASS", rows=[0, 2])
+            assert (a == b).all()
+            assert a.dtype == b.dtype
+
+
+def test_getitem_multi_column_returns_subset_no_read():
+    """hdu[[c1, c2]] returns a ColumnSubset; no I/O yet."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            sub = fits[1][["NAME", "ID"]]
+            assert "TableColumns" in repr(sub)
+            assert "NAME" in repr(sub)
+            assert "ID" in repr(sub)
+
+
+def test_getitem_multi_column_then_slice():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][["NAME", "ID"]][:]
+            assert a.dtype.names == ("NAME", "ID")
+            assert a["ID"].tolist() == [100, 101, 102]
+
+
+def test_getitem_multi_column_then_rows_list():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][["MASS", "ID"]][[2, 0]]
+            assert a.dtype.names == ("MASS", "ID")
+            assert a["ID"].tolist() == [102, 100]
+            assert a["MASS"].tolist() == [3.5, 1.5]
+
+
+def test_getitem_multi_column_tuple_of_names():
+    """A tuple of strings should also be treated as column names."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][("ID", "MASS")][:]
+            assert a.dtype.names == ("ID", "MASS")
+
+
+def test_getitem_multi_column_numpy_str_array():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][np.array(["ID", "MASS"])][:]
+            assert a.dtype.names == ("ID", "MASS")
+
+
+def test_getitem_multi_column_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][["id", "Mass"]][:]
+            assert a.dtype.names == ("ID", "MASS")
+
+
+def test_getitem_multi_column_matches_read_with_kwargs():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][["NAME", "ID"]][[2, 0]]
+            b = fits[1].read(columns=["NAME", "ID"], rows=[2, 0])
+            assert (a == b).all()
+            assert a.dtype == b.dtype
+
+
+def test_getitem_multi_column_unknown_lists_available():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="unknown column"):
+                fits[1][["ID", "BOGUS"]][:]
+
+
+def test_getitem_multi_column_duplicate_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="duplicate column"):
+                fits[1][["ID", "ID"]][:]
+
+
+def test_getitem_empty_sequence_rejected():
+    """Empty sequence is ambiguous (rows or columns?)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="empty sequence"):
+                fits[1][[]]
+
+
+def test_getitem_mixed_types_in_sequence_rejected():
+    """A sequence mixing strings and ints is ambiguous."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="mixes column names"):
+                fits[1][["ID", 0]]
+
+
+def test_getitem_dispatch_int_list_still_rows():
+    """[int, int, ...] must stay on the rows path even after we added
+    column-name dispatch — this is the regression case for the
+    Vec<u8>::extract foot-gun (a list of small ints would have silently
+    decoded as a 'bytes column name')."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[2, 0]]
+            assert a.dtype.names == ("ID", "MASS", "NAME")
+            assert a["ID"].tolist() == [102, 100]
+
+
+def test_getitem_dispatch_numpy_int_array_still_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][np.array([2, 0])]
+            assert a.dtype.names == ("ID", "MASS", "NAME")
+            assert a["ID"].tolist() == [102, 100]
+
+
+def test_getitem_bytearray_not_treated_as_column_name():
+    """bytearray is not a `bytes` subclass; the explicit type-instance
+    check excludes it.  It is also not an int-iterable in our
+    classifier's eyes, so it errors via the iterable path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            # bytearray IS iterable of small ints, so it routes to rows;
+            # at resolve_rows we'll get out-of-range or extract failures.
+            # Either way, no silent column-name match.
+            with pytest.raises((ValueError, IndexError, TypeError)):
+                fits[1][bytearray(b"ID")]
+
+
+def test_getitem_single_column_bad_rows_type():
+    """A SingleColumnSubset still requires slice or iterable-of-int for
+    rows; bare float should raise."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError):
+                fits[1]["ID"][1.5]
+
+
+def test_getitem_multi_column_bad_rows_type():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _three_col_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError):
+                fits[1][["ID", "MASS"]][1.5]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
