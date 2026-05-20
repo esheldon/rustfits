@@ -253,8 +253,8 @@ def test_shape_mismatch_on_write_rejected():
 
 
 def test_scalar_input_into_subarray_column_rejected():
-    """If HDU column has shape (3,) but input field is scalar, byte
-    widths differ and validation rejects."""
+    """If HDU column has shape (3,) but input field is scalar, the
+    per-cell shape check rejects up front."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("x", "f4", (3,))])
@@ -262,5 +262,5 @@ def test_scalar_input_into_subarray_column_rejected():
         bad = np.zeros(2, dtype=dt_arr)
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_table_hdu(dt_hdu, nrows=2)
-            with pytest.raises(ValueError, match="width"):
+            with pytest.raises(ValueError, match="shape"):
                 fits[1].write(bad)
