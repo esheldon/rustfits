@@ -6,7 +6,6 @@ surfaces: a dict / string accessor, plus inclusion in the __repr__.
 """
 
 import os
-import struct
 import sys
 import tempfile
 
