@@ -26,7 +26,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use crate::common::{
-    lock_file, parse_keyword, parse_string_keyword,
+    lock_file, parse_keyword, parse_keyword_float, parse_string_keyword,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
@@ -56,6 +56,12 @@ pub(crate) struct Column {
     pub(crate) byte_width: usize,
     // Variable-length descriptor kind, if this is a P or Q column.
     pub(crate) var_kind: Option<char>,
+    // TSCAL/TZERO scaling: physical = tscal * stored + tzero.
+    // Defaults to no-op (1.0 / 0.0).  Only meaningful for numeric
+    // columns; ignored for L/A/X and raised-on for C/M (see
+    // scaling_kind()).
+    pub(crate) tscal: f64,
+    pub(crate) tzero: f64,
 }
 
 // Bytes per single element for each supported TFORM letter.  'A' is 1
@@ -86,6 +92,174 @@ fn byteswap_unit(letter: char) -> usize {
         'K' | 'D' | 'M' => 8,
         // Unreachable: parse_columns rejects unsupported letters up front.
         _ => unreachable!("byteswap_unit called with unsupported letter '{}'", letter),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TSCAL/TZERO scaling
+// ---------------------------------------------------------------------------
+
+// Classification of how to apply TSCAL/TZERO to a column on read.
+// Pre-computed once per column at read entry so the per-cell loop is a
+// trivial enum match — columns without scaling stay on the same fast
+// copy_with_byteswap path they always used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalingKind {
+    // No scaling — pass stored values through unchanged.  Applied when
+    // TSCAL == 1 AND TZERO == 0, when scale=False is requested, or for
+    // types where scaling is meaningless (L, A, X).
+    None,
+    // The "unsigned-int trick": TSCAL=1 plus TZERO equal to the type's
+    // sign-bias (2^15 for I, 2^31 for J, 2^63 for K, -128 for B).
+    // Output preserves integer semantics — promoted to the matching
+    // unsigned dtype (or i1 for B) — with no precision loss.
+    UnsignedTrick,
+    // Anything else: physical = TSCAL * stored + TZERO computed in f64
+    // and output as f8.  i64 inputs may lose precision (53-bit mantissa).
+    General,
+}
+
+// Inspect a column's TSCAL/TZERO and decide which scaling path to use.
+// Raises for C/M with non-default scaling, because the FITS spec is
+// silent on whether scaling applies to the real half, the imaginary
+// half, or both — and silently picking one would corrupt data.
+fn scaling_kind(col: &Column) -> PyResult<ScalingKind> {
+    if col.tscal == 1.0 && col.tzero == 0.0 {
+        return Ok(ScalingKind::None);
+    }
+    match col.tform_letter {
+        // Scaling is meaningless on these types; treat as no-op
+        // (matches astropy / fitsio).
+        'L' | 'A' | 'X' => return Ok(ScalingKind::None),
+        'C' | 'M' => return Err(PyValueError::new_err(format!(
+            "column '{}' has TSCAL/TZERO set on a complex column \
+             (TFORM='{}'); FITS does not unambiguously specify how to \
+             apply scaling to complex values.  Use scale=False to read \
+             raw stored values.",
+            col.name, col.tform_letter,
+        ))),
+        _ => {}
+    }
+    if col.tscal == 1.0 {
+        let trick = matches!(
+            (col.tform_letter, col.tzero),
+            ('B', t) if t == -128.0
+        ) || matches!(
+            (col.tform_letter, col.tzero),
+            ('I', t) if t == 32768.0
+        ) || matches!(
+            (col.tform_letter, col.tzero),
+            ('J', t) if t == 2147483648.0
+        ) || matches!(
+            (col.tform_letter, col.tzero),
+            ('K', t) if t == 9223372036854775808.0
+        );
+        if trick {
+            return Ok(ScalingKind::UnsignedTrick);
+        }
+    }
+    Ok(ScalingKind::General)
+}
+
+// numpy dtype string the column reads into after applying scaling
+// (only valid when kind != None).
+fn scaled_output_dtype(letter: char, kind: ScalingKind) -> &'static str {
+    match kind {
+        ScalingKind::UnsignedTrick => match letter {
+            'B' => "i1",
+            'I' => "u2",
+            'J' => "u4",
+            'K' => "u8",
+            _ => unreachable!(
+                "unsigned-trick scaling on unexpected letter '{}'", letter
+            ),
+        },
+        ScalingKind::General => "f8",
+        ScalingKind::None => unreachable!("scaled_output_dtype called with None"),
+    }
+}
+
+// Unsigned-trick conversion for one column-cell's worth of elements.
+// All four cases preserve byte width (u8↔i8, i16↔u16, i32↔u32, i64↔u64);
+// the conversion is equivalent to flipping the on-disk sign bit.
+fn convert_unsigned_trick_cell(
+    letter: char, repeat: usize, src: &[u8], dst: &mut [u8],
+) {
+    match letter {
+        'B' => {
+            // FITS B is u8; physical = stored - 128 yields signed i8.
+            // dst[k] = src[k] - 128 reinterpreted as i8 bit pattern.
+            for k in 0..repeat {
+                dst[k] = src[k].wrapping_sub(128);
+            }
+        }
+        'I' => {
+            for k in 0..repeat {
+                let stored = i16::from_be_bytes(
+                    src[2 * k..2 * k + 2].try_into().unwrap()
+                );
+                let physical: u16 = (stored as i32 + 32768) as u16;
+                dst[2 * k..2 * k + 2]
+                    .copy_from_slice(&physical.to_ne_bytes());
+            }
+        }
+        'J' => {
+            for k in 0..repeat {
+                let stored = i32::from_be_bytes(
+                    src[4 * k..4 * k + 4].try_into().unwrap()
+                );
+                let physical: u32 = (stored as i64 + 2147483648) as u32;
+                dst[4 * k..4 * k + 4]
+                    .copy_from_slice(&physical.to_ne_bytes());
+            }
+        }
+        'K' => {
+            for k in 0..repeat {
+                let stored = i64::from_be_bytes(
+                    src[8 * k..8 * k + 8].try_into().unwrap()
+                );
+                // 2^63 doesn't fit in i64; do the add as u64
+                // (wrapping_add is the correct unsigned-bias map).
+                let physical: u64 =
+                    (stored as u64).wrapping_add(1u64 << 63);
+                dst[8 * k..8 * k + 8]
+                    .copy_from_slice(&physical.to_ne_bytes());
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+// General scaling: physical = tscal * stored + tzero, in f64, output
+// as f8.  Loses precision for i64 inputs whose magnitude exceeds 2^53.
+fn convert_general_scaling_cell(
+    letter: char, repeat: usize, tscal: f64, tzero: f64,
+    src: &[u8], dst: &mut [u8],
+) {
+    for k in 0..repeat {
+        let stored: f64 = match letter {
+            'B' => src[k] as f64,
+            'I' => i16::from_be_bytes(
+                src[2 * k..2 * k + 2].try_into().unwrap()
+            ) as f64,
+            'J' => i32::from_be_bytes(
+                src[4 * k..4 * k + 4].try_into().unwrap()
+            ) as f64,
+            'K' => i64::from_be_bytes(
+                src[8 * k..8 * k + 8].try_into().unwrap()
+            ) as f64,
+            'E' => f32::from_be_bytes(
+                src[4 * k..4 * k + 4].try_into().unwrap()
+            ) as f64,
+            'D' => f64::from_be_bytes(
+                src[8 * k..8 * k + 8].try_into().unwrap()
+            ),
+            _ => unreachable!(
+                "general scaling on unsupported letter '{}'", letter
+            ),
+        };
+        let physical = tscal * stored + tzero;
+        dst[8 * k..8 * k + 8].copy_from_slice(&physical.to_ne_bytes());
     }
 }
 
@@ -268,6 +442,10 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 )));
             }
             let descriptor_size = if letter == 'P' { 8 } else { 16 };
+            let tscal = parse_keyword_float(cards, &format!("TSCAL{}", i))
+                .unwrap_or(1.0);
+            let tzero = parse_keyword_float(cards, &format!("TZERO{}", i))
+                .unwrap_or(0.0);
             Column {
                 name,
                 tform_letter: inner,
@@ -276,6 +454,8 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 byte_offset: offset,
                 byte_width: descriptor_size,
                 var_kind: Some(letter),
+                tscal,
+                tzero,
             }
         } else {
             // X is a bit column: `repeat` is the bit count and the
@@ -310,6 +490,10 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 }
                 None => None,
             };
+            let tscal = parse_keyword_float(cards, &format!("TSCAL{}", i))
+                .unwrap_or(1.0);
+            let tzero = parse_keyword_float(cards, &format!("TZERO{}", i))
+                .unwrap_or(0.0);
             Column {
                 name,
                 tform_letter: letter,
@@ -318,6 +502,8 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 byte_offset: offset,
                 byte_width,
                 var_kind: None,
+                tscal,
+                tzero,
             }
         };
         offset += column.byte_width;
@@ -357,61 +543,75 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 // Numpy structured fields with shape (1,) are NOT equivalent to scalar
 // fields (they add a trailing axis of length 1).  We deliberately use
 // scalar for repeat==1, no-TDIM to keep the read-back shape natural.
-fn field_dtype_and_shape(col: &Column) -> (String, Vec<usize>) {
+fn field_dtype_and_shape(
+    col: &Column,
+    scale: bool,
+) -> PyResult<(String, Vec<usize>)> {
     if col.var_kind.is_some() {
-        return ("O".to_string(), Vec::new());
+        return Ok(("O".to_string(), Vec::new()));
     }
     if col.tform_letter == 'X' {
         let shape: Vec<usize> = match &col.tdim {
             Some(tdim) => tdim.iter().rev().copied().collect(),
             None => if col.repeat > 1 { vec![col.repeat] } else { Vec::new() },
         };
-        return ("?".to_string(), shape);
+        return Ok(("?".to_string(), shape));
     }
     if col.tform_letter == 'A' {
-        return match &col.tdim {
+        return Ok(match &col.tdim {
             Some(tdim) => {
                 let str_len = tdim[0];
                 let shape: Vec<usize> = tdim[1..].iter().rev().copied().collect();
                 (format!("U{}", str_len), shape)
             }
             None => (format!("U{}", col.repeat), Vec::new()),
-        };
+        });
     }
     // Numeric letters.  All native-endian; the byte swap from on-disk
-    // big-endian happens in the row reader (task #41).
-    let dtype_str = match col.tform_letter {
-        'L' => "?",         // numpy bool — converted from FITS 'T'/'F' at read
-        'B' => "u1",
-        'I' => "i2",
-        'J' => "i4",
-        'K' => "i8",
-        'E' => "f4",
-        'D' => "f8",
-        'C' => "c8",
-        'M' => "c16",
-        // Unreachable: parse_columns rejects unsupported letters up front.
-        _ => unreachable!("unsupported TFORM letter '{}' reached dtype builder",
-                          col.tform_letter),
+    // big-endian happens in the row reader.  When TSCAL/TZERO are
+    // active, the dtype string may be promoted by scaled_output_dtype.
+    let kind = if scale { scaling_kind(col)? } else { ScalingKind::None };
+    let dtype_str: &str = match kind {
+        ScalingKind::None => match col.tform_letter {
+            'L' => "?",
+            'B' => "u1",
+            'I' => "i2",
+            'J' => "i4",
+            'K' => "i8",
+            'E' => "f4",
+            'D' => "f8",
+            'C' => "c8",
+            'M' => "c16",
+            _ => unreachable!("unsupported TFORM letter '{}'", col.tform_letter),
+        },
+        ScalingKind::UnsignedTrick | ScalingKind::General => {
+            scaled_output_dtype(col.tform_letter, kind)
+        }
     };
     let shape: Vec<usize> = match &col.tdim {
         Some(tdim) => tdim.iter().rev().copied().collect(),
         None => if col.repeat > 1 { vec![col.repeat] } else { Vec::new() },
     };
-    (dtype_str.to_string(), shape)
+    Ok((dtype_str.to_string(), shape))
 }
 
 // Build a numpy structured dtype matching the table layout.  The dtype is
 // always native-endian; the on-disk big-endian bytes are swapped at read
-// time (task #41).  Cell shapes are reversed from TDIMn so that numpy
-// (row-major) iteration walks the same elements as FITS (column-major)
-// iteration would in the original file.
-fn build_numpy_dtype(py: Python<'_>, columns: &[Column]) -> PyResult<Py<PyAny>> {
+// time.  Cell shapes are reversed from TDIMn so that numpy (row-major)
+// iteration walks the same elements as FITS (column-major) iteration
+// would in the original file.  `scale=true` promotes columns with
+// TSCAL/TZERO to their scaled dtype (e.g. u2 for the unsigned-int trick,
+// f8 for general scaling).
+fn build_numpy_dtype(
+    py: Python<'_>,
+    columns: &[Column],
+    scale: bool,
+) -> PyResult<Py<PyAny>> {
     let numpy = py.import("numpy")?;
     let np_dtype = numpy.getattr("dtype")?;
     let fields = PyList::empty(py);
     for col in columns {
-        let (dtype_str, shape) = field_dtype_and_shape(col);
+        let (dtype_str, shape) = field_dtype_and_shape(col, scale)?;
         let tuple = if shape.is_empty() {
             PyTuple::new(py, [
                 col.name.clone().into_pyobject(py)?.into_any(),
@@ -450,13 +650,31 @@ fn copy_with_byteswap(src: &[u8], dst: &mut [u8], elem_size: usize) {
 // Per-row converter for one column.  `src` is the on-disk bytes for this
 // column in one row; `dst` is the numpy field's bytes for the same row.
 // Layouts and sizes match for numerics (modulo byte order); for A columns
-// the numpy U field is 4x larger than the on-disk A bytes.
+// the numpy U field is 4x larger than the on-disk A bytes.  When `kind`
+// is non-None, the scaling converter handles the cell instead and may
+// produce a wider dst (general scaling → f8).
 fn convert_column_cell(
     col: &Column,
     src: &[u8],
     dst: &mut [u8],
     row_index: usize,
+    kind: ScalingKind,
 ) -> PyResult<()> {
+    match kind {
+        ScalingKind::None => {}
+        ScalingKind::UnsignedTrick => {
+            convert_unsigned_trick_cell(
+                col.tform_letter, col.repeat, src, dst,
+            );
+            return Ok(());
+        }
+        ScalingKind::General => {
+            convert_general_scaling_cell(
+                col.tform_letter, col.repeat, col.tscal, col.tzero, src, dst,
+            );
+            return Ok(());
+        }
+    }
     match col.tform_letter {
         // FITS L is one byte: ASCII 'T' (true) or 'F'/anything-else (false).
         // numpy bool is one byte: 0 or 1.  Convert per byte.
@@ -617,13 +835,14 @@ fn read_descriptor(kind: char, src: &[u8]) -> (i64, i64) {
 // bytes are returned verbatim (matches read_column(as_bytes=True)).
 fn build_var_cell_value(
     py: Python<'_>,
-    inner_letter: char,
+    col: &Column,
     src_bytes: &[u8],
     nelements: usize,
-    col_name: &str,
     row_idx: usize,
     as_bytes: bool,
+    kind: ScalingKind,
 ) -> PyResult<Py<PyAny>> {
+    let inner_letter = col.tform_letter;
     if inner_letter == 'A' {
         if as_bytes {
             return Ok(PyBytes::new(py, src_bytes).into_any().unbind());
@@ -638,7 +857,7 @@ fn build_var_cell_value(
                     "column '{}' row {} contains non-ASCII byte 0x{:02X} \
                      at position {} (read this column with \
                      table.read_column('{}', as_bytes=True) to get raw bytes)",
-                    col_name, row_idx, b, i, col_name,
+                    col.name, row_idx, b, i, col.name,
                 )));
             }
         }
@@ -646,17 +865,24 @@ fn build_var_cell_value(
         return Ok(s.into_pyobject(py)?.into_any().unbind());
     }
     let np = py.import("numpy")?;
-    let dtype_str = match inner_letter {
-        'L' => "?",
-        'B' => "u1",
-        'I' => "i2",
-        'J' => "i4",
-        'K' => "i8",
-        'E' => "f4",
-        'D' => "f8",
-        'C' => "c8",
-        'M' => "c16",
-        _ => unreachable!("unsupported variable inner letter '{}'", inner_letter),
+    let dtype_str: &str = match kind {
+        ScalingKind::None => match inner_letter {
+            'L' => "?",
+            'B' => "u1",
+            'I' => "i2",
+            'J' => "i4",
+            'K' => "i8",
+            'E' => "f4",
+            'D' => "f8",
+            'C' => "c8",
+            'M' => "c16",
+            _ => unreachable!(
+                "unsupported variable inner letter '{}'", inner_letter
+            ),
+        },
+        ScalingKind::UnsignedTrick | ScalingKind::General => {
+            scaled_output_dtype(inner_letter, kind)
+        }
     };
     let arr = np.call_method1("empty", (nelements, dtype_str))?;
     if nelements == 0 {
@@ -672,15 +898,29 @@ fn build_var_cell_value(
     }
     let mut buf = RawBuffer::acquire_writable(&arr)?;
     let dst = buf.as_mut_slice();
-    if inner_letter == 'L' {
-        for (i, &b) in src_bytes.iter().enumerate() {
-            dst[i] = if b == b'T' { 1 } else { 0 };
+    match kind {
+        ScalingKind::None => {
+            if inner_letter == 'L' {
+                for (i, &b) in src_bytes.iter().enumerate() {
+                    dst[i] = if b == b'T' { 1 } else { 0 };
+                }
+            } else {
+                // Swap by the base float/int width — for C and M that
+                // means swapping each half (real, imag) independently,
+                // not the whole element.  See `byteswap_unit` docs.
+                copy_with_byteswap(
+                    src_bytes, dst, byteswap_unit(inner_letter),
+                );
+            }
         }
-    } else {
-        // Swap by the base float/int width — for C and M that means
-        // swapping each half (real, imag) independently, not the whole
-        // element.  See `byteswap_unit` docs.
-        copy_with_byteswap(src_bytes, dst, byteswap_unit(inner_letter));
+        ScalingKind::UnsignedTrick => {
+            convert_unsigned_trick_cell(inner_letter, nelements, src_bytes, dst);
+        }
+        ScalingKind::General => {
+            convert_general_scaling_cell(
+                inner_letter, nelements, col.tscal, col.tzero, src_bytes, dst,
+            );
+        }
     }
     drop(buf);
     Ok(arr.unbind())
@@ -703,6 +943,7 @@ fn heap_pass(
     mut var_cells: Vec<VarCell>,
     as_bytes: bool,
     single_column: bool,
+    scaling_kinds: &[ScalingKind],
 ) -> PyResult<()> {
     if var_cells.is_empty() {
         return Ok(());
@@ -737,7 +978,8 @@ fn heap_pass(
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
         }
         let value = build_var_cell_value(
-            py, inner, &buf, n, &col.name, cell.output_row, as_bytes,
+            py, col, &buf, n, cell.output_row, as_bytes,
+            scaling_kinds[cell.col_idx],
         )?;
         if single_column {
             arr.set_item(cell.output_row, value)?;
@@ -1021,6 +1263,7 @@ fn read_table(
     file_handle: &FileHandle,
     rows_arg: Option<&Bound<'_, PyAny>>,
     columns_requested: Option<Vec<String>>,
+    scale: bool,
 ) -> PyResult<Py<PyAny>> {
     let n_rows = parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
     let row_width =
@@ -1031,9 +1274,16 @@ fn read_table(
         Some(names) => resolve_columns(&all_columns, &names)?,
     };
 
+    // Pre-classify scaling per column so the per-cell loop is just a
+    // ScalingKind match — no f64 comparisons or TZERO checks per row.
+    // Also surfaces a C/M-with-scaling error before any I/O.
+    let scaling_kinds: Vec<ScalingKind> = columns.iter()
+        .map(|c| if scale { scaling_kind(c) } else { Ok(ScalingKind::None) })
+        .collect::<PyResult<Vec<_>>>()?;
+
     let (n_out, runs) = plan_runs(rows_arg, n_rows)?;
 
-    let dtype = build_numpy_dtype(py, &columns)?;
+    let dtype = build_numpy_dtype(py, &columns, scale)?;
     let np = py.import("numpy")?;
     let arr = np.call_method1("empty", (n_out, dtype.bind(py)))?;
     if n_out == 0 || row_width == 0 {
@@ -1077,7 +1327,9 @@ fn read_table(
                     } else {
                         let (dst_off, dst_w) = field_layout[col_idx];
                         let dst = &mut dst_row[dst_off..dst_off + dst_w];
-                        convert_column_cell(col, src, dst, disk_row)?;
+                        convert_column_cell(
+                            col, src, dst, disk_row, scaling_kinds[col_idx],
+                        )?;
                     }
                 }
                 Ok(())
@@ -1088,6 +1340,7 @@ fn read_table(
     heap_pass(
         py, &arr, file_handle, &columns, data_offset, cards,
         var_cells, /* as_bytes = */ false, /* single_column = */ false,
+        &scaling_kinds,
     )?;
 
     Ok(arr.unbind())
@@ -1113,6 +1366,7 @@ fn read_one_column(
     name: &str,
     rows_arg: Option<&Bound<'_, PyAny>>,
     as_bytes: bool,
+    scale: bool,
 ) -> PyResult<Py<PyAny>> {
     let n_rows_total =
         parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
@@ -1140,6 +1394,10 @@ fn read_one_column(
         )));
     }
 
+    // Pre-classify scaling for this one column (errors early for C/M
+    // with non-default TSCAL/TZERO, before any I/O).
+    let kind = if scale { scaling_kind(&col)? } else { ScalingKind::None };
+
     let (n_out, runs) = plan_runs(rows_arg, n_rows_total)?;
 
     // Element dtype + per-row "field" shape (excluding the leading row
@@ -1160,7 +1418,7 @@ fn read_one_column(
         };
         (format!("S{}", str_len), array_shape)
     } else {
-        field_dtype_and_shape(&col)
+        field_dtype_and_shape(&col, scale)?
     };
 
     let mut arr_shape: Vec<usize> = Vec::with_capacity(1 + field_shape.len());
@@ -1218,7 +1476,7 @@ fn read_one_column(
                         dst.copy_from_slice(src);
                         Ok(())
                     } else {
-                        convert_column_cell(&col, src, dst, disk_row)
+                        convert_column_cell(&col, src, dst, disk_row, kind)
                     }
                 }
             },
@@ -1229,9 +1487,11 @@ fn read_one_column(
         // For read_one_column the heap pass uses col_idx=0 against a
         // single-element columns slice.
         let columns_slice = std::slice::from_ref(&col);
+        let scaling_kinds = [kind];
         heap_pass(
             py, &arr, file_handle, columns_slice, data_offset, cards,
             var_cells, as_bytes, /* single_column = */ true,
+            &scaling_kinds,
         )?;
     }
 
@@ -1267,13 +1527,15 @@ impl TableHDU {
 
     // numpy structured dtype the table would read into.  Useful for
     // inspecting the column layout (names, per-cell shapes, types)
-    // without paying for an actual read.
+    // without paying for an actual read.  Reflects the default-read
+    // (scale=True) dtype — i.e. columns with the TSCAL/TZERO unsigned
+    // trick appear as u2/u4/u8/i1, and other scaled columns as f8.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         let columns = parse_columns(&cards)?;
-        build_numpy_dtype(py, &columns)
+        build_numpy_dtype(py, &columns, /* scale = */ true)
     }
 
     // Read the table into a numpy structured array of native-endian
@@ -1283,19 +1545,25 @@ impl TableHDU {
     //     order; negative indices supported.
     //   - columns=None: every column in file order.
     //   - columns=list of names: subset + reorder, case-insensitive.
+    //   - scale=True (default): apply TSCAL/TZERO; the unsigned-int
+    //     trick promotes to the matching unsigned dtype, other scaling
+    //     produces f8.  scale=False returns raw stored values.
     //
     // Both subsets validate fully before any I/O happens.
-    #[pyo3(signature = (*, rows=None, columns=None))]
+    #[pyo3(signature = (*, rows=None, columns=None, scale=true))]
     fn read(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         rows: Option<&Bound<'_, PyAny>>,
         columns: Option<Vec<String>>,
+        scale: bool,
     ) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
-        read_table(py, &cards, data_offset, &super_.file, rows, columns)
+        read_table(
+            py, &cards, data_offset, &super_.file, rows, columns, scale,
+        )
     }
 
     // Read a single column into a plain (non-structured) ndarray of
@@ -1304,20 +1572,22 @@ impl TableHDU {
     // columns; it returns the on-disk bytes in an S<n> field with no
     // decode, no null-truncation, and no trailing-space strip — useful
     // when a column has non-ASCII bytes that the default U decode would
-    // reject.
-    #[pyo3(signature = (name, *, rows=None, as_bytes=false))]
+    // reject.  `scale` matches read().
+    #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true))]
     fn read_column(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         name: &str,
         rows: Option<&Bound<'_, PyAny>>,
         as_bytes: bool,
+        scale: bool,
     ) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
             py, &cards, data_offset, &super_.file, name, rows, as_bytes,
+            scale,
         )
     }
 
@@ -1346,6 +1616,7 @@ impl TableHDU {
                 let data_offset = super_.offsets.data_offset();
                 read_table(
                     py, &cards, data_offset, &super_.file, Some(key), None,
+                    /* scale = */ true,
                 )
             }
             TableKey::SingleColumn(name) => {
@@ -1489,7 +1760,8 @@ impl SingleColumnSubset {
         let data_offset = super_.offsets.data_offset();
         read_one_column(
             py, &cards, data_offset, &super_.file,
-            &self.name, Some(rows), false,
+            &self.name, Some(rows), /* as_bytes = */ false,
+            /* scale = */ true,
         )
     }
 }
@@ -1530,6 +1802,7 @@ impl ColumnSubset {
         read_table(
             py, &cards, data_offset, &super_.file,
             Some(rows), Some(self.columns.clone()),
+            /* scale = */ true,
         )
     }
 }

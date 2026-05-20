@@ -1547,6 +1547,424 @@ def test_var_inner_x_rejected():
                 fits[1].read()
 
 
+# ---------------------------------------------------------------------------
+# TSCAL/TZERO scaling: unsigned-int trick + general linear scaling
+# ---------------------------------------------------------------------------
+
+
+def _bintable_with_scaling(naxis1, naxis2, fields, tscals_tzeros):
+    """Like _bintable_cards but inserts TSCAL/TZERO cards.
+
+    `tscals_tzeros` is a dict {col_index_1based: (tscal_str, tzero_str)}.
+    Each value is the literal numeric string to write into the card.
+    """
+    cards = _bintable_cards(naxis1, naxis2, fields)
+    extras = []
+    for i, (tscal, tzero) in tscals_tzeros.items():
+        if tscal is not None:
+            extras.append(f"TSCAL{i:<3d}= {tscal:>20s}")
+        if tzero is not None:
+            extras.append(f"TZERO{i:<3d}= {tzero:>20s}")
+    # Insert before the END card.
+    return cards[:-1] + extras + ["END"]
+
+
+# ---------------- unsigned-int trick: I → u2 ----------------
+
+
+def test_scaling_unsigned_int_trick_u16():
+    """TFORM=I, TSCAL=1, TZERO=32768 → uint16 output."""
+    data = struct.pack(">hhh", -32768, 0, 32767)
+    fields = [("U16", "1I")]
+    cards = _bintable_with_scaling(2, 3, fields, {1: ("1", "32768")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["U16"].dtype == np.uint16
+            assert a["U16"].tolist() == [0, 32768, 65535]
+
+
+def test_scaling_unsigned_int_trick_u32():
+    data = struct.pack(">iii", -2147483648, 0, 2147483647)
+    fields = [("U32", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: ("1", "2147483648")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["U32"].dtype == np.uint32
+            assert a["U32"].tolist() == [0, 2147483648, 4294967295]
+
+
+def test_scaling_unsigned_int_trick_u64():
+    """K (int64) + TZERO=2^63 → uint64, no precision loss."""
+    data = struct.pack(">qqq", -2**63, 0, 2**63 - 1)
+    fields = [("U64", "1K")]
+    cards = _bintable_with_scaling(8, 3, fields,
+                                   {1: ("1", "9223372036854775808")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["U64"].dtype == np.uint64
+            assert a["U64"].tolist() == [0, 2**63, 2**64 - 1]
+
+
+def test_scaling_signed_byte_trick_i8():
+    """B (uint8) + TZERO=-128 → int8."""
+    data = bytes([0, 128, 255])  # stored unsigned 0, 128, 255
+    fields = [("S8", "1B")]
+    cards = _bintable_with_scaling(1, 3, fields, {1: ("1", "-128")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["S8"].dtype == np.int8
+            assert a["S8"].tolist() == [-128, 0, 127]
+
+
+# ---------------- general (TSCAL!=1 or non-trick TZERO) ----------------
+
+
+def test_scaling_general_linear_on_int_column():
+    """TSCAL=2, TZERO=10 on i32 → f8 output with physical = 2*x+10."""
+    data = struct.pack(">iii", 0, 5, 100)
+    fields = [("X", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: ("2.0", "10.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"].dtype == np.float64
+            assert a["X"].tolist() == [10.0, 20.0, 210.0]
+
+
+def test_scaling_general_on_float_column():
+    """TSCAL=0.5 on f4 → f8 output with physical = 0.5*x."""
+    data = struct.pack(">ff", 2.0, 4.0)
+    fields = [("X", "1E")]
+    cards = _bintable_with_scaling(4, 2, fields, {1: ("0.5", "0.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"].dtype == np.float64
+            assert a["X"].tolist() == [1.0, 2.0]
+
+
+def test_scaling_tscal_only():
+    """TSCAL=3, TZERO absent → general scaling (physical = 3*x)."""
+    data = struct.pack(">iii", 1, 2, 3)
+    fields = [("X", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: ("3.0", None)})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"].dtype == np.float64
+            assert a["X"].tolist() == [3.0, 6.0, 9.0]
+
+
+def test_scaling_tzero_only_nontrick():
+    """TZERO set to a non-trick value → general scaling, not unsigned
+    trick.  E.g. TZERO=100 on i32."""
+    data = struct.pack(">iii", -10, 0, 10)
+    fields = [("X", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: (None, "100.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"].dtype == np.float64
+            assert a["X"].tolist() == [90.0, 100.0, 110.0]
+
+
+# ---------------- scale=False opt-out ----------------
+
+
+def test_scaling_disabled_returns_raw():
+    data = struct.pack(">hhh", -32768, 0, 32767)
+    fields = [("U16", "1I")]
+    cards = _bintable_with_scaling(2, 3, fields, {1: ("1", "32768")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(scale=False)
+            assert a["U16"].dtype == np.int16
+            assert a["U16"].tolist() == [-32768, 0, 32767]
+
+
+def test_scaling_read_column_scale_false():
+    data = struct.pack(">iii", 0, 5, 100)
+    fields = [("X", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: ("2.0", "10.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            col_scaled = fits[1].read_column("X")
+            assert col_scaled.dtype == np.float64
+            assert col_scaled.tolist() == [10.0, 20.0, 210.0]
+            col_raw = fits[1].read_column("X", scale=False)
+            assert col_raw.dtype == np.int32
+            assert col_raw.tolist() == [0, 5, 100]
+
+
+# ---------------- defaults are no-op (fast path preserved) ----------------
+
+
+def test_scaling_defaults_no_change():
+    """A column with default TSCAL=1 and TZERO=0 (or missing) gives
+    the same dtype and values regardless of scale=True/False."""
+    data = struct.pack(">iii", 1, 2, 3)
+    fields = [("X", "1J")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(4, 3, fields), data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            b = fits[1].read(scale=False)
+            assert a.dtype == b.dtype
+            assert a.dtype == np.dtype([("X", "<i4")])
+            assert a["X"].tolist() == b["X"].tolist() == [1, 2, 3]
+
+
+def test_scaling_explicit_defaults_no_change():
+    """TSCAL=1.0, TZERO=0.0 explicitly set: still treated as no-op."""
+    data = struct.pack(">ii", 7, 8)
+    fields = [("X", "1J")]
+    cards = _bintable_with_scaling(4, 2, fields, {1: ("1.0", "0.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"].dtype == np.int32
+            assert a["X"].tolist() == [7, 8]
+
+
+# ---------------- complex column: scaling raises ----------------
+
+
+def test_scaling_on_complex_raises():
+    fields = [("Z", "1C")]
+    cards = _bintable_with_scaling(8, 0, fields, {1: ("2.0", "0.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="complex"):
+                fits[1].read()
+
+
+def test_scaling_on_complex_scale_false_ok():
+    """scale=False bypasses scaling — even C/M with TSCAL/TZERO set
+    should read without error."""
+    data = struct.pack(">ff", 1.0, 2.0)
+    fields = [("Z", "1C")]
+    cards = _bintable_with_scaling(8, 1, fields, {1: ("2.0", "0.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(scale=False)
+            assert a["Z"][0] == complex(1, 2)
+
+
+# ---------------- non-numeric types: scaling ignored ----------------
+
+
+def test_scaling_on_logical_silently_ignored():
+    """TSCAL/TZERO on L is meaningless; defaults pass through."""
+    data = bytes([ord("T"), ord("F")])
+    fields = [("FLAG", "1L")]
+    cards = _bintable_with_scaling(1, 2, fields, {1: ("5.0", "10.0")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["FLAG"].dtype == np.bool_
+            assert a["FLAG"].tolist() == [True, False]
+
+
+# ---------------- multi-element repeat with scaling ----------------
+
+
+def test_scaling_unsigned_trick_multi_element():
+    """TFORM='3I' with the u16 trick: 3 elements per row, each scaled."""
+    data = struct.pack(">hhhhhh", -32768, 0, 32767, 1, 2, 3)
+    fields = [("V", "3I")]
+    cards = _bintable_with_scaling(6, 2, fields, {1: ("1", "32768")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["V"].dtype == np.uint16
+            assert a["V"][0].tolist() == [0, 32768, 65535]
+            assert a["V"][1].tolist() == [32769, 32770, 32771]
+
+
+# ---------------- read_column on scaled column ----------------
+
+
+def test_scaling_read_column_unsigned_trick():
+    data = struct.pack(">iii", -1, 0, 1)
+    fields = [("U32", "1J")]
+    cards = _bintable_with_scaling(4, 3, fields, {1: ("1", "2147483648")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            col = fits[1].read_column("U32")
+            assert col.dtype == np.uint32
+            assert col.tolist() == [2147483647, 2147483648, 2147483649]
+
+
+# ---------------- dtype property reflects scaled dtype ----------------
+
+
+def test_scaling_dtype_property_promotes():
+    fields = [("U16", "1I"), ("F", "1J")]
+    cards = _bintable_with_scaling(6, 0, fields, {
+        1: ("1", "32768"),       # unsigned trick → u2
+        2: ("2.0", "10.0"),      # general → f8
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            dt = fits[1].dtype
+            assert dt == np.dtype([("U16", "<u2"), ("F", "<f8")])
+
+
+# ---------------- subset paths still work with scaling ----------------
+
+
+def test_scaling_with_rows_and_columns_subsets():
+    data = b""
+    for stored in [-32768, 0, 32767]:
+        data += struct.pack(">h", stored) + struct.pack(">i", stored)
+    fields = [("U16", "1I"), ("RAW", "1J")]
+    cards = _bintable_with_scaling(6, 3, fields, {1: ("1", "32768")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(rows=[2, 0], columns=["U16"])
+            assert a["U16"].dtype == np.uint16
+            assert a["U16"].tolist() == [65535, 0]
+
+
+def test_scaling_getitem_column_subset():
+    data = struct.pack(">h", 0) + struct.pack(">h", 100)
+    fields = [("U16", "1I")]
+    cards = _bintable_with_scaling(2, 2, fields, {1: ("1", "32768")})
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, data)
+        with rustfits.FITS(fname, "r") as fits:
+            col = fits[1]["U16"][:]
+            assert col.dtype == np.uint16
+            assert col.tolist() == [32768, 32868]
+
+
+# ---------------- variable-length scaling ----------------
+
+
+def test_scaling_variable_length_unsigned_trick():
+    """1PJ with TSCAL=1, TZERO=2^31 → each heap cell becomes a u4 ndarray."""
+    descriptors = (
+        struct.pack(">ii", 3, 0)
+        + struct.pack(">ii", 2, 12)
+    )
+    heap = struct.pack(">iii", -1, 0, 1) + struct.pack(">ii", -2**31, 2**31 - 1)
+    fields = [("V", "1PJ(10)")]
+    row_width = 8
+    naxis2 = 2
+    cards = _bintable_cards(row_width, naxis2, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    cards = cards[:-1] + [
+        "TSCAL1  =                    1",
+        "TZERO1  =           2147483648",
+        "END",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            v0 = a["V"][0]
+            v1 = a["V"][1]
+            assert v0.dtype == np.uint32
+            assert v0.tolist() == [2147483647, 2147483648, 2147483649]
+            assert v1.tolist() == [0, 4294967295]
+
+
+def test_scaling_variable_length_general():
+    """1PE with TSCAL=10.0, TZERO=0.0 → each cell is f8 (promoted)."""
+    descriptors = struct.pack(">ii", 3, 0)
+    heap = struct.pack(">fff", 1.0, 2.0, 3.0)
+    fields = [("V", "1PE(10)")]
+    row_width = 8
+    cards = _bintable_cards(row_width, 1, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    cards = cards[:-1] + [
+        "TSCAL1  =                 10.0",
+        "TZERO1  =                  0.0",
+        "END",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            v = a["V"][0]
+            assert v.dtype == np.float64
+            assert v.tolist() == [10.0, 20.0, 30.0]
+
+
+def test_scaling_variable_length_scale_false():
+    descriptors = struct.pack(">ii", 3, 0)
+    heap = struct.pack(">iii", -1, 0, 1)
+    fields = [("V", "1PJ(10)")]
+    cards = _bintable_cards(8, 1, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    cards = cards[:-1] + [
+        "TSCAL1  =                    1",
+        "TZERO1  =           2147483648",
+        "END",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(scale=False)
+            v = a["V"][0]
+            assert v.dtype == np.int32
+            assert v.tolist() == [-1, 0, 1]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

@@ -344,6 +344,24 @@ pub(crate) fn parse_keyword(cards: &[String], key: &str) -> Option<i64> {
     None
 }
 
+// Same matching rules as parse_keyword, but the value is parsed as
+// f64.  TSCAL/TZERO are float-typed keywords in the FITS standard,
+// and the unsigned-int trick TZERO values (-128, 2^15, 2^31, 2^63)
+// are all exact in f64 since they're powers of 2.
+pub(crate) fn parse_keyword_float(cards: &[String], key: &str) -> Option<f64> {
+    for card in cards {
+        if card.len() < 9 { continue; }
+        if card[..8].trim() != key { continue; }
+        if !card[8..].starts_with('=') { continue; }
+        let value_part = &card[9..];
+        if let Some(num_str) = value_part.split_whitespace().next() {
+            let cleaned = num_str.trim_end_matches(&['\'', ' ', '/'][..]);
+            return cleaned.parse::<f64>().ok();
+        }
+    }
+    None
+}
+
 // Extract the string value for the given keyword from a card list.  The
 // card's keyword field (cols 1-8 trimmed) must match `key` exactly and col 9
 // must be `=`.  Inner `''` is unescaped to `'`, then trailing spaces are
