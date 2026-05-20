@@ -62,6 +62,13 @@ pub(crate) struct Column {
     // scaling_kind()).
     pub(crate) tscal: f64,
     pub(crate) tzero: f64,
+    // TNULLn integer sentinel — only populated for integer columns
+    // (fixed B/I/J/K and VLA inner B/I/J/K).  For non-integer letters
+    // the header keyword is silently ignored (it's meaningless per
+    // the FITS spec).  The mask compare happens in stored-integer
+    // space, before TSCAL/TZERO, so this value is the raw on-disk
+    // sentinel regardless of any scaling.
+    pub(crate) tnull: Option<i64>,
 }
 
 // Bytes per single element for each supported TFORM letter.  'A' is 1
@@ -227,6 +234,51 @@ fn convert_unsigned_trick_cell(
             }
         }
         _ => unreachable!(),
+    }
+}
+
+// Write one byte (0 or 1) per element into `mask_dst`, set to 1 where
+// the stored big-endian element equals `tnull`.  The comparison is in
+// stored (pre-scaling) space per the FITS spec — TNULLn is the raw
+// on-disk sentinel.  Called only for integer columns (B/I/J/K); the
+// caller is responsible for the letter check.
+fn write_cell_mask(
+    letter: char, repeat: usize, tnull: i64, src: &[u8], mask_dst: &mut [u8],
+) {
+    match letter {
+        'B' => {
+            for k in 0..repeat {
+                let stored = src[k] as i64;
+                mask_dst[k] = (stored == tnull) as u8;
+            }
+        }
+        'I' => {
+            for k in 0..repeat {
+                let stored = i16::from_be_bytes(
+                    src[2 * k..2 * k + 2].try_into().unwrap()
+                ) as i64;
+                mask_dst[k] = (stored == tnull) as u8;
+            }
+        }
+        'J' => {
+            for k in 0..repeat {
+                let stored = i32::from_be_bytes(
+                    src[4 * k..4 * k + 4].try_into().unwrap()
+                ) as i64;
+                mask_dst[k] = (stored == tnull) as u8;
+            }
+        }
+        'K' => {
+            for k in 0..repeat {
+                let stored = i64::from_be_bytes(
+                    src[8 * k..8 * k + 8].try_into().unwrap()
+                );
+                mask_dst[k] = (stored == tnull) as u8;
+            }
+        }
+        _ => unreachable!(
+            "write_cell_mask called with non-integer letter '{}'", letter
+        ),
     }
 }
 
@@ -446,6 +498,15 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 .unwrap_or(1.0);
             let tzero = parse_keyword_float(cards, &format!("TZERO{}", i))
                 .unwrap_or(0.0);
+            // Track TNULLn for VLA columns whose inner type is integer
+            // so the read path can refuse mask_null=True (VLA TNULL
+            // masking is not yet implemented).  For non-int inner
+            // letters the keyword has no meaning; leave as None.
+            let tnull = if matches!(inner, 'B' | 'I' | 'J' | 'K') {
+                parse_keyword(cards, &format!("TNULL{}", i))
+            } else {
+                None
+            };
             Column {
                 name,
                 tform_letter: inner,
@@ -456,6 +517,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 var_kind: Some(letter),
                 tscal,
                 tzero,
+                tnull,
             }
         } else {
             // X is a bit column: `repeat` is the bit count and the
@@ -494,6 +556,14 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 .unwrap_or(1.0);
             let tzero = parse_keyword_float(cards, &format!("TZERO{}", i))
                 .unwrap_or(0.0);
+            // TNULLn only applies to integer columns (B/I/J/K) per the
+            // FITS standard.  For other letters the keyword is silently
+            // ignored if present.
+            let tnull = if matches!(letter, 'B' | 'I' | 'J' | 'K') {
+                parse_keyword(cards, &format!("TNULL{}", i))
+            } else {
+                None
+            };
             Column {
                 name,
                 tform_letter: letter,
@@ -504,6 +574,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 var_kind: None,
                 tscal,
                 tzero,
+                tnull,
             }
         };
         offset += column.byte_width;
@@ -622,6 +693,139 @@ fn build_numpy_dtype(
             PyTuple::new(py, [
                 col.name.clone().into_pyobject(py)?.into_any(),
                 dtype_str.into_pyobject(py)?.into_any(),
+                shape_tuple.into_any(),
+            ])?
+        };
+        fields.append(tuple)?;
+    }
+    Ok(np_dtype.call1((fields,))?.unbind())
+}
+
+// Wrap `data` in a numpy.ma.MaskedArray.  When `mask` is None we pass
+// np.ma.nomask explicitly.  For plain ndarrays this gives a true
+// nomask (`.mask is np.ma.nomask`).  For STRUCTURED data numpy.ma
+// always materializes an all-False structured bool mask regardless of
+// what's passed — the "zero overhead" path is unavailable in that
+// case, but the rustfits-side allocation is still skipped, and
+// callers still get a consistent MaskedArray return type.
+fn wrap_masked(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    mask: Option<Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let ma = py.import("numpy")?.getattr("ma")?;
+    let mask_obj = match mask {
+        Some(m) => m,
+        None => ma.getattr("nomask")?,
+    };
+    Ok(ma.call_method1("MaskedArray", (data, mask_obj))?.unbind())
+}
+
+// Reject mask_null=True when any selected column is variable-length
+// AND carries TNULL.  VLA mask support is deferred (per-row Object
+// mask ndarrays); this is a clean up-front rejection so the user sees
+// a useful error before any I/O.
+fn reject_var_tnull(columns: &[Column]) -> PyResult<()> {
+    for col in columns {
+        if col.tnull.is_some() && col.var_kind.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "column '{}' is variable-length and carries TNULL; \
+                 mask_null=True on variable-length columns is not yet \
+                 supported.  Use mask_null=False, or read this column \
+                 separately.",
+                col.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Allocated mask array + pre-computed layout the row loop needs.
+// Returned by allocate_mask_array; absent (None) when mask_null=False
+// or when no selected column carries TNULL (in which case the caller
+// still wraps the data in MaskedArray with nomask, for consistent
+// return type — no allocation overhead).
+struct MaskArray<'py> {
+    arr: Bound<'py, PyAny>,
+    itemsize: usize,
+    field_layout: Vec<(usize, usize)>,
+}
+
+fn allocate_mask_array<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyAny>,
+    columns: &[Column],
+    n_out: usize,
+    mask_null: bool,
+) -> PyResult<Option<MaskArray<'py>>> {
+    if !mask_null || !columns.iter().any(|c| c.tnull.is_some()) {
+        return Ok(None);
+    }
+    let mask_dtype = build_mask_dtype(py, columns)?;
+    // np.zeros so non-null elements (and non-int columns) stay False
+    // without any per-cell mask writes.
+    let arr = np.call_method1("zeros", (n_out, mask_dtype.bind(py)))?;
+    let mdt = arr.getattr("dtype")?;
+    let itemsize: usize = mdt.getattr("itemsize")?.extract()?;
+    let field_layout = numpy_field_layout(py, &mdt, columns)?;
+    Ok(Some(MaskArray { arr, itemsize, field_layout }))
+}
+
+// Write per-element TNULL masks for one row across all selected
+// columns.  Columns without TNULL are skipped (their bytes were
+// pre-zeroed by np.zeros, so False is already correct).  Assumes
+// VLA+TNULL columns have been rejected upstream.
+fn write_row_mask(
+    columns: &[Column],
+    field_layout: &[(usize, usize)],
+    src_row: &[u8],
+    m_row: &mut [u8],
+) {
+    for (col_idx, col) in columns.iter().enumerate() {
+        if let Some(tnull) = col.tnull {
+            let src = &src_row[col.byte_offset
+                ..col.byte_offset + col.byte_width];
+            let (off, w) = field_layout[col_idx];
+            write_cell_mask(
+                col.tform_letter, col.repeat, tnull,
+                src, &mut m_row[off..off + w],
+            );
+        }
+    }
+}
+
+// Build a numpy structured bool dtype that mirrors the data dtype's
+// per-field shapes but uses '?' (bool) for every field.  Used when
+// `mask_null=True` to allocate the parallel mask array that
+// np.ma.MaskedArray wraps around the data.  Each field's shape matches
+// the data field exactly so per-element TNULL masking lines up with
+// the per-element data layout (repeat>1, TDIM reshape, A array, X
+// reshape).  Object (variable-length) fields get a scalar bool slot;
+// callers refuse `mask_null=True` on VLA columns that actually carry
+// TNULL before reaching here.
+fn build_mask_dtype(
+    py: Python<'_>,
+    columns: &[Column],
+) -> PyResult<Py<PyAny>> {
+    let numpy = py.import("numpy")?;
+    let np_dtype = numpy.getattr("dtype")?;
+    let fields = PyList::empty(py);
+    for col in columns {
+        // scale=false: we only need the shape, and that path never
+        // errors (it skips scaling_kind() entirely).  Shape is
+        // identical with scale=true; the dtype string would just be
+        // different (which we override to '?' here anyway).
+        let (_, shape) = field_dtype_and_shape(col, /* scale = */ false)?;
+        let tuple = if shape.is_empty() {
+            PyTuple::new(py, [
+                col.name.clone().into_pyobject(py)?.into_any(),
+                "?".into_pyobject(py)?.into_any(),
+            ])?
+        } else {
+            let shape_tuple = PyTuple::new(py, &shape)?;
+            PyTuple::new(py, [
+                col.name.clone().into_pyobject(py)?.into_any(),
+                "?".into_pyobject(py)?.into_any(),
                 shape_tuple.into_any(),
             ])?
         };
@@ -1264,6 +1468,7 @@ fn read_table(
     rows_arg: Option<&Bound<'_, PyAny>>,
     columns_requested: Option<Vec<String>>,
     scale: bool,
+    mask_null: bool,
 ) -> PyResult<Py<PyAny>> {
     let n_rows = parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
     let row_width =
@@ -1273,6 +1478,9 @@ fn read_table(
         None => all_columns,
         Some(names) => resolve_columns(&all_columns, &names)?,
     };
+    if mask_null {
+        reject_var_tnull(&columns)?;
+    }
 
     // Pre-classify scaling per column so the per-cell loop is just a
     // ScalingKind match — no f64 comparisons or TZERO checks per row.
@@ -1286,8 +1494,14 @@ fn read_table(
     let dtype = build_numpy_dtype(py, &columns, scale)?;
     let np = py.import("numpy")?;
     let arr = np.call_method1("empty", (n_out, dtype.bind(py)))?;
+    let mask = allocate_mask_array(py, &np, &columns, n_out, mask_null)?;
+
     if n_out == 0 || row_width == 0 {
-        return Ok(arr.unbind());
+        return if mask_null {
+            wrap_masked(py, arr, mask.map(|m| m.arr))
+        } else {
+            Ok(arr.unbind())
+        };
     }
 
     let arr_dtype = arr.getattr("dtype")?;
@@ -1304,7 +1518,15 @@ fn read_table(
                 buf.len(), n_out * itemsize
             )));
         }
+        let mut mbuf_opt = mask.as_ref()
+            .map(|m| RawBuffer::acquire_writable(&m.arr))
+            .transpose()?;
         let out = buf.as_mut_slice();
+        let mut mout_opt: Option<&mut [u8]> =
+            mbuf_opt.as_mut().map(|m| m.as_mut_slice());
+        let mask_itemsize = mask.as_ref().map(|m| m.itemsize).unwrap_or(0);
+        let mask_field_layout: Option<&[(usize, usize)]> =
+            mask.as_ref().map(|m| m.field_layout.as_slice());
 
         process_runs(
             file_handle, &runs, data_offset, row_width, rows_per_chunk,
@@ -1332,10 +1554,19 @@ fn read_table(
                         )?;
                     }
                 }
+                if let Some(m) = mout_opt.as_deref_mut() {
+                    let m_row = &mut m
+                        [output_row * mask_itemsize
+                            ..(output_row + 1) * mask_itemsize];
+                    write_row_mask(
+                        &columns, mask_field_layout.unwrap(),
+                        src_row, m_row,
+                    );
+                }
                 Ok(())
             },
         )?;
-    }  // drop RawBuffer here, before heap pass touches the array via Python.
+    }  // drop RawBuffers here, before heap pass touches arrays via Python.
 
     heap_pass(
         py, &arr, file_handle, &columns, data_offset, cards,
@@ -1343,7 +1574,11 @@ fn read_table(
         &scaling_kinds,
     )?;
 
-    Ok(arr.unbind())
+    if mask_null {
+        wrap_masked(py, arr, mask.map(|m| m.arr))
+    } else {
+        Ok(arr.unbind())
+    }
 }
 
 // Read one column of a BINTABLE into a freshly-allocated ndarray of
@@ -1367,6 +1602,7 @@ fn read_one_column(
     rows_arg: Option<&Bound<'_, PyAny>>,
     as_bytes: bool,
     scale: bool,
+    mask_null: bool,
 ) -> PyResult<Py<PyAny>> {
     let n_rows_total =
         parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
@@ -1392,6 +1628,9 @@ fn read_one_column(
              column '{}' has TFORM type '{}'",
             col.name, col.tform_letter
         )));
+    }
+    if mask_null {
+        reject_var_tnull(std::slice::from_ref(&col))?;
     }
 
     // Pre-classify scaling for this one column (errors early for C/M
@@ -1426,10 +1665,23 @@ fn read_one_column(
     arr_shape.extend_from_slice(&field_shape);
 
     let np = py.import("numpy")?;
-    let arr = np.call_method1("empty", (arr_shape, &dtype_str))?;
+    let arr = np.call_method1("empty", (arr_shape.clone(), &dtype_str))?;
+    // The mask is a plain ndarray of the same shape as the data array;
+    // dtype "?" (one byte per element).  Only allocated when this
+    // column actually carries TNULL — otherwise nomask is fine.
+    let mask_arr: Option<Bound<'_, PyAny>> =
+        if mask_null && col.tnull.is_some() {
+            Some(np.call_method1("zeros", (arr_shape, "?"))?)
+        } else {
+            None
+        };
 
     if n_out == 0 || row_width == 0 || col.byte_width == 0 {
-        return Ok(arr.unbind());
+        return if mask_null {
+            wrap_masked(py, arr, mask_arr)
+        } else {
+            Ok(arr.unbind())
+        };
     }
 
     // dst_bytes_per_row is what numpy actually laid out; reading
@@ -1439,6 +1691,9 @@ fn read_one_column(
     let elem_size: usize = dt.getattr("itemsize")?.extract()?;
     let elements_per_row: usize = field_shape.iter().product::<usize>().max(1);
     let dst_bytes_per_row = elem_size * elements_per_row;
+    // Mask buffer is "?" (1 byte per element), so byte stride is the
+    // element count.  Only meaningful when mask_arr is Some.
+    let mask_bytes_per_row = elements_per_row;
 
     let rows_per_chunk = std::cmp::max(1, READ_CHUNK_TARGET_BYTES / row_width);
     let mut var_cells: Vec<VarCell> = Vec::new();
@@ -1451,7 +1706,12 @@ fn read_one_column(
                 buf.len(), n_out * dst_bytes_per_row
             )));
         }
+        let mut mbuf_opt = mask_arr.as_ref()
+            .map(RawBuffer::acquire_writable)
+            .transpose()?;
         let out = buf.as_mut_slice();
+        let mut mout_opt: Option<&mut [u8]> =
+            mbuf_opt.as_mut().map(|m| m.as_mut_slice());
 
         process_runs(
             file_handle, &runs, data_offset, row_width, rows_per_chunk,
@@ -1466,7 +1726,6 @@ fn read_one_column(
                         output_row, col_idx: 0,
                         nelements: n, heap_offset: off,
                     });
-                    Ok(())
                 } else {
                     let dst_start = output_row * dst_bytes_per_row;
                     let dst = &mut out[dst_start..dst_start + dst_bytes_per_row];
@@ -1474,14 +1733,24 @@ fn read_one_column(
                         // No decode, no null-truncate, no rstrip — give
                         // the caller exactly the bytes from disk.
                         dst.copy_from_slice(src);
-                        Ok(())
                     } else {
-                        convert_column_cell(&col, src, dst, disk_row, kind)
+                        convert_column_cell(&col, src, dst, disk_row, kind)?;
                     }
                 }
+                if let Some(m) = mout_opt.as_deref_mut() {
+                    // mask_arr is Some only when col.tnull is Some and
+                    // the column is fixed-width B/I/J/K.
+                    let tnull = col.tnull.unwrap();
+                    let mdst_start = output_row * mask_bytes_per_row;
+                    write_cell_mask(
+                        col.tform_letter, col.repeat, tnull, src,
+                        &mut m[mdst_start..mdst_start + mask_bytes_per_row],
+                    );
+                }
+                Ok(())
             },
         )?;
-    }  // drop RawBuffer before heap pass.
+    }  // drop RawBuffers before heap pass.
 
     if is_variable {
         // For read_one_column the heap pass uses col_idx=0 against a
@@ -1495,7 +1764,11 @@ fn read_one_column(
         )?;
     }
 
-    Ok(arr.unbind())
+    if mask_null {
+        wrap_masked(py, arr, mask_arr)
+    } else {
+        Ok(arr.unbind())
+    }
 }
 
 #[pyclass(extends = HDU)]
@@ -1548,21 +1821,29 @@ impl TableHDU {
     //   - scale=True (default): apply TSCAL/TZERO; the unsigned-int
     //     trick promotes to the matching unsigned dtype, other scaling
     //     produces f8.  scale=False returns raw stored values.
+    //   - mask_null=False (default): return a plain structured ndarray;
+    //     integer columns with TNULL set return the raw sentinel.
+    //     mask_null=True: return numpy.ma.MaskedArray with per-field
+    //     bool masks set True where the stored integer equals TNULLn.
+    //     Mask compare is in stored-int space (pre-scaling).  TNULL on
+    //     variable-length columns is not yet supported and raises.
     //
     // Both subsets validate fully before any I/O happens.
-    #[pyo3(signature = (*, rows=None, columns=None, scale=true))]
+    #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         rows: Option<&Bound<'_, PyAny>>,
         columns: Option<Vec<String>>,
         scale: bool,
+        mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
         read_table(
             py, &cards, data_offset, &super_.file, rows, columns, scale,
+            mask_null,
         )
     }
 
@@ -1572,8 +1853,9 @@ impl TableHDU {
     // columns; it returns the on-disk bytes in an S<n> field with no
     // decode, no null-truncation, and no trailing-space strip — useful
     // when a column has non-ASCII bytes that the default U decode would
-    // reject.  `scale` matches read().
-    #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true))]
+    // reject.  `scale` and `mask_null` match read(); when mask_null=True
+    // and this column carries TNULL, returns a numpy.ma.MaskedArray.
+    #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true, mask_null=false))]
     fn read_column(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -1581,13 +1863,14 @@ impl TableHDU {
         rows: Option<&Bound<'_, PyAny>>,
         as_bytes: bool,
         scale: bool,
+        mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
             py, &cards, data_offset, &super_.file, name, rows, as_bytes,
-            scale,
+            scale, mask_null,
         )
     }
 
@@ -1616,7 +1899,7 @@ impl TableHDU {
                 let data_offset = super_.offsets.data_offset();
                 read_table(
                     py, &cards, data_offset, &super_.file, Some(key), None,
-                    /* scale = */ true,
+                    /* scale = */ true, /* mask_null = */ false,
                 )
             }
             TableKey::SingleColumn(name) => {
@@ -1761,7 +2044,7 @@ impl SingleColumnSubset {
         read_one_column(
             py, &cards, data_offset, &super_.file,
             &self.name, Some(rows), /* as_bytes = */ false,
-            /* scale = */ true,
+            /* scale = */ true, /* mask_null = */ false,
         )
     }
 }
@@ -1802,7 +2085,7 @@ impl ColumnSubset {
         read_table(
             py, &cards, data_offset, &super_.file,
             Some(rows), Some(self.columns.clone()),
-            /* scale = */ true,
+            /* scale = */ true, /* mask_null = */ false,
         )
     }
 }

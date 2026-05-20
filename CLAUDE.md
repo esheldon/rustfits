@@ -386,32 +386,46 @@ reshape on numeric and X).  Variable-length P/Q descriptors with inner
 L/B/I/J/K/A/E/D/C/M (Object dtype, one ndarray per row; A as str or
 `as_bytes` bytes).  THEAP respected.  TSCAL/TZERO scaling on default
 (unsigned-int trick → matching unsigned dtype, general → f8;
-`scale=False` opt-out).  `rows=` / `columns=` subsets + `__getitem__`
+`scale=False` opt-out).  TNULLn integer-sentinel masking on fixed
+B/I/J/K columns via `mask_null=True` (opt-in): returns
+`numpy.ma.MaskedArray` with per-field bool mask; compare is in
+stored-int space (pre-scaling) so it composes correctly with all
+TSCAL/TZERO paths.  VLA columns with TNULL are rejected up-front when
+`mask_null=True`.  `rows=` / `columns=` subsets + `__getitem__`
 column-subset objects.
+
+Quirk worth knowing for the MaskedArray return: numpy.ma materializes
+an all-False structured bool mask on construction with structured
+input regardless of `nomask` being passed.  So `MaskedArray.mask is
+np.ma.nomask` holds for single-column reads (plain ndarray) but NOT
+for full-table reads (structured) — even when no row was actually
+masked.  Tests assert "no element is masked" rather than identity
+against `nomask`.
 
 **Likely high-value next steps**
 
-1. **TNULLn sentinel** — integer columns can carry a "no data" value
-   in TNULLn.  fitsio promotes those rows to NaN / a masked array;
-   right now rustfits returns the raw sentinel integer like any other
-   value.  Pick a representation (masked array vs NaN vs separate
-   mask, behind a kwarg) before implementing.
-
-2. **Variable-length P/Q with `repeat > 1`** — currently rejected.
+1. **Variable-length P/Q with `repeat > 1`** — currently rejected.
    Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor
    means N descriptors per row, each pointing at its own heap cell.
    Field dtype would need to be an Object array of shape `(repeat,)`
    per row, or some other reshape — decide before coding.
 
-3. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
+2. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
    a P/Q column would mean "reshape each heap cell to these dims",
    which is useful for VLA-of-images.  Each cell still uses the
    inner element type; the reshape is just on the ndarray after
    the heap read.
 
-4. **Variable-length P/QX (bit array in heap)** — rejected (inner X).
+3. **Variable-length P/QX (bit array in heap)** — rejected (inner X).
    Niche.  Heap bytes are the same MSB-packed format as fixed X;
    the heap-side unpacker would mirror `convert_x_cell`.
+
+4. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA columns
+   with TNULL set in the header are rejected when `mask_null=True`.
+   Adding support means a per-row bool ndarray for each masked VLA
+   cell (mirroring the per-row Object data ndarrays), either as a
+   parallel Object dtype mask field or as MaskedArrays for each cell.
+   Decide representation before coding.
 
 5. **`max_size`-style read for variable columns** — fitsio offers a
    mode where each variable cell becomes a fixed-size N-D array
