@@ -311,6 +311,12 @@ impl ImageHDU {
         })
     }
 
+    // Image indexing follows numpy semantics: each integer index
+    // reduces a dimension, each slice keeps one.  When EVERY axis is
+    // indexed by an integer the result has zero dimensions left — we
+    // unwrap the 0-d array to a numpy scalar (e.g. np.float64,
+    // np.int32) so `hdu[5, 6]` matches `numpy_arr[5, 6]`.  Mixed
+    // slice + int (e.g. `hdu[5, :]`) still returns an ndarray.
     fn __getitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -320,7 +326,20 @@ impl ImageHDU {
         let header_cards = super_.header_snapshot()?;
         let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
         let slices = normalize_slice_key(key, &hdu_shape)?;
-        read_image_slice(py, &header_cards, super_.offsets.data_offset(), &super_.file, &slices)
+        let all_int = slices.iter().all(|s| s.is_int);
+        let arr_py = read_image_slice(
+            py, &header_cards, super_.offsets.data_offset(),
+            &super_.file, &slices,
+        )?;
+        if all_int {
+            // arr[()] indexes a 0-d ndarray to extract its single
+            // value as a numpy scalar.  Empty PyTuple is the (,)
+            // empty-tuple key Python sees.
+            let arr_bound = arr_py.bind(py);
+            Ok(arr_bound.get_item(PyTuple::empty(py))?.unbind())
+        } else {
+            Ok(arr_py)
+        }
     }
 }
 

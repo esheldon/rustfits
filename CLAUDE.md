@@ -399,6 +399,10 @@ repr line.  Informational only — no consumer in the read/write path.
 Bare-int indexing `hdu[i]` returns a 0-d numpy record (np.void),
 matching `structured_arr[i]` semantics — distinct from `hdu[[i]]`
 and `hdu[i:i+1]` which still return shape-(1,) structured arrays.
+Image HDUs follow the same numpy rule for their pixel grid:
+`image_hdu[i, j, ...]` with an integer on every axis returns a
+numpy scalar of the BITPIX dtype; mixed slice + int still returns
+an ndarray.
 
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
