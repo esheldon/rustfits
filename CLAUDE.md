@@ -412,6 +412,17 @@ read path).  Mid-write I/O failures taint the file (close + reopen
 to recover).  The existing `ImageHDU.write(data, start=...)` still
 works for explicit-start writes.
 
+Inspection accessors on HDUs (no I/O, just header parse): every HDU
+has `extname` (Optional[str]), `extver` (int; default 1 per FITS
+standard), and `has_data` (True iff NAXIS > 0 AND every NAXISn > 0
+— suitable for picking the first HDU worth reading).  ImageHDU adds
+`shape` (tuple in numpy axis order), `dtype` (numpy.dtype), `ndim`,
+`size` (total pixels; 0 for NAXIS=0), `bitpix` (raw FITS value),
+and `__len__` (shape[0]).  TableHDU adds `nrows`, `ncols`, `colnames`
+(tuple, case preserved), `__len__` (== nrows).  AsciiTableHDU has
+`nrows` and `__len__` so generic code can iterate over any HDU type
+uniformly.
+
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
 input regardless of `nomask` being passed.  So `MaskedArray.mask is
@@ -461,11 +472,7 @@ against `nomask`.
    land — decide whether the indexing form coexists with that or
    replaces it.
 
-7. **`hdu.nrows`, `len(hdu)`, `hdu.colnames`** — small accessors.
-   Today the equivalents are `len(hdu.dtype)` (column count), reading
-   NAXIS2 from the header, and `hdu.dtype.names`.
-
-8. **`TDISPn`** — display format hint.  Informational, similar
+7. **`TDISPn`** — display format hint.  Informational, similar
    shape to TUNIT but rarely used.
 
 **Probably not worth chasing yet**

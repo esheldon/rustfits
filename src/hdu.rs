@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    check_not_tainted, FileHandle, FileLayout, HduOffsets, TaintFlag,
+    check_not_tainted, parse_keyword, parse_string_keyword,
+    FileHandle, FileLayout, HduOffsets, TaintFlag,
 };
 use crate::header::FITSHeader;
 
@@ -90,5 +91,50 @@ impl HDU {
     #[getter]
     pub(crate) fn index(&self) -> usize {
         self.index
+    }
+
+    // EXTNAME header value, or None when the keyword is absent.
+    // Inherited by every HDU subclass.
+    #[getter]
+    fn extname(&self) -> PyResult<Option<String>> {
+        let cards = self.header_snapshot()?;
+        Ok(parse_string_keyword(&cards, "EXTNAME"))
+    }
+
+    // EXTVER header value; default 1 per the FITS standard when the
+    // keyword is absent.  Always returns a usable version number so
+    // callers can compare/select without handling Optional[int].
+    #[getter]
+    fn extver(&self) -> PyResult<i64> {
+        let cards = self.header_snapshot()?;
+        Ok(parse_keyword(&cards, "EXTVER").unwrap_or(1))
+    }
+
+    // True iff this HDU has a non-empty data section: NAXIS > 0 and
+    // every NAXISn > 0.  Works uniformly for image and table HDUs
+    // (the FITS data-section formula is Π NAXISn pixels for images,
+    // and row_width × nrows = NAXIS1 × NAXIS2 bytes for tables — both
+    // collapse to "no NAXISn is zero").  Intended use: `fits.read()`-
+    // style convenience that picks the first HDU worth reading, and
+    // user code that wants a quick "is this HDU empty?" check.
+    //
+    // Heap-only edge case: a VLA table with NAXIS2=0 and PCOUNT>0
+    // returns False (no rows to interpret the heap through), which
+    // is the right call for read-convenience semantics.
+    #[getter]
+    fn has_data(&self) -> PyResult<bool> {
+        let cards = self.header_snapshot()?;
+        let naxis = parse_keyword(&cards, "NAXIS").unwrap_or(0);
+        if naxis <= 0 {
+            return Ok(false);
+        }
+        for i in 1..=naxis {
+            let d = parse_keyword(&cards, &format!("NAXIS{}", i))
+                .unwrap_or(0);
+            if d <= 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }

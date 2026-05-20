@@ -54,4 +54,21 @@ impl AsciiTableHDU {
         out.push_str(&format!("  rows: {}\n", nrows));
         Ok(out)
     }
+
+    // Number of rows (NAXIS2).  Mirrors TableHDU.nrows so a user
+    // who doesn't care about ASCII-vs-binary distinction can write
+    // `for hdu in fits: ... hdu.nrows ...` generically.
+    #[getter]
+    fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+    }
+
+    // Pythonic length: same as `nrows`.  Mirrors TableHDU.__len__.
+    fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+    }
 }

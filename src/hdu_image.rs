@@ -46,23 +46,10 @@ impl ImageHDU {
     // type, EXTNAME (if present), and the image dtype + dims in numpy
     // axis order (slowest first — same order the user gets back from
     // a read).  Primary HDUs with NAXIS=0 show `dims: []`.
-    //
-    // parse_image_hdu_shape errors on NAXIS=0 (correct for read
-    // paths) so we inline a tolerant variant here.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
-        let bitpix = parse_keyword(&cards, "BITPIX")
-            .ok_or_else(|| PyValueError::new_err("HDU header missing BITPIX"))?
-            as i32;
-        let naxis = parse_keyword(&cards, "NAXIS").unwrap_or(0).max(0) as usize;
-        let mut shape: Vec<u64> = Vec::with_capacity(naxis);
-        for i in 1..=naxis {
-            let d = parse_keyword(&cards, &format!("NAXIS{}", i))
-                .unwrap_or(0).max(0) as u64;
-            shape.push(d);
-        }
-        shape.reverse();  // numpy axis order: slowest first.
+        let (bitpix, shape) = parse_image_hdu_shape_lax(&cards)?;
         let dtype = bitpix_to_native_dtype(bitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
@@ -91,6 +78,68 @@ impl ImageHDU {
         let super_ = slf.into_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
+    }
+
+    // Image dimensions in numpy axis order (slowest first), as a
+    // tuple.  Primary HDUs with NAXIS=0 return ().
+    #[getter]
+    fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
+        Ok(PyTuple::new(py, &shape)?.unbind())
+    }
+
+    // numpy dtype matching BITPIX — the type `read()` would return.
+    #[getter]
+    fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
+        let dtype_str = bitpix_to_native_dtype(bitpix)?;
+        let np = py.import("numpy")?;
+        Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
+    }
+
+    // NAXIS — number of image axes.  0 for primary HDUs with no data.
+    #[getter]
+    fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
+        Ok(shape.len())
+    }
+
+    // Total pixel count (product of all NAXISn).  Returns 0 for
+    // NAXIS=0 (empty shape would otherwise give the empty-product
+    // identity 1, which is wrong for "no data").
+    #[getter]
+    fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
+        Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
+    }
+
+    // Raw FITS BITPIX value (e.g. 8, 16, -32, -64).  Useful for
+    // round-trip / standards-level inspection; everyday code should
+    // prefer `.dtype`.
+    #[getter]
+    fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
+        Ok(bitpix)
+    }
+
+    // numpy convention: `len(arr)` is shape[0].  For a 2-D image
+    // that's the row count; for a 1-D image the pixel count.  Returns
+    // 0 when NAXIS=0 (no data section).
+    fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
+        Ok(shape.first().copied().unwrap_or(0) as usize)
     }
 
     #[pyo3(signature = (data, start=None))]
@@ -1033,6 +1082,27 @@ fn compute_strip_layout(
         }
     }
     (0, strip_pixels)
+}
+
+// Tolerant variant of `parse_image_hdu_shape`: returns `[]` for the
+// NAXIS=0 case instead of erroring.  Used by __repr__ and the
+// .shape / .dtype / .ndim / .size / .bitpix / __len__ accessors,
+// which all need to work on primary HDUs with no data section.  The
+// strict parse_image_hdu_shape (errors on NAXIS=0) stays in place for
+// the read/write code paths that genuinely need a data section.
+fn parse_image_hdu_shape_lax(header: &[String]) -> PyResult<(i32, Vec<u64>)> {
+    let bitpix = parse_keyword(header, "BITPIX")
+        .ok_or_else(|| PyValueError::new_err("HDU header missing BITPIX"))?
+        as i32;
+    let naxis = parse_keyword(header, "NAXIS").unwrap_or(0).max(0) as usize;
+    let mut shape: Vec<u64> = Vec::with_capacity(naxis);
+    for i in 1..=naxis {
+        let d = parse_keyword(header, &format!("NAXIS{}", i))
+            .unwrap_or(0).max(0) as u64;
+        shape.push(d);
+    }
+    shape.reverse();  // numpy axis order: slowest first.
+    Ok((bitpix, shape))
 }
 
 // Parse BITPIX, NAXIS, and NAXIS1..NAXISn out of an image HDU header.

@@ -1907,6 +1907,43 @@ impl TableHDU {
         Ok(dict.unbind())
     }
 
+    // Number of rows (NAXIS2).  Returns 0 if the keyword is absent
+    // (malformed header) or set to a negative value.
+    #[getter]
+    fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+    }
+
+    // Number of columns (TFIELDS).
+    #[getter]
+    fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "TFIELDS").unwrap_or(0).max(0) as usize)
+    }
+
+    // Column names in file order (case preserved verbatim).  Returns
+    // a Python tuple so the value is immutable from the caller side.
+    #[getter]
+    fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let columns = parse_columns(&cards)?;
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        Ok(PyTuple::new(py, &names)?.unbind())
+    }
+
+    // Pythonic length: `len(table_hdu)` == row count.  Mirrors
+    // `len(structured_array)` for the equivalent numpy structured
+    // array a full read would return.
+    fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+    }
+
     // Read the table into a numpy structured array of native-endian
     // dtype.  Returned shape is `(n_selected,)`:
     //   - rows=None: every row in file order (n_selected == NAXIS2).
