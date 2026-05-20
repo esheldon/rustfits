@@ -298,14 +298,6 @@ def test_unsupported_dtype_rejected_string():
                 fits.create_table_hdu([("x", "S10")], nrows=1)
 
 
-def test_subarray_field_rejected_for_now():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = os.path.join(tmpdir, "t.fits")
-        with rustfits.FITS(fname, "w+") as fits:
-            with pytest.raises(ValueError, match="Phase 1c"):
-                fits.create_table_hdu([("x", "f4", (3, 4))], nrows=1)
-
-
 def test_int8_rejected_explicitly():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")

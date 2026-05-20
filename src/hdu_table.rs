@@ -1812,13 +1812,17 @@ fn read_one_column(
 // create_table_hdu time, used to emit the BINTABLE header cards.
 // `tzero` is Some only when the column uses the unsigned-int trick (its
 // value is the power-of-two offset added on read to recover the
-// unsigned interpretation).
+// unsigned interpretation).  `tdim` is Some only when the field is a
+// 2-D-or-higher subarray (1-D shapes are fully described by the TFORM
+// repeat count and don't need a TDIM card).  The stored string is
+// already in FITS (FORTRAN, fastest-first) order.
 struct WriteColumn {
     name: String,
     tform_letter: char,
     repeat: usize,
     byte_width: usize,
     tzero: Option<u64>,
+    tdim: Option<String>,
     tunit: Option<String>,
 }
 
@@ -1856,9 +1860,29 @@ fn classify_scalar_numpy_field(
     }
 }
 
+// Pull the base dtype and numpy subarray shape out of a numpy field
+// dtype.  For a scalar field, returns (field_dtype, []).  For a
+// subarray field like ('f4', (3, 4)), returns (f4_dtype, [3, 4]).
+fn extract_field_base_and_shape<'py>(
+    field_dtype: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Vec<usize>)> {
+    let subdtype = field_dtype.getattr("subdtype")?;
+    if subdtype.is_none() {
+        Ok((field_dtype.clone(), Vec::new()))
+    } else {
+        let tup = subdtype.cast::<PyTuple>()?;
+        let base = tup.get_item(0)?;
+        let shape: Vec<usize> = tup.get_item(1)?.extract()?;
+        Ok((base, shape))
+    }
+}
+
 // Walk a numpy structured dtype, emit per-column write specs in field
-// order.  MVP rejects subarray fields and any dtype outside the scalar
-// numeric set classify_scalar_numpy_field allows.
+// order.  Subarray fields like ('flux', 'f4', (3, 4)) are supported in
+// Phase 1c: TFORM repeat is the product of the subarray shape, TDIM is
+// emitted in FITS (FORTRAN, fastest-first) order = reversed numpy
+// shape.  1-D shapes are fully captured by the repeat count and TDIM
+// is omitted (matches astropy convention).
 fn dtype_to_write_columns(
     dtype: &Bound<'_, PyAny>,
     units: Option<&Bound<'_, PyDict>>,
@@ -1880,16 +1904,22 @@ fn dtype_to_write_columns(
         let entry = fields.get_item(name.as_str())?;
         let entry_tup = entry.cast::<PyTuple>()?;
         let field_dtype = entry_tup.get_item(0)?;
-        let subdtype = field_dtype.getattr("subdtype")?;
-        if !subdtype.is_none() {
-            return Err(PyValueError::new_err(format!(
-                "column '{}': subarray fields are Phase 1c (not yet supported)",
-                name)));
-        }
+        let (base_dtype, np_shape) =
+            extract_field_base_and_shape(&field_dtype)?;
         let (tform_letter, elem_bytes, tzero) =
-            classify_scalar_numpy_field(&field_dtype, name)?;
-        let repeat = 1usize;
-        let byte_width = elem_bytes * repeat;
+            classify_scalar_numpy_field(&base_dtype, name)?;
+        let element_count: usize =
+            np_shape.iter().copied().product::<usize>().max(1);
+        let byte_width = elem_bytes * element_count;
+        // TDIM (FITS = FORTRAN, fastest-first) only for rank ≥ 2.
+        // 1-D fields are fully described by the TFORM repeat count.
+        let tdim = if np_shape.len() >= 2 {
+            let dims: Vec<String> = np_shape.iter().rev()
+                .map(|d| d.to_string()).collect();
+            Some(format!("({})", dims.join(",")))
+        } else {
+            None
+        };
         let tunit = units.and_then(|d| {
             d.get_item(name.as_str()).ok().flatten()
                 .and_then(|v| v.extract::<String>().ok())
@@ -1897,9 +1927,10 @@ fn dtype_to_write_columns(
         out.push(WriteColumn {
             name: name.clone(),
             tform_letter,
-            repeat,
+            repeat: element_count,
             byte_width,
             tzero,
+            tdim,
             tunit,
         });
     }
@@ -1939,6 +1970,11 @@ fn build_bintable_header_cards(
             &format!("TTYPE{}", n), &col.name, "label for column"));
         cards.push(card_string(
             &format!("TFORM{}", n), &tform, "data format of column"));
+        if let Some(tdim) = &col.tdim {
+            cards.push(card_string(
+                &format!("TDIM{}", n), tdim,
+                "array dimensions (FORTRAN, fastest-first)"));
+        }
         if let Some(tz) = col.tzero {
             cards.push(card_uint(
                 &format!("TZERO{}", n), tz,
@@ -2081,13 +2117,24 @@ fn column_transform(
         input_kind, input_size)))
 }
 
+// Expected per-cell numpy shape for an on-disk column.  Mirrors the
+// read side's dtype-building rule: TDIM (FITS order) reversed into
+// numpy order; else (repeat,) for 1-D; else () for scalar.
+fn column_expected_shape(col: &Column) -> Vec<usize> {
+    match &col.tdim {
+        Some(tdim) => tdim.iter().rev().copied().collect(),
+        None => if col.repeat > 1 { vec![col.repeat] } else { Vec::new() },
+    }
+}
+
 // Validate the input ndarray's structured dtype against the HDU's
 // on-disk columns, returning the per-column WriteTransform vector.
 // Checks: same field count, same names in same order, per-field
-// width equal to column byte_width (all Phase 1b transforms preserve
+// width equal to column byte_width (all Phase 1c transforms preserve
 // width), src_itemsize equal to row_width, each field at the column's
-// byte_offset (no padding/reordering).  Phase 1e will relax these and
-// route mismatches through a slow per-column strided fill.
+// byte_offset (no padding/reordering), and per-cell subarray shape
+// matches the column's expected shape.  Phase 1e will relax these
+// and route mismatches through a slow per-column strided fill.
 fn validate_write_layout(
     input_dtype: &Bound<'_, PyAny>,
     columns: &[Column],
@@ -2117,12 +2164,13 @@ fn validate_write_layout(
         let entry_tup = entry.cast::<PyTuple>()?;
         let field_dtype = entry_tup.get_item(0)?;
         let src_offset: usize = entry_tup.get_item(1)?.extract()?;
-        let src_size: usize = field_dtype.getattr("itemsize")?.extract()?;
-        if src_size != col.byte_width {
+        let src_total_size: usize =
+            field_dtype.getattr("itemsize")?.extract()?;
+        if src_total_size != col.byte_width {
             return Err(PyValueError::new_err(format!(
                 "TableHDU.write: column '{}' input field width {} bytes does \
                  not match table column width {} bytes",
-                input_name, src_size, col.byte_width)));
+                input_name, src_total_size, col.byte_width)));
         }
         if src_offset != col.byte_offset {
             return Err(PyValueError::new_err(format!(
@@ -2131,9 +2179,25 @@ fn validate_write_layout(
                  reordered fields, which is Phase 1e", input_name,
                 src_offset, col.byte_offset)));
         }
-        let input_kind: String =
-            field_dtype.getattr("kind")?.extract()?;
-        transforms.push(column_transform(col, &input_kind, src_size)?);
+        // For subarray fields, .shape returns the subarray dims (numpy
+        // axis order); for scalar fields it returns ().  Compare with
+        // the column's expected per-cell shape derived from TDIM/repeat.
+        let input_shape: Vec<usize> =
+            field_dtype.getattr("shape")?.extract()?;
+        let expected_shape = column_expected_shape(col);
+        if input_shape != expected_shape {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: column '{}' per-cell shape {:?} does not \
+                 match table column expected shape {:?}",
+                input_name, input_shape, expected_shape)));
+        }
+        // Per-element kind + size come from the BASE dtype, not the
+        // subarray dtype (whose itemsize is the total per cell).
+        let base = field_dtype.getattr("base")?;
+        let input_kind: String = base.getattr("kind")?.extract()?;
+        let input_elem_size: usize =
+            base.getattr("itemsize")?.extract()?;
+        transforms.push(column_transform(col, &input_kind, input_elem_size)?);
     }
     let input_itemsize: usize = input_dtype.getattr("itemsize")?.extract()?;
     if input_itemsize != row_width {
