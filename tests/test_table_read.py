@@ -557,13 +557,15 @@ def test_as_bytes_rejected_on_non_character_column():
 # ---------------------------------------------------------------------------
 
 
-def test_variable_length_p_column_rejected():
-    fields = [("VLA", "1PE(100)")]
+def test_variable_length_repeat_gt_1_rejected():
+    """Multi-descriptor variable columns (e.g. '2PE') aren't supported
+    yet."""
+    fields = [("VLA", "2PE(100)")]
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
-        _write_bintable(fname, _bintable_cards(8, 0, fields), b"")
+        _write_bintable(fname, _bintable_cards(16, 0, fields), b"")
         with rustfits.FITS(fname, "r") as fits:
-            with pytest.raises(ValueError, match="variable-length"):
+            with pytest.raises(ValueError, match="repeat>1"):
                 fits[1].read()
 
 
@@ -995,6 +997,396 @@ def test_getitem_multi_column_bad_rows_type():
         with rustfits.FITS(fname, "r") as fits:
             with pytest.raises(ValueError):
                 fits[1][["ID", "MASS"]][1.5]
+
+
+# ---------------------------------------------------------------------------
+# variable-length (P/Q descriptor) columns
+# ---------------------------------------------------------------------------
+
+
+def _write_var_table(path, fields, descriptors, heap, theap=None):
+    """Build a BINTABLE file with a variable-length column.
+
+    `fields` is the usual list of (ttype, tform) tuples; the variable
+    column's TFORM is e.g. '1PE(maxlen)'.  `descriptors` are the raw
+    main-data bytes (one descriptor per row, big-endian).  `heap` is
+    the raw heap bytes laid out immediately after the main array (or
+    at THEAP if given).  PCOUNT is set to len(heap).
+    """
+    row_width = 0
+    for _, tform in fields:
+        if "P" in tform and not tform.lstrip("0123456789").startswith("PA"):
+            row_width += 8  # default: assume 1P descriptor
+        elif "P" in tform:
+            row_width += 8
+        elif "Q" in tform:
+            row_width += 16
+        else:
+            raise ValueError(f"unsupported tform in helper: {tform}")
+    naxis2 = len(descriptors) // row_width
+    cards = _bintable_cards(row_width, naxis2, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    if theap is not None:
+        cards = cards[:-1] + [f"THEAP   = {theap:>20d}", "END"]
+    payload = descriptors
+    if theap is not None and theap > row_width * naxis2:
+        payload += b"\x00" * (theap - row_width * naxis2)
+    payload += heap
+    _write_bintable(path, cards, payload)
+
+
+def test_var_p_float32_basic():
+    """1PE: per-row float32 array; lengths vary."""
+    descriptors = (
+        struct.pack(">ii", 3, 0)
+        + struct.pack(">ii", 0, 12)
+        + struct.pack(">ii", 2, 12)
+    )
+    heap = struct.pack(">fff", 1.0, 2.0, 3.0) + struct.pack(">ff", 10.0, 20.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("VLA", "1PE(20)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a.dtype == np.dtype([("VLA", "O")])
+            assert a["VLA"][0].tolist() == [1.0, 2.0, 3.0]
+            assert a["VLA"][1].tolist() == []
+            assert a["VLA"][2].tolist() == [10.0, 20.0]
+            for v in a["VLA"]:
+                assert v.dtype == np.float32
+
+
+def test_var_p_int64():
+    descriptors = (
+        struct.pack(">ii", 2, 0) + struct.pack(">ii", 1, 16)
+    )
+    heap = struct.pack(">qq", 10**10, -1) + struct.pack(">q", 42)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PK(5)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"][0].dtype == np.int64
+            assert a["X"][0].tolist() == [10**10, -1]
+            assert a["X"][1].tolist() == [42]
+
+
+def test_var_q_descriptor_i64():
+    """Q descriptors use two i64 (16 bytes per row)."""
+    descriptors = (
+        struct.pack(">qq", 2, 0) + struct.pack(">qq", 4, 8)
+    )
+    heap = struct.pack(">ii", 100, 200) + struct.pack(">iiii", 1, 2, 3, 4)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("Q1", "1QJ(10)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["Q1"][0].tolist() == [100, 200]
+            assert a["Q1"][1].tolist() == [1, 2, 3, 4]
+
+
+def test_var_logical_l():
+    descriptors = struct.pack(">ii", 3, 0)
+    heap = b"TFT"
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("FLAGS", "1PL(5)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            v = a["FLAGS"][0]
+            assert v.dtype == np.bool_
+            assert v.tolist() == [True, False, True]
+
+
+def test_var_a_string_basic():
+    descriptors = (
+        struct.pack(">ii", 5, 0)
+        + struct.pack(">ii", 3, 5)
+        + struct.pack(">ii", 0, 8)
+    )
+    heap = b"hello" + b"foo"
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("NAME", "1PA(20)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["NAME"][0] == "hello"
+            assert a["NAME"][1] == "foo"
+            assert a["NAME"][2] == ""
+
+
+def test_var_a_non_ascii_error_with_escape_hint():
+    descriptors = struct.pack(">ii", 4, 0)
+    heap = b"ab\xffc"
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("NAME", "1PA(10)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError) as ei:
+                fits[1].read()
+            msg = str(ei.value)
+            assert "NAME" in msg
+            assert "as_bytes=True" in msg
+
+
+def test_var_a_as_bytes_returns_raw_bytes():
+    descriptors = (
+        struct.pack(">ii", 4, 0) + struct.pack(">ii", 3, 4)
+    )
+    heap = b"ab\xffc" + b"\x00\x00\x00"
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("NAME", "1PA(10)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            col = fits[1].read_column("NAME", as_bytes=True)
+            assert col[0] == b"ab\xffc"
+            assert col[1] == b"\x00\x00\x00"
+
+
+def test_var_complex_c8():
+    descriptors = struct.pack(">ii", 2, 0)
+    # 2 c8 elements = 4 float32 values
+    heap = struct.pack(">ffff", 1.0, 2.0, 3.0, 4.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("Z", "1PC(5)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["Z"][0].dtype == np.complex64
+            assert a["Z"][0].tolist() == [complex(1, 2), complex(3, 4)]
+
+
+def test_var_empty_cell_is_empty_ndarray():
+    """A descriptor with nelements=0 should yield a 0-length ndarray
+    (not None, not a scalar), so downstream code can unconditionally
+    index into the cell."""
+    descriptors = struct.pack(">ii", 0, 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PE(10)")], descriptors, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            v = a["X"][0]
+            assert isinstance(v, np.ndarray)
+            assert v.shape == (0,)
+            assert v.dtype == np.float32
+
+
+def test_var_rows_subset():
+    descriptors = (
+        struct.pack(">ii", 1, 0)
+        + struct.pack(">ii", 2, 4)
+        + struct.pack(">ii", 3, 12)
+    )
+    heap = (
+        struct.pack(">i", 100)
+        + struct.pack(">ii", 200, 201)
+        + struct.pack(">iii", 300, 301, 302)
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PJ(5)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            t = fits[1]
+            a = t.read(rows=[2, 0])
+            assert a["X"][0].tolist() == [300, 301, 302]
+            assert a["X"][1].tolist() == [100]
+            # __getitem__ paths
+            b = t[[2, 0]]
+            assert b["X"][0].tolist() == [300, 301, 302]
+            c = t["X"][[2, 0]]
+            assert c[0].tolist() == [300, 301, 302]
+            assert c[1].tolist() == [100]
+
+
+def test_var_mixed_with_fixed_columns():
+    """A row has a fixed J and a variable PE; both must come out
+    correctly into the same structured array."""
+    descriptors = b""
+    for nelem, off, ident in [(2, 0, 10), (3, 8, 11), (1, 20, 12)]:
+        descriptors += struct.pack(">i", ident)            # ID (J, 4 bytes)
+        descriptors += struct.pack(">ii", nelem, off)      # VLA descriptor
+    heap = (
+        struct.pack(">ff", 1.0, 2.0)
+        + struct.pack(">fff", 3.0, 4.0, 5.0)
+        + struct.pack(">f", 6.0)
+    )
+    fields = [("ID", "1J"), ("VLA", "1PE(10)")]
+    cards = _bintable_cards(12, 3, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            t = fits[1]
+            a = t.read()
+            assert a["ID"].tolist() == [10, 11, 12]
+            assert a["VLA"][0].tolist() == [1.0, 2.0]
+            assert a["VLA"][1].tolist() == [3.0, 4.0, 5.0]
+            assert a["VLA"][2].tolist() == [6.0]
+
+
+def test_var_columns_subset_excludes_variable():
+    """columns= without the variable column should not need any heap
+    reads (and skipping is harmless when the heap is unreadable)."""
+    descriptors = b""
+    for ident in [10, 11]:
+        descriptors += struct.pack(">i", ident)
+        descriptors += struct.pack(">ii", 0, 0)
+    heap = b""
+    fields = [("ID", "1J"), ("VLA", "1PE(10)")]
+    cards = _bintable_cards(12, 2, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(columns=["ID"])
+            assert a.dtype == np.dtype([("ID", "<i4")])
+            assert a["ID"].tolist() == [10, 11]
+
+
+def test_var_columns_subset_includes_variable():
+    descriptors = b""
+    for ident in [10, 11]:
+        descriptors += struct.pack(">i", ident)
+        descriptors += struct.pack(">ii", 1, 0 if ident == 10 else 4)
+    heap = struct.pack(">f", 1.0) + struct.pack(">f", 2.0)
+    fields = [("ID", "1J"), ("VLA", "1PE(10)")]
+    cards = _bintable_cards(12, 2, fields)
+    cards = [
+        f"PCOUNT  = {len(heap):>20d}" if c.startswith("PCOUNT") else c
+        for c in cards
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(columns=["VLA"])
+            assert a.dtype == np.dtype([("VLA", "O")])
+            assert a["VLA"][0].tolist() == [1.0]
+            assert a["VLA"][1].tolist() == [2.0]
+
+
+def test_var_theap_keyword_respected():
+    """THEAP says the heap starts at a non-default offset (i.e. there's
+    a gap between the main rows and the heap)."""
+    descriptors = struct.pack(">ii", 2, 0)
+    gap = b"\x00" * 20
+    heap = struct.pack(">ff", 7.0, 8.0)
+    row_width = 8
+    naxis2 = 1
+    theap = row_width * naxis2 + len(gap)
+    fields = [("X", "1PE(10)")]
+    cards = _bintable_cards(row_width, naxis2, fields)
+    cards = [
+        f"PCOUNT  = {len(gap) + len(heap):>20d}" if c.startswith("PCOUNT")
+        else c
+        for c in cards
+    ]
+    cards = cards[:-1] + [f"THEAP   = {theap:>20d}", "END"]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, cards, descriptors + gap + heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"][0].tolist() == [7.0, 8.0]
+
+
+def test_var_dtype_property_object():
+    descriptors = struct.pack(">ii", 0, 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PE(10)")], descriptors, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            dt = fits[1].dtype
+            assert dt == np.dtype([("X", "O")])
+
+
+def test_var_negative_nelements_raises():
+    """A bad descriptor (nelements < 0) is a corrupt file; reject with
+    a clear error rather than crashing."""
+    descriptors = struct.pack(">ii", -1, 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PE(10)")], descriptors, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises((OSError, ValueError)):
+                fits[1].read()
+
+
+def test_var_aliased_heap_offset_allowed():
+    """Two rows pointing at the same heap region must each get their
+    own ndarray (correct + safe — no shared mutability)."""
+    descriptors = (
+        struct.pack(">ii", 2, 0)
+        + struct.pack(">ii", 2, 0)
+    )
+    heap = struct.pack(">ff", 1.5, 2.5)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_var_table(fname, [("X", "1PE(5)")], descriptors, heap)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["X"][0].tolist() == [1.5, 2.5]
+            assert a["X"][1].tolist() == [1.5, 2.5]
+            # Verify they are independent objects.
+            a["X"][0][0] = 99.0
+            assert a["X"][1][0] == 1.5
+
+
+def test_var_tdim_on_p_rejected():
+    """TDIM on a P column is not yet supported; reject at parse
+    time."""
+    fields = [("VLA", "1PE(10)", "(2,5)")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        # Build cards manually since _bintable_cards adds TDIMn.
+        cards = _bintable_cards(8, 0, fields)
+        _write_bintable(fname, cards, b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="TDIM"):
+                fits[1].read()
+
+
+def test_var_bad_inner_letter_rejected():
+    fields = [("VLA", "1PZ(10)")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(8, 0, fields), b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="inner element"):
+                fits[1].read()
+
+
+def test_var_missing_inner_letter_rejected():
+    fields = [("VLA", "1P")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(8, 0, fields), b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="inner element"):
+                fits[1].read()
+
+
+def test_var_inner_x_rejected():
+    fields = [("VLA", "1PX(10)")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(8, 0, fields), b"")
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError, match="bit"):
+                fits[1].read()
 
 
 if __name__ == "__main__":

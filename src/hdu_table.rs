@@ -3,12 +3,19 @@
 // builder, row reader) can operate on a typed Vec<Column> rather than
 // re-walking the header.
 //
-// Column types currently supported: L (logical), B (uint8), I (int16),
+// Fixed-length column types supported: L (logical), B (uint8), I (int16),
 // J (int32), K (int64), A (character), E (float32), D (float64),
 // C (complex64), M (complex128).  TDIMn multi-dim cells respected.
 //
+// Variable-length (P/Q descriptor) columns supported for the same inner
+// element letters.  Each row's main-data slot holds an 8-byte (P) or
+// 16-byte (Q) big-endian descriptor (nelements, heap_offset); the actual
+// data lives in the heap section at file offset
+// (data_offset + THEAP + heap_offset).  Read returns numpy Object dtype,
+// one ndarray (or str/bytes for A) per row.
+//
 // Not yet supported (rejected at parse time so downstream code stays
-// simple): X (bit, packed), P/Q (variable-length array descriptors).
+// simple): X (bit, packed), P/Q with TFORM repeat > 1, TDIM on P/Q.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyList, PySlice, PyString, PyTuple};
@@ -25,12 +32,19 @@ use crate::hdu::HDU;
 // All the per-column metadata needed downstream.  byte_offset is the
 // offset of this column's bytes within a single row; byte_width is the
 // total bytes the column occupies in each row.
+//
+// For variable-length (P/Q) columns: `tform_letter` is the INNER element
+// letter (e.g. 'E' for "1PE(100)"), `repeat` is always 1 (multi-
+// descriptor not yet supported), `byte_width` is the descriptor size
+// (8 for P, 16 for Q), and `var_kind` is Some('P') or Some('Q').  The
+// actual data is in the heap; the row's bytes carry only the descriptor.
 #[derive(Debug, Clone)]
 pub(crate) struct Column {
     pub(crate) name: String,
     pub(crate) tform_letter: char,
     // For most types: number of values per row.  For 'A' it is the total
-    // string length in bytes per row (per FITS standard).
+    // string length in bytes per row (per FITS standard).  For P/Q: 1
+    // (a single descriptor per row).
     pub(crate) repeat: usize,
     // From TDIMn, in FITS (FORTRAN) order: fastest-varying axis first.
     // For 'A' columns, the first dim is the per-string length; the rest
@@ -38,6 +52,8 @@ pub(crate) struct Column {
     pub(crate) tdim: Option<Vec<usize>>,
     pub(crate) byte_offset: usize,
     pub(crate) byte_width: usize,
+    // Variable-length descriptor kind, if this is a P or Q column.
+    pub(crate) var_kind: Option<char>,
 }
 
 // Bytes per single element for each supported TFORM letter.  'A' is 1
@@ -54,13 +70,39 @@ fn bytes_per_element(letter: char) -> Option<usize> {
     }
 }
 
-// Split a TFORM string like "8A", "1J", "3D", or "J" (default repeat 1)
-// into (repeat, letter).  P and Q (variable-length array descriptors)
-// have their own trailing syntax `1PE(maxlen)` / `1QE(maxlen)`; we
-// accept it here without parsing the inner type/maxlen because the
-// caller rejects P/Q columns as not-yet-supported anyway.  Other letters
-// must not carry trailing characters.
-fn parse_tform(tform: &str, col_index: usize) -> PyResult<(usize, char)> {
+// Width (in bytes) of the smallest unit that must be byte-reversed when
+// going from FITS big-endian to native-endian.  Note this differs from
+// bytes_per_element for the complex types: a C (complex64) element is
+// 8 bytes total but is two 4-byte float halves, each byteswapped
+// independently; an M (complex128) is 16 bytes total but two 8-byte
+// float halves.  Reversing the whole element would swap real↔imaginary.
+fn byteswap_unit(letter: char) -> usize {
+    match letter {
+        'L' | 'B' | 'A' => 1,
+        'I' => 2,
+        'J' | 'E' | 'C' => 4,
+        'K' | 'D' | 'M' => 8,
+        // Unreachable: parse_columns rejects unsupported letters up front.
+        _ => unreachable!("byteswap_unit called with unsupported letter '{}'", letter),
+    }
+}
+
+// Parsed pieces of a TFORM string.  For "8A": repeat=8, letter='A',
+// inner_letter=None.  For "1PE(100)": repeat=1, letter='P',
+// inner_letter=Some('E') (the "(100)" maxlen hint is informational and
+// ignored at read time).
+struct TformInfo {
+    repeat: usize,
+    letter: char,
+    inner_letter: Option<char>,
+}
+
+// Split a TFORM string into its pieces.  P/Q descriptors have the
+// trailing syntax `rPt(maxlen)` / `rQt(maxlen)` where `t` is the inner
+// element type letter; the `(maxlen)` hint is parsed leniently (just
+// validates the shape and discards the content).  Other letters must
+// not carry any trailing characters.
+fn parse_tform(tform: &str, col_index: usize) -> PyResult<TformInfo> {
     let trimmed = tform.trim();
     let (digits, rest) = trimmed
         .find(|c: char| c.is_ascii_alphabetic())
@@ -78,13 +120,52 @@ fn parse_tform(tform: &str, col_index: usize) -> PyResult<(usize, char)> {
             col_index, tform
         )))?
     };
-    if !trailing.trim().is_empty() && letter != 'P' && letter != 'Q' {
+    let inner_letter = if letter == 'P' || letter == 'Q' {
+        Some(parse_variable_inner_letter(trailing, tform, col_index)?)
+    } else {
+        if !trailing.trim().is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "column {}: TFORM='{}' has unsupported trailing modifier '{}'",
+                col_index, tform, trailing
+            )));
+        }
+        None
+    };
+    Ok(TformInfo { repeat, letter, inner_letter })
+}
+
+// Pull the inner element letter out of the trailing portion of a P/Q
+// TFORM (e.g. "E" or "E(100)").  The "(maxlen)" hint is ignored.
+fn parse_variable_inner_letter(
+    trailing: &str,
+    tform: &str,
+    col_index: usize,
+) -> PyResult<char> {
+    let t = trailing.trim();
+    if t.is_empty() {
         return Err(PyValueError::new_err(format!(
-            "column {}: TFORM='{}' has unsupported trailing modifier '{}'",
-            col_index, tform, trailing
+            "column {}: variable-length TFORM='{}' is missing the inner \
+             element type letter (e.g. 'PE', 'PD', '1PJ(100)')",
+            col_index, tform,
         )));
     }
-    Ok((repeat, letter))
+    let inner = t.chars().next().unwrap();
+    if !inner.is_ascii_alphabetic() {
+        return Err(PyValueError::new_err(format!(
+            "column {}: variable-length TFORM='{}' inner element '{}' \
+             is not a letter", col_index, tform, inner,
+        )));
+    }
+    let after = t[inner.len_utf8()..].trim();
+    if !after.is_empty()
+        && !(after.starts_with('(') && after.ends_with(')'))
+    {
+        return Err(PyValueError::new_err(format!(
+            "column {}: variable-length TFORM='{}' has invalid trailer \
+             '{}' after the inner letter", col_index, tform, after,
+        )));
+    }
+    Ok(inner)
 }
 
 // Parse a TDIMn value like "(3,3)" or "(10,5,2)" into a Vec of positive
@@ -119,9 +200,12 @@ fn parse_tdim(tdim: &str, col_index: usize) -> PyResult<Vec<usize>> {
     Ok(dims)
 }
 
-// Walk the header cards and produce a Vec<Column> describing each column.
-// Rejects P, Q (variable-length), and X (bit) columns with a clear
-// "not yet supported" error so downstream layers don't have to branch.
+// Walk the header cards and produce a Vec<Column> describing each
+// column.  Fixed-width types L/B/I/J/K/A/E/D/C/M are supported.
+// Variable-length P/Q descriptors are supported for those same inner
+// element letters (output via Object dtype, filled from the heap on
+// read).  X (bit) columns are rejected — they would need bit-unpacking
+// machinery not yet built.
 pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
     let tfields = parse_keyword(cards, "TFIELDS").ok_or_else(|| {
         PyValueError::new_err("BINTABLE missing required TFIELDS keyword")
@@ -143,58 +227,99 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 "BINTABLE missing required {} keyword", tform_key
             ))
         })?;
-        let (repeat, letter) = parse_tform(&tform, i)?;
+        let TformInfo { repeat, letter, inner_letter } =
+            parse_tform(&tform, i)?;
 
-        // Reject not-yet-supported types here so callers don't have to.
-        match letter {
-            'P' | 'Q' => return Err(PyValueError::new_err(format!(
-                "column {}: TFORM='{}' uses variable-length arrays (P/Q), \
-                 not yet supported", i, tform
-            ))),
-            'X' => return Err(PyValueError::new_err(format!(
+        if letter == 'X' {
+            return Err(PyValueError::new_err(format!(
                 "column {}: TFORM='{}' uses bit columns (X), not yet supported",
                 i, tform
-            ))),
-            _ => {}
+            )));
         }
-        let elem_size = bytes_per_element(letter).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "column {}: TFORM='{}' uses unsupported type letter '{}'",
-                i, tform, letter
-            ))
-        })?;
-        let byte_width = repeat * elem_size;
 
         let name = parse_string_keyword(cards, &format!("TTYPE{}", i))
             .unwrap_or_else(|| format!("COL{}", i));
 
-        let tdim = match parse_string_keyword(cards, &format!("TDIM{}", i)) {
-            Some(s) => {
-                let dims = parse_tdim(&s, i)?;
-                // Validate: product of dims must match the TFORM repeat
-                // (for A columns this is the total byte count, since A's
-                // repeat is the per-row string length in bytes).
-                let product: usize = dims.iter().product();
-                if product != repeat {
-                    return Err(PyValueError::new_err(format!(
-                        "column {}: TDIM dims {:?} have product {} but \
-                         TFORM repeat is {}", i, dims, product, repeat
-                    )));
-                }
-                Some(dims)
+        let column = if letter == 'P' || letter == 'Q' {
+            // Variable-length descriptor.  Only repeat=1 supported for
+            // now (multi-descriptor P/Q is rare and would complicate
+            // the dtype + per-cell descriptor extraction).
+            if repeat != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "column {}: variable-length TFORM='{}' with repeat>1 \
+                     not yet supported (only one descriptor per row)",
+                    i, tform
+                )));
             }
-            None => None,
+            let inner = inner_letter.unwrap();
+            if inner == 'X' {
+                return Err(PyValueError::new_err(format!(
+                    "column {}: variable-length TFORM='{}' inner bit type \
+                     (X) not yet supported", i, tform
+                )));
+            }
+            bytes_per_element(inner).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "column {}: variable-length TFORM='{}' has unsupported \
+                     inner element letter '{}'", i, tform, inner
+                ))
+            })?;
+            // TDIM on P/Q would mean "reshape each cell to these dims",
+            // which is a useful feature but adds a heap-side reshape step.
+            // Reject for now so behavior is predictable.
+            if parse_string_keyword(cards, &format!("TDIM{}", i)).is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "column {}: TDIM on variable-length column not yet \
+                     supported", i
+                )));
+            }
+            let descriptor_size = if letter == 'P' { 8 } else { 16 };
+            Column {
+                name,
+                tform_letter: inner,
+                repeat: 1,
+                tdim: None,
+                byte_offset: offset,
+                byte_width: descriptor_size,
+                var_kind: Some(letter),
+            }
+        } else {
+            let elem_size = bytes_per_element(letter).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "column {}: TFORM='{}' uses unsupported type letter '{}'",
+                    i, tform, letter
+                ))
+            })?;
+            let byte_width = repeat * elem_size;
+            let tdim = match parse_string_keyword(cards, &format!("TDIM{}", i)) {
+                Some(s) => {
+                    let dims = parse_tdim(&s, i)?;
+                    // Validate: product of dims must match the TFORM repeat
+                    // (for A columns this is the total byte count, since A's
+                    // repeat is the per-row string length in bytes).
+                    let product: usize = dims.iter().product();
+                    if product != repeat {
+                        return Err(PyValueError::new_err(format!(
+                            "column {}: TDIM dims {:?} have product {} but \
+                             TFORM repeat is {}", i, dims, product, repeat
+                        )));
+                    }
+                    Some(dims)
+                }
+                None => None,
+            };
+            Column {
+                name,
+                tform_letter: letter,
+                repeat,
+                tdim,
+                byte_offset: offset,
+                byte_width,
+                var_kind: None,
+            }
         };
-
-        columns.push(Column {
-            name,
-            tform_letter: letter,
-            repeat,
-            tdim,
-            byte_offset: offset,
-            byte_width,
-        });
-        offset += byte_width;
+        offset += column.byte_width;
+        columns.push(column);
     }
 
     // The accumulated row width should equal NAXIS1; if it doesn't, the
@@ -217,6 +342,7 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 // so we reverse it for numpy.
 //
 // Shape conventions:
+//   - variable (P/Q): scalar Object — one ndarray (or str/bytes) per row
 //   - no TDIM, numeric, repeat == 1: scalar (empty shape)
 //   - no TDIM, numeric, repeat  > 1: shape = (repeat,)
 //   - TDIM present, numeric: shape = reversed(tdim)
@@ -227,6 +353,9 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 // fields (they add a trailing axis of length 1).  We deliberately use
 // scalar for repeat==1, no-TDIM to keep the read-back shape natural.
 fn field_dtype_and_shape(col: &Column) -> (String, Vec<usize>) {
+    if col.var_kind.is_some() {
+        return ("O".to_string(), Vec::new());
+    }
     if col.tform_letter == 'A' {
         return match &col.tdim {
             Some(tdim) => {
@@ -394,6 +523,198 @@ fn convert_a_cell(
             }
             let cp_bytes = (b as u32).to_ne_bytes();
             dst_str[i * 4..i * 4 + 4].copy_from_slice(&cp_bytes);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Variable-length (P/Q) heap-pass helpers
+// ---------------------------------------------------------------------------
+
+// One variable-length cell descriptor, captured during the main pass.
+// Sorted by heap_offset before the heap pass so that sequential heap
+// access is cache-friendly.
+//
+// col_idx: index into the `columns` slice the caller is using (so the
+//   heap pass can look up the inner element letter, column name for
+//   error messages, and the destination column-name for structured
+//   assignment).
+// output_row: row in the output ndarray (already in user-requested
+//   order — the main pass's run-planner does the on-disk → output
+//   shuffle for us).
+struct VarCell {
+    output_row: usize,
+    col_idx: usize,
+    nelements: i64,
+    heap_offset: i64,
+}
+
+// Parse THEAP and compute the heap base offset (relative to the start
+// of the data section).  THEAP is allowed to be 0 / missing, in which
+// case the heap starts immediately after the main row block at offset
+// NAXIS1 * NAXIS2.
+fn heap_base_in_data(cards: &[String]) -> u64 {
+    let naxis1 = parse_keyword(cards, "NAXIS1").unwrap_or(0).max(0) as u64;
+    let naxis2 = parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as u64;
+    let theap = parse_keyword(cards, "THEAP").unwrap_or(0);
+    if theap > 0 { theap as u64 } else { naxis1.saturating_mul(naxis2) }
+}
+
+// Pull the big-endian (nelements, heap_offset) descriptor from a row's
+// bytes for one P or Q column.  P is two i32s, Q is two i64s.  The
+// signed types are per the FITS standard; values < 0 indicate a bad
+// file and are rejected at heap-read time.
+fn read_descriptor(kind: char, src: &[u8]) -> (i64, i64) {
+    match kind {
+        'P' => {
+            let n = i32::from_be_bytes(src[0..4].try_into().unwrap()) as i64;
+            let off = i32::from_be_bytes(src[4..8].try_into().unwrap()) as i64;
+            (n, off)
+        }
+        'Q' => {
+            let n = i64::from_be_bytes(src[0..8].try_into().unwrap());
+            let off = i64::from_be_bytes(src[8..16].try_into().unwrap());
+            (n, off)
+        }
+        _ => unreachable!("read_descriptor called with kind '{}'", kind),
+    }
+}
+
+// Build the Python object for one variable-length cell from already-
+// read big-endian heap bytes.  For numeric/L: a numpy 1-D ndarray of
+// native-endian dtype matching the inner element letter.  For A: a
+// Python `str` (strict ASCII, with the same kind of helpful error as
+// the fixed-A path) — unless `as_bytes` is set, in which case raw
+// bytes are returned verbatim (matches read_column(as_bytes=True)).
+fn build_var_cell_value(
+    py: Python<'_>,
+    inner_letter: char,
+    src_bytes: &[u8],
+    nelements: usize,
+    col_name: &str,
+    row_idx: usize,
+    as_bytes: bool,
+) -> PyResult<Py<PyAny>> {
+    if inner_letter == 'A' {
+        if as_bytes {
+            return Ok(PyBytes::new(py, src_bytes).into_any().unbind());
+        }
+        // Strict ASCII validate; FITS A is supposed to be printable
+        // ASCII.  No null-truncation / rstrip applied — variable A
+        // cells store exactly `nelements` bytes with no implicit
+        // padding, and the user gets all of them as-is.
+        for (i, &b) in src_bytes.iter().enumerate() {
+            if !b.is_ascii() {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' row {} contains non-ASCII byte 0x{:02X} \
+                     at position {} (read this column with \
+                     table.read_column('{}', as_bytes=True) to get raw bytes)",
+                    col_name, row_idx, b, i, col_name,
+                )));
+            }
+        }
+        let s = std::str::from_utf8(src_bytes).unwrap();
+        return Ok(s.into_pyobject(py)?.into_any().unbind());
+    }
+    let np = py.import("numpy")?;
+    let dtype_str = match inner_letter {
+        'L' => "?",
+        'B' => "u1",
+        'I' => "i2",
+        'J' => "i4",
+        'K' => "i8",
+        'E' => "f4",
+        'D' => "f8",
+        'C' => "c8",
+        'M' => "c16",
+        _ => unreachable!("unsupported variable inner letter '{}'", inner_letter),
+    };
+    let arr = np.call_method1("empty", (nelements, dtype_str))?;
+    if nelements == 0 {
+        return Ok(arr.unbind());
+    }
+    let elem_size = bytes_per_element(inner_letter).unwrap();
+    if src_bytes.len() != nelements * elem_size {
+        return Err(PyIOError::new_err(format!(
+            "variable cell heap read length mismatch: got {} bytes, \
+             expected {} ({} elements × {})",
+            src_bytes.len(), nelements * elem_size, nelements, elem_size,
+        )));
+    }
+    let mut buf = RawBuffer::acquire_writable(&arr)?;
+    let dst = buf.as_mut_slice();
+    if inner_letter == 'L' {
+        for (i, &b) in src_bytes.iter().enumerate() {
+            dst[i] = if b == b'T' { 1 } else { 0 };
+        }
+    } else {
+        // Swap by the base float/int width — for C and M that means
+        // swapping each half (real, imag) independently, not the whole
+        // element.  See `byteswap_unit` docs.
+        copy_with_byteswap(src_bytes, dst, byteswap_unit(inner_letter));
+    }
+    drop(buf);
+    Ok(arr.unbind())
+}
+
+// Walk the captured variable-cell descriptors, read each cell's bytes
+// from the heap (sorted by heap offset so seeks are forward-moving),
+// build the corresponding Python object, and assign it into the output
+// array.  For structured arrays use `arr[col_name][row]`; for the
+// single-column 1-D Object case use `arr[row]`.  Empty cells (nelements
+// == 0) are still assigned so they overwrite numpy's default None with
+// an explicit empty ndarray / "" / b"".
+fn heap_pass(
+    py: Python<'_>,
+    arr: &Bound<'_, PyAny>,
+    file_handle: &FileHandle,
+    columns: &[Column],
+    data_offset: u64,
+    cards: &[String],
+    mut var_cells: Vec<VarCell>,
+    as_bytes: bool,
+    single_column: bool,
+) -> PyResult<()> {
+    if var_cells.is_empty() {
+        return Ok(());
+    }
+    let heap_base_file = data_offset + heap_base_in_data(cards);
+    var_cells.sort_by_key(|c| c.heap_offset);
+
+    let mut guard = lock_file(file_handle)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    for cell in &var_cells {
+        if cell.nelements < 0 || cell.heap_offset < 0 {
+            return Err(PyIOError::new_err(format!(
+                "variable cell descriptor (nelements={}, heap_offset={}) \
+                 has negative values",
+                cell.nelements, cell.heap_offset,
+            )));
+        }
+        let n = cell.nelements as usize;
+        let col = &columns[cell.col_idx];
+        let inner = col.tform_letter;
+        let elem_size = bytes_per_element(inner).unwrap();
+        let read_len = n * elem_size;
+        let abs_offset = heap_base_file + cell.heap_offset as u64;
+        f.seek(SeekFrom::Start(abs_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        buf.resize(read_len, 0);
+        if read_len > 0 {
+            f.read_exact(&mut buf)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+        let value = build_var_cell_value(
+            py, inner, &buf, n, &col.name, cell.output_row, as_bytes,
+        )?;
+        if single_column {
+            arr.set_item(cell.output_row, value)?;
+        } else {
+            arr.get_item(&col.name)?.set_item(cell.output_row, value)?;
         }
     }
     Ok(())
@@ -696,29 +1017,49 @@ fn read_table(
     let field_layout = numpy_field_layout(py, &arr_dtype, &columns)?;
 
     let rows_per_chunk = std::cmp::max(1, READ_CHUNK_TARGET_BYTES / row_width);
-    let mut buf = RawBuffer::acquire_writable(&arr)?;
-    if buf.len() != n_out * itemsize {
-        return Err(PyValueError::new_err(format!(
-            "numpy buffer size {} != expected {}",
-            buf.len(), n_out * itemsize
-        )));
-    }
-    let out = buf.as_mut_slice();
+    let mut var_cells: Vec<VarCell> = Vec::new();
+    {
+        let mut buf = RawBuffer::acquire_writable(&arr)?;
+        if buf.len() != n_out * itemsize {
+            return Err(PyValueError::new_err(format!(
+                "numpy buffer size {} != expected {}",
+                buf.len(), n_out * itemsize
+            )));
+        }
+        let out = buf.as_mut_slice();
 
-    process_runs(
-        file_handle, &runs, data_offset, row_width, rows_per_chunk,
-        |src_row, disk_row, output_row| {
-            let dst_row = &mut out
-                [output_row * itemsize..(output_row + 1) * itemsize];
-            for (col_idx, col) in columns.iter().enumerate() {
-                let (dst_off, dst_w) = field_layout[col_idx];
-                let src = &src_row[col.byte_offset
-                    ..col.byte_offset + col.byte_width];
-                let dst = &mut dst_row[dst_off..dst_off + dst_w];
-                convert_column_cell(col, src, dst, disk_row)?;
-            }
-            Ok(())
-        },
+        process_runs(
+            file_handle, &runs, data_offset, row_width, rows_per_chunk,
+            |src_row, disk_row, output_row| {
+                let dst_row = &mut out
+                    [output_row * itemsize..(output_row + 1) * itemsize];
+                for (col_idx, col) in columns.iter().enumerate() {
+                    let src = &src_row[col.byte_offset
+                        ..col.byte_offset + col.byte_width];
+                    if let Some(kind) = col.var_kind {
+                        // Skip the Object pointer slot — its bytes were
+                        // initialized to None by np.empty and must not
+                        // be touched via raw memory.  Just capture the
+                        // descriptor for the heap pass.
+                        let (n, off) = read_descriptor(kind, src);
+                        var_cells.push(VarCell {
+                            output_row, col_idx,
+                            nelements: n, heap_offset: off,
+                        });
+                    } else {
+                        let (dst_off, dst_w) = field_layout[col_idx];
+                        let dst = &mut dst_row[dst_off..dst_off + dst_w];
+                        convert_column_cell(col, src, dst, disk_row)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }  // drop RawBuffer here, before heap pass touches the array via Python.
+
+    heap_pass(
+        py, &arr, file_handle, &columns, data_offset, cards,
+        var_cells, /* as_bytes = */ false, /* single_column = */ false,
     )?;
 
     Ok(arr.unbind())
@@ -773,11 +1114,14 @@ fn read_one_column(
 
     let (n_out, runs) = plan_runs(rows_arg, n_rows_total)?;
 
-    // Element dtype + per-row "field" shape (excluding the leading
-    // row axis).  For as_bytes, override the A-column U field with the
-    // same-length S field; otherwise reuse the structured-dtype builder
-    // helper so single-column shape matches the structured-field shape.
-    let (dtype_str, field_shape) = if as_bytes {
+    // Element dtype + per-row "field" shape (excluding the leading row
+    // axis).  Cases:
+    //   variable (P/Q):           dtype = 'O', shape = ()  — heap fills.
+    //   fixed A, as_bytes=true:   dtype = 'S<n>'           — raw bytes per cell.
+    //   fixed otherwise:          field_dtype_and_shape()  — same as structured.
+    let (dtype_str, field_shape) = if col.var_kind.is_some() {
+        ("O".to_string(), Vec::new())
+    } else if as_bytes {
         let str_len = match &col.tdim {
             Some(tdim) => tdim[0],
             None => col.repeat,
@@ -811,32 +1155,57 @@ fn read_one_column(
     let dst_bytes_per_row = elem_size * elements_per_row;
 
     let rows_per_chunk = std::cmp::max(1, READ_CHUNK_TARGET_BYTES / row_width);
-    let mut buf = RawBuffer::acquire_writable(&arr)?;
-    if buf.len() != n_out * dst_bytes_per_row {
-        return Err(PyValueError::new_err(format!(
-            "numpy buffer size {} != expected {}",
-            buf.len(), n_out * dst_bytes_per_row
-        )));
-    }
-    let out = buf.as_mut_slice();
+    let mut var_cells: Vec<VarCell> = Vec::new();
+    let is_variable = col.var_kind.is_some();
+    {
+        let mut buf = RawBuffer::acquire_writable(&arr)?;
+        if buf.len() != n_out * dst_bytes_per_row {
+            return Err(PyValueError::new_err(format!(
+                "numpy buffer size {} != expected {}",
+                buf.len(), n_out * dst_bytes_per_row
+            )));
+        }
+        let out = buf.as_mut_slice();
 
-    process_runs(
-        file_handle, &runs, data_offset, row_width, rows_per_chunk,
-        |src_row, disk_row, output_row| {
-            let src = &src_row[col.byte_offset
-                ..col.byte_offset + col.byte_width];
-            let dst_start = output_row * dst_bytes_per_row;
-            let dst = &mut out[dst_start..dst_start + dst_bytes_per_row];
-            if as_bytes {
-                // No decode, no null-truncate, no rstrip — give the
-                // caller exactly the bytes from disk.
-                dst.copy_from_slice(src);
-                Ok(())
-            } else {
-                convert_column_cell(&col, src, dst, disk_row)
-            }
-        },
-    )?;
+        process_runs(
+            file_handle, &runs, data_offset, row_width, rows_per_chunk,
+            |src_row, disk_row, output_row| {
+                let src = &src_row[col.byte_offset
+                    ..col.byte_offset + col.byte_width];
+                if let Some(kind) = col.var_kind {
+                    // Variable: do not write the Object pointer slot;
+                    // capture the descriptor for the heap pass.
+                    let (n, off) = read_descriptor(kind, src);
+                    var_cells.push(VarCell {
+                        output_row, col_idx: 0,
+                        nelements: n, heap_offset: off,
+                    });
+                    Ok(())
+                } else {
+                    let dst_start = output_row * dst_bytes_per_row;
+                    let dst = &mut out[dst_start..dst_start + dst_bytes_per_row];
+                    if as_bytes {
+                        // No decode, no null-truncate, no rstrip — give
+                        // the caller exactly the bytes from disk.
+                        dst.copy_from_slice(src);
+                        Ok(())
+                    } else {
+                        convert_column_cell(&col, src, dst, disk_row)
+                    }
+                }
+            },
+        )?;
+    }  // drop RawBuffer before heap pass.
+
+    if is_variable {
+        // For read_one_column the heap pass uses col_idx=0 against a
+        // single-element columns slice.
+        let columns_slice = std::slice::from_ref(&col);
+        heap_pass(
+            py, &arr, file_handle, columns_slice, data_offset, cards,
+            var_cells, as_bytes, /* single_column = */ true,
+        )?;
+    }
 
     Ok(arr.unbind())
 }
