@@ -442,6 +442,20 @@ against `nomask`.
    Python-ism (matches numpy structured-array indexing); should
    return a 0-d record / np.void.
 
+   Worth doing as a read/write pair: once `hdu[5]` reads a scalar,
+   `__setitem__` becomes the natural write surface for both tables
+   and images.  Sketch:
+     - `table_hdu[5] = scalar_record`        (whole-row write)
+     - `table_hdu[3:5] = [r1, r2]`           (slice / iterable write)
+     - `table_hdu[10:20] = struct_arr`       (bulk structured-array write)
+     - `image_hdu[i, j] = 1`                 (scalar pixel)
+     - `image_hdu[3:5] = data`               (slice write)
+   This subsumes / generalizes the existing `ImageHDU.write(data,
+   start=...)` and would be the natural place for a future
+   `TableHDU.write(rows=..., ...)` to land.  Decide whether the
+   indexing form coexists with the explicit `.write()` calls or
+   replaces them.
+
 7. **`hdu.nrows`, `len(hdu)`, `hdu.colnames`** — small accessors.
    Today the equivalents are `len(hdu.dtype)` (column count), reading
    NAXIS2 from the header, and `hdu.dtype.names`.
