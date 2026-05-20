@@ -612,6 +612,156 @@ def test_read_empty_table():
             assert col.shape == (0,)
 
 
+# ---------------------------------------------------------------------------
+# __getitem__: hdu[key] is shorthand for hdu.read(rows=key)
+# ---------------------------------------------------------------------------
+
+
+def test_getitem_slice_basic():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][2:5]
+            assert a.dtype.names == ("ID", "NAME")
+            assert a["ID"].tolist() == [1002, 1003, 1004]
+
+
+def test_getitem_slice_step():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][1:8:2]
+            assert a["ID"].tolist() == [1001, 1003, 1005, 1007]
+
+
+def test_getitem_slice_open_ended():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][:3]
+            assert a["ID"].tolist() == [1000, 1001, 1002]
+            b = fits[1][7:]
+            assert b["ID"].tolist() == [1007, 1008, 1009]
+
+
+def test_getitem_slice_negative_bounds():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][-3:]
+            assert a["ID"].tolist() == [1007, 1008, 1009]
+            b = fits[1][-5:-2]
+            assert b["ID"].tolist() == [1005, 1006, 1007]
+
+
+def test_getitem_slice_reversed():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][::-2]
+            assert a["ID"].tolist() == [1009, 1007, 1005, 1003, 1001]
+
+
+def test_getitem_list_in_user_order():
+    """Returned rows must be in the user's requested order, not on-disk
+    order — that's what the run-planner's output_indices is for."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[5, 1, 8, 3]]
+            assert a["ID"].tolist() == [1005, 1001, 1008, 1003]
+
+
+def test_getitem_numpy_array():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][np.array([0, 4, 9])]
+            assert a["ID"].tolist() == [1000, 1004, 1009]
+
+
+def test_getitem_tuple_treated_as_iterable():
+    """A tuple key is iterable-of-ints, equivalent to a list."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][(2, 5, 7)]
+            assert a["ID"].tolist() == [1002, 1005, 1007]
+
+
+def test_getitem_negative_indices_in_list():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[-1, -3, 0]]
+            assert a["ID"].tolist() == [1009, 1007, 1000]
+
+
+def test_getitem_duplicates_deduped_preserving_first_order():
+    """Matches read(rows=) dedup behavior: duplicates dropped, first
+    occurrence wins the position in the output."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[3, 1, 3, 5, 1]]
+            assert a["ID"].tolist() == [1003, 1001, 1005]
+
+
+def test_getitem_matches_read_rows_for_slice():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][2:9:3]
+            b = fits[1].read(rows=slice(2, 9, 3))
+            assert (a == b).all()
+            assert a.dtype == b.dtype
+
+
+def test_getitem_matches_read_rows_for_list():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[7, 0, 4, 2]]
+            b = fits[1].read(rows=[7, 0, 4, 2])
+            assert (a == b).all()
+
+
+def test_getitem_out_of_range_index_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(IndexError):
+                fits[1][[0, 20]]
+
+
+def test_getitem_non_integer_in_list_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError):
+                fits[1][[0, 1.5]]
+
+
+def test_getitem_bad_key_type_raises():
+    """A bare float (non-iterable, non-slice) is rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises(ValueError):
+                fits[1][1.5]
+
+
+def test_getitem_on_string_columns():
+    """Make sure A-column decode goes through __getitem__ just like
+    through read()."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ten_row_file(tmp)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1][[2, 0]]
+            assert a["NAME"].tolist() == ["r  2", "r  0"]
+            assert a["ID"].tolist() == [1002, 1000]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

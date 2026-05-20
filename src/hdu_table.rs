@@ -923,4 +923,19 @@ impl TableHDU {
             py, &cards, data_offset, &super_.file, name, rows, as_bytes,
         )
     }
+
+    // hdu[key] is shorthand for hdu.read(rows=key).  `key` may be a slice
+    // (hdu[20:100:2]) or any iterable of ints (hdu[[2, 5, 8]],
+    // hdu[np.array([0, 3, 9])], hdu[(1, 2, 3)]).  Column subsetting
+    // (hdu[columns][rows]) is intentionally not yet supported.
+    fn __getitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let super_ = slf.into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_table(py, &cards, data_offset, &super_.file, Some(key), None)
+    }
 }
