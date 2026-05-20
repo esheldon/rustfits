@@ -4,7 +4,7 @@
 // it uses.
 
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyBool, PyBytes, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
 use std::fs::OpenOptions;
@@ -474,7 +474,7 @@ impl FITS {
     // rejected explicitly because Python's int/bool subclass relationship
     // would otherwise let `fits[True]` resolve as `fits[1]`.
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        if key.is_instance_of::<pyo3::types::PyBool>() {
+        if key.is_instance_of::<PyBool>() {
             return Err(PyValueError::new_err(
                 "FITS index must be int (HDU position) or str (EXTNAME); got bool",
             ));
@@ -493,9 +493,16 @@ impl FITS {
         // (incl. np.bytes_, which subclasses bytes).  FITS keyword and
         // string values are restricted to printable ASCII by spec, so a
         // non-ASCII byte sequence can't match anything and is rejected.
-        let name: Option<String> = if let Ok(s) = key.extract::<String>() {
-            Some(s)
-        } else if let Ok(b) = key.extract::<Vec<u8>>() {
+        //
+        // Type checks are explicit (PyString / PyBytes) rather than
+        // relying on extract::<String>() / extract::<Vec<u8>>() — the
+        // latter is generic over iterables, so a list of small ints
+        // like [5, 0, 2] would silently succeed as Vec<u8>=[5,0,2] and
+        // be misinterpreted as a control-character EXTNAME lookup.
+        let name: Option<String> = if key.is_instance_of::<PyString>() {
+            Some(key.extract::<String>()?)
+        } else if key.is_instance_of::<PyBytes>() {
+            let b: Vec<u8> = key.extract()?;
             if !b.iter().all(|c| c.is_ascii()) {
                 return Err(PyValueError::new_err(
                     "FITS EXTNAME lookup key must be ASCII",

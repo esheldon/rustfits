@@ -179,6 +179,27 @@ def test_other_key_types_rejected():
                 fits[(0, 1)]
 
 
+def test_list_of_small_ints_not_treated_as_bytes_extname():
+    """Regression: PyO3's extract::<Vec<u8>>() accepts any iterable of
+    small ints, so without explicit PyBytes type-instance checking,
+    `fits[[5, 0, 2]]` would silently route to an EXTNAME lookup of
+    a 3-byte control-char string.  Must reject as an unknown key
+    type."""
+    with _three_hdus() as fname:
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises((ValueError, TypeError)):
+                fits[[5, 0, 2]]
+
+
+def test_numpy_int_array_not_treated_as_bytes_extname():
+    """Same regression — numpy arrays of small ints are iterable and
+    each element is u8-extractable."""
+    with _three_hdus() as fname:
+        with rustfits.FITS(fname, "r") as fits:
+            with pytest.raises((ValueError, TypeError)):
+                fits[np.array([0, 1], dtype=np.uint8)]
+
+
 # ---------------- edge case: duplicate EXTNAME (first wins) ----------------
 
 
@@ -214,5 +235,7 @@ if __name__ == "__main__":
     test_non_ascii_bytes_rejected()
     test_bool_rejected_explicitly()
     test_other_key_types_rejected()
+    test_list_of_small_ints_not_treated_as_bytes_extname()
+    test_numpy_int_array_not_treated_as_bytes_extname()
     test_duplicate_extname_returns_first()
     print("all tests passed")
