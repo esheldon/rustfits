@@ -117,7 +117,6 @@ def test_read_default_skips_empty_primary_to_find_table():
 
 def test_read_default_skips_empty_primary_to_find_image_extension():
     """Empty primary, image extension → return the image."""
-    pix = (np.arange(6, dtype="i4") + 1).tobytes()
     # Build a primary with no data + an IMAGE extension with NAXIS=2.
     primary = _primary_no_data()
     ext = [
@@ -170,7 +169,9 @@ def test_read_ext_by_extname():
             (_primary_no_data(), b""),
             (
                 _bintable_ext(
-                    4, 2, [("X", "1J")],
+                    4,
+                    2,
+                    [("X", "1J")],
                     extras=["EXTNAME = 'CATALOG '"],
                 ),
                 rows,
@@ -291,7 +292,10 @@ def test_read_header_true_returns_tuple():
         _write_file(
             fname,
             (_primary_no_data(), b""),
-            (_bintable_ext(4, 1, fields, extras=["EXTNAME = 'TBL     '"]), rows),
+            (
+                _bintable_ext(4, 1, fields, extras=["EXTNAME = 'TBL     '"]),
+                rows,
+            ),
         )
         got, hdr = rustfits.read(fname, header=True)
         assert got["X"][0] == 42
