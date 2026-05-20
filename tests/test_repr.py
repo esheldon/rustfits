@@ -174,7 +174,10 @@ def test_fits_repr_image_and_table():
         primary = _image_primary(-32, [10])
         primary_data = bytes(10 * 4)
         ext = _bintable_ext(
-            8, 2, [("X", "1D")], extras=["EXTNAME = 'MYTABLE '"],
+            8,
+            2,
+            [("X", "1D")],
+            extras=["EXTNAME = 'MYTABLE '"],
         )
         ext_data = struct.pack(">dd", 1.0, 2.0)
         _write_file(fname, (primary, primary_data), (ext, ext_data))
@@ -353,7 +356,9 @@ def test_table_repr_tdim_array():
         with rustfits.FITS(fname) as fits:
             r = repr(fits[1])
             _show(r)
-            m_line = [ln for ln in r.splitlines() if "M" in ln and "i4" in ln][0]
+            m_line = [ln for ln in r.splitlines() if "M" in ln and "i4" in ln][
+                0
+            ]
             assert "array[2,3]" in m_line
 
 
@@ -367,7 +372,9 @@ def test_table_repr_vla():
         with rustfits.FITS(fname) as fits:
             r = repr(fits[1])
             _show(r)
-            v_line = [ln for ln in r.splitlines() if "V" in ln and "f4" in ln][0]
+            v_line = [ln for ln in r.splitlines() if "V" in ln and "f4" in ln][
+                0
+            ]
             assert "array[var]" in v_line
 
 
@@ -378,7 +385,9 @@ def test_table_repr_unsigned_int_trick_dtype():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            2, 1, [("U", "1I")],
+            2,
+            1,
+            [("U", "1I")],
             extras=[
                 "TSCAL1  =                    1",
                 "TZERO1  =                32768",
@@ -414,7 +423,10 @@ def test_table_repr_with_extname():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            4, 1, [("X", "1J")], extras=["EXTNAME = 'CATALOG '"],
+            4,
+            1,
+            [("X", "1J")],
+            extras=["EXTNAME = 'CATALOG '"],
         )
         _write_file(fname, (primary, b""), (ext, bytes(4)))
         with rustfits.FITS(fname) as fits:
@@ -432,7 +444,7 @@ def test_table_repr_mixed_columns_alignment():
         ("Magnitude", "1D"),
         ("ra_deg", "3E"),
     ]
-    naxis1 = 4 + 8 + 12   # i4 + f8 + 3*f4
+    naxis1 = 4 + 8 + 12  # i4 + f8 + 3*f4
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
@@ -442,12 +454,20 @@ def test_table_repr_mixed_columns_alignment():
             r = repr(fits[1])
             _show(r)
             # All three columns appear with their case intact.
-            for name, dtype in [("id", "i4"), ("Magnitude", "f8"), ("ra_deg", "f4")]:
-                line = [ln for ln in r.splitlines() if name in ln and dtype in ln]
+            for name, dtype in [
+                ("id", "i4"),
+                ("Magnitude", "f8"),
+                ("ra_deg", "f4"),
+            ]:
+                line = [
+                    ln for ln in r.splitlines() if name in ln and dtype in ln
+                ]
                 assert line, f"missing line for {name} {dtype} in:\n{r}"
             # Alignment check: dtype column is at the same offset on
             # every column row (since name field is left-padded).
-            id_line = [ln for ln in r.splitlines() if "id" in ln and "i4" in ln][0]
+            id_line = [
+                ln for ln in r.splitlines() if "id" in ln and "i4" in ln
+            ][0]
             mag_line = [ln for ln in r.splitlines() if "Magnitude" in ln][0]
             # Find the dtype-string start positions.
             assert id_line.index("i4") == mag_line.index("f8")
