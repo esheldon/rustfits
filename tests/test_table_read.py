@@ -569,15 +569,173 @@ def test_variable_length_repeat_gt_1_rejected():
                 fits[1].read()
 
 
-def test_bit_x_column_rejected():
-    # TFORM='8X' = 8 bits packed in 1 byte
-    fields = [("BITS", "8X")]
+# ---------------------------------------------------------------------------
+# X (bit) columns — MSB-packed bits, unpacked to numpy bool
+# ---------------------------------------------------------------------------
+
+
+def test_x_full_byte_two_rows():
+    """8X = 8 bits = 1 byte per row.  No padding bits."""
+    rows = bytes([0b10110100, 0b00001111])
+    fields = [("F", "8X")]
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
-        _write_bintable(fname, _bintable_cards(1, 0, fields), b"")
+        _write_bintable(fname, _bintable_cards(1, 2, fields), rows)
         with rustfits.FITS(fname, "r") as fits:
-            with pytest.raises(ValueError, match="bit columns"):
-                fits[1].read()
+            a = fits[1].read()
+            assert a.dtype == np.dtype([("F", "?", (8,))])
+            assert a["F"][0].tolist() == [
+                True, False, True, True, False, True, False, False
+            ]
+            assert a["F"][1].tolist() == [
+                False, False, False, False, True, True, True, True
+            ]
+
+
+def test_x_scalar_1x():
+    """1X = single bit per row.  Shape () (scalar bool) — consistent
+    with the rest of the dtype convention (repeat==1, no TDIM)."""
+    rows = bytes([0b10000000, 0b00000000])
+    fields = [("F", "1X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 2, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a.dtype == np.dtype([("F", "?")])
+            assert a["F"].tolist() == [True, False]
+
+
+def test_x_partial_byte_padding_bits_ignored():
+    """7X = 7 bits in 1 byte; the 8th (low) bit is padding and must
+    not appear in the unpacked output."""
+    rows = bytes([0b10101011])  # last 1 is padding
+    fields = [("F", "7X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 1, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["F"][0].tolist() == [
+                True, False, True, False, True, False, True
+            ]
+
+
+def test_x_multi_byte_with_partial_last_byte():
+    """13X = 13 bits in 2 bytes; 3 padding bits in the second byte."""
+    # First byte: 8 bits.  Second byte: top 5 bits used.
+    rows = bytes([0b11110000, 0b10101000])
+    fields = [("F", "13X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(2, 1, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["F"][0].tolist() == [
+                True, True, True, True, False, False, False, False,
+                True, False, True, False, True,
+            ]
+
+
+def test_x_with_tdim_reshape():
+    """TDIM='(2,3)' over '6X' should reshape each cell to numpy shape
+    (3, 2) using the same FORTRAN-to-numpy transpose rule as numeric
+    TDIM."""
+    # 6 bits packed MSB-first: bits b0..b5 (b5 is the 6th bit).
+    # bit pattern: 1,0,1,1,0,0  → byte 0b101100xx (last 2 bits padding).
+    rows = bytes([0b10110000])
+    fields = [("M", "6X", "(2,3)")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 1, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            # field shape is reversed(tdim) = (3, 2)
+            assert a["M"].shape == (1, 3, 2)
+            # FITS FORTRAN-flat order: b0..b5 = [1,0,1,1,0,0].  With
+            # TDIM=(2,3), the FORTRAN-indexed element [i,j] (i in [0,2),
+            # j in [0,3)) at flat k = i + j*2 maps to numpy [r=j, c=i].
+            # So numpy[0] = (b0,b1), numpy[1] = (b2,b3), numpy[2]=(b4,b5).
+            assert a["M"][0].tolist() == [[True, False],
+                                          [True, True],
+                                          [False, False]]
+
+
+def test_x_read_column_returns_plain_bool_array():
+    rows = bytes([0b11000000])
+    fields = [("F", "8X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 1, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            col = fits[1].read_column("F")
+            assert col.dtype == np.bool_
+            assert col.shape == (1, 8)
+            assert col[0].tolist() == [
+                True, True, False, False, False, False, False, False
+            ]
+
+
+def test_x_rows_subset():
+    rows = bytes([0b10000000, 0b01000000, 0b00100000, 0b00010000])
+    fields = [("F", "3X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 4, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read(rows=[3, 1])
+            assert a["F"][0].tolist() == [False, False, False]
+            assert a["F"][1].tolist() == [False, True, False]
+
+
+def test_x_mixed_with_other_columns():
+    """X alongside fixed numeric — both must come out correctly in the
+    same structured array."""
+    # row 0: ID=10, FLAGS bits = [T,F,T,F,T,F,T,F] = 0b10101010
+    # row 1: ID=20, FLAGS bits = [F,T,F,T,F,T,F,T] = 0b01010101
+    rows = (
+        struct.pack(">i", 10) + bytes([0b10101010])
+        + struct.pack(">i", 20) + bytes([0b01010101])
+    )
+    fields = [("ID", "1J"), ("FLAGS", "8X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(5, 2, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            a = fits[1].read()
+            assert a["ID"].tolist() == [10, 20]
+            assert a["FLAGS"][0].tolist() == [
+                True, False, True, False, True, False, True, False
+            ]
+            assert a["FLAGS"][1].tolist() == [
+                False, True, False, True, False, True, False, True
+            ]
+
+
+def test_x_column_subset_via_getitem():
+    rows = bytes([0b11110000])
+    fields = [("F", "8X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(1, 1, fields), rows)
+        with rustfits.FITS(fname, "r") as fits:
+            t = fits[1]
+            col = t["F"][:]
+            assert col.tolist() == [[True, True, True, True,
+                                     False, False, False, False]]
+
+
+def test_x_dtype_property_matches_read():
+    rows = bytes([0])
+    fields = [("F", "12X")]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        _write_bintable(fname, _bintable_cards(2, 1, fields), rows + b"\x00")
+        with rustfits.FITS(fname, "r") as fits:
+            dt = fits[1].dtype
+            a = fits[1].read()
+            assert dt == a.dtype
+            assert dt == np.dtype([("F", "?", (12,))])
 
 
 # ---------------------------------------------------------------------------

@@ -5,17 +5,19 @@
 //
 // Fixed-length column types supported: L (logical), B (uint8), I (int16),
 // J (int32), K (int64), A (character), E (float32), D (float64),
-// C (complex64), M (complex128).  TDIMn multi-dim cells respected.
+// C (complex64), M (complex128), X (bit, MSB-packed).  TDIMn multi-dim
+// cells respected.
 //
 // Variable-length (P/Q descriptor) columns supported for the same inner
-// element letters.  Each row's main-data slot holds an 8-byte (P) or
-// 16-byte (Q) big-endian descriptor (nelements, heap_offset); the actual
-// data lives in the heap section at file offset
+// element letters except X.  Each row's main-data slot holds an 8-byte
+// (P) or 16-byte (Q) big-endian descriptor (nelements, heap_offset); the
+// actual data lives in the heap section at file offset
 // (data_offset + THEAP + heap_offset).  Read returns numpy Object dtype,
 // one ndarray (or str/bytes for A) per row.
 //
 // Not yet supported (rejected at parse time so downstream code stays
-// simple): X (bit, packed), P/Q with TFORM repeat > 1, TDIM on P/Q.
+// simple): P/Q with TFORM repeat > 1, TDIM on P/Q, variable-length bit
+// (P/Q with inner X).
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyList, PySlice, PyString, PyTuple};
@@ -201,11 +203,10 @@ fn parse_tdim(tdim: &str, col_index: usize) -> PyResult<Vec<usize>> {
 }
 
 // Walk the header cards and produce a Vec<Column> describing each
-// column.  Fixed-width types L/B/I/J/K/A/E/D/C/M are supported.
-// Variable-length P/Q descriptors are supported for those same inner
-// element letters (output via Object dtype, filled from the heap on
-// read).  X (bit) columns are rejected — they would need bit-unpacking
-// machinery not yet built.
+// column.  Fixed-width types L/B/I/J/K/A/E/D/C/M and X (bit) are
+// supported.  Variable-length P/Q descriptors are supported for those
+// same inner element letters except X (output via Object dtype, filled
+// from the heap on read).
 pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
     let tfields = parse_keyword(cards, "TFIELDS").ok_or_else(|| {
         PyValueError::new_err("BINTABLE missing required TFIELDS keyword")
@@ -229,13 +230,6 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
         })?;
         let TformInfo { repeat, letter, inner_letter } =
             parse_tform(&tform, i)?;
-
-        if letter == 'X' {
-            return Err(PyValueError::new_err(format!(
-                "column {}: TFORM='{}' uses bit columns (X), not yet supported",
-                i, tform
-            )));
-        }
 
         let name = parse_string_keyword(cards, &format!("TTYPE{}", i))
             .unwrap_or_else(|| format!("COL{}", i));
@@ -284,19 +278,27 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 var_kind: Some(letter),
             }
         } else {
-            let elem_size = bytes_per_element(letter).ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "column {}: TFORM='{}' uses unsupported type letter '{}'",
-                    i, tform, letter
-                ))
-            })?;
-            let byte_width = repeat * elem_size;
+            // X is a bit column: `repeat` is the bit count and the
+            // on-disk row width is ceil(repeat/8).  Other fixed types
+            // have a whole-byte element size.
+            let byte_width = if letter == 'X' {
+                repeat.div_ceil(8)
+            } else {
+                let elem_size = bytes_per_element(letter).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "column {}: TFORM='{}' uses unsupported type letter '{}'",
+                        i, tform, letter
+                    ))
+                })?;
+                repeat * elem_size
+            };
             let tdim = match parse_string_keyword(cards, &format!("TDIM{}", i)) {
                 Some(s) => {
                     let dims = parse_tdim(&s, i)?;
-                    // Validate: product of dims must match the TFORM repeat
-                    // (for A columns this is the total byte count, since A's
-                    // repeat is the per-row string length in bytes).
+                    // Validate: product of dims must match the TFORM
+                    // repeat.  For A columns this is the total byte
+                    // count (A's repeat is per-row string length).
+                    // For X columns this is the total bit count.
                     let product: usize = dims.iter().product();
                     if product != repeat {
                         return Err(PyValueError::new_err(format!(
@@ -348,6 +350,9 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 //   - TDIM present, numeric: shape = reversed(tdim)
 //   - no TDIM, A: scalar U<repeat>
 //   - TDIM present, A: U<tdim[0]>, shape = reversed(tdim[1..])
+//   - X (bit), repeat == 1, no TDIM: scalar bool
+//   - X (bit), repeat  > 1, no TDIM: shape = (repeat,) of bool
+//   - X (bit), TDIM present: shape = reversed(tdim) of bool
 //
 // Numpy structured fields with shape (1,) are NOT equivalent to scalar
 // fields (they add a trailing axis of length 1).  We deliberately use
@@ -355,6 +360,13 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 fn field_dtype_and_shape(col: &Column) -> (String, Vec<usize>) {
     if col.var_kind.is_some() {
         return ("O".to_string(), Vec::new());
+    }
+    if col.tform_letter == 'X' {
+        let shape: Vec<usize> = match &col.tdim {
+            Some(tdim) => tdim.iter().rev().copied().collect(),
+            None => if col.repeat > 1 { vec![col.repeat] } else { Vec::new() },
+        };
+        return ("?".to_string(), shape);
     }
     if col.tform_letter == 'A' {
         return match &col.tdim {
@@ -464,8 +476,24 @@ fn convert_column_cell(
         // K (i8), D (f8), and the f8 halves of M (c16) are 8 bytes.
         'K' | 'D' | 'M' => { copy_with_byteswap(src, dst, 8); Ok(()) }
         'A' => convert_a_cell(col, src, dst, row_index),
+        'X' => { convert_x_cell(col, src, dst); Ok(()) }
         // parse_columns rejects unsupported letters up front.
         _ => unreachable!("unsupported TFORM letter '{}'", col.tform_letter),
+    }
+}
+
+// Unpack a row's FITS X (bit) cell into numpy bool bytes.  On disk:
+// `n_bits` packed bits in ceil(n_bits/8) bytes, MSB-first within each
+// byte (so the first bit of the cell is the high bit of the first
+// byte).  In numpy: one byte per bit (0 or 1).  The bit-walk order
+// matches the FITS in-cell order, so a TDIM reshape ends up correctly
+// transposed by the standard "reversed(tdim) on the numpy side" rule.
+fn convert_x_cell(col: &Column, src: &[u8], dst: &mut [u8]) {
+    let n_bits = col.repeat;
+    for i in 0..n_bits {
+        let byte_idx = i / 8;
+        let bit_idx = 7 - (i % 8);
+        dst[i] = (src[byte_idx] >> bit_idx) & 1;
     }
 }
 
