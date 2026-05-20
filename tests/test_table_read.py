@@ -76,7 +76,13 @@ def _bintable_cards(naxis1, naxis2, fields):
 
 
 def test_read_all_basic_numeric_types():
-    """Cover B / I / J / K / E / D round-trip + endian swap."""
+    """Cover B / I / J / K / E / D round-trip + endian swap.
+
+    Demonstrates the default-mode form: FITS(fname) opens for reading
+    just like the built-in open(fname).  Most read-only tests in this
+    file still use the explicit FITS(fname, "r") form for historical
+    reasons — either is fine.
+    """
     fields = [
         ("B1", "1B"), ("I1", "1I"), ("J1", "1J"),
         ("K1", "1K"), ("E1", "1E"), ("D1", "1D"),
@@ -93,7 +99,7 @@ def test_read_all_basic_numeric_types():
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, _bintable_cards(row_w, 3, fields), rows_data)
-        with rustfits.FITS(fname, "r") as fits:
+        with rustfits.FITS(fname) as fits:
             a = fits[1].read()
             assert a["B1"].tolist() == [100, 101, 102]
             assert a["I1"].tolist() == [-200, -199, -198]

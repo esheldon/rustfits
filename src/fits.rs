@@ -255,11 +255,15 @@ pub(crate) struct FITS {
 
 #[pymethods]
 impl FITS {
+    // Default mode is 'r' so FITS(filename) reads — matches the
+    // built-in open(filename) convention.  'r+' opens for in-place
+    // mutation; 'w+' truncates / creates.
     #[new]
-    fn new(py: Python<'_>, filename: String, mode: String) -> PyResult<Self> {
+    #[pyo3(signature = (filename, mode="r"))]
+    fn new(py: Python<'_>, filename: String, mode: &str) -> PyResult<Self> {
         let mut options = OpenOptions::new();
 
-        match mode.as_str() {
+        match mode {
             "r"  => options.read(true),
             "r+" => options.read(true).write(true),
             "w+" => options.read(true).write(true).truncate(true).create(true),

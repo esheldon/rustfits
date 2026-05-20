@@ -34,8 +34,10 @@ def _three_hdus():
 
 
 def test_int_indexing_unchanged():
+    # FITS(fname) defaults to mode='r', matching the built-in open()
+    # convention.  Most other tests still use the explicit "r" form.
     with _three_hdus() as fname:
-        with rustfits.FITS(fname, "r") as fits:
+        with rustfits.FITS(fname) as fits:
             assert fits[0].header["NAXIS1"] == 3
             assert fits[1].header["EXTNAME"] == "SCI"
             assert fits[2].header["EXTNAME"] == "Weights"
@@ -43,7 +45,7 @@ def test_int_indexing_unchanged():
 
 def test_negative_int_indexing_unchanged():
     with _three_hdus() as fname:
-        with rustfits.FITS(fname, "r") as fits:
+        with rustfits.FITS(fname) as fits:
             assert fits[-1].header["EXTNAME"] == "Weights"
             assert fits[-2].header["EXTNAME"] == "SCI"
 

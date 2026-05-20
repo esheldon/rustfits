@@ -152,8 +152,8 @@ def test_read_multi_hdu_file():
             fits.hdus[1].write(b)
             fits.hdus[2].write(c)
 
-        # Reopen and read each HDU.
-        with rustfits.FITS(fname, "r") as fits:
+        # Reopen and read each HDU.  FITS(fname) defaults to mode='r'.
+        with rustfits.FITS(fname) as fits:
             assert len(fits.hdus) == 3
             np.testing.assert_array_equal(fits.hdus[0].read(), a)
             np.testing.assert_array_equal(fits.hdus[1].read(), b)
