@@ -115,6 +115,7 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
 // handle so that write-back methods can locate themselves on disk.
 fn parse_hdus_from_file(
     py: Python<'_>,
+    filename: &str,
     handle: &FileHandle,
     layout: &Arc<FileLayout>,
     tainted: &TaintFlag,
@@ -188,7 +189,10 @@ fn parse_hdus_from_file(
             c.starts_with("SIMPLE  =") || c.starts_with("XTENSION= 'IMAGE")
         });
         let is_binary_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'BINTABLE'"));
-        let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE'"));
+        // Match both 'TABLE' (unpadded, 5 chars, non-conforming but
+        // accepted) and 'TABLE   ' (padded to the FITS 8-char minimum
+        // for string values).  Mirrors the IMAGE pattern just above.
+        let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE"));
 
         let hdu_offsets = HduOffsets::new(
             header_offset, num_header_blocks, data_offset,
@@ -202,24 +206,25 @@ fn parse_hdus_from_file(
         let hdu_file = Arc::clone(handle);
         let hdu_layout = Arc::clone(layout);
         let hdu_taint = Arc::clone(tainted);
+        let hdu_filename = filename.to_string();
         let hdu_py: Py<PyAny> = if is_image {
             Py::new(py, ImageHDU::new(
-                header_cards.clone(), hdus.len(),
+                header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_binary_table {
             Py::new(py, TableHDU::new(
-                header_cards.clone(), hdus.len(),
+                header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_ascii_table {
             Py::new(py, AsciiTableHDU::new(
-                header_cards.clone(), hdus.len(),
+                header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else {
             let h = HDU::new(
-                header_cards.clone(), hdus.len(),
+                header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             );
             Py::new(py, h)?.into()
@@ -242,6 +247,9 @@ fn parse_hdus_from_file(
 #[pyclass]
 pub(crate) struct FITS {
     filename: String,
+    // Held verbatim for __repr__; the open() flags are derived from
+    // this at construction time and not stored separately.
+    mode: String,
     file: FileHandle,
     hdus: Vec<Py<PyAny>>,
     // Shared with every HDU and FITSHeader; the upcoming grow path will
@@ -279,10 +287,13 @@ impl FITS {
         let handle: FileHandle = Arc::new(Mutex::new(Some(file)));
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
         let layout = FileLayout::new();
-        let hdus = parse_hdus_from_file(py, &handle, &layout, &tainted)?;
+        let hdus = parse_hdus_from_file(
+            py, &filename, &handle, &layout, &tainted,
+        )?;
 
         Ok(FITS {
             filename,
+            mode: mode.to_string(),
             file: handle,
             hdus,
             layout,
@@ -315,13 +326,57 @@ impl FITS {
         Ok(guard.is_none())
     }
 
-    fn __repr__(&self) -> String {
-        let status = match self.file.lock() {
+    // Multi-line, fitsio-style repr.  Typing the bound name + Enter in
+    // a REPL calls __repr__ (not __str__), so the rich layout has to
+    // live here.  For a healthy open file:
+    //
+    //   file: foo.fits
+    //   mode: r+
+    //   extnum  hdutype     extname
+    //   0       IMAGE_HDU
+    //   1       BINARY_TBL  MYTABLE
+    //
+    // For a closed/poisoned file we skip the per-HDU table (the HDU
+    // refs themselves still work for header inspection, but pulling
+    // EXTNAME may go through the file lock, and the cleaner thing is
+    // just to show the status and return).
+    fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
+        let status = match slf.file.lock() {
             Ok(guard) if guard.is_none() => "closed",
             Ok(_) => "open",
             Err(_) => "poisoned",
         };
-        format!("FITS('{}', {} HDUs, {})", self.filename, self.hdus.len(), status)
+
+        let mut out = String::new();
+        out.push_str(&format!("  file: {}\n", slf.filename));
+        out.push_str(&format!("  mode: {}\n", slf.mode));
+        if status != "open" {
+            out.push_str(&format!("  status: {}\n", status));
+            return Ok(out);
+        }
+
+        out.push_str("  extnum  hdutype     extname\n");
+        for (i, hdu) in slf.hdus.iter().enumerate() {
+            let hdu_bound = hdu.bind(py);
+            let kind = if hdu_bound.is_instance_of::<ImageHDU>() {
+                "IMAGE_HDU"
+            } else if hdu_bound.is_instance_of::<TableHDU>() {
+                "BINARY_TBL"
+            } else if hdu_bound.is_instance_of::<AsciiTableHDU>() {
+                "ASCII_TBL"
+            } else {
+                "UNKNOWN"
+            };
+            // Every HDU subclass extends HDU, so this downcast succeeds.
+            let base = hdu_bound.cast::<HDU>()?.borrow();
+            let cards = base.header_snapshot()?;
+            let extname = parse_string_keyword(&cards, "EXTNAME")
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {:<7} {:<11} {}\n", i, kind, extname,
+            ));
+        }
+        Ok(out)
     }
 
     fn __len__(&self) -> usize {
@@ -462,6 +517,7 @@ impl FITS {
             ImageHDU::new(
                 stored_cards,
                 self.hdus.len(),
+                self.filename.clone(),
                 hdu_offsets,
                 Arc::clone(&self.layout),
                 Arc::clone(&self.file),

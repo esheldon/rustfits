@@ -22,6 +22,9 @@ pub(crate) struct HDU {
     // back to the HDU's canonical card list (and any other readers).
     pub(crate) header: Arc<Mutex<Vec<String>>>,
     pub(crate) index: usize,
+    // Source filename, cloned in from FITS at construction.  Used only
+    // by __repr__; size is negligible compared to header storage.
+    pub(crate) filename: String,
     // Shared with FITSHeader and FITS so grows update everyone in lockstep.
     pub(crate) offsets: Arc<HduOffsets>,
     pub(crate) layout: Arc<FileLayout>,
@@ -33,6 +36,7 @@ impl HDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
+        filename: String,
         offsets: Arc<HduOffsets>,
         layout: Arc<FileLayout>,
         file: FileHandle,
@@ -41,6 +45,7 @@ impl HDU {
         HDU {
             header: Arc::new(Mutex::new(header)),
             index,
+            filename,
             offsets,
             layout,
             file,

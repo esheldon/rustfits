@@ -1778,6 +1778,7 @@ impl TableHDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
+        filename: String,
         offsets: Arc<HduOffsets>,
         layout: Arc<FileLayout>,
         file: FileHandle,
@@ -1785,17 +1786,85 @@ impl TableHDU {
     ) -> (Self, HDU) {
         (
             TableHDU,
-            HDU::new(header, index, offsets, layout, file, tainted),
+            HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
     }
 }
 
+// Per-column line in the TableHDU.__repr__ column-info block.  Returns
+// the numpy dtype string + an optional shape annotation:
+//   - fixed scalar (repeat == 1, no TDIM):         dtype, None
+//   - fixed multi (repeat > 1 or TDIM):            dtype, Some("array[a,b,...]")
+//   - variable-length (P/Q):                       inner-dtype, Some("array[var]")
+// Scaled dtype is shown when possible (e.g. unsigned-int trick → u2),
+// falling back to the unscaled mapping if scale-based dtype resolution
+// would error (C/M with non-default TSCAL/TZERO).
+fn column_repr_info(col: &Column) -> (String, Option<String>) {
+    if col.var_kind.is_some() {
+        let inner = match col.tform_letter {
+            'L' => "?",
+            'B' => "u1",
+            'I' => "i2",
+            'J' => "i4",
+            'K' => "i8",
+            'E' => "f4",
+            'D' => "f8",
+            'C' => "c8",
+            'M' => "c16",
+            'A' => "S",
+            _   => return (col.tform_letter.to_string(),
+                           Some("array[var]".to_string())),
+        };
+        return (inner.to_string(), Some("array[var]".to_string()));
+    }
+    let (dtype_str, shape) = field_dtype_and_shape(col, /* scale = */ true)
+        .or_else(|_| field_dtype_and_shape(col, /* scale = */ false))
+        .unwrap_or_else(|_| ("?".to_string(), Vec::new()));
+    let shape_str = if shape.is_empty() {
+        None
+    } else {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        Some(format!("array[{}]", dims.join(",")))
+    };
+    (dtype_str, shape_str)
+}
+
 #[pymethods]
 impl TableHDU {
+    // Multi-line, fitsio-style repr.  Shows file, extension, type,
+    // EXTNAME (if present), row count, and per-column dtype + shape
+    // annotation.  Column lines are dynamically aligned to the longest
+    // column name.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
-        let index: usize = super_.index();
-        Ok(format!("<TableHDU (binary) #{}>", index))
+        let cards = super_.header_snapshot()?;
+        let columns = parse_columns(&cards)?;
+        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0);
+        let extname = parse_string_keyword(&cards, "EXTNAME");
+
+        let mut out = String::new();
+        out.push_str(&format!("  file: {}\n", super_.filename));
+        out.push_str(&format!("  extension: {}\n", super_.index));
+        out.push_str("  type: BINARY_TBL\n");
+        if let Some(name) = extname {
+            out.push_str(&format!("  extname: {}\n", name));
+        }
+        out.push_str(&format!("  rows: {}\n", nrows));
+        out.push_str("  column info:\n");
+
+        let max_name_len = columns.iter().map(|c| c.name.len()).max().unwrap_or(0);
+        let name_w = max_name_len + 4;
+        for col in &columns {
+            let (dtype_str, shape_str) = column_repr_info(col);
+            out.push_str(&format!(
+                "    {:<w$}{}", col.name, dtype_str, w = name_w,
+            ));
+            if let Some(shape) = shape_str {
+                out.push_str(&format!("  {}", shape));
+            }
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     // numpy structured dtype the table would read into.  Useful for

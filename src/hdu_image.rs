@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    byteswap_in_place, lock_file, parse_keyword,
+    byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
     shift_file_tail_and_update_offsets, zero_fill_range,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
@@ -27,6 +27,7 @@ impl ImageHDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
+        filename: String,
         offsets: Arc<HduOffsets>,
         layout: Arc<FileLayout>,
         file: FileHandle,
@@ -34,17 +35,48 @@ impl ImageHDU {
     ) -> (Self, HDU) {
         (
             ImageHDU,
-            HDU::new(header, index, offsets, layout, file, tainted),
+            HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
     }
 }
 
 #[pymethods]
 impl ImageHDU {
+    // Multi-line, fitsio-style repr.  Shows file, extension index,
+    // type, EXTNAME (if present), and the image dtype + dims in numpy
+    // axis order (slowest first — same order the user gets back from
+    // a read).  Primary HDUs with NAXIS=0 show `dims: []`.
+    //
+    // parse_image_hdu_shape errors on NAXIS=0 (correct for read
+    // paths) so we inline a tolerant variant here.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
-        let index: usize = super_.index();
-        Ok(format!("<ImageHDU #{}>", index))
+        let cards = super_.header_snapshot()?;
+        let bitpix = parse_keyword(&cards, "BITPIX")
+            .ok_or_else(|| PyValueError::new_err("HDU header missing BITPIX"))?
+            as i32;
+        let naxis = parse_keyword(&cards, "NAXIS").unwrap_or(0).max(0) as usize;
+        let mut shape: Vec<u64> = Vec::with_capacity(naxis);
+        for i in 1..=naxis {
+            let d = parse_keyword(&cards, &format!("NAXIS{}", i))
+                .unwrap_or(0).max(0) as u64;
+            shape.push(d);
+        }
+        shape.reverse();  // numpy axis order: slowest first.
+        let dtype = bitpix_to_native_dtype(bitpix)?;
+        let extname = parse_string_keyword(&cards, "EXTNAME");
+
+        let mut out = String::new();
+        out.push_str(&format!("  file: {}\n", super_.filename));
+        out.push_str(&format!("  extension: {}\n", super_.index));
+        out.push_str("  type: IMAGE_HDU\n");
+        if let Some(name) = extname {
+            out.push_str(&format!("  extname: {}\n", name));
+        }
+        out.push_str("  image info:\n");
+        out.push_str(&format!("    data type: {}\n", dtype));
+        out.push_str(&format!("    dims: {:?}\n", shape));
+        Ok(out)
     }
 
     #[pyo3(signature = (data, start=None))]

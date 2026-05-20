@@ -5,7 +5,10 @@
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-use crate::common::{FileHandle, FileLayout, HduOffsets, TaintFlag};
+use crate::common::{
+    parse_keyword, parse_string_keyword,
+    FileHandle, FileLayout, HduOffsets, TaintFlag,
+};
 use crate::hdu::HDU;
 
 #[pyclass(extends = HDU)]
@@ -15,6 +18,7 @@ impl AsciiTableHDU {
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
+        filename: String,
         offsets: Arc<HduOffsets>,
         layout: Arc<FileLayout>,
         file: FileHandle,
@@ -22,16 +26,32 @@ impl AsciiTableHDU {
     ) -> (Self, HDU) {
         (
             AsciiTableHDU,
-            HDU::new(header, index, offsets, layout, file, tainted),
+            HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
     }
 }
 
 #[pymethods]
 impl AsciiTableHDU {
+    // Multi-line, fitsio-style repr.  Column info is intentionally
+    // omitted: ASCII tables aren't yet parsed into a typed Vec<Column>
+    // (the pyclass exists so input files with ASCII tables surface as
+    // their own type, but read/write isn't implemented yet).  Add
+    // column listing when the read API lands.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
         let super_ = slf.into_super();
-        let index: usize = super_.index();
-        Ok(format!("<AsciiTableHDU #{}>", index))
+        let cards = super_.header_snapshot()?;
+        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0);
+        let extname = parse_string_keyword(&cards, "EXTNAME");
+
+        let mut out = String::new();
+        out.push_str(&format!("  file: {}\n", super_.filename));
+        out.push_str(&format!("  extension: {}\n", super_.index));
+        out.push_str("  type: ASCII_TBL\n");
+        if let Some(name) = extname {
+            out.push_str(&format!("  extname: {}\n", name));
+        }
+        out.push_str(&format!("  rows: {}\n", nrows));
+        Ok(out)
     }
 }
