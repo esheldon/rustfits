@@ -1889,7 +1889,7 @@ def test_scaling_variable_length_unsigned_trick():
         struct.pack(">ii", 3, 0)
         + struct.pack(">ii", 2, 12)
     )
-    heap = struct.pack(">iii", -1, 0, 1) + struct.pack(">ii", -2**31, 2**31 - 1)
+    heap = struct.pack(">iii", -1, 0, 1) + struct.pack(">ii", -2**31, 2**31 - 1)  # noqa
     fields = [("V", "1PJ(10)")]
     row_width = 8
     naxis2 = 2
