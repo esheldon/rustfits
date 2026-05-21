@@ -1,9 +1,13 @@
 // CompressedImageHDU — tile-compressed image extension (ZIMAGE
-// convention).  Phase 1 (this file): detection + dispatch wiring,
-// image-shape and compression accessors, and a configurable LRU
-// tile cache placeholder.  Decoding lives in src/zimage/* and is
-// added in later phases (Phase 2: RICE_1 whole-image read; Phase
-// 3: slicing + cache fill).
+// convention).  Subclasses ImageHDU so `isinstance(hdu, ImageHDU)`
+// works on tile-compressed HDUs; overrides the data-access
+// methods so the uncompressed read/write paths never run on
+// BINTABLE bytes.
+//
+// Phase 2 (current): RICE_1 whole-image read.  Subsequent phases
+// add slicing (Phase 3), GZIP_1/2 (Phase 4), quantized floats
+// (Phase 5), and compressed writes (Phase 7+).  Decoder modules
+// live in src/zimage/.
 //
 // On disk the HDU is a BINTABLE with the standard COMPRESSED_DATA
 // / ZSCALE / ZZERO column conventions, but the user-facing API
@@ -14,49 +18,39 @@
 // convention and what the FITS bytes actually say.
 //
 // `extname`, `extver`, `has_data`, `header`, `index`, and
-// `_force_taint` are inherited from HDU.  `has_data` reads the
-// BINTABLE NAXIS/NAXISn (not the Z* keys) but the two agree:
-// non-empty image → non-zero n_tiles → BINTABLE NAXIS2 > 0;
-// empty image → n_tiles = 0 → NAXIS2 = 0.  So no override needed.
-//
-// TODO (Phase 2): make CompressedImageHDU extend ImageHDU instead
-// of HDU directly, so `isinstance(hdu, ImageHDU)` is True.  This
-// requires restructuring `new()` to use PyClassInitializer with
-// the three-level chain (HDU + ImageHDU + CompressedImageHDU),
-// updating accessor `into_super()` chains to step through both
-// parents, and overriding ImageHDU's data-access methods (`read`,
-// `write`, `extend`, `__getitem__`, `__setitem__`) so the
-// inherited uncompressed implementations don't silently produce
-// wrong results on a tile-compressed HDU.  The override of
-// `read` becomes the actual decoder in Phase 2; the override of
-// `__getitem__` becomes the slice path in Phase 3; the write-
-// side overrides stay as NotImplementedError until compressed
-// writes (Phase 7+).
+// `_force_taint` are inherited from HDU (through ImageHDU).
+// `has_data` reads the BINTABLE NAXIS/NAXISn (not the Z* keys)
+// but the two agree: non-empty image → non-zero n_tiles →
+// BINTABLE NAXIS2 > 0; empty image → n_tiles = 0 → NAXIS2 = 0.
+// So no override needed.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::types::PyTuple;
 
 use crate::common::{
-    parse_keyword, parse_string_keyword,
+    check_not_tainted, parse_keyword, parse_string_keyword,
     FileHandle, FileLayout, HduOffsets, TaintFlag,
 };
 use crate::hdu::HDU;
+use crate::hdu_image::ImageHDU;
+use crate::zimage::CompressionAlgorithm;
 
 // 32 MiB by default — large enough to cache a few hundred typical
 // 256x256 i4 tiles, small enough not to be surprising on a desktop.
 pub(crate) const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
-#[pyclass(extends = HDU)]
+#[pyclass(extends = ImageHDU)]
 pub(crate) struct CompressedImageHDU {
     // Configured cache size in bytes.  Stored in an Arc<AtomicU64>
     // so the value survives across get/set calls and so Phase 3's
     // LRU storage (added alongside slicing) can co-own it.  Phase
-    // 1 reads/writes the size but does not yet store decoded tiles
-    // anywhere — there's no .read() / __getitem__ yet.
+    // 2 reads/writes the size but does not yet store decoded tiles
+    // anywhere — slicing + cache fill is Phase 3 work.
     pub(crate) tile_cache_max_bytes: Arc<AtomicU64>,
 }
 
@@ -69,15 +63,17 @@ impl CompressedImageHDU {
         layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
-    ) -> (Self, HDU) {
-        (
-            CompressedImageHDU {
+    ) -> PyClassInitializer<Self> {
+        let hdu = HDU::new(
+            header, index, filename, offsets, layout, file, tainted,
+        );
+        PyClassInitializer::from(hdu)
+            .add_subclass(ImageHDU)
+            .add_subclass(CompressedImageHDU {
                 tile_cache_max_bytes: Arc::new(
                     AtomicU64::new(DEFAULT_TILE_CACHE_BYTES),
                 ),
-            },
-            HDU::new(header, index, filename, offsets, layout, file, tainted),
-        )
+            })
     }
 }
 
@@ -88,7 +84,7 @@ impl CompressedImageHDU {
     // image dtype + dims (what the user sees after .read()), not
     // the on-disk BINTABLE.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (zbitpix, shape) = parse_compressed_image_shape(&cards)?;
         let dtype = zbitpix_to_native_dtype(zbitpix)?;
@@ -122,7 +118,7 @@ impl CompressedImageHDU {
     // Image dimensions in numpy axis order (slowest first).
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, shape) = parse_compressed_image_shape(&cards)?;
         Ok(PyTuple::new(py, &shape)?.unbind())
@@ -131,7 +127,7 @@ impl CompressedImageHDU {
     // numpy dtype matching ZBITPIX — what .read() will return.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
         let dtype_str = zbitpix_to_native_dtype(zbitpix)?;
@@ -142,7 +138,7 @@ impl CompressedImageHDU {
     // ZNAXIS — number of image axes.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, shape) = parse_compressed_image_shape(&cards)?;
         Ok(shape.len())
@@ -153,7 +149,7 @@ impl CompressedImageHDU {
     // headers; real compressed HDUs always have NAXIS > 0.
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, shape) = parse_compressed_image_shape(&cards)?;
         Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
@@ -162,7 +158,7 @@ impl CompressedImageHDU {
     // Raw ZBITPIX — the image-side bitpix the user will read into.
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
         Ok(zbitpix)
@@ -170,7 +166,7 @@ impl CompressedImageHDU {
 
     // numpy convention: `len(arr)` is shape[0].
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, shape) = parse_compressed_image_shape(&cards)?;
         if shape.is_empty() {
@@ -183,7 +179,7 @@ impl CompressedImageHDU {
     // BUNIT (informational).
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
     }
@@ -196,7 +192,7 @@ impl CompressedImageHDU {
     // tolerant so callers can introspect without crashing).
     #[getter]
     fn compression_type(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "ZCMPTYPE"))
     }
@@ -208,7 +204,7 @@ impl CompressedImageHDU {
     fn tile_shape(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, image_shape) = parse_compressed_image_shape(&cards)?;
         let tile_shape = parse_tile_shape(&cards, &image_shape);
@@ -219,7 +215,7 @@ impl CompressedImageHDU {
     // ceil(NAXISn / TILEn).
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super();
+        let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (_, image_shape) = parse_compressed_image_shape(&cards)?;
         let tile_shape = parse_tile_shape(&cards, &image_shape);
@@ -240,6 +236,89 @@ impl CompressedImageHDU {
     // one-shot reads).
     fn set_tile_cache_size(&self, bytes: u64) {
         self.tile_cache_max_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    // ----- overrides for ImageHDU's data-access methods -----
+    //
+    // These shadow ImageHDU's implementations so the uncompressed
+    // read/write paths never run on a compressed BINTABLE.  Only
+    // `read` does real work in Phase 2; everything else raises.
+
+    // Whole-image read.  Walks every tile in the BINTABLE, decodes
+    // it, places it in the output ndarray.  Honors `scale` and
+    // `mask_blank` for compatibility with the ImageHDU signature;
+    // `mask_blank=True` currently raises because ZBLANK isn't
+    // wired in yet (planned: small follow-up after Phase 2).
+    #[pyo3(signature = (*, scale=true, mask_blank=false))]
+    fn read(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        scale: bool,
+        mask_blank: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        read_compressed_image_data(
+            py, &cards, super_.offsets.data_offset(),
+            &super_.file, &super_.tainted, scale, mask_blank,
+        )
+    }
+
+    // Slicing on compressed images comes in Phase 3 (along with
+    // the LRU tile cache).  Raise loudly until then so users get
+    // a clear "do .read() instead" signal.
+    #[allow(unused_variables)]
+    fn __getitem__(
+        slf: PyRef<'_, Self>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        Err(PyNotImplementedError::new_err(
+            "slicing tile-compressed images is not yet implemented \
+             (planned: Phase 3 of the ZIMAGE roadmap).  Use .read() \
+             to materialize the full image instead."
+        ))
+    }
+
+    // Compressed writes are Phase 7+ territory.  Reject every
+    // path that would otherwise inherit ImageHDU's uncompressed
+    // implementation, since those would happily blast bytes into
+    // the BINTABLE data area and produce a corrupt file.
+    #[pyo3(signature = (data, start=None))]
+    #[allow(unused_variables)]
+    fn write(
+        slf: PyRef<'_, Self>,
+        data: &Bound<'_, PyAny>,
+        start: Option<Vec<i64>>,
+    ) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "writing tile-compressed images is not yet implemented \
+             (planned: Phase 7+ of the ZIMAGE roadmap)."
+        ))
+    }
+
+    #[pyo3(signature = (data, start=None))]
+    #[allow(unused_variables)]
+    fn extend(
+        slf: PyRef<'_, Self>,
+        data: &Bound<'_, PyAny>,
+        start: Option<Vec<i64>>,
+    ) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "extending tile-compressed images is not yet implemented \
+             (planned: Phase 7+ of the ZIMAGE roadmap)."
+        ))
+    }
+
+    #[allow(unused_variables)]
+    fn __setitem__(
+        slf: PyRef<'_, Self>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "assigning to tile-compressed images is not yet \
+             implemented (planned: Phase 7+ of the ZIMAGE roadmap)."
+        ))
     }
 }
 
@@ -347,4 +426,436 @@ pub(crate) fn header_has_zimage(header: &[String]) -> bool {
         }
     }
     false
+}
+
+// ====== Phase 2: whole-image read ======
+//
+// REFACTOR NOTE (revisit when Phase 4+ adds more algorithms):
+// Phase 2 only knows about COMPRESSED_DATA.  Two places will
+// need to widen when fallback / quantization columns enter:
+//
+//   1. `find_compressed_data_column` returns *one* column.  When
+//      Phase 4 wires GZIP_COMPRESSED_DATA + UNCOMPRESSED_DATA
+//      fallbacks (used by the encoder when a tile doesn't
+//      benefit from RICE), this becomes a "find all data
+//      columns" call returning offsets for whichever are
+//      present.  The per-tile read then checks each column's
+//      nelements in priority order (primary → GZIP → UNCOMPRESSED)
+//      and dispatches to the corresponding decoder.  Empty
+//      COMPRESSED_DATA on a row currently raises; that error
+//      becomes the "try fallback" path.
+//
+//   2. `parse_rice_params` is RICE-specific.  When Phase 5 adds
+//      quantized floats it needs siblings for ZSCALE/ZZERO/
+//      ZBLANK column positions (each is a per-tile column in
+//      the BINTABLE, not a ZNAMEn/ZVALn pair).  Likely shape:
+//      a `CompressionContext` struct passed through the read
+//      loop, holding per-algorithm params plus optional
+//      quantization-column offsets.
+//
+// Both refactors keep the outer flow (tile loop → decode →
+// place) intact; they just widen the "what to read per row"
+// step.
+
+// Top-level entry point invoked from CompressedImageHDU::read.
+// Walks the BINTABLE one tile at a time, decoding each via the
+// algorithm-specific code in src/zimage/, and assembling the
+// tiles into the output ndarray.  Applies BSCALE/BZERO via the
+// shared image-side scaling machinery so a scaled compressed
+// HDU returns the same dtype as an equivalent uncompressed one.
+//
+// Phase 2 limits (will lift later):
+//   - RICE_1 only (Phase 4 adds GZIP_1/2, Phase 6 HCOMPRESS/PLIO)
+//   - Integer ZBITPIX only (Phase 5 adds quantized floats)
+//   - mask_blank=True rejected (ZBLANK handling is a follow-up)
+//   - Empty COMPRESSED_DATA on a row → error (GZIP_COMPRESSED_DATA
+//     / UNCOMPRESSED_DATA fallback comes with Phase 4)
+fn read_compressed_image_data(
+    py: Python<'_>,
+    cards: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+    tainted: &TaintFlag,
+    scale: bool,
+    mask_blank: bool,
+) -> PyResult<Py<PyAny>> {
+    check_not_tainted(tainted)?;
+
+    if mask_blank {
+        return Err(PyNotImplementedError::new_err(
+            "mask_blank on tile-compressed images requires ZBLANK \
+             handling, not yet implemented (planned as a small \
+             follow-up after Phase 2 of the ZIMAGE roadmap)."
+        ));
+    }
+
+    // Algorithm dispatch — Phase 2 supports RICE_1 only.
+    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
+        .ok_or_else(|| PyValueError::new_err(
+            "compressed HDU missing ZCMPTYPE"
+        ))?;
+    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
+    if algorithm != CompressionAlgorithm::Rice1 {
+        return Err(PyNotImplementedError::new_err(format!(
+            "{} decompression is not yet implemented (Phase 2 \
+             supports RICE_1 only; see CLAUDE.md for the roadmap)",
+            zcmptype
+        )));
+    }
+
+    // Image shape + bitpix (image-side).
+    let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
+    if image_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "compressed HDU has ZNAXIS=0 (no image data)"
+        ));
+    }
+    if zbitpix < 0 {
+        return Err(PyNotImplementedError::new_err(format!(
+            "compressed image with ZBITPIX={} (floating point) is \
+             not yet supported — this requires per-tile \
+             quantization (ZSCALE/ZZERO + dithering), planned for \
+             Phase 5 of the ZIMAGE roadmap",
+            zbitpix
+        )));
+    }
+    let bytepix: u32 = match zbitpix {
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        64 => 8,
+        _ => return Err(PyValueError::new_err(format!(
+            "unsupported ZBITPIX {}", zbitpix
+        ))),
+    };
+
+    // RICE parameters: BLOCKSIZE and BYTEPIX from ZNAMEn/ZVALn.
+    // Defaults: BLOCKSIZE=32, BYTEPIX = zbitpix/8.
+    let (blocksize, bytepix_from_header) = parse_rice_params(cards);
+    let blocksize = blocksize.unwrap_or(32);
+    let bytepix = bytepix_from_header.unwrap_or(bytepix);
+
+    // BINTABLE layout.
+    let naxis1 = parse_keyword(cards, "NAXIS1")
+        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
+        as u64;
+    let naxis2 = parse_keyword(cards, "NAXIS2")
+        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS2"))?
+        as u64;
+    // THEAP default = NAXIS1 * NAXIS2 (heap immediately after the
+    // main data section).
+    let theap = parse_keyword(cards, "THEAP")
+        .map(|x| x.max(0) as u64)
+        .unwrap_or(naxis1 * naxis2);
+    let col = find_compressed_data_column(cards)?;
+
+    // Tile shape + sanity-check against NAXIS2.
+    let tile_shape = parse_tile_shape(cards, &image_shape);
+    let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
+    if n_tiles != naxis2 {
+        return Err(PyValueError::new_err(format!(
+            "ZIMAGE row count NAXIS2={} disagrees with computed \
+             tile count {} (image shape {:?}, tile shape {:?})",
+            naxis2, n_tiles, image_shape, tile_shape,
+        )));
+    }
+
+    // Allocate output ndarray of the right shape + native dtype.
+    let np = py.import("numpy")?;
+    let dtype_str = zbitpix_to_native_dtype(zbitpix)?;
+    let shape_tuple = PyTuple::new(py, &image_shape)?;
+    let out_arr = np.call_method1("empty", (shape_tuple, dtype_str))?;
+    // Zero the array so that any test that asserts initial state
+    // (or any future code that exits early) sees a clean value.
+    out_arr.call_method0("fill")
+        .or_else(|_| {
+            // fill() requires an argument; pass 0.
+            out_arr.call_method1("fill", (0i32,))
+        })?;
+
+    // Iterate tiles.  Each BINTABLE row = one tile; rows are
+    // ordered FITS-row-major (numpy-last-axis fastest).
+    {
+        let mut guard = file_handle.lock()
+            .map_err(|_| PyIOError::new_err("file lock poisoned"))?;
+        let file = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+        for tile_idx in 0..n_tiles {
+            // Read this row's COMPRESSED_DATA descriptor.
+            let desc_offset = data_offset
+                + tile_idx * naxis1
+                + col.byte_offset_in_row;
+            file.seek(SeekFrom::Start(desc_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let (nelements, heap_offset) = if col.is_q {
+                let mut buf = [0u8; 16];
+                file.read_exact(&mut buf)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let nelem = u64::from_be_bytes(
+                    buf[..8].try_into().unwrap());
+                let off = u64::from_be_bytes(
+                    buf[8..16].try_into().unwrap());
+                (nelem, off)
+            } else {
+                let mut buf = [0u8; 8];
+                file.read_exact(&mut buf)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let nelem = u32::from_be_bytes(
+                    buf[..4].try_into().unwrap()) as u64;
+                let off = u32::from_be_bytes(
+                    buf[4..8].try_into().unwrap()) as u64;
+                (nelem, off)
+            };
+            if nelements == 0 {
+                return Err(PyNotImplementedError::new_err(format!(
+                    "ZIMAGE tile {} has empty COMPRESSED_DATA; \
+                     GZIP_COMPRESSED_DATA / UNCOMPRESSED_DATA \
+                     fallback is not yet implemented (planned: \
+                     Phase 4 of the ZIMAGE roadmap)", tile_idx
+                )));
+            }
+
+            // Read the compressed bytes from the heap.  Heap
+            // starts at data_offset + THEAP.
+            let heap_byte_offset = data_offset + theap + heap_offset;
+            let mut compressed = vec![0u8; nelements as usize];
+            file.seek(SeekFrom::Start(heap_byte_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            file.read_exact(&mut compressed)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+            // Compute this tile's numpy-order origin + actual
+            // shape (edge tiles may be smaller than the nominal
+            // tile shape).
+            let (origin, actual_shape) = tile_origin_and_shape(
+                tile_idx, &image_shape, &tile_shape,
+            );
+            let tile_n_pixels: usize = actual_shape.iter()
+                .product::<u64>() as usize;
+
+            // Decode + place.
+            let pixels = crate::zimage::decode_tile_to_i64(
+                algorithm, &compressed, tile_n_pixels,
+                bytepix, blocksize,
+            )?;
+            place_tile_into_output(
+                py, &out_arr, &pixels, dtype_str,
+                &origin, &actual_shape,
+            )?;
+        }
+    }
+
+    // Apply BSCALE/BZERO (same dispatch the uncompressed path uses).
+    let unbound = out_arr.unbind();
+    let final_arr = if scale {
+        let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
+        let kind = crate::hdu_image::image_scaling_kind(zbitpix, bscale, bzero);
+        crate::hdu_image::apply_image_scaling(
+            py, unbound, zbitpix, kind, bscale, bzero,
+        )?
+    } else {
+        unbound
+    };
+    Ok(final_arr)
+}
+
+// Where the COMPRESSED_DATA column lives in a BINTABLE row.
+struct CompressedDataColumn {
+    // Byte offset of this column's first byte within a row.
+    byte_offset_in_row: u64,
+    // True if descriptors are 'Q' (16 bytes); false for 'P' (8).
+    is_q: bool,
+}
+
+// Walk TFORMn / TTYPEn to find the COMPRESSED_DATA column.  All
+// preceding columns contribute their byte width to the offset.
+fn find_compressed_data_column(
+    header: &[String],
+) -> PyResult<CompressedDataColumn> {
+    let tfields = parse_keyword(header, "TFIELDS").unwrap_or(0).max(0) as u64;
+    if tfields == 0 {
+        return Err(PyValueError::new_err(
+            "ZIMAGE BINTABLE has TFIELDS=0"
+        ));
+    }
+    let mut offset: u64 = 0;
+    for i in 1..=tfields {
+        let ttype = parse_string_keyword(header, &format!("TTYPE{}", i))
+            .unwrap_or_default();
+        let tform = parse_string_keyword(header, &format!("TFORM{}", i))
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "ZIMAGE BINTABLE column {} missing TFORM", i
+            )))?;
+        let width = tform_byte_width(&tform)?;
+        if ttype.trim() == "COMPRESSED_DATA" {
+            return Ok(CompressedDataColumn {
+                byte_offset_in_row: offset,
+                is_q: tform_is_q_descriptor(&tform),
+            });
+        }
+        offset += width;
+    }
+    Err(PyValueError::new_err(
+        "ZIMAGE BINTABLE missing COMPRESSED_DATA column"
+    ))
+}
+
+// Byte width of one row's slot for a given TFORM value.  Handles
+// the column types that appear in ZIMAGE BINTABLEs.  Unknown
+// types raise — better than silently mis-computing an offset.
+fn tform_byte_width(tform: &str) -> PyResult<u64> {
+    let trimmed = tform.trim();
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    let repeat: u64 = if idx == 0 {
+        1
+    } else {
+        trimmed[..idx].parse().map_err(|_| PyValueError::new_err(
+            format!("bad TFORM repeat: {}", tform)
+        ))?
+    };
+    if idx >= bytes.len() {
+        return Err(PyValueError::new_err(format!(
+            "TFORM missing type letter: {}", tform
+        )));
+    }
+    let t = bytes[idx] as char;
+    match t {
+        // Fixed-width scalars.
+        'L' | 'A' | 'B' => Ok(repeat),
+        'I' => Ok(repeat * 2),
+        'J' | 'E' => Ok(repeat * 4),
+        'K' | 'D' | 'C' => Ok(repeat * 8),
+        'M' => Ok(repeat * 16),
+        // Bit-array: ceil(repeat / 8) bytes.
+        'X' => Ok((repeat + 7) / 8),
+        // Variable-length descriptors — fixed bytes per
+        // descriptor; `repeat` here is the descriptor count.
+        'P' => Ok(repeat * 8),
+        'Q' => Ok(repeat * 16),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported TFORM type '{}' in ZIMAGE BINTABLE", other
+        ))),
+    }
+}
+
+// Does this TFORM use 'Q' descriptors (16 bytes) rather than 'P'?
+fn tform_is_q_descriptor(tform: &str) -> bool {
+    let trimmed = tform.trim();
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    idx < bytes.len() && bytes[idx] as char == 'Q'
+}
+
+// Walk ZNAMEn/ZVALn pairs to extract the BLOCKSIZE and BYTEPIX
+// values used by the RICE encoder.  Either may be absent; the
+// caller substitutes defaults (32 / ZBITPIX/8).
+fn parse_rice_params(header: &[String]) -> (Option<u32>, Option<u32>) {
+    let mut blocksize: Option<u32> = None;
+    let mut bytepix: Option<u32> = None;
+    // ZNAMEn / ZVALn pairs are indexed 1..; in practice there
+    // are at most a few.  Iterate until we hit a gap.
+    for n in 1.. {
+        let name_key = format!("ZNAME{}", n);
+        let val_key = format!("ZVAL{}", n);
+        let name = parse_string_keyword(header, &name_key);
+        if name.is_none() {
+            break;
+        }
+        let v = parse_keyword(header, &val_key);
+        match (name.as_deref().map(|s| s.trim()), v) {
+            (Some("BLOCKSIZE"), Some(val)) => {
+                if val > 0 {
+                    blocksize = Some(val as u32);
+                }
+            }
+            (Some("BYTEPIX"), Some(val)) => {
+                if val > 0 {
+                    bytepix = Some(val as u32);
+                }
+            }
+            _ => {}
+        }
+    }
+    (blocksize, bytepix)
+}
+
+// Given a tile index (0..n_tiles, FITS-row-major), the image
+// shape (numpy order), and the nominal tile shape (numpy order),
+// return the tile's numpy-order origin and its actual shape
+// (which may be smaller than nominal at the image edges).
+fn tile_origin_and_shape(
+    tile_idx: u64,
+    image_shape_numpy: &[u64],
+    nominal_tile_shape_numpy: &[u64],
+) -> (Vec<u64>, Vec<u64>) {
+    let d = image_shape_numpy.len();
+    let mut idx = tile_idx;
+    let mut tile_coord_numpy = vec![0u64; d];
+    // Unfold from numpy-last (= FITS-fastest = varies fastest in
+    // the BINTABLE row ordering) to numpy-first.
+    for axis_numpy in (0..d).rev() {
+        let n_along = (image_shape_numpy[axis_numpy]
+            + nominal_tile_shape_numpy[axis_numpy] - 1)
+            / nominal_tile_shape_numpy[axis_numpy];
+        tile_coord_numpy[axis_numpy] = idx % n_along;
+        idx /= n_along;
+    }
+    let mut origin = vec![0u64; d];
+    let mut shape = vec![0u64; d];
+    for axis in 0..d {
+        origin[axis] = tile_coord_numpy[axis]
+            * nominal_tile_shape_numpy[axis];
+        let end = (origin[axis] + nominal_tile_shape_numpy[axis])
+            .min(image_shape_numpy[axis]);
+        shape[axis] = end - origin[axis];
+    }
+    (origin, shape)
+}
+
+// Write the decoded pixels of one tile into the output ndarray.
+// `pixels` is a flat Vec<i64> in FITS-row-major order, which is
+// identical to numpy-C-order once reshaped to the numpy-order
+// tile shape (slow axis first).  Approach: build a 1-D numpy
+// array from the i64 vec, cast to the target dtype, reshape,
+// and assign to the appropriate slice of out_arr.
+fn place_tile_into_output(
+    py: Python<'_>,
+    out_arr: &Bound<'_, PyAny>,
+    pixels: &[i64],
+    target_dtype: &str,
+    origin_numpy: &[u64],
+    actual_shape_numpy: &[u64],
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+    // 1-D ndarray from the i64 vec.  np.asarray takes a Python
+    // list; build it via PyList::new for speed (the per-row cost
+    // dominates the per-pixel cost anyway).
+    let pylist = pyo3::types::PyList::new(py, pixels)?;
+    let arr1d = np.call_method1("array", (pylist, "i8"))?;
+    let cast = arr1d.call_method1("astype", (target_dtype,))?;
+    let shape_tuple = PyTuple::new(py, actual_shape_numpy)?;
+    let reshaped = cast.call_method1("reshape", (shape_tuple,))?;
+
+    // Build the (slice(...), slice(...), ...) tuple addressing
+    // the tile's region of the output ndarray.
+    let slice_objs: Vec<Bound<'_, pyo3::types::PySlice>> = origin_numpy
+        .iter()
+        .zip(actual_shape_numpy.iter())
+        .map(|(&o, &s)| {
+            pyo3::types::PySlice::new(
+                py, o as isize, (o + s) as isize, 1,
+            )
+        })
+        .collect();
+    let slice_tuple = PyTuple::new(py, &slice_objs)?;
+    out_arr.set_item(slice_tuple, reshaped)?;
+    Ok(())
 }

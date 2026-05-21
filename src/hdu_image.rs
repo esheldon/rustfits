@@ -21,7 +21,7 @@ use crate::common::{
 use crate::hdu::HDU;
 use crate::header::card_int;
 
-#[pyclass(extends = HDU)]
+#[pyclass(extends = HDU, subclass)]
 pub(crate) struct ImageHDU;
 
 impl ImageHDU {
@@ -1151,7 +1151,7 @@ fn bitpix_to_numpy_kind(bitpix: i32) -> PyResult<(&'static str, u64)> {
     }
 }
 
-fn bitpix_to_native_dtype(bitpix: i32) -> PyResult<&'static str> {
+pub(crate) fn bitpix_to_native_dtype(bitpix: i32) -> PyResult<&'static str> {
     match bitpix {
         8   => Ok("u1"),
         16  => Ok("i2"),
@@ -1169,7 +1169,7 @@ fn bitpix_to_native_dtype(bitpix: i32) -> PyResult<&'static str> {
 // once at read entry; mirrors the table-side ScalingKind enum in
 // hdu_table.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScalingKind {
+pub(crate) enum ScalingKind {
     // BSCALE == 1 AND BZERO == 0 (or scale=False) — return stored
     // values in the BITPIX native dtype.
     None,
@@ -1184,13 +1184,13 @@ enum ScalingKind {
     General,
 }
 
-fn parse_bscale_bzero(header: &[String]) -> (f64, f64) {
+pub(crate) fn parse_bscale_bzero(header: &[String]) -> (f64, f64) {
     let bscale = parse_keyword_float(header, "BSCALE").unwrap_or(1.0);
     let bzero = parse_keyword_float(header, "BZERO").unwrap_or(0.0);
     (bscale, bzero)
 }
 
-fn image_scaling_kind(bitpix: i32, bscale: f64, bzero: f64) -> ScalingKind {
+pub(crate) fn image_scaling_kind(bitpix: i32, bscale: f64, bzero: f64) -> ScalingKind {
     if bscale == 1.0 && bzero == 0.0 {
         return ScalingKind::None;
     }
@@ -1438,7 +1438,7 @@ fn bitpix_int_bounds(bitpix: i32) -> (f64, f64, &'static str, &'static str) {
 // followed by a vectorized XOR with the sign bit (equivalent to adding
 // 2^(n-1) modulo 2^n in two's complement).  For General: promote to f8,
 // multiply by BSCALE, add BZERO — all in numpy's vectorized loops.
-fn apply_image_scaling(
+pub(crate) fn apply_image_scaling(
     py: Python<'_>,
     arr: Py<PyAny>,
     bitpix: i32,

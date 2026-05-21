@@ -7,6 +7,13 @@ calls __repr__, so the rich display has to live there (not in __str__).
 Tests check that the expected lines appear in the right order without
 asserting exact whitespace counts, so small formatting tweaks don't
 break them.
+
+TODO: add repr coverage for CompressedImageHDU here, alongside the
+ImageHDU/TableHDU/AsciiTableHDU cases below.  The Phase 1 file
+test_compressed_image_phase1.py::test_repr_contains_compression_info
+has a minimal smoke test, but the full _show-instrumented visual-
+inspection suite in this file doesn't include compressed images yet.
+Needs fitsio (pytest.importorskip) to generate the fixture.
 """
 
 import os

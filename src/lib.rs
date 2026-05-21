@@ -7,6 +7,7 @@
 //   hdu_image_compressed — CompressedImageHDU (ZIMAGE convention)
 //   hdu_table      — TableHDU (BINTABLE) stub
 //   hdu_ascii_table — AsciiTableHDU (TABLE) stub
+//   zimage         — per-algorithm tile decoders (RICE_1 in Phase 2)
 //   fits           — FITS pyclass + HDU-list parser
 
 use pyo3::prelude::*;
@@ -18,6 +19,7 @@ mod hdu_image;
 mod hdu_image_compressed;
 mod hdu_table;
 mod hdu_ascii_table;
+mod zimage;
 mod fits;
 
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};

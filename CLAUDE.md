@@ -827,23 +827,54 @@ override becomes the actual Phase 2 decoder; `__getitem__`
 becomes Phase 3's slice path; write-side overrides stay as
 NotImplementedError until compressed writes (Phase 7+).
 
+Phase 2 follow-ups (not blocking):
+- **Add CompressedImageHDU cases to tests/test_repr.py** —
+  the Phase 1 smoke test in test_compressed_image_phase1.py
+  exists, but the full _show-instrumented visual-inspection
+  suite in test_repr.py doesn't include compressed images
+  yet.  Add alongside the ImageHDU/TableHDU cases.
+
 **Phase 3 — Slicing + LRU cache.**  `__getitem__` walking only
 the tiles that overlap the slice.  Per-HDU LRU cache (lru
 crate, bytes-bound) backing `tile_cache_size`.  `read()`
 bypasses the cache by default (whole-image one-shot has no
-locality benefit); `cache=True` opt-in.
+locality benefit); `cache=True` opt-in.  **Remove the
+`#[allow(unused_variables)]` on `__getitem__` in
+hdu_image_compressed.rs** — Phase 2 set it because the method
+body just raises NotImplementedError; Phase 3 replaces that
+body with the real slice implementation that consumes `key`.
 
 **Phase 4 — GZIP_1 / GZIP_2.**  `flate2` crate.  GZIP_2 adds a
-byte-shuffle preprocessor.
+byte-shuffle preprocessor.  Folded into Phase 4:
+**`find_compressed_data_column` refactor** — Phase 2 finds
+exactly one column (`COMPRESSED_DATA`).  Phase 4 widens this to
+also locate `GZIP_COMPRESSED_DATA` and `UNCOMPRESSED_DATA`
+fallback columns (used by the encoder when a tile doesn't
+benefit from the primary algorithm), and the per-tile loop
+checks each column's `nelements` in priority order (primary →
+GZIP fallback → uncompressed fallback) before decoding.  The
+"empty COMPRESSED_DATA on a row" error in Phase 2 becomes the
+"try fallback" path.
 
 **Phase 5 — Quantized floats.**  ZSCALE / ZZERO per-tile
 columns; ZQUANTIZ + ZDITHER0 dither variants.  Trickiest part
-is the dither PRNG (specific to the FITS spec).
+is the dither PRNG (specific to the FITS spec).  Also folded
+in: **`parse_rice_params` widens into a `CompressionContext`**
+that carries per-algorithm params plus optional quantization-
+column offsets (ZSCALE/ZZERO/ZBLANK are per-tile BINTABLE
+columns, not header ZNAMEn/ZVALn pairs).  The outer tile loop
+gains a "apply per-tile dequantization after decode" step;
+overall flow (find columns → tile loop → decode → place) is
+unchanged.
 
 **Phase 6+ — HCOMPRESS_1, PLIO_1, then writes.**  Both
 algorithms are real implementation effort and individually
 rare.  Defer until someone asks.  Compressed write is its own
-multi-phase project.
+multi-phase project.  When write lands (Phase 7+), **remove
+the `#[allow(unused_variables)]` on `write`, `extend`, and
+`__setitem__` in hdu_image_compressed.rs** — Phase 2 set them
+because the bodies just raise NotImplementedError; real
+implementations will consume those parameters.
 
 ## Testing conventions
 
