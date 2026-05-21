@@ -99,11 +99,15 @@ def test_dtype_maps_to_bitpix(dtype, bitpix):
 
 
 def test_unsupported_dtype_raises():
+    # c8 (complex64) is not a FITS image storage type; bool, datetime,
+    # and strings are also rejected.  u2/u4/u8/i1 are now accepted via
+    # the unsigned-int trick (BZERO offset) — covered in
+    # test_image_scale_write.py.
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
         with rustfits.FITS(fname, "w+") as fits:
             with pytest.raises(ValueError, match="unsupported numpy dtype"):
-                fits.create_image_hdu(dtype="u4", dims=(2, 3))
+                fits.create_image_hdu(dtype="c8", dims=(2, 3))
 
 
 def test_zero_dim_rejected():

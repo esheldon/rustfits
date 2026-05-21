@@ -435,23 +435,46 @@ on floating-point arrays.
 ### Image write
 
 **Supported.**  `FITS.create_image_hdu(dtype, shape, *, extname,
-extver)` writes header + zero-filled data.  `ImageHDU.write(data,
-start=...)` does an explicit-start bulk write.  `__setitem__` is
-symmetric with `__getitem__`: anything readable is writable.  RHS can
-be a scalar (Python int/float, numpy scalar, or 0-d ndarray —
-broadcast across the selection) or a shape-matching ndarray with
-dtype matching BITPIX.  Stepped slices fall into per-pixel writes via
-the same strip-layout walk as the read path.  `ImageHDU.extend(new_shape)`
-grows the data section in place, shifting the file tail and bumping
-later-HDU offsets when the image is not the last HDU on disk.  Mid-
-write I/O failures taint the file (close + reopen to recover).
+extver)` writes header + zero-filled data.  Accepted dtypes:
+`u1/i2/i4/i8/f4/f8` (BITPIX-direct) plus `u2/u4/u8/i1` (unsigned-int
+trick — see below).  `ImageHDU.write(data, start=...)` does an
+explicit-start bulk write.  `__setitem__` is symmetric with
+`__getitem__`: anything readable is writable.  RHS can be a scalar
+(Python int/float, numpy scalar, or 0-d ndarray — broadcast across
+the selection) or a shape-matching ndarray.  Stepped slices fall
+into per-pixel writes via the same strip-layout walk as the read
+path.  `ImageHDU.extend(new_shape)` grows the data section in place,
+shifting the file tail and bumping later-HDU offsets when the image
+is not the last HDU on disk.  Mid-write I/O failures taint the file
+(close + reopen to recover).
+
+Unsigned-int trick on write (symmetric with the read side):
+`create_image_hdu(dtype='u2'/'u4'/'u8'/'i1', ...)` emits
+`BITPIX=signed-int + BSCALE=1 + BZERO=2^(n-1)` (or `BZERO=-128` for
+`i1`).  `write` / `__setitem__` / `extend` accept either the
+BITPIX-native (signed) dtype OR the scaled (unsigned/i1) dtype as
+input; scaled-dtype input is reverse-transformed on the fly via XOR
++ view-cast (the inverse of `apply_image_scaling`).  Dispatch lives
+in the shared `normalize_input_dtype` helper which is the single
+source of truth for the write-side dtype rules — used by
+`write_image_data`, `write_image_slice`, and `ImageHDU.extend`.
+**No-copy fast path**: when input dtype already matches BITPIX,
+`normalize_input_dtype` returns the input via a Python refcount
+bump only; `RawBuffer::acquire` pins the numpy buffer; native-endian
+writes flow straight from the user's array to disk.  Reverse-
+transform allocates one new array (unavoidable).
 
 **Missing.**
-- **BSCALE/BZERO scaling on write** — the read side does scaling, but
-  the write side stores values as-given.  Symmetric round-trip would
-  need to emit `BITPIX=signed-int + BZERO=2^(n-1)` when the user gives
-  an unsigned-int dtype, and reverse-transform float input for HDUs
-  with non-trivial BSCALE/BZERO already set.
+- **General reverse-scaling on write** — when an HDU has non-trivial
+  BSCALE/BZERO set (not just the unsigned-int trick), `write()` does
+  not yet accept f8 input and reverse-transform via
+  `stored = (physical - BZERO) / BSCALE`.  Lossy (rounding + potential
+  overflow) and rarer in practice; deferred until a user asks.
+- **Scalar broadcast with unsigned trick** — `__setitem__` scalar RHS
+  (`img[k] = 42`) currently goes through `scalar_to_be_bytes` which
+  reads the value at the BITPIX dtype; for unsigned-trick HDUs this
+  means the user must pass the BITPIX (signed) value.  Promoting to
+  a 0-d ndarray is a workaround.  Add when there's a use case.
 - **Tile-compressed image writes (`ZIMAGE`)** — pair with the read
   side; do both at once when ZIMAGE work lands.
 

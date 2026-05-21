@@ -21,7 +21,7 @@ use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
 use crate::hdu_table::{normalize_and_build_table_header, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
-use crate::header::{card_int, card_logical, card_string, pad_to_card};
+use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
 
 // Per the FITS standard, the primary HDU must begin with `SIMPLE`, extension
 // HDUs must begin with `XTENSION`, and every HDU must declare BITPIX, NAXIS,
@@ -545,7 +545,7 @@ impl FITS {
             }
         }
 
-        let bitpix = dtype_to_bitpix(&dtype)?;
+        let (bitpix, bzero) = dtype_to_bitpix(&dtype)?;
         let naxis = dims.len() as i64;
 
         // numpy (row-major) -> FITS (NAXIS1 is fastest-varying): reverse.
@@ -579,6 +579,26 @@ impl FITS {
         }
         if let Some(ver) = extver {
             cards.push(card_int("EXTVER", ver, "extension version"));
+        }
+        // Unsigned-int trick: user-facing dtype was u2/u4/u8/i1 but the
+        // on-disk BITPIX is the opposite signedness.  Emit BZERO so
+        // readers (rustfits + astropy + cfitsio) recover the original
+        // dtype on read.  BSCALE=1 is the default but is emitted
+        // alongside for clarity.  Use card_uint for the u8 case (BZERO
+        // = 2^63 overflows i64); card_int for the others.
+        if let Some(bz) = bzero {
+            cards.push(card_int(
+                "BSCALE", 1, "default linear scaling"));
+            let bz_card = if bz > i64::MAX as f64 {
+                card_uint(
+                    "BZERO", bz as u64,
+                    "offset for unsigned-int storage")
+            } else {
+                card_int(
+                    "BZERO", bz as i64,
+                    "offset for unsigned-int storage")
+            };
+            cards.push(bz_card);
         }
         cards.push(pad_to_card("END"));
 

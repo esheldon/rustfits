@@ -146,12 +146,16 @@ impl ImageHDU {
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         data: &Bound<'_, PyAny>,
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
         let super_: PyRef<HDU> = slf.into_super();
         let header_cards = super_.header_snapshot()?;
-        write_image_data(&header_cards, super_.offsets.data_offset(), &super_.file, data, start)
+        write_image_data(
+            py, &header_cards, super_.offsets.data_offset(),
+            &super_.file, data, start,
+        )
     }
 
     // `scale=True` (default) applies BSCALE/BZERO on read.  For files
@@ -195,6 +199,7 @@ impl ImageHDU {
     #[pyo3(signature = (data, start=None))]
     fn extend(
         slf: PyRefMut<'_, Self>,
+        py: Python<'_>,
         data: &Bound<'_, PyAny>,
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
@@ -204,16 +209,12 @@ impl ImageHDU {
         let (bitpix, current_hdu_shape) = parse_image_hdu_shape(&header_snapshot)?;
         let naxis = current_hdu_shape.len();
 
-        let dtype = data.getattr("dtype")?;
-        let kind: String = dtype.getattr("kind")?.extract()?;
-        let itemsize_attr: u64 = dtype.getattr("itemsize")?.extract()?;
-        let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
-        if kind != expected_kind || itemsize_attr != expected_size {
-            return Err(PyValueError::new_err(format!(
-                "data dtype ({}{}) does not match HDU BITPIX={} (expected {}{})",
-                kind, itemsize_attr, bitpix, expected_kind, expected_size,
-            )));
-        }
+        // Accept BITPIX-native or (for unsigned-trick HDUs) scaled
+        // dtype; reverse-transform in flight.  Done before any file
+        // mutation so a dtype error leaves the file untouched.
+        let data_owned = normalize_input_dtype(py, &header_snapshot, data)?;
+        let data = data_owned.bind(py);
+        let (_expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
 
         let data_shape: Vec<u64> = data.getattr("shape")?.extract()?;
         if data_shape.len() != naxis {
@@ -267,6 +268,7 @@ impl ImageHDU {
 
         if new_hdu_shape == current_hdu_shape {
             return write_image_data(
+                py,
                 &header_snapshot,
                 super_.offsets.data_offset(),
                 &super_.file,
@@ -374,6 +376,7 @@ impl ImageHDU {
         // data section partly stale or unwritten — taint so the user is
         // forced to reopen rather than reading inconsistent bytes.
         write_image_data(
+            py,
             &new_cards,
             data_offset,
             &super_.file,
@@ -776,6 +779,7 @@ fn read_image_slice(
 }
 
 fn write_image_data(
+    py: Python<'_>,
     header: &[String],
     data_offset: u64,
     file_handle: &FileHandle,
@@ -785,16 +789,23 @@ fn write_image_data(
     let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
     let naxis = hdu_shape.len();
 
+    // Single source of truth for input-dtype rules: accepts BITPIX
+    // native dtype directly OR the scaled dtype for HDUs configured
+    // with the unsigned-int trick (then reverse-transforms in flight).
+    let data_owned = normalize_input_dtype(py, header, data)?;
+    let data = data_owned.bind(py);
+
     let dtype = data.getattr("dtype")?;
     let kind: String = dtype.getattr("kind")?.extract()?;
     let itemsize_attr: u64 = dtype.getattr("itemsize")?.extract()?;
     let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
-    if kind != expected_kind || itemsize_attr != expected_size {
-        return Err(PyValueError::new_err(format!(
-            "data dtype ({}{}) does not match HDU BITPIX={} (expected {}{})",
-            kind, itemsize_attr, bitpix, expected_kind, expected_size,
-        )));
-    }
+    // Defensive: normalize_input_dtype must produce BITPIX-native
+    // dtype.  Mismatch here is an internal logic bug, not user input.
+    debug_assert!(
+        kind == expected_kind && itemsize_attr == expected_size,
+        "normalize_input_dtype returned wrong dtype: {}{} != {}{}",
+        kind, itemsize_attr, expected_kind, expected_size,
+    );
 
     let data_shape: Vec<u64> = data.getattr("shape")?.extract()?;
     if data_shape.len() != naxis {
@@ -1034,17 +1045,12 @@ fn write_image_slice(
                 rhs_shape, output_shape,
             )));
         }
+        // Accept BITPIX-native or (for unsigned-trick HDUs) scaled
+        // dtype; reverse-transform in flight so the byte-pump below
+        // always sees BITPIX-native bytes.
+        let rhs_owned = normalize_input_dtype(py, header, rhs)?;
+        let rhs = rhs_owned.bind(py);
         let dtype = rhs.getattr("dtype")?;
-        let kind: String = dtype.getattr("kind")?.extract()?;
-        let itemsize: u64 = dtype.getattr("itemsize")?.extract()?;
-        let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
-        if kind != expected_kind || itemsize != expected_size {
-            return Err(PyValueError::new_err(format!(
-                "RHS dtype ({}{}) does not match HDU BITPIX={} \
-                 (expected {}{})",
-                kind, itemsize, bitpix, expected_kind, expected_size,
-            )));
-        }
         let dtype_str: String = dtype.getattr("str")?.extract()?;
         let needs_swap = if bpp_usize == 1 {
             false
@@ -1058,7 +1064,7 @@ fn write_image_slice(
                 ))),
             }
         };
-        let buffer = RawBuffer::acquire(rhs).map_err(|e| {
+        let buffer = RawBuffer::acquire(&rhs).map_err(|e| {
             PyValueError::new_err(format!(
                 "RHS must be a C-contiguous numpy array \
                  (try np.ascontiguousarray): {}", e
@@ -1225,6 +1231,114 @@ fn scaled_image_dtype(bitpix: i32, kind: ScalingKind) -> &'static str {
     }
 }
 
+// (numpy_kind, itemsize) of the scaled (user-facing) dtype for an
+// HDU configured with the unsigned-int trick.  Mirrors
+// `scaled_image_dtype` but returns the parts in the same shape as
+// `bitpix_to_numpy_kind`, so input-dtype matching can use the same
+// shape on both sides.  Only valid when the HDU's BSCALE/BZERO
+// classify as UnsignedTrick.
+fn scaled_dtype_kind_size(bitpix: i32) -> (&'static str, u64) {
+    match bitpix {
+        8  => ("i", 1),
+        16 => ("u", 2),
+        32 => ("u", 4),
+        64 => ("u", 8),
+        _ => unreachable!(
+            "scaled_dtype_kind_size on unexpected BITPIX {}", bitpix
+        ),
+    }
+}
+
+// Validate input dtype against the HDU's BITPIX (and, for HDUs
+// configured with the unsigned-int trick, the scaled dtype too).
+// Returns the data to write — either the input array unchanged (in
+// BITPIX dtype) or a freshly reverse-transformed array (BITPIX dtype,
+// when the input was the scaled dtype).  Single source of truth for
+// the write-side dtype rules; called from write_image_data,
+// write_image_slice, and ImageHDU.extend.
+fn normalize_input_dtype(
+    py: Python<'_>,
+    header: &[String],
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let (bitpix, _) = parse_image_hdu_shape(header)?;
+    let dtype = data.getattr("dtype")?;
+    let input_kind: String = dtype.getattr("kind")?.extract()?;
+    let input_size: u64 = dtype.getattr("itemsize")?.extract()?;
+    let (expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
+
+    // Fast path: input already in BITPIX-native dtype.
+    if input_kind == expected_kind && input_size == expected_size {
+        return Ok(data.clone().unbind());
+    }
+
+    // Allow scaled-dtype input when the HDU has the unsigned-int
+    // trick configured; reverse-transform to BITPIX dtype.
+    let (bscale, bzero) = parse_bscale_bzero(header);
+    let kind = image_scaling_kind(bitpix, bscale, bzero);
+    if kind == ScalingKind::UnsignedTrick {
+        let (scaled_kind, scaled_size) = scaled_dtype_kind_size(bitpix);
+        if input_kind == scaled_kind && input_size == scaled_size {
+            return reverse_unsigned_trick(py, data, bitpix);
+        }
+    }
+
+    let extra = if kind == ScalingKind::UnsignedTrick {
+        format!(" or scaled '{}'", scaled_image_dtype(bitpix, kind))
+    } else {
+        String::new()
+    };
+    Err(PyValueError::new_err(format!(
+        "data dtype ({}{}) does not match HDU BITPIX={} \
+         (expected '{}{}'{})",
+        input_kind, input_size, bitpix,
+        expected_kind, expected_size, extra,
+    )))
+}
+
+// Inverse of `apply_image_scaling`'s UnsignedTrick branch: scaled-
+// dtype input (u2/u4/u8/i1) → BITPIX-native dtype output (i2/i4/i8/u1).
+// Same primitives (XOR with sign bit + view-cast for bit reinterpret)
+// applied in reverse.  Caller must guarantee input dtype matches the
+// scaled dtype for this BITPIX.
+fn reverse_unsigned_trick(
+    py: Python<'_>,
+    arr: &Bound<'_, PyAny>,
+    bitpix: i32,
+) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    match bitpix {
+        8 => {
+            // i1 input → u1 stored.  View as u1 (bit reinterpret),
+            // then XOR with 0x80 in u1 space.
+            let view = arr.call_method1("view", ("u1",))?;
+            let mask = np.call_method1("uint8", (0x80u8,))?;
+            Ok(view.call_method1("__xor__", (mask,))?.unbind())
+        }
+        16 => {
+            // u2 input → i2 stored.  XOR 0x8000 in u2 space, then
+            // view as i2.
+            let mask = np.call_method1("uint16", (0x8000u16,))?;
+            let xored = arr.call_method1("__xor__", (mask,))?;
+            Ok(xored.call_method1("view", ("i2",))?.unbind())
+        }
+        32 => {
+            let mask = np.call_method1("uint32", (0x80000000u32,))?;
+            let xored = arr.call_method1("__xor__", (mask,))?;
+            Ok(xored.call_method1("view", ("i4",))?.unbind())
+        }
+        64 => {
+            let mask = np.call_method1(
+                "uint64", (0x8000000000000000u64,))?;
+            let xored = arr.call_method1("__xor__", (mask,))?;
+            Ok(xored.call_method1("view", ("i8",))?.unbind())
+        }
+        _ => unreachable!(
+            "reverse_unsigned_trick on unexpected BITPIX {}", bitpix
+        ),
+    }
+}
+
 // Apply BSCALE/BZERO scaling to an as-read numpy array.  Returns a new
 // array of the scaled dtype.  For UnsignedTrick: zero-copy view-cast
 // followed by a vectorized XOR with the sign bit (equivalent to adding
@@ -1386,21 +1500,38 @@ pub(crate) fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
     out
 }
 
-// Map a numpy short-code or long-name dtype string to a FITS BITPIX value.
-// Lives next to its inverses (bitpix_to_numpy_kind / bitpix_to_native_dtype)
-// so the supported-dtype set is maintained in one place.
-pub(crate) fn dtype_to_bitpix(dtype: &str) -> PyResult<i32> {
-    let s = dtype.trim_start_matches(|c| c == '<' || c == '>' || c == '|' || c == '=');
+// Map a numpy short-code or long-name dtype string to a FITS BITPIX
+// value plus an optional BZERO offset for the unsigned-int trick.
+// Direct-mapped dtypes (u1/i2/i4/i8/f4/f8) return None for bzero;
+// "scaled" dtypes (i1/u2/u4/u8) return the matching sign-bias so
+// `create_image_hdu` can emit the BZERO card.
+//
+// The trick lets users round-trip unsigned (or signed-byte) arrays
+// through FITS even though the on-disk BITPIX representation is the
+// opposite signedness: write u2 input → stored as i2 + BZERO=32768;
+// read back recovers the u2 dtype via apply_image_scaling.
+//
+// Lives next to its inverses (bitpix_to_numpy_kind /
+// bitpix_to_native_dtype) so the supported-dtype set stays in one
+// place.
+pub(crate) fn dtype_to_bitpix(dtype: &str) -> PyResult<(i32, Option<f64>)> {
+    let s = dtype.trim_start_matches(
+        |c| c == '<' || c == '>' || c == '|' || c == '=');
     let normalized = s.to_lowercase();
     match normalized.as_str() {
-        "u1" | "uint8" => Ok(8),
-        "i2" | "int16" => Ok(16),
-        "i4" | "int32" => Ok(32),
-        "i8" | "int64" => Ok(64),
-        "f4" | "float32" => Ok(-32),
-        "f8" | "float64" => Ok(-64),
+        "u1" | "uint8"   => Ok((8,   None)),
+        "i1" | "int8"    => Ok((8,   Some(-128.0))),
+        "i2" | "int16"   => Ok((16,  None)),
+        "u2" | "uint16"  => Ok((16,  Some(32768.0))),
+        "i4" | "int32"   => Ok((32,  None)),
+        "u4" | "uint32"  => Ok((32,  Some(2147483648.0))),
+        "i8" | "int64"   => Ok((64,  None)),
+        "u8" | "uint64"  => Ok((64,  Some(9223372036854775808.0))),
+        "f4" | "float32" => Ok((-32, None)),
+        "f8" | "float64" => Ok((-64, None)),
         _ => Err(PyValueError::new_err(format!(
-            "unsupported numpy dtype '{}'. Supported: 'u1','i2','i4','i8','f4','f8'",
+            "unsupported numpy dtype '{}'. Supported: \
+             'u1','i1','i2','u2','i4','u4','i8','u8','f4','f8'",
             dtype
         ))),
     }
