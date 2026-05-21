@@ -335,7 +335,8 @@ def test_write_wrong_column_name_rejected():
         arr = np.zeros(3, dtype=dt_arr)
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_table_hdu(dt_hdu, nrows=3)
-            with pytest.raises(ValueError, match="does not match"):
+            # The HDU's column 'id' is missing from the input dtype.
+            with pytest.raises(ValueError, match="missing field"):
                 fits[1].write(arr)
 
 
@@ -345,7 +346,9 @@ def test_write_non_ndarray_rejected():
         dt = np.dtype([("id", "i4")])
         with rustfits.FITS(fname, "w+") as fits:
             fits.create_table_hdu(dt, nrows=3)
-            with pytest.raises(ValueError, match="ndarray"):
+            # A bare Python list (no names= kwarg) is rejected because
+            # the 1e API requires names= for list/tuple input.
+            with pytest.raises(ValueError, match="names="):
                 fits[1].write([1, 2, 3])
 
 

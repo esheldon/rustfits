@@ -2219,112 +2219,324 @@ fn column_expected_shape(col: &Column) -> Vec<usize> {
     }
 }
 
-// Per-field byte-layout info returned by validate, used by both fast
-// and slow paths.  `src_offset` is the source byte offset within one
-// input row; `src_total_size` is the source per-cell byte count
-// (== col.byte_width for non-U fields; == 4 × col.byte_width for U
-// fields, since numpy U is UTF-32-LE).
-struct SrcFieldLayout {
+// Per-column source view for the strip writer.
+//
+// For structured-array input, all columns share the same `src_bytes`
+// (the array's raw buffer) and `src_row_stride` (the array's itemsize),
+// with each column's `src_offset` set to its field offset within a row.
+//
+// For dict / list+names input, each column has its OWN `src_bytes`
+// (its own ndarray's raw buffer), `src_offset` is 0, and
+// `src_row_stride == src_total_size` (the per-cell byte count).
+struct ColumnSource<'a> {
+    src_bytes: &'a [u8],
     src_offset: usize,
+    src_row_stride: usize,
     src_total_size: usize,
 }
 
-// Validate the input ndarray's structured dtype against the HDU's
-// on-disk columns and resolve per-column transforms + layout info.
-//
-// Allows U columns to expand source byte widths (4×) — those shift
-// later field offsets relative to the FITS row layout and force the
-// slow path.  Other mismatches (padding in input dtype) are rejected
-// as Phase 1e.
-//
-// Returns (transforms, per-column src layouts, layout_matches).
-// layout_matches is true iff every input field's src offset and
-// total size exactly match the FITS column's byte offset and width,
-// in which case the fast path (bulk strip memcpy + in-place
-// transforms) is safe.
-fn validate_write_layout(
-    input_dtype: &Bound<'_, PyAny>,
+// Per-column source metadata that doesn't carry the borrowed bytes,
+// so the per-input-form preparation functions can build it before the
+// final Vec<ColumnSource> is assembled.  buffer_idx indexes into a
+// per-call Vec<RawBuffer> owned by the write pymethod.
+struct ColumnSourceMeta {
+    buffer_idx: usize,
+    src_offset: usize,
+    src_row_stride: usize,
+    src_total_size: usize,
+}
+
+// Result of input preparation, common across all input forms.
+struct PreparedInput {
+    transforms: Vec<WriteTransform>,
+    metas: Vec<ColumnSourceMeta>,
+    // True iff the fast-path bulk-memcpy is safe: all sources share
+    // the same buffer, each src_offset == col.byte_offset, each
+    // src_total_size == col.byte_width, and src_row_stride == row_width.
+    layout_matches: bool,
+}
+
+// Validate one input field's shape + dtype against the HDU column and
+// return the per-cell WriteTransform.  Shared by all input forms.
+// `field_dtype` may be a subarray dtype (carrying numpy shape) for
+// structured-array input, or a synthetic per-cell dtype derived from
+// a per-column ndarray's shape for dict/list input.
+fn validate_field_for_column(
+    col: &Column,
+    field_dtype: &Bound<'_, PyAny>,
+) -> PyResult<WriteTransform> {
+    let input_shape: Vec<usize> = field_dtype.getattr("shape")?.extract()?;
+    let expected_shape = column_expected_shape(col);
+    if input_shape != expected_shape {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}' per-cell shape {:?} does not \
+             match table column expected shape {:?}",
+            col.name, input_shape, expected_shape)));
+    }
+    let base = field_dtype.getattr("base")?;
+    let input_kind: String = base.getattr("kind")?.extract()?;
+    let input_elem_size: usize = base.getattr("itemsize")?.extract()?;
+    column_transform(col, &input_kind, input_elem_size)
+}
+
+// Structured ndarray input.  Allows field-order normalization: the
+// HDU is the authoritative ordering, and the input dtype just needs
+// to contain a field for every HDU column (extras, missing, or
+// duplicates are rejected).  layout_matches is true iff (a) names
+// are in HDU order with no reordering, (b) per-field offsets and
+// widths match the FITS row layout, (c) input itemsize == row_width.
+fn prepare_structured_input(
+    data: &Bound<'_, PyAny>,
     columns: &[Column],
+    nrows: usize,
     row_width: usize,
-) -> PyResult<(Vec<WriteTransform>, Vec<SrcFieldLayout>, bool)> {
-    let names_attr = input_dtype.getattr("names")?;
+    buffers: &mut Vec<RawBuffer>,
+) -> PyResult<PreparedInput> {
+    let dtype = data.getattr("dtype")?;
+    let names_attr = dtype.getattr("names")?;
     if names_attr.is_none() {
         return Err(PyValueError::new_err(
-            "TableHDU.write: input must be a structured ndarray with \
-             named fields"));
+            "TableHDU.write: structured input must have named fields"));
     }
-    let names: Vec<String> = names_attr.extract()?;
-    if names.len() != columns.len() {
+    let input_names: Vec<String> = names_attr.extract()?;
+    if input_names.len() != columns.len() {
         return Err(PyValueError::new_err(format!(
             "TableHDU.write: input has {} columns, table has {}",
-            names.len(), columns.len())));
+            input_names.len(), columns.len())));
     }
-    let fields = input_dtype.getattr("fields")?;
-    let mut transforms = Vec::with_capacity(columns.len());
-    let mut layouts = Vec::with_capacity(columns.len());
-    let mut layout_matches = true;
-    let mut cumulative_src_offset = 0usize;
-    for (i, (input_name, col)) in names.iter().zip(columns.iter()).enumerate() {
-        if input_name != &col.name {
+    // Build a name -> input-index map for cross-check, also catches
+    // duplicate field names in the input dtype.
+    let mut name_seen = std::collections::HashSet::with_capacity(
+        input_names.len());
+    for n in &input_names {
+        if !name_seen.insert(n.clone()) {
             return Err(PyValueError::new_err(format!(
-                "TableHDU.write: column {} name '{}' does not match table \
-                 column '{}'", i, input_name, col.name)));
+                "TableHDU.write: input dtype has duplicate field name '{}'", n)));
         }
-        let entry = fields.get_item(input_name.as_str())?;
+    }
+    // Every HDU column must be present by exact name.
+    for col in columns {
+        if !name_seen.contains(&col.name) {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: input dtype is missing field '{}' \
+                 (table column)", col.name)));
+        }
+    }
+    let data_len: usize = data.len()?;
+    if data_len != nrows {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: input has {} rows but table NAXIS2={}",
+            data_len, nrows)));
+    }
+    let flags = data.getattr("flags")?;
+    let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+    if !c_contig {
+        return Err(PyValueError::new_err(
+            "TableHDU.write: input ndarray must be C-contiguous"));
+    }
+    let input_itemsize: usize = dtype.getattr("itemsize")?.extract()?;
+    let buf = RawBuffer::acquire(data)?;
+    let expected_bytes = data_len.checked_mul(input_itemsize)
+        .ok_or_else(|| PyValueError::new_err("input size overflow"))?;
+    if buf.as_slice().len() < expected_bytes {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: source buffer length {} smaller than \
+             expected {}", buf.as_slice().len(), expected_bytes)));
+    }
+    let buffer_idx = buffers.len();
+    buffers.push(buf);
+
+    // Walk HDU columns in order; for each, look up the input field
+    // (which may be at a different position in the input dtype).
+    let fields = dtype.getattr("fields")?;
+    let mut transforms = Vec::with_capacity(columns.len());
+    let mut metas = Vec::with_capacity(columns.len());
+    let mut layout_matches = input_itemsize == row_width;
+    for (i, col) in columns.iter().enumerate() {
+        let entry = fields.get_item(col.name.as_str())?;
         let entry_tup = entry.cast::<PyTuple>()?;
         let field_dtype = entry_tup.get_item(0)?;
         let src_offset: usize = entry_tup.get_item(1)?.extract()?;
         let src_total_size: usize =
             field_dtype.getattr("itemsize")?.extract()?;
-        // Reject input-dtype padding: source offsets must be tightly
-        // packed in field order.  Reordered fields are caught earlier
-        // by the name check; padding is the only remaining mismatch
-        // pattern and is Phase 1e.
-        if src_offset != cumulative_src_offset {
-            return Err(PyValueError::new_err(format!(
-                "TableHDU.write: column '{}' input field offset {} does \
-                 not match expected tight-packed offset {} — input dtype \
-                 has padding, which is Phase 1e",
-                input_name, src_offset, cumulative_src_offset)));
+        transforms.push(validate_field_for_column(col, &field_dtype)?);
+        metas.push(ColumnSourceMeta {
+            buffer_idx,
+            src_offset,
+            src_row_stride: input_itemsize,
+            src_total_size,
+        });
+        // Order check: input dtype's field at position i must be col.
+        let input_name_at_i = &input_names[i];
+        if input_name_at_i != &col.name {
+            layout_matches = false;
         }
-        cumulative_src_offset += src_total_size;
-        // Per-cell shape check.
-        let input_shape: Vec<usize> =
-            field_dtype.getattr("shape")?.extract()?;
-        let expected_shape = column_expected_shape(col);
-        if input_shape != expected_shape {
-            return Err(PyValueError::new_err(format!(
-                "TableHDU.write: column '{}' per-cell shape {:?} does not \
-                 match table column expected shape {:?}",
-                input_name, input_shape, expected_shape)));
-        }
-        // Per-element kind + size come from the BASE dtype, not the
-        // subarray dtype (whose itemsize is the total per cell).
-        let base = field_dtype.getattr("base")?;
-        let input_kind: String = base.getattr("kind")?.extract()?;
-        let input_elem_size: usize = base.getattr("itemsize")?.extract()?;
-        transforms.push(column_transform(col, &input_kind, input_elem_size)?);
-        layouts.push(SrcFieldLayout { src_offset, src_total_size });
-        if src_offset != col.byte_offset || src_total_size != col.byte_width {
+        if src_offset != col.byte_offset
+            || src_total_size != col.byte_width
+        {
             layout_matches = false;
         }
     }
-    let input_itemsize: usize = input_dtype.getattr("itemsize")?.extract()?;
-    if input_itemsize != cumulative_src_offset {
-        return Err(PyValueError::new_err(format!(
-            "TableHDU.write: input dtype itemsize {} does not match sum of \
-             field sizes {} — input dtype has trailing padding (Phase 1e)",
-            input_itemsize, cumulative_src_offset)));
+    Ok(PreparedInput { transforms, metas, layout_matches })
+}
+
+// Dict input: keys are column names, values are per-column ndarrays.
+// Each ndarray contributes its own buffer; layout_matches is always
+// false (per-column buffers cannot share a contiguous strip).
+fn prepare_dict_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyDict>,
+    columns: &[Column],
+    nrows: usize,
+    buffers: &mut Vec<RawBuffer>,
+) -> PyResult<PreparedInput> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let hdu_names: std::collections::HashSet<&str> =
+        columns.iter().map(|c| c.name.as_str()).collect();
+    // Reject extras up front.
+    for key_obj in data.keys() {
+        let key: String = key_obj.extract().map_err(|_| {
+            PyValueError::new_err("TableHDU.write: dict keys must be strings")
+        })?;
+        if !hdu_names.contains(key.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: dict has extra key '{}' not in table \
+                 columns", key)));
+        }
     }
-    if layout_matches && input_itemsize != row_width {
-        // Shouldn't happen if per-field offsets and widths all match,
-        // but a belt-and-braces guard.
-        return Err(PyValueError::new_err(format!(
-            "TableHDU.write: input dtype itemsize {} does not match table \
-             row_width {} even though all fields appear aligned",
-            input_itemsize, row_width)));
+    let mut transforms = Vec::with_capacity(columns.len());
+    let mut metas = Vec::with_capacity(columns.len());
+    for col in columns {
+        let val = data.get_item(col.name.as_str())?
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "TableHDU.write: dict is missing column '{}'", col.name)))?;
+        let (transform, src_total_size, buffer_idx) =
+            acquire_per_column_array(&val, &ndarray, col, nrows, buffers)?;
+        transforms.push(transform);
+        metas.push(ColumnSourceMeta {
+            buffer_idx,
+            src_offset: 0,
+            src_row_stride: src_total_size,
+            src_total_size,
+        });
     }
-    Ok((transforms, layouts, layout_matches))
+    Ok(PreparedInput { transforms, metas, layout_matches: false })
+}
+
+// List+names input: parallel sequences of arrays and column names.
+// Same per-column model as dict; just a different surface API.
+fn prepare_list_names_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    names_obj: &Bound<'_, PyAny>,
+    columns: &[Column],
+    nrows: usize,
+    buffers: &mut Vec<RawBuffer>,
+) -> PyResult<PreparedInput> {
+    let arrays: Vec<Bound<'_, PyAny>> = data.try_iter()?
+        .collect::<PyResult<Vec<_>>>()?;
+    let names: Vec<String> = names_obj.extract().map_err(|_| {
+        PyValueError::new_err(
+            "TableHDU.write: names= must be a sequence of strings")
+    })?;
+    if arrays.len() != names.len() {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: len(data)={} != len(names)={}",
+            arrays.len(), names.len())));
+    }
+    let hdu_names: std::collections::HashSet<&str> =
+        columns.iter().map(|c| c.name.as_str()).collect();
+    let mut name_to_arr: std::collections::HashMap<String, &Bound<'_, PyAny>> =
+        std::collections::HashMap::with_capacity(names.len());
+    for (n, a) in names.iter().zip(arrays.iter()) {
+        if !hdu_names.contains(n.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: names list has extra entry '{}' not in \
+                 table columns", n)));
+        }
+        if name_to_arr.insert(n.clone(), a).is_some() {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU.write: duplicate name '{}' in names list", n)));
+        }
+    }
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let mut transforms = Vec::with_capacity(columns.len());
+    let mut metas = Vec::with_capacity(columns.len());
+    for col in columns {
+        let arr = name_to_arr.get(col.name.as_str())
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "TableHDU.write: column '{}' is missing from names list",
+                col.name)))?;
+        let (transform, src_total_size, buffer_idx) =
+            acquire_per_column_array(arr, &ndarray, col, nrows, buffers)?;
+        transforms.push(transform);
+        metas.push(ColumnSourceMeta {
+            buffer_idx,
+            src_offset: 0,
+            src_row_stride: src_total_size,
+            src_total_size,
+        });
+    }
+    Ok(PreparedInput { transforms, metas, layout_matches: false })
+}
+
+// Per-column ndarray validation + buffer acquisition for dict/list
+// inputs.  arr.shape[0] must equal nrows; arr.shape[1:] is the
+// per-cell numpy shape and must match the column's expected shape.
+// Returns (transform, src_total_size, buffer_idx).
+fn acquire_per_column_array(
+    arr: &Bound<'_, PyAny>,
+    ndarray: &Bound<'_, PyAny>,
+    col: &Column,
+    nrows: usize,
+    buffers: &mut Vec<RawBuffer>,
+) -> PyResult<(WriteTransform, usize, usize)> {
+    if !arr.is_instance(ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}': value must be a numpy ndarray",
+            col.name)));
+    }
+    let arr_shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    if arr_shape.is_empty() || arr_shape[0] != nrows {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}': array shape {:?} does not have \
+             first axis == nrows ({})", col.name, arr_shape, nrows)));
+    }
+    let per_cell_shape: Vec<usize> = arr_shape[1..].to_vec();
+    let expected_shape = column_expected_shape(col);
+    if per_cell_shape != expected_shape {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}': per-cell shape {:?} does not \
+             match table column expected shape {:?}",
+            col.name, per_cell_shape, expected_shape)));
+    }
+    let arr_dtype = arr.getattr("dtype")?;
+    let kind: String = arr_dtype.getattr("kind")?.extract()?;
+    let elem_size: usize = arr_dtype.getattr("itemsize")?.extract()?;
+    let transform = column_transform(col, &kind, elem_size)?;
+    let cell_elements: usize =
+        per_cell_shape.iter().product::<usize>().max(1);
+    let src_total_size = elem_size * cell_elements;
+    let flags = arr.getattr("flags")?;
+    let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+    if !c_contig {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}': ndarray must be C-contiguous",
+            col.name)));
+    }
+    let buf = RawBuffer::acquire(arr)?;
+    let expected_bytes = nrows.checked_mul(src_total_size)
+        .ok_or_else(|| PyValueError::new_err("input size overflow"))?;
+    if buf.as_slice().len() < expected_bytes {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU.write: column '{}': buffer length {} smaller than \
+             expected {}", col.name, buf.as_slice().len(), expected_bytes)));
+    }
+    let buffer_idx = buffers.len();
+    buffers.push(buf);
+    Ok((transform, src_total_size, buffer_idx))
 }
 
 // Apply one cell-worth of a WriteTransform from `src` to `dst`.
@@ -2448,30 +2660,29 @@ fn apply_in_place_transform(
 // Strip-based bulk write into the table's data section.
 //
 // Two paths:
-//   - FAST: input layout exactly matches FITS row layout (no U
-//     columns, no padding, no reordering).  Per strip, one memcpy of
-//     `chunk * row_width` source bytes into the strip buffer + per-
-//     column in-place transform.
-//   - SLOW: input layout differs (currently only when U columns are
-//     present, expanding the source per-cell width to 4×).  Per strip,
-//     zero-init the buffer; per column, per row, copy `src_total_size`
-//     bytes from the source with transform applied to `col.byte_width`
-//     bytes in the destination.  Pre-zero is important so any unwritten
-//     bytes (e.g., short strings padded to full width) are null-filled.
+//   - FAST: layout_matches=true.  All ColumnSources share the same
+//     buffer and offsets/widths exactly match the FITS row layout.
+//     Per strip: one memcpy of `chunk * row_width` bytes from the
+//     shared buffer into the strip buffer, then per-column in-place
+//     transform.
+//   - SLOW: layout_matches=false.  Each ColumnSource is read
+//     independently using its own src_bytes + src_offset +
+//     src_row_stride.  Used for U columns (which break the row
+//     layout because numpy U is UTF-32-LE), for structured arrays
+//     with reordered fields, and for dict / list+names input.
+//     Strip is pre-zeroed so short strings end up null-padded.
 //
 // Peak memory ~1 MiB regardless of nrows.
 #[allow(clippy::too_many_arguments)]
 fn write_table_data(
     columns: &[Column],
     transforms: &[WriteTransform],
-    src_layouts: &[SrcFieldLayout],
+    sources: &[ColumnSource<'_>],
     layout_matches: bool,
     file: &FileHandle,
     data_offset: u64,
     nrows: usize,
     row_width: usize,
-    src_itemsize: usize,
-    src_bytes: &[u8],
     tainted: &TaintFlag,
 ) -> PyResult<()> {
     if nrows == 0 {
@@ -2496,29 +2707,33 @@ fn write_table_data(
         }
 
         if layout_matches {
-            // Fast path: bulk copy strip bytes, then per-column in-place
-            // transform.
-            let src_start = row_start * row_width;
-            strip_buf.copy_from_slice(&src_bytes[src_start..src_start + want]);
+            // Fast path: bulk copy strip bytes from the shared source
+            // buffer (all sources point to it), then per-column
+            // in-place transform.  sources[0] carries the shared
+            // src_bytes + row stride; layout_matches=true guarantees
+            // every other ColumnSource agrees.
+            let shared = &sources[0];
+            let src_start = row_start * shared.src_row_stride;
+            strip_buf.copy_from_slice(
+                &shared.src_bytes[src_start..src_start + want]);
             for (col, transform) in columns.iter().zip(transforms.iter()) {
                 apply_in_place_transform(
                     &mut strip_buf, transform, col, chunk, row_width);
             }
         } else {
-            // Slow path: pre-zero the buffer (so partial / short fields
-            // end up null-padded), then per-column per-row strided copy
-            // + transform.  Caller is expected to be infrequent (only
-            // when U columns are present today).
+            // Slow path: zero-init the strip (so partial / short
+            // fields end up null-padded), then per-column per-row
+            // strided copy + transform from each column's own source.
             for b in strip_buf.iter_mut() { *b = 0; }
-            for ((col, transform), layout) in
-                columns.iter().zip(transforms.iter()).zip(src_layouts.iter())
+            for ((col, transform), source) in
+                columns.iter().zip(transforms.iter()).zip(sources.iter())
             {
                 for r in 0..chunk {
-                    let src_off = (row_start + r) * src_itemsize
-                        + layout.src_offset;
+                    let src_off = (row_start + r) * source.src_row_stride
+                        + source.src_offset;
                     let dst_off = r * row_width + col.byte_offset;
-                    let src = &src_bytes
-                        [src_off..src_off + layout.src_total_size];
+                    let src = &source.src_bytes
+                        [src_off..src_off + source.src_total_size];
                     let dst = &mut strip_buf
                         [dst_off..dst_off + col.byte_width];
                     apply_transform_cell(transform, src, dst, &col.name, r)?;
@@ -2830,65 +3045,95 @@ impl TableHDU {
         }
     }
 
-    // Bulk-write a structured numpy ndarray into this table's data
-    // section.  MVP requires the input dtype to match the HDU's
-    // columns field-for-field (same names, same order, same per-field
-    // widths, no padding/reordering), and `len(data)` to equal NAXIS2
-    // exactly.  Per-field bytes are byteswapped from native to FITS
-    // big-endian during the strip-by-strip write.
+    // Bulk-write data into this table's data section.  Three input
+    // forms are accepted; all normalize through the same per-column
+    // strip-write kernel:
     //
-    // Future commits relax these constraints (Phase 1b: unsigned trick
-    // and bool/complex; Phase 1c: subarrays; Phase 1d: strings;
-    // Phase 1e: dict / list+names input + field-order normalization).
-    fn write(slf: PyRef<'_, Self>, py: Python<'_>,
-             data: &Bound<'_, PyAny>) -> PyResult<()> {
+    //   - Structured numpy ndarray.  Field names must match the HDU's
+    //     columns (extras, missing, or duplicates rejected); field
+    //     order may differ from HDU order (the slow path handles
+    //     reordering).  `len(data)` must equal NAXIS2.
+    //
+    //   - Dict of {name: ndarray}.  One entry per HDU column;
+    //     extras / missing rejected.  Each value is a per-column
+    //     ndarray with shape (NAXIS2,) + per-cell shape.
+    //
+    //   - List/tuple of ndarrays + `names=[...]` keyword.  Parallel
+    //     sequences; same per-column model as dict.
+    //
+    // The fast path (one bulk memcpy per strip + per-column in-place
+    // transform) is used when the input is a structured ndarray
+    // whose fields are in HDU order with no width / offset mismatches
+    // (no U columns, no padding).  All other cases run the slow path
+    // (per-column strided copy + per-cell transform).
+    #[pyo3(signature = (data, *, names=None))]
+    fn write(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         let super_ = slf.into_super();
         check_not_tainted(&super_.tainted)?;
         let cards = super_.header_snapshot()?;
-        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize;
-        let row_width = parse_keyword(&cards, "NAXIS1").unwrap_or(0).max(0) as usize;
+        let nrows =
+            parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize;
+        let row_width =
+            parse_keyword(&cards, "NAXIS1").unwrap_or(0).max(0) as usize;
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
 
-        // Reject non-ndarray input early so the user gets a useful error
-        // before any dtype introspection.
-        let np = py.import("numpy")?;
-        let ndarray = np.getattr("ndarray")?;
-        if !data.is_instance(&ndarray)? {
-            return Err(PyValueError::new_err(
-                "TableHDU.write: data must be a numpy ndarray"));
-        }
-        let input_dtype = data.getattr("dtype")?;
-        let (transforms, src_layouts, layout_matches) =
-            validate_write_layout(&input_dtype, &columns, row_width)?;
-        let data_len: usize = data.len()?;
-        if data_len != nrows {
-            return Err(PyValueError::new_err(format!(
-                "TableHDU.write: input has {} rows but table NAXIS2={}",
-                data_len, nrows)));
-        }
-        let flags = data.getattr("flags")?;
-        let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
-        if !c_contig {
-            return Err(PyValueError::new_err(
-                "TableHDU.write: input ndarray must be C-contiguous"));
-        }
-        let src_itemsize: usize =
-            input_dtype.getattr("itemsize")?.extract()?;
-        let buf = RawBuffer::acquire(data)?;
-        let src_bytes = buf.as_slice();
-        let expected_bytes = data_len.checked_mul(src_itemsize)
-            .ok_or_else(|| PyValueError::new_err(
-                "input size overflow"))?;
-        if src_bytes.len() < expected_bytes {
-            return Err(PyValueError::new_err(format!(
-                "TableHDU.write: source buffer length {} smaller than \
-                 expected {}", src_bytes.len(), expected_bytes)));
-        }
+        // Dispatch on input form, populating a per-call Vec<RawBuffer>
+        // that outlives the Vec<ColumnSource> built below.
+        let mut buffers: Vec<RawBuffer> = Vec::new();
+        let prep = if data.is_instance_of::<PyDict>() {
+            if names.is_some() {
+                return Err(PyValueError::new_err(
+                    "TableHDU.write: names= is only valid with \
+                     list/tuple data, not dict"));
+            }
+            let d = data.cast::<PyDict>()?;
+            prepare_dict_input(py, d, &columns, nrows, &mut buffers)?
+        } else if data.is_instance_of::<PyList>()
+            || data.is_instance_of::<PyTuple>()
+        {
+            let names_obj = names.ok_or_else(|| PyValueError::new_err(
+                "TableHDU.write: when data is a list/tuple, names= is \
+                 required"))?;
+            prepare_list_names_input(
+                py, data, names_obj, &columns, nrows, &mut buffers)?
+        } else {
+            if names.is_some() {
+                return Err(PyValueError::new_err(
+                    "TableHDU.write: names= is only valid with \
+                     list/tuple data, not a structured ndarray"));
+            }
+            let np = py.import("numpy")?;
+            let ndarray = np.getattr("ndarray")?;
+            if !data.is_instance(&ndarray)? {
+                return Err(PyValueError::new_err(
+                    "TableHDU.write: data must be a structured numpy \
+                     ndarray, a dict {name: ndarray}, or a list/tuple of \
+                     ndarrays with names=[...]"));
+            }
+            prepare_structured_input(
+                data, &columns, nrows, row_width, &mut buffers)?
+        };
+
+        // Build the borrow-bearing Vec<ColumnSource> from buffer indexes
+        // + metas; both live in this method's stack frame.
+        let sources: Vec<ColumnSource> = prep.metas.iter()
+            .map(|m| ColumnSource {
+                src_bytes: buffers[m.buffer_idx].as_slice(),
+                src_offset: m.src_offset,
+                src_row_stride: m.src_row_stride,
+                src_total_size: m.src_total_size,
+            })
+            .collect();
+
         write_table_data(
-            &columns, &transforms, &src_layouts, layout_matches,
-            &super_.file, data_offset, nrows, row_width, src_itemsize,
-            src_bytes, &super_.tainted,
+            &columns, &prep.transforms, &sources, prep.layout_matches,
+            &super_.file, data_offset, nrows, row_width, &super_.tainted,
         )
     }
 }
