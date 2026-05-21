@@ -34,8 +34,15 @@ else stays private to its file.
 - `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
   bitpix conversions, shape parsing.  Only exports `ImageHDU` (+ `new`)
   and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
-- `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass stub.
-- `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub.
+- `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass: parses TFORM /
+  TDIM / TSCAL / TZERO / TNULL / TUNIT / THEAP / PCOUNT, reads fixed
+  and variable-length columns, writes via `create_table_hdu` +
+  `TableHDU.write` / `__setitem__` / `append`.  Free helpers
+  `write_fixed_only` / `write_vla_aware` / `append_fixed_only` /
+  `append_vla_aware` carry the per-path I/O so the pymethods stay
+  thin dispatchers.
+- `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub
+  (read returns header only; no column read/write yet).
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
   `validate_header` + `calculate_data_size`.  Owns the per-file
   `Arc<FileLayout>` and pushes a new `Arc<HduOffsets>` into it for every
@@ -205,12 +212,13 @@ Design notes:
   `append_commentary_to_cards`.  Same disk-write-before-commit ordering
   as every other mutation path.
 
-**Forward-looking (Tier 2, deferred until table writing lands):** the
-image-only metadata keys `BUNIT`, `BSCALE`, `BZERO` are *not* protected —
-they're fine to set on an image HDU — but they're meaningless on a table
-HDU.  When `update()` is extended to copy from one HDU to another, the
-destination's HDU type needs to be consulted: if the target is a table,
-these three keys should be stripped from the source.
+**Forward-looking — cross-HDU-type copy.**  The image-only metadata
+keys `BUNIT`, `BSCALE`, `BZERO` are *not* protected — they're fine to
+set on an image HDU — but they're meaningless on a table HDU.  When
+`update()` learns to copy a header across HDU types, the destination's
+HDU type needs to be consulted: if the target is a table, these three
+keys should be stripped from the source.  Same direction in reverse
+(table → image) would strip TUNIT/TDISP/etc.
 
 ## CONTINUE-chained string values
 
@@ -363,11 +371,14 @@ the shift loop, zero-fill, header write, or image-data write all taint
 because the file layout has been mutated by then.  Pre-shift failures
 (file lock, metadata) do not taint.
 
-**Still pending — table data grow.** When `TableHDU.append` /
-heap-grow lands, it will call the same primitives with
-`after_offset = self.data_offset + self.data_size` (data_size computed
-from the header by `calculate_data_size`).  Self's offsets stay
-unchanged just like image grow.
+**Table data grow uses the same primitive.**  `TableHDU.append`
+(Phase 3 of the table-write roadmap) calls
+`shift_file_tail_and_update_offsets` with `after_offset =
+self.data_offset + current_padded` to make room for the appended
+rows.  For VLA tables (Phase 4) the padded extent also includes the
+heap (PCOUNT) and the existing heap is relocated forward to sit
+after the new main rows.  Self's offsets stay unchanged just like
+image grow.
 
 **Taint semantics in the grow path:** pre-shift failures (file lock,
 metadata, `set_len`) do NOT taint — nothing on disk has moved yet.  Any
@@ -375,67 +386,77 @@ failure inside the shift loop, the post-shift `flush`, or the subsequent
 header `write_all`/`flush` DOES taint, because the file may now be
 inconsistent.  See the `check_not_tainted` block above.
 
-## Binary table read TODO
+## Feature status: supported and missing
 
-Snapshot of what's still missing for BINTABLE reading, ordered by what
-seems most useful next.  Cross off as features land; revisit ordering
-when new use cases show up.
+Snapshot of what's implemented across (image | table) × (read | write).
+Items in **missing** are roughly ordered by likely value; cross them
+off as they land, revisit ordering when new use cases show up.
 
-**Currently supported.**  Fixed L/B/I/J/K/A/E/D/C/M/X (with TDIM
-reshape on numeric and X).  Variable-length P/Q descriptors with inner
+### Inspection accessors (shared, no I/O)
+
+Every HDU has `extname` (Optional[str]), `extver` (int; default 1 per
+FITS standard), and `has_data` (True iff NAXIS > 0 AND every NAXISn > 0
+— suitable for picking the first HDU worth reading).  `ImageHDU` adds
+`shape` (tuple, numpy axis order), `dtype` (numpy.dtype), `ndim`,
+`size` (total pixels; 0 for NAXIS=0), `bitpix` (raw FITS value),
+`unit` (BUNIT, informational), and `__len__` (== shape[0]).
+`TableHDU` adds `nrows`, `ncols`, `colnames` (tuple, case preserved),
+`units` (dict, informational), and `__len__` (== nrows).
+`AsciiTableHDU` has `nrows` and `__len__` so generic code can iterate
+any HDU type uniformly.
+
+### Image read
+
+**Supported.**  Whole-array read via `ImageHDU.read()`.  Slicing via
+`__getitem__` over arbitrary mixes of slice / int / list, including
+fancy row-list selection.  When every axis is indexed with an int the
+result is a numpy scalar of the BITPIX dtype, matching the numpy rule
+for `arr[i, j, ...]`; mixed slice + int returns an ndarray.  Internal
+strip-layout walk keeps peak RSS at ~1 MiB above the output array.
+
+**Missing.**
+- **BSCALE/BZERO/BLANK scaling** — these keys are not enforced on read;
+  files with non-trivial scaling return raw stored values.  Table side
+  already does the equivalent TSCAL/TZERO/TNULL machinery; the image
+  path needs a parallel build-out.
+- **Tile-compressed images (`ZIMAGE`)** — large, separate spec; the
+  most commonly-needed extension.  Do before any ZTABLE work.
+
+### Image write
+
+**Supported.**  `FITS.create_image_hdu(dtype, shape, *, extname,
+extver)` writes header + zero-filled data.  `ImageHDU.write(data,
+start=...)` does an explicit-start bulk write.  `__setitem__` is
+symmetric with `__getitem__`: anything readable is writable.  RHS can
+be a scalar (Python int/float, numpy scalar, or 0-d ndarray —
+broadcast across the selection) or a shape-matching ndarray with
+dtype matching BITPIX.  Stepped slices fall into per-pixel writes via
+the same strip-layout walk as the read path.  `ImageHDU.extend(new_shape)`
+grows the data section in place, shifting the file tail and bumping
+later-HDU offsets when the image is not the last HDU on disk.  Mid-
+write I/O failures taint the file (close + reopen to recover).
+
+**Missing.**
+- **BSCALE/BZERO scaling on write** — analogue of the read-side gap.
+- **Tile-compressed image writes (`ZIMAGE`)** — pair with the read
+  side; do both at once when ZIMAGE work lands.
+
+### Table read
+
+**Supported.**  Fixed L/B/I/J/K/A/E/D/C/M/X (with TDIM reshape on
+numeric and X).  Variable-length P/Q descriptors with inner
 L/B/I/J/K/A/E/D/C/M (Object dtype, one ndarray per row; A as str or
-`as_bytes` bytes).  THEAP respected.  TSCAL/TZERO scaling on default
+`as_bytes` bytes).  THEAP respected.  TSCAL/TZERO scaling on by default
 (unsigned-int trick → matching unsigned dtype, general → f8;
 `scale=False` opt-out).  TNULLn integer-sentinel masking on fixed
 B/I/J/K columns via `mask_null=True` (opt-in): returns
 `numpy.ma.MaskedArray` with per-field bool mask; compare is in
 stored-int space (pre-scaling) so it composes correctly with all
-TSCAL/TZERO paths.  VLA columns with TNULL are rejected up-front when
-`mask_null=True`.  TUNITn surfaced via `TableHDU.units` (dict mapping
-column name → unit string or None) and shown in the repr; BUNIT
-exposed at the image level via `ImageHDU.unit` and the image-info
-repr line.  Informational only — no consumer in the read/write path.
+TSCAL/TZERO paths.  TUNITn surfaced via `TableHDU.units` (informational).
 `rows=` / `columns=` subsets + `__getitem__` column-subset objects.
 Bare-int indexing `hdu[i]` returns a 0-d numpy record (np.void),
 matching `structured_arr[i]` semantics — distinct from `hdu[[i]]`
 and `hdu[i:i+1]` which still return shape-(1,) structured arrays.
-Image HDUs follow the same numpy rule for their pixel grid:
-`image_hdu[i, j, ...]` with an integer on every axis returns a
-numpy scalar of the BITPIX dtype; mixed slice + int still returns
-an ndarray.  Image write via `__setitem__` is symmetric with the
-read: anything `image_hdu[key]` reads, `image_hdu[key] = value`
-writes.  RHS is either a scalar (Python int/float, numpy scalar,
-or 0-d ndarray — broadcast across the selection) or a shape-matching
-ndarray with dtype matching BITPIX.  Stepped slices are supported
-(falls into per-pixel writes via the same strip-layout walk as the
-read path).  Mid-write I/O failures taint the file (close + reopen
-to recover).  The existing `ImageHDU.write(data, start=...)` still
-works for explicit-start writes.  Table write via `__setitem__`
-(Phase 2 of the table-write roadmap) covers single-row
-`hdu[i] = record`, slice `hdu[a:b[:s]] = arr`, and whole-column
-`hdu["col"] = arr`; mid-write I/O failures taint the file the
-same way.  `TableHDU.append(rows)` (Phase 3, alias `extend`) grows
-NAXIS2 and the data section to append new rows, shifting the file
-tail and bumping later-HDU offsets when the table is not the last
-HDU on disk.  VLA columns (Phase 4) are supported on both
-`write` and `append`: `create_table_hdu` takes a `var_dtypes={col:
-inner_dtype}` sidecar and an optional `descriptor='P'|'Q'` choice;
-heap layout is planned per write, PCOUNT is updated in the header,
-and append relocates the existing heap forward to make room for
-new main rows.  VLA `__setitem__` is deferred (cell-resize needs
-heap re-layout — see Phase 5).  Detail in the "Table write
-roadmap" section below.
-
-Inspection accessors on HDUs (no I/O, just header parse): every HDU
-has `extname` (Optional[str]), `extver` (int; default 1 per FITS
-standard), and `has_data` (True iff NAXIS > 0 AND every NAXISn > 0
-— suitable for picking the first HDU worth reading).  ImageHDU adds
-`shape` (tuple in numpy axis order), `dtype` (numpy.dtype), `ndim`,
-`size` (total pixels; 0 for NAXIS=0), `bitpix` (raw FITS value),
-and `__len__` (shape[0]).  TableHDU adds `nrows`, `ncols`, `colnames`
-(tuple, case preserved), `__len__` (== nrows).  AsciiTableHDU has
-`nrows` and `__len__` so generic code can iterate over any HDU type
-uniformly.
 
 Quirk worth knowing for the MaskedArray return: numpy.ma materializes
 an all-False structured bool mask on construction with structured
@@ -445,61 +466,84 @@ for full-table reads (structured) — even when no row was actually
 masked.  Tests assert "no element is masked" rather than identity
 against `nomask`.
 
-**Likely high-value next steps**
-
+**Missing (ordered by likely value).**
 1. **Variable-length P/Q with `repeat > 1`** — currently rejected.
    Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor
    means N descriptors per row, each pointing at its own heap cell.
    Field dtype would need to be an Object array of shape `(repeat,)`
    per row, or some other reshape — decide before coding.
-
 2. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
    a P/Q column would mean "reshape each heap cell to these dims",
-   which is useful for VLA-of-images.  Each cell still uses the
-   inner element type; the reshape is just on the ndarray after
-   the heap read.
-
+   useful for VLA-of-images.  Each cell still uses the inner element
+   type; the reshape is just on the ndarray after the heap read.
 3. **Variable-length P/QX (bit array in heap)** — rejected (inner X).
    Niche.  Heap bytes are the same MSB-packed format as fixed X;
    the heap-side unpacker would mirror `convert_x_cell`.
-
-4. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA columns
-   with TNULL set in the header are rejected when `mask_null=True`.
-   Adding support means a per-row bool ndarray for each masked VLA
-   cell (mirroring the per-row Object data ndarrays), either as a
-   parallel Object dtype mask field or as MaskedArrays for each cell.
-   Decide representation before coding.
-
+4. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
+   columns with TNULL in the header are rejected when `mask_null=
+   True`.  Adding support means a per-row bool ndarray for each
+   masked VLA cell (parallel Object dtype mask field, or
+   MaskedArrays for each cell — decide representation before coding).
 5. **`max_size`-style read for variable columns** — fitsio offers a
    mode where each variable cell becomes a fixed-size N-D array
    padded to the largest cell.  Explicitly deferred (user request);
    noted here so we don't forget.
-
-**Convenience / API surface**
-
-6. **`__setitem__` for TableHDU** — image `__setitem__` is done; the
-   table side still needs the symmetric write surface.  Sketch:
-     - `table_hdu[5] = scalar_record`        (whole-row write)
-     - `table_hdu[3:5] = [r1, r2]`           (slice / iterable write)
-     - `table_hdu[10:20] = struct_arr`       (bulk structured-array write)
-   Natural place for a future `TableHDU.write(rows=..., ...)` to
-   land — decide whether the indexing form coexists with that or
-   replaces it.
-
-7. **`TDISPn`** — display format hint.  Informational, similar
+6. **`TDISPn`** — display format hint.  Informational, similar
    shape to TUNIT but rarely used.
 
-**Probably not worth chasing yet**
+### Table write
 
-- **Compressed BINTABLE (tile-compressed tables, ZTABLE)** — large,
-  separate spec.  Image tile compression (`ZIMAGE`) is the more
-  commonly-needed sibling and isn't done either; do that first.
-- **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format, vanishingly
-  rare in new files.
+**Supported.**  `FITS.create_table_hdu(dtype, nrows=0, *, extname,
+extver, units, var_dtypes, descriptor)` maps a numpy structured
+dtype to TFORMn / TDIMn / TUNITn cards.  `var_dtypes={col:
+inner_dtype}` sidecar declares VLA columns (numpy `'O'` field +
+sidecar entry); `descriptor='P'` (default; 8-byte descriptors, 32-bit
+nelements/offset, 4 GB heap ceiling) or `'Q'` (16-byte, no practical
+ceiling).  `TableHDU.write(data)` bulk-writes the table (fixed +
+VLA columns supported); accepts structured ndarray, dict `{name:
+ndarray}`, or list/tuple of arrays with `names=[...]`.
+`TableHDU.__setitem__` covers single-row `hdu[i] = record`, slice
+`hdu[a:b[:s]] = arr` (step=1 fast path, step>1 strided), and whole-
+column `hdu["col"] = arr` (per-row direct cell writes; no read-
+modify-write since the other columns' bytes are preserved by not
+being touched).  `TableHDU.append(rows)` (alias `extend`) grows
+NAXIS2 and the data section to append new rows, shifting the file
+tail and bumping later-HDU offsets when the table is not the last
+HDU on disk.  For VLA tables, append relocates the existing heap
+forward to sit after the new main rows.  Validate-then-mutate so
+dtype errors leave the file untouched.  Mid-write I/O failures
+taint the file the same way as image writes.
+
+**Missing.**
+- **VLA `__setitem__`** — fixed `__setitem__` is implemented; VLA
+  is deferred because cell-resize forces heap re-layout (either
+  rewrite the heap, or always-append-and-orphan which bloats).
+  Revisit when an actual workload demands it.
+- **String VLAs (`PA`) on write** — read side has niche support;
+  not on the write side.  Defer until requested.
+- **Bit VLAs (`PX`) on write** — paired with the read-side gap.
+- **`X` (bit) columns on write** — numpy `bool` currently maps to
+  `L` (one byte per bool).  True `X` would need an explicit opt-in.
+- **Multi-column / fancy / `(row, col)` `__setitem__`** —
+  `hdu[[c1, c2]] = ...`, `hdu[[1, 3, 5]] = ...`, and tuple writes
+  are rejected with a clear `ValueError`.  Add when a use case
+  shows up.
+- **ASCII tables (creating, writing)** — rare in modern files.
+- **Add / remove columns from existing tables** — header rewriting
+  + byte shuffling; non-trivial.
+- **`TDISPn` on write** — informational, low priority.
+
+### Cross-cutting (read + write)
+
+- **Compressed BINTABLE (tile-compressed tables, `ZTABLE`)** — large,
+  separate spec.  `ZIMAGE` is the more commonly-needed sibling and
+  isn't done either; do that first.
+- **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format,
+  vanishingly rare in new files.
 - **Memory-mapped reads** — chunked sequential I/O already keeps peak
-  RSS at ~1 MiB above the output array, so the motivation is weak.
-- **Streaming / row-iterator API** — for tables that don't fit in RAM.
-  No user has asked yet; add when one does.
+  RSS at ~1 MiB above the output array, so motivation is weak.
+- **Streaming / row-iterator API** — for tables that don't fit in
+  RAM.  No user has asked yet; add when one does.
 
 ## Table write roadmap
 
@@ -656,48 +700,18 @@ chunked back-to-front copy would bound peak memory at strip size,
 trade for code complexity.  Add when a real workload pushes
 heap-in-RAM into pain.
 
-**Refactor debt.**  Both `write()` and `append()` pymethods now
-have a long inline VLA dispatch branch (~100 lines each).
-Bundled into a follow-up cleanup commit — same pattern as the
-post-Phase-1 `dbc7bfc` refactor that pulled
-`append_header_and_data_to_file` + `finalize_hdu` out of
-`create_image_hdu` / `create_table_hdu`.
+**Refactor.**  Done in `b0e37df`.  The inline VLA branches in
+`write()` and `append()` were extracted into the free functions
+`write_fixed_only` / `write_vla_aware` / `append_fixed_only` /
+`append_vla_aware`; both pymethods are now ~25-line dispatchers
+that branch on `any_var_column(&columns)`.  Same pattern as the
+post-Phase-1 `dbc7bfc` refactor.
 
 **Phase 5 — out of scope.**  ASCII tables (rare in modern files);
 adding / removing columns from existing tables (header rewriting
 + byte shuffling); VLA `__setitem__` (resizing a cell forces heap
 re-layout — either rewrite the heap, or always-append-and-orphan
 which bloats; revisit when an actual workload demands it).
-
-### Design decisions to settle at Phase 1 detail-design time
-
-These were sketched during planning but not formally chosen.  Worth
-re-checking before code goes in.
-
-1. **Column-spec API.**  Recommendation: numpy structured dtype
-   carries the structural part (names, dtypes, subarray shapes);
-   separate kwargs (`units=dict`, future `tnull=dict`) carry the
-   FITS-specific metadata numpy can't express.  Matches fitsio.
-
-2. **`write()` vs `__setitem__` labor split.**  Recommendation:
-   `__setitem__` is canonical (handles all the indexing); `write(arr)`
-   is sugar for `hdu[:] = arr`.  Keeps the byteswap + strip-write
-   loop in one place.  Implementation order is still 1 → 2 since
-   Phase 1 ships a usable write API before the indexing surface is
-   built.
-
-3. **`nrows=` default.**  Recommendation: 0.  `write(arr)` then sets
-   the size from the input array.  Explicit `nrows=N` for users who
-   want pre-allocated zero rows to fill via `__setitem__`.
-
-4. **Unsigned-int trick on write.**  Symmetric round-trip: when the
-   user gives `u2`/`u4`/`u8`, emit `I`/`J`/`K` + TZERO=2^(n-1).  Same
-   convention the read side already uses.
-
-5. **`X` (bit) columns on write.**  Numpy `bool` would naturally map
-   to `L` (one byte per bool, not bit-packed).  To get true `X` the
-   user has to ask explicitly somehow.  Probably defer X-write past
-   Phase 1.
 
 ## Testing conventions
 
