@@ -160,17 +160,27 @@ impl ImageHDU {
     // unsigned (or i1) dtype.  For general scaling, the result is
     // promoted to f8.  `scale=False` returns raw stored values in the
     // BITPIX native dtype.
-    #[pyo3(signature = (*, scale=true))]
+    //
+    // `mask_blank=True` (opt-in, default False) returns a
+    // numpy.ma.MaskedArray with True at pixels whose stored value
+    // matches the header's `BLANK` keyword.  Comparison is in stored
+    // (pre-scaling) space per the FITS spec.  Only valid on integer
+    // BITPIX (8/16/32/64); float BITPIX rejects up-front because the
+    // spec forbids BLANK on floating-point arrays (NaN serves that
+    // role).  When BLANK is absent from the header, returns a
+    // MaskedArray with an all-False mask for consistent return type.
+    #[pyo3(signature = (*, scale=true, mask_blank=false))]
     fn read(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         scale: bool,
+        mask_blank: bool,
     ) -> PyResult<Py<PyAny>> {
         let super_: PyRef<HDU> = slf.into_super();
         let header_cards = super_.header_snapshot()?;
         read_image_data(
             py, &header_cards, super_.offsets.data_offset(),
-            &super_.file, scale,
+            &super_.file, scale, mask_blank,
         )
     }
 
@@ -447,8 +457,18 @@ fn read_image_data(
     data_offset: u64,
     file_handle: &FileHandle,
     scale: bool,
+    mask_blank: bool,
 ) -> PyResult<Py<PyAny>> {
     let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    if mask_blank && bitpix < 0 {
+        return Err(PyValueError::new_err(format!(
+            "mask_blank=True is not valid on float BITPIX ({}); the \
+             FITS standard forbids BLANK on floating-point arrays \
+             (NaN serves that role).  Use mask_blank=False, or \
+             post-process with numpy.isnan.",
+            bitpix
+        )));
+    }
     let bpp = (bitpix.abs() / 8) as u64;
     let total_pixels: u64 = hdu_shape.iter().product();
     let total_bytes = (total_pixels * bpp) as usize;
@@ -481,13 +501,61 @@ fn read_image_data(
         }
     }
 
-    let arr_unbound = arr.unbind();
-    if !scale {
-        return Ok(arr_unbound);
+    // Compute mask in stored (pre-scaling) space before applying any
+    // scaling.  Per the FITS spec, BLANK is the raw on-disk sentinel.
+    let mask_opt = if mask_blank {
+        compute_blank_mask(header, &arr)?
+    } else {
+        None
+    };
+
+    let arr_unbound = if scale {
+        let (bscale, bzero) = parse_bscale_bzero(header);
+        let kind = image_scaling_kind(bitpix, bscale, bzero);
+        apply_image_scaling(py, arr.unbind(), bitpix, kind, bscale, bzero)?
+    } else {
+        arr.unbind()
+    };
+
+    if mask_blank {
+        wrap_in_masked_array(py, arr_unbound, mask_opt)
+    } else {
+        Ok(arr_unbound)
     }
-    let (bscale, bzero) = parse_bscale_bzero(header);
-    let kind = image_scaling_kind(bitpix, bscale, bzero);
-    apply_image_scaling(py, arr_unbound, bitpix, kind, bscale, bzero)
+}
+
+// Compute a per-pixel bool mask of `arr == BLANK`.  Returns None when
+// the BLANK keyword is absent (caller wraps the data with nomask for
+// consistent return type without an unused mask allocation).
+fn compute_blank_mask(
+    header: &[String],
+    arr: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(blank) = parse_keyword(header, "BLANK") else {
+        return Ok(None);
+    };
+    // arr == blank: numpy broadcasts the Python int against arr's
+    // dtype.  If `blank` is out of range for the dtype, no element
+    // matches and the result is all-False — harmless.
+    let mask = arr.call_method1("__eq__", (blank,))?;
+    Ok(Some(mask.unbind()))
+}
+
+// Wrap a plain ndarray in numpy.ma.MaskedArray.  None mask → nomask
+// (no allocation overhead, but the return type stays MaskedArray for
+// consistency).  Mirrors `wrap_masked` in hdu_table.rs.
+fn wrap_in_masked_array(
+    py: Python<'_>,
+    data: Py<PyAny>,
+    mask: Option<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let ma = py.import("numpy")?.getattr("ma")?;
+    let mask_obj = match mask {
+        Some(m) => m.into_bound(py),
+        None => ma.getattr("nomask")?,
+    };
+    Ok(ma.call_method1(
+        "MaskedArray", (data.into_bound(py), mask_obj))?.unbind())
 }
 
 // ===== Slicing for image reads =====

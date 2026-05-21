@@ -418,14 +418,17 @@ False)` opt-out): unsigned-int trick on BITPIX 16/32/64 with
 BZERO=2^(n-1) returns the matching `u2`/`u4`/`u8` dtype; BITPIX=8 with
 BZERO=-128 returns `i1`; anything else promotes to `f8` via
 `physical = stored * BSCALE + BZERO`.  `__getitem__` always scales
-(no opt-out, matches table convention).
+(no opt-out, matches table convention).  BLANK masking via
+`ImageHDU.read(mask_blank=True)` (opt-in, integer BITPIX only): returns
+a `numpy.ma.MaskedArray` with True at pixels whose stored value matches
+the header's `BLANK`; comparison happens in stored (pre-scaling) space
+per the FITS spec, so it composes correctly with the unsigned-int
+trick and general scaling.  When `BLANK` is absent the return is a
+MaskedArray with `nomask` for consistent return type.  Float BITPIX +
+`mask_blank=True` is rejected up-front because the spec forbids BLANK
+on floating-point arrays.
 
 **Missing.**
-- **BLANK masking** — image-side analogue of table TNULL.  Files with
-  `BLANK` set on integer images currently return the raw sentinel value
-  in the output; an opt-in `mask_blank=True` would return a
-  `numpy.ma.MaskedArray` instead.  Same shape as the table-side
-  `mask_null=True` flag.
 - **Tile-compressed images (`ZIMAGE`)** — large, separate spec; the
   most commonly-needed extension.  Do before any ZTABLE work.
 
