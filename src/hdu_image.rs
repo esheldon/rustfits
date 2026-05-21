@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::common::{
-    byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
+    byteswap_in_place, lock_file, parse_keyword, parse_keyword_float,
+    parse_string_keyword,
     shift_file_tail_and_update_offsets, zero_fill_range,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
@@ -153,10 +154,24 @@ impl ImageHDU {
         write_image_data(&header_cards, super_.offsets.data_offset(), &super_.file, data, start)
     }
 
-    fn read(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    // `scale=True` (default) applies BSCALE/BZERO on read.  For files
+    // with the unsigned-int trick (BITPIX=16/32/64, BZERO=2^(n-1), or
+    // BITPIX=8, BZERO=-128), the result is returned in the matching
+    // unsigned (or i1) dtype.  For general scaling, the result is
+    // promoted to f8.  `scale=False` returns raw stored values in the
+    // BITPIX native dtype.
+    #[pyo3(signature = (*, scale=true))]
+    fn read(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        scale: bool,
+    ) -> PyResult<Py<PyAny>> {
         let super_: PyRef<HDU> = slf.into_super();
         let header_cards = super_.header_snapshot()?;
-        read_image_data(py, &header_cards, super_.offsets.data_offset(), &super_.file)
+        read_image_data(
+            py, &header_cards, super_.offsets.data_offset(),
+            &super_.file, scale,
+        )
     }
 
     // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to
@@ -376,9 +391,11 @@ impl ImageHDU {
         let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
         let slices = normalize_slice_key(key, &hdu_shape)?;
         let all_int = slices.iter().all(|s| s.is_int);
+        // Always scale on __getitem__ — matches the table-side
+        // convention.  Use ImageHDU.read(scale=False) to bypass.
         let arr_py = read_image_slice(
             py, &header_cards, super_.offsets.data_offset(),
-            &super_.file, &slices,
+            &super_.file, &slices, true,
         )?;
         if all_int {
             // arr[()] indexes a 0-d ndarray to extract its single
@@ -429,6 +446,7 @@ fn read_image_data(
     header: &[String],
     data_offset: u64,
     file_handle: &FileHandle,
+    scale: bool,
 ) -> PyResult<Py<PyAny>> {
     let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
     let bpp = (bitpix.abs() / 8) as u64;
@@ -463,7 +481,13 @@ fn read_image_data(
         }
     }
 
-    Ok(arr.unbind())
+    let arr_unbound = arr.unbind();
+    if !scale {
+        return Ok(arr_unbound);
+    }
+    let (bscale, bzero) = parse_bscale_bzero(header);
+    let kind = image_scaling_kind(bitpix, bscale, bzero);
+    apply_image_scaling(py, arr_unbound, bitpix, kind, bscale, bzero)
 }
 
 // ===== Slicing for image reads =====
@@ -591,6 +615,7 @@ fn read_image_slice(
     data_offset: u64,
     file_handle: &FileHandle,
     slices: &[AxisSlice],
+    scale: bool,
 ) -> PyResult<Py<PyAny>> {
     let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
     let naxis = hdu_shape.len();
@@ -673,7 +698,13 @@ fn read_image_slice(
     }
     drop(buffer);
 
-    Ok(arr.unbind())
+    let arr_unbound = arr.unbind();
+    if !scale {
+        return Ok(arr_unbound);
+    }
+    let (bscale, bzero) = parse_bscale_bzero(header);
+    let kind = image_scaling_kind(bitpix, bscale, bzero);
+    apply_image_scaling(py, arr_unbound, bitpix, kind, bscale, bzero)
 }
 
 fn write_image_data(
@@ -1053,6 +1084,133 @@ fn bitpix_to_native_dtype(bitpix: i32) -> PyResult<&'static str> {
         -32 => Ok("f4"),
         -64 => Ok("f8"),
         _   => Err(PyValueError::new_err(format!("unsupported BITPIX {}", bitpix))),
+    }
+}
+
+// ===== BSCALE / BZERO scaling =====
+
+// Classification of how to apply BSCALE/BZERO on read.  Pre-computed
+// once at read entry; mirrors the table-side ScalingKind enum in
+// hdu_table.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalingKind {
+    // BSCALE == 1 AND BZERO == 0 (or scale=False) — return stored
+    // values in the BITPIX native dtype.
+    None,
+    // "Unsigned-int trick": BSCALE=1 plus BZERO equal to the type's
+    // sign-bias (2^15 for BITPIX=16, 2^31 for BITPIX=32, 2^63 for
+    // BITPIX=64, or -128 for BITPIX=8 → signed bytes).  Output
+    // preserves integer semantics with no precision loss.
+    UnsignedTrick,
+    // Anything else: physical = BSCALE * stored + BZERO computed in
+    // f64, output as f8.  i64 inputs may lose precision (53-bit
+    // mantissa) — unavoidable.
+    General,
+}
+
+fn parse_bscale_bzero(header: &[String]) -> (f64, f64) {
+    let bscale = parse_keyword_float(header, "BSCALE").unwrap_or(1.0);
+    let bzero = parse_keyword_float(header, "BZERO").unwrap_or(0.0);
+    (bscale, bzero)
+}
+
+fn image_scaling_kind(bitpix: i32, bscale: f64, bzero: f64) -> ScalingKind {
+    if bscale == 1.0 && bzero == 0.0 {
+        return ScalingKind::None;
+    }
+    if bscale == 1.0 {
+        let trick = matches!(
+            (bitpix, bzero),
+            (8, b)  if b == -128.0
+        ) || matches!(
+            (bitpix, bzero),
+            (16, b) if b == 32768.0
+        ) || matches!(
+            (bitpix, bzero),
+            (32, b) if b == 2147483648.0
+        ) || matches!(
+            (bitpix, bzero),
+            (64, b) if b == 9223372036854775808.0
+        );
+        if trick {
+            return ScalingKind::UnsignedTrick;
+        }
+    }
+    ScalingKind::General
+}
+
+// numpy dtype string the array reads into after applying scaling.
+// Only valid when kind != None.
+fn scaled_image_dtype(bitpix: i32, kind: ScalingKind) -> &'static str {
+    match kind {
+        ScalingKind::UnsignedTrick => match bitpix {
+            8  => "i1",
+            16 => "u2",
+            32 => "u4",
+            64 => "u8",
+            _ => unreachable!(
+                "unsigned-trick scaling on float BITPIX {}", bitpix
+            ),
+        },
+        ScalingKind::General => "f8",
+        ScalingKind::None => unreachable!("scaled_image_dtype called with None"),
+    }
+}
+
+// Apply BSCALE/BZERO scaling to an as-read numpy array.  Returns a new
+// array of the scaled dtype.  For UnsignedTrick: zero-copy view-cast
+// followed by a vectorized XOR with the sign bit (equivalent to adding
+// 2^(n-1) modulo 2^n in two's complement).  For General: promote to f8,
+// multiply by BSCALE, add BZERO — all in numpy's vectorized loops.
+fn apply_image_scaling(
+    py: Python<'_>,
+    arr: Py<PyAny>,
+    bitpix: i32,
+    kind: ScalingKind,
+    bscale: f64,
+    bzero: f64,
+) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    let arr_b = arr.bind(py);
+    match kind {
+        ScalingKind::None => Ok(arr),
+        ScalingKind::UnsignedTrick => {
+            let scaled_dtype = scaled_image_dtype(bitpix, kind);
+            match bitpix {
+                8 => {
+                    // u1 → i1: XOR in u1 space, view as i1.
+                    let mask = np.call_method1("uint8", (0x80u8,))?;
+                    let xored = arr_b.call_method1("__xor__", (mask,))?;
+                    Ok(xored.call_method1("view", ("i1",))?.unbind())
+                }
+                16 => {
+                    let view = arr_b.call_method1("view", (scaled_dtype,))?;
+                    let mask = np.call_method1("uint16", (0x8000u16,))?;
+                    Ok(view.call_method1("__xor__", (mask,))?.unbind())
+                }
+                32 => {
+                    let view = arr_b.call_method1("view", (scaled_dtype,))?;
+                    let mask = np.call_method1("uint32", (0x80000000u32,))?;
+                    Ok(view.call_method1("__xor__", (mask,))?.unbind())
+                }
+                64 => {
+                    let view = arr_b.call_method1("view", (scaled_dtype,))?;
+                    let mask = np.call_method1(
+                        "uint64", (0x8000000000000000u64,))?;
+                    Ok(view.call_method1("__xor__", (mask,))?.unbind())
+                }
+                _ => unreachable!(
+                    "unsigned-trick scaling on unexpected BITPIX {}",
+                    bitpix
+                ),
+            }
+        }
+        ScalingKind::General => {
+            // physical = stored * bscale + bzero, in f8.
+            let promoted = arr_b.call_method1("astype", ("f8",))?;
+            let scaled = promoted.call_method1("__mul__", (bscale,))?;
+            Ok(scaled.call_method1("__add__", (bzero,))?.unbind())
+        }
     }
 }
 

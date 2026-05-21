@@ -410,15 +410,22 @@ any HDU type uniformly.
 **Supported.**  Whole-array read via `ImageHDU.read()`.  Slicing via
 `__getitem__` over arbitrary mixes of slice / int / list, including
 fancy row-list selection.  When every axis is indexed with an int the
-result is a numpy scalar of the BITPIX dtype, matching the numpy rule
-for `arr[i, j, ...]`; mixed slice + int returns an ndarray.  Internal
-strip-layout walk keeps peak RSS at ~1 MiB above the output array.
+result is a numpy scalar of the *scaled* BITPIX dtype, matching the
+numpy rule for `arr[i, j, ...]`; mixed slice + int returns an ndarray.
+Internal strip-layout walk keeps peak RSS at ~1 MiB above the output
+array.  BSCALE/BZERO applied on by default (`ImageHDU.read(scale=
+False)` opt-out): unsigned-int trick on BITPIX 16/32/64 with
+BZERO=2^(n-1) returns the matching `u2`/`u4`/`u8` dtype; BITPIX=8 with
+BZERO=-128 returns `i1`; anything else promotes to `f8` via
+`physical = stored * BSCALE + BZERO`.  `__getitem__` always scales
+(no opt-out, matches table convention).
 
 **Missing.**
-- **BSCALE/BZERO/BLANK scaling** — these keys are not enforced on read;
-  files with non-trivial scaling return raw stored values.  Table side
-  already does the equivalent TSCAL/TZERO/TNULL machinery; the image
-  path needs a parallel build-out.
+- **BLANK masking** — image-side analogue of table TNULL.  Files with
+  `BLANK` set on integer images currently return the raw sentinel value
+  in the output; an opt-in `mask_blank=True` would return a
+  `numpy.ma.MaskedArray` instead.  Same shape as the table-side
+  `mask_null=True` flag.
 - **Tile-compressed images (`ZIMAGE`)** — large, separate spec; the
   most commonly-needed extension.  Do before any ZTABLE work.
 
@@ -437,7 +444,11 @@ later-HDU offsets when the image is not the last HDU on disk.  Mid-
 write I/O failures taint the file (close + reopen to recover).
 
 **Missing.**
-- **BSCALE/BZERO scaling on write** — analogue of the read-side gap.
+- **BSCALE/BZERO scaling on write** — the read side does scaling, but
+  the write side stores values as-given.  Symmetric round-trip would
+  need to emit `BITPIX=signed-int + BZERO=2^(n-1)` when the user gives
+  an unsigned-int dtype, and reverse-transform float input for HDUs
+  with non-trivial BSCALE/BZERO already set.
 - **Tile-compressed image writes (`ZIMAGE`)** — pair with the read
   side; do both at once when ZIMAGE work lands.
 
