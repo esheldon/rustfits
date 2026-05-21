@@ -238,13 +238,7 @@ def test_scaled_compressed_hdu():
 # -------------------- NotImplementedError stubs --------------------
 
 
-def test_getitem_raises_not_implemented():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname, _ = _write_rice(tmpdir, (4, 4), "i4")
-        with rustfits.FITS(fname, "r") as fits:
-            hdu = fits[1]
-            with pytest.raises(NotImplementedError, match="Phase 3"):
-                hdu[0:2, 0:2]
+# __getitem__ shipped in Phase 3 — see test_compressed_image_phase3_slice.py.
 
 
 def test_write_raises_not_implemented():

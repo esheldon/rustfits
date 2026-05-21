@@ -565,11 +565,11 @@ fn wrap_in_masked_array(
 // ===== Slicing for image reads =====
 
 #[derive(Debug, Clone)]
-struct AxisSlice {
-    start: u64,
-    step: u64,
-    count: u64,
-    is_int: bool,
+pub(crate) struct AxisSlice {
+    pub(crate) start: u64,
+    pub(crate) step: u64,
+    pub(crate) count: u64,
+    pub(crate) is_int: bool,
 }
 
 fn full_axis_slice(dim: u64) -> AxisSlice {
@@ -609,7 +609,7 @@ fn parse_axis_indexer(item: &Bound<'_, PyAny>, dim: u64) -> PyResult<AxisSlice> 
     }
 }
 
-fn normalize_slice_key(
+pub(crate) fn normalize_slice_key(
     key: &Bound<'_, PyAny>,
     hdu_shape: &[u64],
 ) -> PyResult<Vec<AxisSlice>> {

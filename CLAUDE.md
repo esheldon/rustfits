@@ -834,15 +834,30 @@ Phase 2 follow-ups (not blocking):
   suite in test_repr.py doesn't include compressed images
   yet.  Add alongside the ImageHDU/TableHDU cases.
 
-**Phase 3 — Slicing + LRU cache.**  `__getitem__` walking only
-the tiles that overlap the slice.  Per-HDU LRU cache (lru
-crate, bytes-bound) backing `tile_cache_size`.  `read()`
-bypasses the cache by default (whole-image one-shot has no
-locality benefit); `cache=True` opt-in.  **Remove the
-`#[allow(unused_variables)]` on `__getitem__` in
-hdu_image_compressed.rs** — Phase 2 set it because the method
-body just raises NotImplementedError; Phase 3 replaces that
-body with the real slice implementation that consumes `key`.
+**Phase 3 — Slicing + LRU cache.**  Done.  `__getitem__` walks
+only the tiles overlapping the slice (per-axis `axis_overlap`
+helper computes which slice indices land in each tile).  Same
+slice surface as `ImageHDU`: slice / int / ellipsis per axis,
+stepped slices, mixed int+slice, all-int → numpy scalar.
+
+Bytes-bound LRU cache via the `lru` crate, keyed by flat tile
+index.  Values are full-tile bytes already cast to the target
+(stored) dtype in numpy C-order, so cache hits skip both
+decode and dtype conversion.  Single tuning knob:
+`set_tile_cache_size(bytes)` — 0 disables, default 32 MiB.
+`tile_cache_used` reports current bytes; `clear_tile_cache()`
+drops all entries (keeps the size setting).
+
+`read()` and `__getitem__` both go through the same cache —
+no per-call `cache=` kwarg.  Cache-on-by-default for `read()`
+warms tiles for any follow-up slicing on the same handle; the
+overhead is <1% wall time and ≤ tile_cache_size in memory.
+
+Concurrency: the inner mutex is held only briefly for `get`
+and `put` (Arc clone-out, then drop the lock).  File I/O for
+a missed tile happens under the file lock per tile, but decode
+runs without the file lock — multi-threaded callers don't
+serialize through long decode runs.
 
 **Phase 4 — GZIP_1 / GZIP_2.**  `flate2` crate.  GZIP_2 adds a
 byte-shuffle preprocessor.  Folded into Phase 4:
