@@ -2680,7 +2680,7 @@ fn write_table_data(
     sources: &[ColumnSource<'_>],
     layout_matches: bool,
     file: &FileHandle,
-    data_offset: u64,
+    start_offset: u64,
     nrows: usize,
     row_width: usize,
     tainted: &TaintFlag,
@@ -2695,7 +2695,7 @@ fn write_table_data(
     let mut guard = lock_file(file)?;
     let f = guard.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-    f.seek(SeekFrom::Start(data_offset))
+    f.seek(SeekFrom::Start(start_offset))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
     let mut row_start = 0usize;
@@ -2754,6 +2754,355 @@ fn write_table_data(
             "flush error during table write: {}", e)));
     }
     Ok(())
+}
+
+// Per-row write for strided slice assignment.  Each row is built from
+// the per-strip machinery (fast-path bulk memcpy + in-place transform
+// when layout matches, otherwise zero-pad + per-column strided copy)
+// then written at a custom file offset.  No read-modify-write: every
+// column is being overwritten so the prior on-disk bytes are discarded.
+#[allow(clippy::too_many_arguments)]
+fn write_table_strided(
+    columns: &[Column],
+    transforms: &[WriteTransform],
+    sources: &[ColumnSource<'_>],
+    layout_matches: bool,
+    file: &FileHandle,
+    data_offset: u64,
+    row_indices: &[i64],
+    row_width: usize,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if row_indices.is_empty() {
+        return Ok(());
+    }
+    let mut row_buf: Vec<u8> = vec![0u8; row_width];
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+    for (input_row, &disk_row) in row_indices.iter().enumerate() {
+        if layout_matches {
+            let shared = &sources[0];
+            let src_start = input_row * shared.src_row_stride;
+            row_buf.copy_from_slice(
+                &shared.src_bytes[src_start..src_start + row_width]);
+            for (col, transform) in columns.iter().zip(transforms.iter()) {
+                apply_in_place_transform(
+                    &mut row_buf, transform, col, 1, row_width);
+            }
+        } else {
+            for b in row_buf.iter_mut() { *b = 0; }
+            for ((col, transform), source) in
+                columns.iter().zip(transforms.iter()).zip(sources.iter())
+            {
+                let src_off = input_row * source.src_row_stride
+                    + source.src_offset;
+                let src = &source.src_bytes
+                    [src_off..src_off + source.src_total_size];
+                let dst = &mut row_buf
+                    [col.byte_offset..col.byte_offset + col.byte_width];
+                apply_transform_cell(transform, src, dst, &col.name, input_row)?;
+            }
+        }
+        let file_off = data_offset
+            + (disk_row as u64) * row_width as u64;
+        f.seek(SeekFrom::Start(file_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&row_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during strided row write: {}", e)));
+        }
+    }
+    if let Err(e) = f.flush() {
+        tainted.store(true, Ordering::Release);
+        return Err(PyIOError::new_err(format!(
+            "flush error during strided row write: {}", e)));
+    }
+    Ok(())
+}
+
+// Whole-column write: per-row seek + write of just this column's
+// byte_width bytes.  No read-modify-write — the other columns' bytes
+// in each row are preserved by virtue of never being touched.  Cost
+// is O(nrows) seek+write syscalls of byte_width each; this dominates
+// over the alternative strip RMW (which would read/write ~2× the
+// full table) whenever byte_width << row_width, which is the common
+// case for "fix one column" assignments.
+#[allow(clippy::too_many_arguments)]
+fn write_table_one_column(
+    col: &Column,
+    transform: &WriteTransform,
+    source: &ColumnSource<'_>,
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if nrows == 0 {
+        return Ok(());
+    }
+    let mut cell_buf: Vec<u8> = vec![0u8; col.byte_width];
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+
+    for r in 0..nrows {
+        for b in cell_buf.iter_mut() { *b = 0; }
+        let src_off = r * source.src_row_stride + source.src_offset;
+        let src = &source.src_bytes
+            [src_off..src_off + source.src_total_size];
+        apply_transform_cell(transform, src, &mut cell_buf, &col.name, r)?;
+        let file_off = data_offset
+            + (r * row_width + col.byte_offset) as u64;
+        f.seek(SeekFrom::Start(file_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&cell_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during column write: {}", e)));
+        }
+    }
+    if let Err(e) = f.flush() {
+        tainted.store(true, Ordering::Release);
+        return Err(PyIOError::new_err(format!(
+            "flush error during column write: {}", e)));
+    }
+    Ok(())
+}
+
+// Normalize a possibly-negative row index against nrows; reject
+// out-of-range.  Mirrors numpy/structured-array indexing semantics.
+fn normalize_row_index(i: i64, nrows: usize) -> PyResult<usize> {
+    let n = nrows as i64;
+    let r = if i < 0 { i + n } else { i };
+    if r < 0 || r >= n {
+        return Err(PyIndexError::new_err(format!(
+            "row index {} out of bounds for {} rows", i, nrows)));
+    }
+    Ok(r as usize)
+}
+
+// Locate a column by name, case-insensitively (matches read-side
+// lookup conventions).
+fn find_column_by_name<'a>(
+    columns: &'a [Column],
+    name: &str,
+) -> PyResult<&'a Column> {
+    let name_u = name.to_uppercase();
+    for c in columns.iter() {
+        if c.name.to_uppercase() == name_u {
+            return Ok(c);
+        }
+    }
+    Err(PyValueError::new_err(format!(
+        "TableHDU[name] = value: no column named '{}'", name)))
+}
+
+// Coerce a single-row value into a length-1 structured ndarray that
+// prepare_structured_input can consume.  Accepts numpy.void (0-d
+// structured scalar) or a structured ndarray with shape `()` or `(1,)`.
+// Everything else (tuple, dict, plain ndarray, etc.) is rejected with
+// a clear message — those forms can be added later if requested.
+fn coerce_to_len1_record<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let void = np.getattr("void")?;
+    if !value.is_instance(&ndarray)? && !value.is_instance(&void)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[i] = value: value must be a structured numpy record \
+             (numpy.void) or a structured ndarray with one row"));
+    }
+    let arr = np.call_method1("asarray", (value,))?;
+    let names = arr.getattr("dtype")?.getattr("names")?;
+    if names.is_none() {
+        return Err(PyValueError::new_err(
+            "TableHDU[i] = value: value's dtype must be a structured \
+             dtype with named fields"));
+    }
+    let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    if shape.is_empty() {
+        arr.call_method1("reshape", ((1usize,),))
+    } else if shape == [1usize] {
+        Ok(arr)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "TableHDU[i] = value: expected scalar record or shape-(1,) \
+             ndarray, got shape {:?}", shape)))
+    }
+}
+
+// Build a Vec<ColumnSource> by walking PreparedInput.metas and the
+// per-call Vec<RawBuffer>.  Same pattern used by the bulk write entry
+// point; factored out so the setitem helpers share it.
+fn build_sources<'a>(
+    metas: &[ColumnSourceMeta],
+    buffers: &'a [RawBuffer],
+) -> Vec<ColumnSource<'a>> {
+    metas.iter()
+        .map(|m| ColumnSource {
+            src_bytes: buffers[m.buffer_idx].as_slice(),
+            src_offset: m.src_offset,
+            src_row_stride: m.src_row_stride,
+            src_total_size: m.src_total_size,
+        })
+        .collect()
+}
+
+// hdu[i] = record: overwrite a single row.  The value is coerced into
+// a length-1 structured ndarray and validated against the HDU columns
+// the same way bulk write validates; the write then targets the byte
+// range [data_offset + i*row_width, +row_width).
+#[allow(clippy::too_many_arguments)]
+fn setitem_single_row(
+    py: Python<'_>,
+    columns: &[Column],
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    i: i64,
+    value: &Bound<'_, PyAny>,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    let r = normalize_row_index(i, nrows)?;
+    let arr = coerce_to_len1_record(py, value)?;
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let prep = prepare_structured_input(
+        &arr, columns, 1, row_width, &mut buffers)?;
+    let sources = build_sources(&prep.metas, &buffers);
+    let start_offset = data_offset + (r as u64) * row_width as u64;
+    write_table_data(
+        columns, &prep.transforms, &sources, prep.layout_matches,
+        file, start_offset, 1, row_width, tainted)
+}
+
+// hdu[a:b[:s]] = arr: overwrite a range of rows.  Step-1 slices fall
+// through to write_table_data with the strip-write fast path; non-unit
+// steps go through write_table_strided (per-row seek + write).  Length
+// validation is delegated to prepare_structured_input.
+#[allow(clippy::too_many_arguments)]
+fn setitem_row_slice(
+    py: Python<'_>,
+    columns: &[Column],
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    slice_py: &Bound<'_, PySlice>,
+    value: &Bound<'_, PyAny>,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    let indices = slice_py.indices(nrows as isize)?;
+    if indices.step <= 0 {
+        return Err(PyValueError::new_err(
+            "TableHDU[slice] = value: negative or zero step is not supported"));
+    }
+    let count = indices.slicelength as usize;
+    let start = indices.start as i64;
+    let step = indices.step as i64;
+
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[slice] = value: value must be a structured numpy \
+             ndarray with one element per selected row"));
+    }
+    if count == 0 {
+        let v_len: usize = value.len().unwrap_or(0);
+        if v_len != 0 {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[slice] = value: slice selects 0 rows but value \
+                 has length {}", v_len)));
+        }
+        return Ok(());
+    }
+
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let prep = prepare_structured_input(
+        value, columns, count, row_width, &mut buffers)?;
+    let sources = build_sources(&prep.metas, &buffers);
+
+    if step == 1 {
+        let start_offset = data_offset
+            + (start as u64) * row_width as u64;
+        write_table_data(
+            columns, &prep.transforms, &sources, prep.layout_matches,
+            file, start_offset, count, row_width, tainted)
+    } else {
+        let row_indices: Vec<i64> = (0..count as i64)
+            .map(|r| start + r * step)
+            .collect();
+        write_table_strided(
+            columns, &prep.transforms, &sources, prep.layout_matches,
+            file, data_offset, &row_indices, row_width, tainted)
+    }
+}
+
+// hdu["col"] = arr: overwrite a single column across all rows.  The
+// per-column ndarray is validated the same way dict/list+names input
+// validates one column, then handed to write_table_one_column.
+#[allow(clippy::too_many_arguments)]
+fn setitem_single_column(
+    py: Python<'_>,
+    columns: &[Column],
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    name: &str,
+    value: &Bound<'_, PyAny>,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    let col = find_column_by_name(columns, name)?;
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let (transform, src_total_size, buffer_idx) =
+        acquire_per_column_array(value, &ndarray, col, nrows, &mut buffers)?;
+    let source = ColumnSource {
+        src_bytes: buffers[buffer_idx].as_slice(),
+        src_offset: 0,
+        src_row_stride: src_total_size,
+        src_total_size,
+    };
+    write_table_one_column(
+        col, &transform, &source, file, data_offset, nrows, row_width, tainted)
+}
+
+// What kind of selection the user passed to TableHDU.__setitem__.
+// Scope is intentionally narrower than __getitem__'s TableKey:
+// multi-column subset writes, fancy row-list writes, and (row, col)
+// tuple writes are all rejected with a clear message until a use case
+// for them shows up.
+enum SetItemKey {
+    SingleRow(i64),
+    RowSlice,
+    SingleColumn(String),
+}
+
+fn classify_setitem_key(key: &Bound<'_, PyAny>) -> PyResult<SetItemKey> {
+    if key.is_instance_of::<PySlice>() {
+        return Ok(SetItemKey::RowSlice);
+    }
+    if let Some(name) = try_extract_column_name(key)? {
+        return Ok(SetItemKey::SingleColumn(name));
+    }
+    if !key.is_instance_of::<PyBool>() {
+        if let Ok(idx) = key.extract::<i64>() {
+            return Ok(SetItemKey::SingleRow(idx));
+        }
+    }
+    Err(PyValueError::new_err(
+        "TableHDU[key] = value: key must be an int (single row), a slice \
+         (range of rows), or a str/bytes column name; other forms are \
+         not yet supported"))
 }
 
 #[pyclass(extends = HDU)]
@@ -3135,6 +3484,54 @@ impl TableHDU {
             &columns, &prep.transforms, &sources, prep.layout_matches,
             &super_.file, data_offset, nrows, row_width, &super_.tainted,
         )
+    }
+
+    // hdu[key] = value dispatches based on what `key` looks like:
+    //
+    //   bare int (not bool) → single-row write at row index `key`
+    //     (negative supported); `value` must be a numpy.void record
+    //     or a length-1 structured ndarray.
+    //   slice → range-of-rows write; `value` must be a structured
+    //     ndarray of length equal to the slicelength.  step=1 uses
+    //     the bulk-write fast path; step>1 does per-row writes.
+    //     step<=0 is rejected.
+    //   single str/bytes/np.str_/np.bytes_ → whole-column write
+    //     across all rows; `value` must be an ndarray of shape
+    //     (nrows,) + per-cell shape, matching what __getitem__
+    //     would return for that column.
+    //
+    // Multi-column subset writes, (row, col) tuple writes, and fancy
+    // row-list writes are rejected; add when a use case shows up.
+    fn __setitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_ = slf.into_super();
+        check_not_tainted(&super_.tainted)?;
+        let cards = super_.header_snapshot()?;
+        let nrows =
+            parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize;
+        let row_width =
+            parse_keyword(&cards, "NAXIS1").unwrap_or(0).max(0) as usize;
+        let columns = parse_columns(&cards)?;
+        let data_offset = super_.offsets.data_offset();
+        let kind = classify_setitem_key(key)?;
+        match kind {
+            SetItemKey::SingleRow(i) => setitem_single_row(
+                py, &columns, &super_.file, data_offset, nrows, row_width,
+                i, value, &super_.tainted),
+            SetItemKey::RowSlice => {
+                let slice_py = key.cast::<PySlice>()?;
+                setitem_row_slice(
+                    py, &columns, &super_.file, data_offset, nrows,
+                    row_width, slice_py, value, &super_.tainted)
+            }
+            SetItemKey::SingleColumn(name) => setitem_single_column(
+                py, &columns, &super_.file, data_offset, nrows, row_width,
+                &name, value, &super_.tainted),
+        }
     }
 }
 

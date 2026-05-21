@@ -410,7 +410,11 @@ ndarray with dtype matching BITPIX.  Stepped slices are supported
 (falls into per-pixel writes via the same strip-layout walk as the
 read path).  Mid-write I/O failures taint the file (close + reopen
 to recover).  The existing `ImageHDU.write(data, start=...)` still
-works for explicit-start writes.
+works for explicit-start writes.  Table write via `__setitem__`
+(Phase 2 of the table-write roadmap) covers single-row
+`hdu[i] = record`, slice `hdu[a:b[:s]] = arr`, and whole-column
+`hdu["col"] = arr`; mid-write I/O failures taint the file the
+same way.  Detail in the "Table write roadmap" section below.
 
 Inspection accessors on HDUs (no I/O, just header parse): every HDU
 has `extname` (Optional[str]), `extver` (int; default 1 per FITS
@@ -490,9 +494,10 @@ against `nomask`.
 ## Table write roadmap
 
 Plan for getting table creation + writing on par with the image side.
-Reading is mature; writing has zero coverage (no `create_table_hdu`,
-no `TableHDU.write`, no `TableHDU.__setitem__`, no `TableHDU.extend`).
-The image side has all four and the patterns translate directly.
+Reading is mature; Phases 1 (create + bulk write) and 2 (__setitem__)
+have shipped.  Still missing: `TableHDU.extend` (Phase 3) and VLA
+columns on write (Phase 4).  The image side has all four and the
+patterns translate directly.
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -505,17 +510,41 @@ for everything else.
   fields via numpy `(T, shape)`).  No VLA, no `X` bit columns, no
   ASCII tables.
 
-**Phase 2 — `TableHDU.__setitem__`.**  TODO #6 in the read TODO list.
-Symmetric with `__getitem__`:
-- `hdu[i] = record`         (single row)
-- `hdu[a:b] = arr`          (slice)
-- `hdu["col"] = arr`        (whole-column write across all rows)
-- maybe `hdu[i, "col"] = scalar` (single cell)
-Reuses Phase 1's byteswap + I/O infrastructure.
+**Phase 2 — `TableHDU.__setitem__`.**  Done.  Symmetric with
+`__getitem__`, reusing the Phase 1 `prepare_structured_input` +
+`acquire_per_column_array` validators and the same WriteTransform
+dispatch.  Forms supported:
+- `hdu[i] = record` — single-row write.  Value is a `numpy.void`
+  scalar or a shape-`(1,)` structured ndarray; negative `i` allowed.
+  Routes through `write_table_data` with `start_offset = data_offset
+  + i*row_width` and `nrows=1`.
+- `hdu[a:b[:s]] = arr` — slice write.  Value must be a structured
+  ndarray of length equal to the slicelength.  `step==1` falls
+  through to `write_table_data` (fast/slow path as in bulk write);
+  `step>1` goes through `write_table_strided` (per-row seek + write
+  with the same per-row strip machinery).  `step<=0` is rejected.
+- `hdu["col"] = arr` — whole-column write.  Value is an ndarray of
+  shape `(nrows,) + per-cell shape`.  Routes through
+  `write_table_one_column`, which does per-row direct writes of just
+  `byte_width` bytes per row (no read-modify-write — the other
+  columns' bytes are preserved by not being touched).  Strip RMW
+  was considered and rejected because it would read+write `~2 ×
+  full-table` to modify a thin column slice (pathological when
+  `byte_width << row_width`, which is the common case).
 
-**Phase 3 — `TableHDU.extend()`.**  Append rows; mirrors
-`ImageHDU.extend`.  Grows NAXIS2 in the header, grows the data
-section, uses `shift_file_tail_and_update_offsets` for non-last HDUs.
+Deferred (not implemented; clear `ValueError` on attempt): multi-
+column subset writes `hdu[[c1,c2]] = ...`, fancy row-list writes
+`hdu[[1,3,5]] = ...`, tuple `(row, col)` writes.  Add when a use
+case shows up.
+
+**Phase 3 — `TableHDU.append()` (with `extend` alias).**  Append
+rows.  Primary method name is `append` because that's the natural
+verb for adding rows to a table (matches list/pandas usage);
+`extend` is kept as an alias so generic code that iterates over
+HDUs and calls `.extend(...)` keeps working symmetrically with
+`ImageHDU.extend`.  Mechanics mirror `ImageHDU.extend`: grows
+NAXIS2 in the header, grows the data section, uses
+`shift_file_tail_and_update_offsets` for non-last HDUs.
 
 **Phase 4 — VLA columns on write.**  Genuinely harder than 1–3.
 `create_table_hdu` accepts numpy Object columns; emits `1Pt(maxlen)`
