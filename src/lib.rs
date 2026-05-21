@@ -4,6 +4,7 @@
 //   header         — FITSHeader + FITSHeaderEdit + all card-level helpers
 //   hdu            — base HDU pyclass
 //   hdu_image      — ImageHDU + image read/write/slicing
+//   hdu_image_compressed — CompressedImageHDU (ZIMAGE convention)
 //   hdu_table      — TableHDU (BINTABLE) stub
 //   hdu_ascii_table — AsciiTableHDU (TABLE) stub
 //   fits           — FITS pyclass + HDU-list parser
@@ -14,6 +15,7 @@ mod common;
 mod header;
 mod hdu;
 mod hdu_image;
+mod hdu_image_compressed;
 mod hdu_table;
 mod hdu_ascii_table;
 mod fits;
@@ -21,6 +23,7 @@ mod fits;
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
+use crate::hdu_image_compressed::CompressedImageHDU;
 use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::fits::FITS;
@@ -30,6 +33,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FITS>()?;
     m.add_class::<HDU>()?;
     m.add_class::<ImageHDU>()?;
+    m.add_class::<CompressedImageHDU>()?;
     m.add_class::<TableHDU>()?;
     m.add_class::<ColumnSubset>()?;
     m.add_class::<SingleColumnSubset>()?;

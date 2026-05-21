@@ -429,8 +429,11 @@ MaskedArray with `nomask` for consistent return type.  Float BITPIX +
 on floating-point arrays.
 
 **Missing.**
-- **Tile-compressed images (`ZIMAGE`)** — large, separate spec; the
-  most commonly-needed extension.  Do before any ZTABLE work.
+- **Tile-compressed image read** — Phase 1 of the ZIMAGE roadmap has
+  landed (dispatch + accessors only; see "Tile-compressed images
+  (ZIMAGE)" section below).  Phase 2 (RICE_1 whole-image read) is
+  the next chunk; subsequent phases cover slicing, GZIP/HCOMPRESS,
+  quantized floats.
 
 ### Image write
 
@@ -762,6 +765,85 @@ adding / removing columns from existing tables (header rewriting
 + byte shuffling); VLA `__setitem__` (resizing a cell forces heap
 re-layout — either rewrite the heap, or always-append-and-orphan
 which bloats; revisit when an actual workload demands it).
+
+## Tile-compressed images (ZIMAGE) roadmap
+
+ZIMAGE-format tile-compressed images are stored on disk as a
+BINTABLE with `ZIMAGE=T` plus Z-prefixed image-shape and tile-
+shape cards.  The user-facing API mirrors `ImageHDU`; internally
+the reader walks tiles and decodes them.
+
+Implementation lives in `src/hdu_image_compressed.rs` (the
+pyclass + dispatch) and (eventually) `src/zimage/` (the
+algorithm-specific decoders).  Detection happens in
+`parse_hdus_from_file` in `fits.rs`: a BINTABLE with `ZIMAGE=T`
+routes to `CompressedImageHDU` instead of `TableHDU`.
+
+**Phase 1 — Detection + accessors + cache plumbing.**  Done.
+- `CompressedImageHDU` pyclass subclassing `HDU`.  Inherits
+  `header` / `index` / `extname` / `extver` / `has_data` from
+  the base; defines image-side accessors (`shape`, `dtype`,
+  `bitpix`, `ndim`, `size`, `__len__`, `unit`) that read the
+  Z-prefixed cards instead of NAXIS/BITPIX; and compression-
+  specific accessors (`compression_type`, `tile_shape`,
+  `n_tiles`).
+- Tile-cache config: `tile_cache_size` getter + `set_tile_cache_size(bytes)`
+  setter, default 32 MiB.  Storage of decoded tiles itself
+  lands in Phase 3 when slicing arrives — Phase 1 holds only
+  the configured size.
+- Detection is BINTABLE-with-ZIMAGE-card; the helper
+  `header_has_zimage` is in the `hdu_image_compressed` module
+  and called from `fits.rs::parse_hdus_from_file`.
+- `header_has_zimage` is lenient about whitespace; the value
+  parse just looks for a `T` in the value portion of the
+  card after `=`.
+- `extname`/`extver`/`has_data` are inherited from the HDU
+  base.  `has_data` reads BINTABLE NAXIS2 (n_tiles), which
+  happens to agree with "image has data" because an empty
+  image has n_tiles=0 → NAXIS2=0.
+- Raw `hdu.header["BITPIX"]` returns 8 (the BINTABLE bitpix
+  on disk).  Use `hdu.bitpix` for the image-side value
+  (`ZBITPIX`).  Astropy follows the same convention.
+
+**Phase 2 — RICE_1 whole-image read.**  Not yet started.
+Decoder lives in `src/zimage/rice.rs`.  Algorithm trait in
+`src/zimage/mod.rs` so future codecs slot in.  Integer
+ZBITPIX only (8/16/32/64); reject `-32`/`-64` (quantized
+floats come in Phase 5).  Reject non-RICE_1 ZCMPTYPE with a
+clear error.  BSCALE/BZERO applied via the existing
+`apply_image_scaling` machinery on the assembled array (the
+read-side scaling code is unchanged).
+
+Also folded into Phase 2: **restructure inheritance so
+`CompressedImageHDU` extends `ImageHDU`** (currently extends
+`HDU` directly), so `isinstance(hdu, ImageHDU)` returns True
+on a compressed HDU.  Mechanics: `PyClassInitializer` chain
+through HDU + ImageHDU + CompressedImageHDU; update accessor
+`into_super()` calls to step through both parents; override
+ImageHDU's data-access methods (`read`, `write`, `extend`,
+`__getitem__`, `__setitem__`) so the uncompressed
+implementations don't run on compressed bytes.  The `read`
+override becomes the actual Phase 2 decoder; `__getitem__`
+becomes Phase 3's slice path; write-side overrides stay as
+NotImplementedError until compressed writes (Phase 7+).
+
+**Phase 3 — Slicing + LRU cache.**  `__getitem__` walking only
+the tiles that overlap the slice.  Per-HDU LRU cache (lru
+crate, bytes-bound) backing `tile_cache_size`.  `read()`
+bypasses the cache by default (whole-image one-shot has no
+locality benefit); `cache=True` opt-in.
+
+**Phase 4 — GZIP_1 / GZIP_2.**  `flate2` crate.  GZIP_2 adds a
+byte-shuffle preprocessor.
+
+**Phase 5 — Quantized floats.**  ZSCALE / ZZERO per-tile
+columns; ZQUANTIZ + ZDITHER0 dither variants.  Trickiest part
+is the dither PRNG (specific to the FITS spec).
+
+**Phase 6+ — HCOMPRESS_1, PLIO_1, then writes.**  Both
+algorithms are real implementation effort and individually
+rare.  Defer until someone asks.  Compressed write is its own
+multi-phase project.
 
 ## Testing conventions
 

@@ -19,6 +19,7 @@ use crate::common::{
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
+use crate::hdu_image_compressed::{header_has_zimage, CompressedImageHDU};
 use crate::hdu_table::{normalize_and_build_table_header, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
@@ -193,6 +194,11 @@ fn parse_hdus_from_file(
         // accepted) and 'TABLE   ' (padded to the FITS 8-char minimum
         // for string values).  Mirrors the IMAGE pattern just above.
         let is_ascii_table = header_cards.iter().any(|c| c.starts_with("XTENSION= 'TABLE"));
+        // ZIMAGE convention: BINTABLE with ZIMAGE=T is a
+        // tile-compressed image.  Detect here so we route to
+        // CompressedImageHDU instead of TableHDU.
+        let is_compressed_image = is_binary_table
+            && header_has_zimage(&header_cards);
 
         let hdu_offsets = HduOffsets::new(
             header_offset, num_header_blocks, data_offset,
@@ -209,6 +215,11 @@ fn parse_hdus_from_file(
         let hdu_filename = filename.to_string();
         let hdu_py: Py<PyAny> = if is_image {
             Py::new(py, ImageHDU::new(
+                header_cards.clone(), hdus.len(), hdu_filename,
+                hdu_offsets, hdu_layout, hdu_file, hdu_taint,
+            ))?.into()
+        } else if is_compressed_image {
+            Py::new(py, CompressedImageHDU::new(
                 header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
