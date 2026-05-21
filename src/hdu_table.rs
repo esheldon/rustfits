@@ -3767,6 +3767,153 @@ fn write_vla_data_range(
 //     heap).
 //   - Relocates the existing heap forward (within the data section)
 //     to sit after the appended main rows.
+// Bulk write path for tables with no VLA columns.  Validates input
+// against the table schema, then dispatches to write_table_data,
+// which writes contiguous main-section rows.
+fn write_fixed_only(
+    py: Python<'_>,
+    super_: &HDU,
+    columns: &[Column],
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+    nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let prep = dispatch_write_input(
+        py, data, names, columns, nrows, row_width, &mut buffers)?;
+    let sources = build_sources(&prep.metas, &buffers);
+    write_table_data(
+        columns, &prep.transforms, &sources, prep.layout_matches,
+        &super_.file, data_offset, nrows, row_width, &super_.tainted,
+    )
+}
+
+// Bulk write path for tables with at least one VLA (P/Q) column.
+// Validates fixed + VLA columns, plans the heap layout from scratch
+// (a full overwrite resets the heap to start at offset 0), grows the
+// data section if needed, writes main rows + heap, then updates
+// PCOUNT in the header.
+#[allow(clippy::too_many_arguments)]
+fn write_vla_aware(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+    nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let per_col = extract_per_column_inputs(
+        py, data, names, columns)?;
+    // Per-column input length check: each input must have nrows rows.
+    for (col_idx, col) in columns.iter().enumerate() {
+        let shape: Vec<usize> =
+            per_col[col_idx].getattr("shape")?.extract()?;
+        if shape.first().copied().unwrap_or(0) != nrows {
+            return Err(PyValueError::new_err(format!(
+                "column '{}': input has {} rows but table NAXIS2={}",
+                col.name, shape.first().copied().unwrap_or(0),
+                nrows)));
+        }
+    }
+    let mut fixed: Vec<Option<FixedColInfo>> =
+        columns.iter().map(|_| None).collect();
+    for (col_idx, col) in columns.iter().enumerate() {
+        if col.var_kind.is_none() {
+            fixed[col_idx] = Some(build_fixed_col_info(
+                &per_col[col_idx], &ndarray, col, nrows)?);
+        }
+    }
+    let (plans, total_heap_bytes) = plan_vla_heap_layout(
+        columns, &per_col, nrows, &ndarray, 0)?;
+    let vla: Vec<Option<VlaColInfo>> = columns.iter().enumerate()
+        .map(|(col_idx, col)| {
+            if col.var_kind.is_some() {
+                Some(VlaColInfo {
+                    plans: plans[col_idx].clone(),
+                    per_col_array: per_col[col_idx].clone(),
+                })
+            } else {
+                None
+            }
+        }).collect();
+
+    let current_pcount = parse_keyword(cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let main_bytes = (nrows * row_width) as u64;
+    let current_data_bytes = main_bytes + current_pcount;
+    let new_data_bytes = main_bytes + total_heap_bytes as u64;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta,
+                &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    let heap_offset_in_file = data_offset + main_bytes;
+    write_vla_data_range(
+        columns, &fixed, &vla, total_heap_bytes, 0,
+        &super_.file, data_offset, heap_offset_in_file,
+        nrows, row_width, &super_.tainted)?;
+
+    // PCOUNT update — disk-write-before-commit ordering.
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, total_heap_bytes as u64);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header flush failed: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
 //   - Updates PCOUNT alongside NAXIS2 in the header rewrite.
 // Reads the old heap into memory once, before any byte movement,
 // and writes it back to its new position after the new main rows
@@ -3943,6 +4090,115 @@ fn append_vla_aware(
     }
     *cards_guard = new_cards;
     Ok(())
+}
+
+// Append rows to a table with no VLA columns.  Validates input, grows
+// the data section if needed (last-HDU branch uses set_len; non-last
+// branch shifts the file tail and zero-fills the gap), rewrites
+// NAXIS2 on disk, then writes the appended rows at the end of the
+// existing data section.
+#[allow(clippy::too_many_arguments)]
+fn append_fixed_only(
+    py: Python<'_>,
+    super_: &HDU,
+    columns: &[Column],
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+    current_nrows: usize,
+    append_nrows: usize,
+    new_nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let prep = dispatch_write_input(
+        py, data, names, columns, append_nrows, row_width,
+        &mut buffers)?;
+
+    let current_data_bytes = (current_nrows * row_width) as u64;
+    let new_data_bytes = (new_nrows * row_width) as u64;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let guard = lock_file(&super_.file)?;
+            let file = guard.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            file.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted,
+            )?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta, &super_.tainted,
+            )?;
+        } else {
+            let mut guard = lock_file(&super_.file)?;
+            let file = guard.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            file.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Disk-write-before-commit ordering with taint on mid-write
+    // failure, same as the header- and image-grow paths.
+    let new_card = card_int(
+        "NAXIS2", new_nrows as i64, "number of rows in table");
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    let card_idx = new_cards.iter()
+        .position(|c| c.len() >= 6 && c[..6].trim() == "NAXIS2")
+        .ok_or_else(|| PyValueError::new_err(
+            "header missing NAXIS2"))?;
+    new_cards[card_idx] = new_card.trim_end().to_string();
+
+    {
+        let mut guard = lock_file(&super_.file)?;
+        let file = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        file.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        file.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "header write failed during append: {}; close + \
+                 reopen the file to recover", e))
+        })?;
+        file.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "header flush failed during append: {}; close + \
+                 reopen the file to recover", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    drop(cards_guard);
+
+    // A write failure here taints — header already advertises the
+    // larger NAXIS2 but the new rows are partly or wholly stale.
+    let sources = build_sources(&prep.metas, &buffers);
+    let append_offset = data_offset
+        + (current_nrows * row_width) as u64;
+    write_table_data(
+        columns, &prep.transforms, &sources, prep.layout_matches,
+        &super_.file, append_offset, append_nrows, row_width,
+        &super_.tainted,
+    ).map_err(|e| {
+        super_.tainted.store(true, Ordering::Release);
+        e
+    })
 }
 
 // Rewrite (or insert) the PCOUNT card in `new_cards` to `new_pcount`.
@@ -4418,127 +4674,15 @@ impl TableHDU {
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
 
-        if !any_var_column(&columns) {
-            let mut buffers: Vec<RawBuffer> = Vec::new();
-            let prep = dispatch_write_input(
-                py, data, names, &columns, nrows, row_width, &mut buffers)?;
-            let sources = build_sources(&prep.metas, &buffers);
-            return write_table_data(
-                &columns, &prep.transforms, &sources, prep.layout_matches,
-                &super_.file, data_offset, nrows, row_width, &super_.tainted,
-            );
+        if any_var_column(&columns) {
+            write_vla_aware(
+                py, &super_, &cards, &columns, data, names,
+                nrows, row_width, data_offset)
+        } else {
+            write_fixed_only(
+                py, &super_, &columns, data, names,
+                nrows, row_width, data_offset)
         }
-
-        // VLA-aware bulk write.  Validates fixed + VLA columns,
-        // plans the heap layout from scratch (full overwrite resets
-        // the heap), grows the file if needed, writes main+heap,
-        // updates PCOUNT in the header.
-        let np = py.import("numpy")?;
-        let ndarray = np.getattr("ndarray")?;
-        let per_col = extract_per_column_inputs(
-            py, data, names, &columns)?;
-        // Per-column input length check: every fixed and VLA column
-        // arrays must have length nrows.
-        for (col_idx, col) in columns.iter().enumerate() {
-            let shape: Vec<usize> =
-                per_col[col_idx].getattr("shape")?.extract()?;
-            if shape.first().copied().unwrap_or(0) != nrows {
-                return Err(PyValueError::new_err(format!(
-                    "column '{}': input has {} rows but table NAXIS2={}",
-                    col.name, shape.first().copied().unwrap_or(0),
-                    nrows)));
-            }
-        }
-        let mut fixed: Vec<Option<FixedColInfo>> =
-            columns.iter().map(|_| None).collect();
-        for (col_idx, col) in columns.iter().enumerate() {
-            if col.var_kind.is_none() {
-                fixed[col_idx] = Some(build_fixed_col_info(
-                    &per_col[col_idx], &ndarray, col, nrows)?);
-            }
-        }
-        let (plans, total_heap_bytes) = plan_vla_heap_layout(
-            &columns, &per_col, nrows, &ndarray, 0)?;
-        let vla: Vec<Option<VlaColInfo>> = columns.iter().enumerate()
-            .map(|(col_idx, col)| {
-                if col.var_kind.is_some() {
-                    Some(VlaColInfo {
-                        plans: plans[col_idx].clone(),
-                        per_col_array: per_col[col_idx].clone(),
-                    })
-                } else {
-                    None
-                }
-            }).collect();
-
-        let current_pcount = parse_keyword(&cards, "PCOUNT")
-            .unwrap_or(0).max(0) as u64;
-        let main_bytes = (nrows * row_width) as u64;
-        let current_data_bytes = main_bytes + current_pcount;
-        let new_data_bytes = main_bytes + total_heap_bytes as u64;
-        let current_padded = round_up_to_block(current_data_bytes);
-        let new_padded = round_up_to_block(new_data_bytes);
-        let current_hdu_end = data_offset + current_padded;
-        let new_hdu_end = data_offset + new_padded;
-
-        if new_hdu_end > current_hdu_end {
-            let delta = new_hdu_end - current_hdu_end;
-            let file_len = {
-                let g = lock_file(&super_.file)?;
-                let f = g.as_ref()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.metadata()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    .len()
-            };
-            if file_len > current_hdu_end {
-                shift_file_tail_and_update_offsets(
-                    &super_.file, &super_.layout,
-                    current_hdu_end, delta, &super_.tainted)?;
-                zero_fill_range(
-                    &super_.file, current_hdu_end, delta,
-                    &super_.tainted)?;
-            } else {
-                let mut g = lock_file(&super_.file)?;
-                let f = g.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.set_len(new_hdu_end)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-        }
-
-        let heap_offset_in_file = data_offset + main_bytes;
-        write_vla_data_range(
-            &columns, &fixed, &vla, total_heap_bytes, 0,
-            &super_.file, data_offset, heap_offset_in_file,
-            nrows, row_width, &super_.tainted)?;
-
-        // PCOUNT update — disk-write-before-commit ordering.
-        let mut cards_guard = super_.header.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = cards_guard.clone();
-        set_pcount_in_cards(&mut new_cards, total_heap_bytes as u64);
-        {
-            let mut g = lock_file(&super_.file)?;
-            let f = g.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            let header_bytes = serialize_header_to_disk_bytes(&new_cards);
-            let header_offset = data_offset - header_bytes.len() as u64;
-            f.seek(SeekFrom::Start(header_offset))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            f.write_all(&header_bytes).map_err(|e| {
-                super_.tainted.store(true, Ordering::Release);
-                PyIOError::new_err(format!(
-                    "PCOUNT header write failed: {}; close + reopen", e))
-            })?;
-            f.flush().map_err(|e| {
-                super_.tainted.store(true, Ordering::Release);
-                PyIOError::new_err(format!(
-                    "PCOUNT header flush failed: {}; close + reopen", e))
-            })?;
-        }
-        *cards_guard = new_cards;
-        Ok(())
     }
 
     // hdu[key] = value dispatches based on what `key` looks like:
@@ -4621,10 +4765,9 @@ impl TableHDU {
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
 
-        // Step 1: determine how many rows the caller is appending,
-        // validate the input fully (without writing).  Both are done
-        // before any file mutation so a dtype error leaves the file
-        // untouched.
+        // Validate-then-mutate: determine append size and run input
+        // validation BEFORE touching the file, so a dtype error
+        // leaves the file untouched.
         let append_nrows = determine_input_nrows(data, names)?;
         if append_nrows == 0 {
             return Ok(());
@@ -4632,110 +4775,16 @@ impl TableHDU {
         let new_nrows = current_nrows + append_nrows;
 
         if any_var_column(&columns) {
-            return append_vla_aware(
+            append_vla_aware(
                 py, &super_, &cards, &columns, data, names,
                 current_nrows, append_nrows, new_nrows, row_width,
-                data_offset);
+                data_offset)
+        } else {
+            append_fixed_only(
+                py, &super_, &columns, data, names,
+                current_nrows, append_nrows, new_nrows, row_width,
+                data_offset)
         }
-
-        let mut buffers: Vec<RawBuffer> = Vec::new();
-        let prep = dispatch_write_input(
-            py, data, names, &columns, append_nrows, row_width,
-            &mut buffers)?;
-
-        // Step 2: grow the data section if the new rows push past
-        // the current padded extent.  Last-HDU branch (file_len ==
-        // current_hdu_end) uses set_len to zero-extend; non-last
-        // branch shifts the file tail forward and zero-fills the
-        // gap left behind.
-        let current_data_bytes = (current_nrows * row_width) as u64;
-        let new_data_bytes = (new_nrows * row_width) as u64;
-        let current_padded = round_up_to_block(current_data_bytes);
-        let new_padded = round_up_to_block(new_data_bytes);
-        let current_hdu_end = data_offset + current_padded;
-        let new_hdu_end = data_offset + new_padded;
-
-        if new_hdu_end > current_hdu_end {
-            let delta = new_hdu_end - current_hdu_end;
-            let file_len = {
-                let guard = lock_file(&super_.file)?;
-                let file = guard.as_ref()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                file.metadata()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    .len()
-            };
-            if file_len > current_hdu_end {
-                shift_file_tail_and_update_offsets(
-                    &super_.file, &super_.layout,
-                    current_hdu_end, delta, &super_.tainted,
-                )?;
-                zero_fill_range(
-                    &super_.file, current_hdu_end, delta, &super_.tainted,
-                )?;
-            } else {
-                let mut guard = lock_file(&super_.file)?;
-                let file = guard.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                file.set_len(new_hdu_end)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-        }
-
-        // Step 3: rewrite the NAXIS2 card on disk, then commit the
-        // in-memory cards.  Disk-write-before-commit ordering with
-        // taint on mid-write failure, same convention as the header-
-        // and image-grow paths.
-        let new_card = card_int(
-            "NAXIS2", new_nrows as i64, "number of rows in table");
-        let mut cards_guard = super_.header.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = cards_guard.clone();
-        let card_idx = new_cards.iter()
-            .position(|c| c.len() >= 6 && c[..6].trim() == "NAXIS2")
-            .ok_or_else(|| PyValueError::new_err(
-                "header missing NAXIS2"))?;
-        new_cards[card_idx] = new_card.trim_end().to_string();
-
-        {
-            let mut guard = lock_file(&super_.file)?;
-            let file = guard.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            let header_bytes = serialize_header_to_disk_bytes(&new_cards);
-            let header_offset = data_offset - header_bytes.len() as u64;
-            file.seek(SeekFrom::Start(header_offset))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            file.write_all(&header_bytes).map_err(|e| {
-                super_.tainted.store(true, Ordering::Release);
-                PyIOError::new_err(format!(
-                    "header write failed during append: {}; close + \
-                     reopen the file to recover", e))
-            })?;
-            file.flush().map_err(|e| {
-                super_.tainted.store(true, Ordering::Release);
-                PyIOError::new_err(format!(
-                    "header flush failed during append: {}; close + \
-                     reopen the file to recover", e))
-            })?;
-        }
-        *cards_guard = new_cards;
-        drop(cards_guard);
-
-        // Step 4: write the appended rows at the end of the existing
-        // data section.  A failure here taints the file (the header
-        // already advertises the larger NAXIS2 but the new rows are
-        // partly or wholly stale).
-        let sources = build_sources(&prep.metas, &buffers);
-        let append_offset = data_offset
-            + (current_nrows * row_width) as u64;
-        write_table_data(
-            &columns, &prep.transforms, &sources, prep.layout_matches,
-            &super_.file, append_offset, append_nrows, row_width,
-            &super_.tainted,
-        ).map_err(|e| {
-            super_.tainted.store(true, Ordering::Release);
-            e
-        })
     }
 
     // Alias for append().  Kept for symmetry with ImageHDU.extend so
