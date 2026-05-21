@@ -1,4 +1,5 @@
-"""Phase 1d tests: string columns (S/U → A).
+"""
+Phase 1d tests: string columns (S/U → A).
 
 Numpy structured-dtype fields with kind 'S' (bytes) or 'U' (unicode)
 map to FITS A columns:
@@ -31,8 +32,10 @@ import rustfits
 
 
 def test_s_scalar_round_trips():
-    """A single S<N> column emits TFORM=NA with no TDIM (the bare
-    repeat captures the per-string width)."""
+    """
+    A single S<N> column emits TFORM=NA with no TDIM (the bare
+    repeat captures the per-string width).
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("name", "S10")])
@@ -58,9 +61,11 @@ def test_s_scalar_round_trips():
 
 
 def test_s_1d_subarray_emits_tdim():
-    """Unlike 1-D numeric subarrays (which omit TDIM), 1-D string
+    """
+    Unlike 1-D numeric subarrays (which omit TDIM), 1-D string
     subarrays MUST emit TDIM because 'TFORM=30A' alone is ambiguous
-    between '30-char string' and '3 strings of 10 chars'."""
+    between '30-char string' and '3 strings of 10 chars'.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("labels", "S5", (3,))])
@@ -115,8 +120,10 @@ def test_s_2d_subarray():
 
 
 def test_u_scalar_ascii_round_trips():
-    """U<N> with pure-ASCII content round-trips through the slow path
-    (numpy U is UTF-32-LE so its per-cell width differs from A's)."""
+    """
+    U<N> with pure-ASCII content round-trips through the slow path
+    (numpy U is UTF-32-LE so its per-cell width differs from A's).
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("name", "U10")])
@@ -140,7 +147,9 @@ def test_u_scalar_ascii_round_trips():
 
 
 def test_u_subarray_ascii_round_trips():
-    """U with shape (3,): TDIM=(N,3); per-cell ASCII validation."""
+    """
+    U with shape (3,): TDIM=(N,3); per-cell ASCII validation.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("tags", "U5", (3,))])
@@ -161,8 +170,10 @@ def test_u_subarray_ascii_round_trips():
 
 
 def test_u_non_ascii_rejected():
-    """A non-ASCII codepoint (e.g. é = U+00E9) must raise rather
-    than silently truncate or replace."""
+    """
+    A non-ASCII codepoint (e.g. é = U+00E9) must raise rather
+    than silently truncate or replace.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("name", "U10")])
@@ -176,7 +187,9 @@ def test_u_non_ascii_rejected():
 
 
 def test_u_high_unicode_rejected():
-    """Codepoints above the BMP (e.g. emoji) also raise."""
+    """
+    Codepoints above the BMP (e.g. emoji) also raise.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("name", "U5")])
@@ -193,8 +206,10 @@ def test_u_high_unicode_rejected():
 
 
 def test_mixed_string_and_numeric_columns():
-    """A table with both S and U columns alongside numeric ones —
-    routes through the slow path because of the U column."""
+    """
+    A table with both S and U columns alongside numeric ones —
+    routes through the slow path because of the U column.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype(
@@ -229,9 +244,11 @@ def test_mixed_string_and_numeric_columns():
 
 
 def test_short_string_padded():
-    """A string shorter than its column width must be null-padded on
+    """
+    A string shorter than its column width must be null-padded on
     disk (and round-trip back without the trailing nulls / spaces
-    interfering)."""
+    interfering).
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("s", "U10")])
@@ -251,8 +268,10 @@ def test_short_string_padded():
 
 
 def test_wrong_string_width_rejected():
-    """Input S width different from HDU's column width is rejected
-    by the per-cell shape / width validation."""
+    """
+    Input S width different from HDU's column width is rejected
+    by the per-cell shape / width validation.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("s", "S10")])
@@ -273,11 +292,13 @@ def test_zero_length_string_rejected():
 
 
 def test_s_into_u_column_rejected():
-    """If the HDU was created with a U column (TFORM=NA), passing an
+    """
+    If the HDU was created with a U column (TFORM=NA), passing an
     S column with the same chars-per-string is OK (both map to A) —
     in fact this is how the read side returns U regardless of how
     the column was written.  Verify that S input round-trips correctly
-    even when the HDU was created with U."""
+    even when the HDU was created with U.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         # HDU created with U → same TFORM, same on-disk layout as if

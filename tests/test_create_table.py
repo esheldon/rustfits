@@ -1,4 +1,5 @@
-"""Phase 1 MVP tests for create_table_hdu + TableHDU.write.
+"""
+Phase 1 MVP tests for create_table_hdu + TableHDU.write.
 
 Scope:
   - Round-trip write + read for the MVP scalar dtypes
@@ -31,7 +32,9 @@ def _tmp(name="t.fits"):
 
 
 def _make_arr(dt, n=5):
-    """Populate a structured array with distinguishable values per field."""
+    """
+    Populate a structured array with distinguishable values per field.
+    """
     arr = np.zeros(n, dtype=dt)
     for i, name in enumerate(arr.dtype.names):
         base = arr.dtype.fields[name][0]
@@ -103,7 +106,9 @@ def test_roundtrip_multi_column_mixed_dtypes():
 
 
 def test_dtype_input_accepts_descr_list():
-    """create_table_hdu accepts the same forms numpy.dtype() does."""
+    """
+    create_table_hdu accepts the same forms numpy.dtype() does.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         descr = [("id", "i4"), ("flux", "f8")]
@@ -134,8 +139,10 @@ def test_dtype_input_accepts_np_dtype():
 
 
 def test_auto_primary_on_fresh_file():
-    """create_table_hdu on a fresh file auto-adds an empty primary
-    image (NAXIS=0) so the BINTABLE can land as extension 1."""
+    """
+    create_table_hdu on a fresh file auto-adds an empty primary
+    image (NAXIS=0) so the BINTABLE can land as extension 1.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4")])
@@ -153,8 +160,10 @@ def test_auto_primary_on_fresh_file():
 
 
 def test_no_double_primary_when_user_already_created_one():
-    """If the user already created an image HDU first, the next
-    create_table_hdu must NOT auto-add another primary."""
+    """
+    If the user already created an image HDU first, the next
+    create_table_hdu must NOT auto-add another primary.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4")])
@@ -170,8 +179,10 @@ def test_no_double_primary_when_user_already_created_one():
 
 
 def test_two_tables_in_one_file():
-    """Successive create_table_hdu calls just append extensions; only
-    the first call adds the primary."""
+    """
+    Successive create_table_hdu calls just append extensions; only
+    the first call adds the primary.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_a = np.dtype([("a", "i4")])
@@ -239,7 +250,9 @@ def test_units_kwarg_round_trips():
 
 
 def test_empty_table_nrows_zero():
-    """nrows=0 creates a header-only BINTABLE; read returns empty."""
+    """
+    nrows=0 creates a header-only BINTABLE; read returns empty.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4"), ("flux", "f8")])
@@ -259,7 +272,9 @@ def test_empty_table_nrows_zero():
 
 
 def test_write_empty_into_empty_table():
-    """write(arr) with len(arr) == 0 must succeed on an nrows=0 table."""
+    """
+    write(arr) with len(arr) == 0 must succeed on an nrows=0 table.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4")])
@@ -335,8 +350,10 @@ def test_write_non_ndarray_rejected():
 
 
 def test_write_plain_ndarray_rejected():
-    """A non-structured ndarray (no field names) is not a valid
-    table-row source."""
+    """
+    A non-structured ndarray (no field names) is not a valid
+    table-row source.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4")])
@@ -351,8 +368,10 @@ def test_write_plain_ndarray_rejected():
 
 
 def test_getitem_and_read_column_round_trip():
-    """The existing __getitem__ and read_column paths should work on
-    a freshly-created+written table without any special handling."""
+    """
+    The existing __getitem__ and read_column paths should work on
+    a freshly-created+written table without any special handling.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4"), ("flux", "f8")])
@@ -370,8 +389,10 @@ def test_getitem_and_read_column_round_trip():
 
 
 def test_larger_table_exercises_strip_loop():
-    """Write a table large enough (~2 MiB) to span multiple strips in
-    the chunked write loop."""
+    """
+    Write a table large enough (~2 MiB) to span multiple strips in
+    the chunked write loop.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("id", "i4"), ("v1", "f8"), ("v2", "f8")])

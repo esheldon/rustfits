@@ -1,4 +1,5 @@
-"""Phase 1c tests: subarray fields + TDIM.
+"""
+Phase 1c tests: subarray fields + TDIM.
 
 Numpy structured-dtype fields can carry a subarray shape:
   np.dtype([('flux', 'f4', (3, 4))])
@@ -28,9 +29,11 @@ import rustfits
 
 
 def test_1d_subarray_no_tdim_card():
-    """A 1-D subarray emits TFORM=5E but NO TDIM card — the repeat
+    """
+    A 1-D subarray emits TFORM=5E but NO TDIM card — the repeat
     count alone is enough to describe the shape, and astropy's
-    convention is to omit a redundant TDIM."""
+    convention is to omit a redundant TDIM.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("v", "f4", (5,))])
@@ -56,8 +59,10 @@ def test_1d_subarray_no_tdim_card():
 
 
 def test_2d_subarray_emits_reversed_tdim():
-    """numpy shape (3, 4) → TFORM=12E + TDIM=(4,3) on disk; read
-    returns numpy shape (3, 4) again."""
+    """
+    numpy shape (3, 4) → TFORM=12E + TDIM=(4,3) on disk; read
+    returns numpy shape (3, 4) again.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("img", "f4", (3, 4))])
@@ -104,8 +109,10 @@ def test_3d_subarray():
 
 
 def test_subarray_unsigned_int_trick():
-    """Subarray with u4: TFORM=6J + TDIM=(3,2) + TZERO=2^31; per-cell
-    XOR top bit applies to every element in the cell."""
+    """
+    Subarray with u4: TFORM=6J + TDIM=(3,2) + TZERO=2^31; per-cell
+    XOR top bit applies to every element in the cell.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("uimg", "u4", (2, 3))])
@@ -130,8 +137,10 @@ def test_subarray_unsigned_int_trick():
 
 
 def test_subarray_bool():
-    """Subarray of bool: each cell holds shape (3, 4) of bool, stored
-    as 12 L-bytes per row."""
+    """
+    Subarray of bool: each cell holds shape (3, 4) of bool, stored
+    as 12 L-bytes per row.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("mask", "?", (3, 4))])
@@ -157,8 +166,10 @@ def test_subarray_bool():
 
 
 def test_subarray_complex():
-    """Subarray of c8: per-half byteswap applies across all elements
-    in the cell."""
+    """
+    Subarray of c8: per-half byteswap applies across all elements
+    in the cell.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("z", "c16", (2, 2))])
@@ -182,8 +193,10 @@ def test_subarray_complex():
 
 
 def test_mixed_scalar_and_subarray_columns():
-    """A table mixing scalar fields with subarray fields, each with a
-    different transform, exercises the full strip-loop dispatch."""
+    """
+    A table mixing scalar fields with subarray fields, each with a
+    different transform, exercises the full strip-loop dispatch.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype(
@@ -238,9 +251,11 @@ def test_mixed_scalar_and_subarray_columns():
 
 
 def test_shape_mismatch_on_write_rejected():
-    """If the HDU has shape (3,4) but the user passes shape (4,3), the
+    """
+    If the HDU has shape (3,4) but the user passes shape (4,3), the
     transform succeeds (same total bytes) but the on-disk axes would
-    be wrong — validate must catch this up front."""
+    be wrong — validate must catch this up front.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("x", "f4", (3, 4))])
@@ -253,8 +268,10 @@ def test_shape_mismatch_on_write_rejected():
 
 
 def test_scalar_input_into_subarray_column_rejected():
-    """If HDU column has shape (3,) but input field is scalar, the
-    per-cell shape check rejects up front."""
+    """
+    If HDU column has shape (3,) but input field is scalar, the
+    per-cell shape check rejects up front.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("x", "f4", (3,))])

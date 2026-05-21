@@ -1,4 +1,5 @@
-"""Phase 1b tests: unsigned-int trick (u2/u4/u8), bool, and complex.
+"""
+Phase 1b tests: unsigned-int trick (u2/u4/u8), bool, and complex.
 
 These dtypes were rejected in the 1a MVP and added in 1b:
   - u2/u4/u8 → I/J/K + TZERO=2^(n-1)  (unsigned-int trick)
@@ -30,7 +31,9 @@ import rustfits
     ],
 )
 def test_unsigned_int_trick_round_trips(dtype_str, expected_tzero):
-    """Writing u2/u4/u8 emits TZERO=2^(n-1) and the value range survives."""
+    """
+    Writing u2/u4/u8 emits TZERO=2^(n-1) and the value range survives.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("v", dtype_str)])
@@ -61,7 +64,9 @@ def test_unsigned_int_trick_round_trips(dtype_str, expected_tzero):
 
 
 def test_unsigned_trick_extreme_values():
-    """Boundary values (0, mid, max) must round-trip exactly for u2/u4/u8."""
+    """
+    Boundary values (0, mid, max) must round-trip exactly for u2/u4/u8.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("u16", "u2"), ("u32", "u4"), ("u64", "u8")])
@@ -82,7 +87,9 @@ def test_unsigned_trick_extreme_values():
 
 
 def test_unsigned_trick_signed_input_rejected():
-    """A u-trick column expects u-input; passing i-input is a mismatch."""
+    """
+    A u-trick column expects u-input; passing i-input is a mismatch.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("v", "u4")])
@@ -95,8 +102,10 @@ def test_unsigned_trick_signed_input_rejected():
 
 
 def test_mixed_signed_unsigned_columns():
-    """A table that mixes plain signed columns with unsigned-trick
-    columns writes each through the right transform."""
+    """
+    A table that mixes plain signed columns with unsigned-trick
+    columns writes each through the right transform.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype(
@@ -127,7 +136,9 @@ def test_mixed_signed_unsigned_columns():
 
 
 def test_bool_round_trips():
-    """numpy bool → L → numpy bool, T/F preserved."""
+    """
+    numpy bool → L → numpy bool, T/F preserved.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("flag", "?"), ("idx", "i4")])
@@ -150,7 +161,9 @@ def test_bool_round_trips():
 
 
 def test_bool_non_bool_input_rejected():
-    """An L column expects bool input; integer input is a mismatch."""
+    """
+    An L column expects bool input; integer input is a mismatch.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt_hdu = np.dtype([("flag", "?")])
@@ -167,9 +180,11 @@ def test_bool_non_bool_input_rejected():
 
 @pytest.mark.parametrize("dtype_str", ["c8", "c16"])
 def test_complex_round_trips(dtype_str):
-    """c8 → C, c16 → M.  Real and imag halves byteswap independently
+    """
+    c8 → C, c16 → M.  Real and imag halves byteswap independently
     (swap unit 4 for C, 8 for M) — covered by the existing Identity
-    transform path."""
+    transform path.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("z", dtype_str)])
@@ -191,9 +206,11 @@ def test_complex_round_trips(dtype_str):
 
 
 def test_complex_real_and_imag_not_swapped():
-    """If byteswap_unit incorrectly used the whole-element width (8 for
+    """
+    If byteswap_unit incorrectly used the whole-element width (8 for
     C, 16 for M), real and imag halves would swap places.  This test
-    catches that regression by writing values where real != imag."""
+    catches that regression by writing values where real != imag.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("z", "c16")])
@@ -215,8 +232,10 @@ def test_complex_real_and_imag_not_swapped():
 
 
 def test_mixed_dtypes_1a_and_1b():
-    """A table with a mix of MVP and Phase 1b dtypes — exercises all
-    three transform variants in one strip-by-strip write."""
+    """
+    A table with a mix of MVP and Phase 1b dtypes — exercises all
+    three transform variants in one strip-by-strip write.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype(
