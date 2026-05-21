@@ -612,7 +612,9 @@ impl FITS {
     // bool/complex, subarray fields, strings, and dict/list+names
     // input forms.  See the Table Write Roadmap in CLAUDE.md.
     #[pyo3(signature = (
-        dtype, nrows=0, *, extname=None, extver=None, units=None
+        dtype, nrows=0, *,
+        extname=None, extver=None, units=None,
+        var_dtypes=None, descriptor=None
     ))]
     fn create_table_hdu(
         &mut self,
@@ -622,13 +624,25 @@ impl FITS {
         extname: Option<String>,
         extver: Option<i64>,
         units: Option<&Bound<'_, PyDict>>,
+        var_dtypes: Option<&Bound<'_, PyDict>>,
+        descriptor: Option<String>,
     ) -> PyResult<()> {
         if nrows < 0 {
             return Err(PyValueError::new_err(format!(
                 "create_table_hdu: nrows must be >= 0, got {}", nrows)));
         }
+        // descriptor is 'P' (default) or 'Q'.  Only relevant when any
+        // VLA columns are declared; ignored otherwise.
+        let desc_char = match descriptor.as_deref() {
+            None | Some("P") | Some("p") => 'P',
+            Some("Q") | Some("q") => 'Q',
+            Some(other) => return Err(PyValueError::new_err(format!(
+                "create_table_hdu: descriptor must be 'P' or 'Q', got '{}'",
+                other))),
+        };
         let (table_cards, row_width) = normalize_and_build_table_header(
             py, dtype, nrows, extname.as_deref(), extver, units,
+            var_dtypes, desc_char,
         )?;
         let data_size = (nrows as u64).saturating_mul(row_width);
         let data_padded = data_section_padded(data_size);

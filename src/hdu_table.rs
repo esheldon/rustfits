@@ -1817,6 +1817,12 @@ fn read_one_column(
 // 2-D-or-higher subarray (1-D shapes are fully described by the TFORM
 // repeat count and don't need a TDIM card).  The stored string is
 // already in FITS (FORTRAN, fastest-first) order.
+// Per-column write spec.  Fixed columns carry tform_letter (the FITS
+// type) + repeat + byte_width; VLA columns set var_kind to Some('P')
+// or Some('Q'), with `tform_letter` repurposed as the INNER element
+// letter (matching the read-side Column convention) and byte_width
+// fixed at 8 (P) or 16 (Q) — the size of one descriptor in the main
+// row.  repeat is always 1 for VLAs.
 struct WriteColumn {
     name: String,
     tform_letter: char,
@@ -1825,6 +1831,7 @@ struct WriteColumn {
     tzero: Option<u64>,
     tdim: Option<String>,
     tunit: Option<String>,
+    var_kind: Option<char>,
 }
 
 // Classification of a single numpy field base dtype.  For numeric
@@ -1886,6 +1893,41 @@ fn classify_scalar_numpy_field(
     }
 }
 
+// Classification for one VLA column's inner element type.  Maps a
+// numpy dtype string (e.g. "f4", "i4") to the FITS inner-element
+// letter + per-element byte width on disk.  Mirrors the read-side
+// inner-letter → numpy dtype mapping in `field_dtype_and_shape`.
+struct VarClass {
+    inner_letter: char,
+    elem_size: usize,
+}
+
+fn classify_var_numpy_field(
+    inner_dtype: &str,
+    col_name: &str,
+) -> PyResult<VarClass> {
+    let err = |reason: &str| PyValueError::new_err(format!(
+        "var_dtypes['{}'] = '{}': {}", col_name, inner_dtype, reason));
+    let s = inner_dtype
+        .trim_start_matches(|c| c == '<' || c == '>' || c == '|' || c == '=');
+    let normalized = s.to_lowercase();
+    let (letter, size) = match normalized.as_str() {
+        "u1" | "uint8"  => ('B', 1),
+        "i2" | "int16"  => ('I', 2),
+        "i4" | "int32"  => ('J', 4),
+        "i8" | "int64"  => ('K', 8),
+        "f4" | "float32" => ('E', 4),
+        "f8" | "float64" => ('D', 8),
+        "c8" | "complex64"  => ('C', 8),
+        "c16" | "complex128" => ('M', 16),
+        "?" | "b1" | "bool" | "bool_" => ('L', 1),
+        _ => return Err(err(
+            "unsupported inner dtype (supported: \
+             u1/i2/i4/i8/f4/f8/c8/c16/? / bool)")),
+    };
+    Ok(VarClass { inner_letter: letter, elem_size: size })
+}
+
 // Pull the base dtype and numpy subarray shape out of a numpy field
 // dtype.  For a scalar field, returns (field_dtype, []).  For a
 // subarray field like ('f4', (3, 4)), returns (f4_dtype, [3, 4]).
@@ -1912,6 +1954,8 @@ fn extract_field_base_and_shape<'py>(
 fn dtype_to_write_columns(
     dtype: &Bound<'_, PyAny>,
     units: Option<&Bound<'_, PyDict>>,
+    var_dtypes: Option<&Bound<'_, PyDict>>,
+    descriptor: char,
 ) -> PyResult<Vec<WriteColumn>> {
     let names_attr = dtype.getattr("names")?;
     if names_attr.is_none() {
@@ -1924,6 +1968,22 @@ fn dtype_to_write_columns(
         return Err(PyValueError::new_err(
             "create_table_hdu: dtype has no fields"));
     }
+    // Build a set of every name the var_dtypes kwarg mentions so we
+    // can reject keys that don't match any column.
+    let var_dtypes_names: Option<std::collections::HashSet<String>> =
+        if let Some(d) = var_dtypes {
+            let mut s = std::collections::HashSet::new();
+            for k in d.keys() {
+                let key: String = k.extract().map_err(|_| {
+                    PyValueError::new_err(
+                        "var_dtypes keys must be strings")
+                })?;
+                s.insert(key);
+            }
+            Some(s)
+        } else {
+            None
+        };
     let fields = dtype.getattr("fields")?;
     let mut out = Vec::with_capacity(names.len());
     for name in &names {
@@ -1932,6 +1992,58 @@ fn dtype_to_write_columns(
         let field_dtype = entry_tup.get_item(0)?;
         let (base_dtype, np_shape) =
             extract_field_base_and_shape(&field_dtype)?;
+        let base_kind: String = base_dtype.getattr("kind")?.extract()?;
+
+        // Object-dtype field → VLA column.  The user must specify
+        // the inner element type via var_dtypes={name: 'f4'} (or
+        // similar); without it we can't pick a TFORM letter.
+        if base_kind == "O" {
+            if !np_shape.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}': VLA columns must be scalar Object \
+                     (numpy dtype 'O' with no subarray shape); got \
+                     shape {:?}", name, np_shape)));
+            }
+            let inner_dtype_str: String = match var_dtypes {
+                Some(d) => match d.get_item(name.as_str())? {
+                    Some(v) => v.extract().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "var_dtypes['{}'] must be a string \
+                             (e.g. 'f4', 'i4')", name))
+                    })?,
+                    None => return Err(PyValueError::new_err(format!(
+                        "column '{}': Object dtype requires the inner \
+                         element type via var_dtypes['{}'] = ...",
+                        name, name))),
+                },
+                None => return Err(PyValueError::new_err(format!(
+                    "column '{}': Object dtype requires the inner \
+                     element type via the var_dtypes= kwarg",
+                    name))),
+            };
+            let vc = classify_var_numpy_field(&inner_dtype_str, name)?;
+            let descriptor_size = if descriptor == 'P' { 8 } else { 16 };
+            let tunit = units.and_then(|d| {
+                d.get_item(name.as_str()).ok().flatten()
+                    .and_then(|v| v.extract::<String>().ok())
+            });
+            // vc.elem_size is consumed by the write-path heap writer
+            // via bytes_per_element(tform_letter); no per-column copy
+            // is stored here.
+            let _ = vc.elem_size;
+            out.push(WriteColumn {
+                name: name.clone(),
+                tform_letter: vc.inner_letter,
+                repeat: 1,
+                byte_width: descriptor_size,
+                tzero: None,
+                tdim: None,
+                tunit,
+                var_kind: Some(descriptor),
+            });
+            continue;
+        }
+
         let cls = classify_scalar_numpy_field(&base_dtype, name)?;
         let array_count: usize =
             np_shape.iter().copied().product::<usize>().max(1);
@@ -1979,7 +2091,22 @@ fn dtype_to_write_columns(
             tzero: cls.tzero,
             tdim,
             tunit,
+            var_kind: None,
         });
+    }
+    // Reject var_dtypes keys that don't match any column — usually
+    // a typo.  Build the set of matched names from the final out and
+    // diff against the user-supplied keys.
+    if let Some(provided) = var_dtypes_names {
+        let column_names: std::collections::HashSet<String> =
+            out.iter().map(|c| c.name.clone()).collect();
+        for k in &provided {
+            if !column_names.contains(k) {
+                return Err(PyValueError::new_err(format!(
+                    "var_dtypes contains key '{}' that does not match \
+                     any column in the dtype", k)));
+            }
+        }
     }
     Ok(out)
 }
@@ -2012,7 +2139,10 @@ fn build_bintable_header_cards(
     }
     for (i, col) in write_columns.iter().enumerate() {
         let n = i + 1;
-        let tform = format!("{}{}", col.repeat, col.tform_letter);
+        let tform = match col.var_kind {
+            Some(desc) => format!("1{}{}", desc, col.tform_letter),
+            None => format!("{}{}", col.repeat, col.tform_letter),
+        };
         cards.push(card_string(
             &format!("TTYPE{}", n), &col.name, "label for column"));
         cards.push(card_string(
@@ -2046,10 +2176,13 @@ pub(crate) fn normalize_and_build_table_header(
     extname: Option<&str>,
     extver: Option<i64>,
     units: Option<&Bound<'_, PyDict>>,
+    var_dtypes: Option<&Bound<'_, PyDict>>,
+    descriptor: char,
 ) -> PyResult<(Vec<String>, u64)> {
     let np = py.import("numpy")?;
     let np_dtype = np.getattr("dtype")?.call1((dtype_in,))?;
-    let write_columns = dtype_to_write_columns(&np_dtype, units)?;
+    let write_columns = dtype_to_write_columns(
+        &np_dtype, units, var_dtypes, descriptor)?;
     let row_width: u64 = write_columns.iter()
         .map(|c| c.byte_width as u64).sum();
     let cards = build_bintable_header_cards(
@@ -3077,6 +3210,761 @@ fn setitem_single_column(
         col, &transform, &source, file, data_offset, nrows, row_width, tainted)
 }
 
+// ---------------------------------------------------------------------------
+// VLA write support (Phase 4)
+// ---------------------------------------------------------------------------
+
+// True iff any column is variable-length (P/Q).  Dispatches the write
+// path: fixed-only tables take the existing fast/slow strip writer;
+// tables with any VLA column take the heap-aware path below.
+fn any_var_column(columns: &[Column]) -> bool {
+    columns.iter().any(|c| c.var_kind.is_some())
+}
+
+// Pull per-column input ndarrays out of any of the three accepted
+// input forms (structured ndarray / dict / list+names), in column
+// order.  Used by the VLA write path because structured-ndarray
+// shared-buffer addressing breaks down once Object fields appear:
+// every column needs its own per-row source array for the slow path.
+//
+// Validates the per-form structural constraints (extras / missing /
+// duplicates / wrong length) but does NOT validate per-cell dtypes —
+// that's per-column work the caller does next.
+fn extract_per_column_inputs<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    names: Option<&Bound<'py, PyAny>>,
+    columns: &[Column],
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let column_names: std::collections::HashSet<&str> =
+        columns.iter().map(|c| c.name.as_str()).collect();
+    if data.is_instance_of::<PyDict>() {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not dict"));
+        }
+        let d = data.cast::<PyDict>()?;
+        for k in d.keys() {
+            let key: String = k.extract().map_err(|_| {
+                PyValueError::new_err("dict keys must be strings")
+            })?;
+            if !column_names.contains(key.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "dict has extra key '{}' not in table columns", key)));
+            }
+        }
+        let mut out = Vec::with_capacity(columns.len());
+        for col in columns {
+            let val = d.get_item(col.name.as_str())?
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "dict is missing column '{}'", col.name)))?;
+            out.push(val);
+        }
+        Ok(out)
+    } else if data.is_instance_of::<PyList>()
+        || data.is_instance_of::<PyTuple>()
+    {
+        let names_obj = names.ok_or_else(|| PyValueError::new_err(
+            "when data is a list/tuple, names= is required"))?;
+        let arrays: Vec<Bound<'_, PyAny>> = data.try_iter()?
+            .collect::<PyResult<Vec<_>>>()?;
+        let provided_names: Vec<String> = names_obj.extract().map_err(|_| {
+            PyValueError::new_err(
+                "names= must be a sequence of strings")
+        })?;
+        if arrays.len() != provided_names.len() {
+            return Err(PyValueError::new_err(format!(
+                "len(data)={} != len(names)={}",
+                arrays.len(), provided_names.len())));
+        }
+        let mut name_to_arr: std::collections::HashMap<String, Bound<'_, PyAny>> =
+            std::collections::HashMap::with_capacity(provided_names.len());
+        for (n, a) in provided_names.iter().zip(arrays.iter()) {
+            if !column_names.contains(n.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "names list has extra entry '{}' not in table columns", n)));
+            }
+            if name_to_arr.insert(n.clone(), a.clone()).is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "duplicate name '{}' in names list", n)));
+            }
+        }
+        let mut out = Vec::with_capacity(columns.len());
+        for col in columns {
+            let val = name_to_arr.remove(&col.name)
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "column '{}' is missing from names list", col.name)))?;
+            out.push(val);
+        }
+        Ok(out)
+    } else {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not a \
+                 structured ndarray"));
+        }
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        if !data.is_instance(&ndarray)? {
+            return Err(PyValueError::new_err(
+                "data must be a structured numpy ndarray, a dict \
+                 {name: ndarray}, or a list/tuple of ndarrays with \
+                 names=[...]"));
+        }
+        let dtype = data.getattr("dtype")?;
+        let names_attr = dtype.getattr("names")?;
+        if names_attr.is_none() {
+            return Err(PyValueError::new_err(
+                "structured input must have named fields"));
+        }
+        let input_names: Vec<String> = names_attr.extract()?;
+        let input_names_set: std::collections::HashSet<&str> =
+            input_names.iter().map(|s| s.as_str()).collect();
+        for col in columns {
+            if !input_names_set.contains(col.name.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "input dtype is missing field '{}' (table column)",
+                    col.name)));
+            }
+        }
+        // arr[col_name] on a structured ndarray returns a per-column
+        // VIEW with stride == record itemsize, not stride == field
+        // itemsize.  So for any input with more than one field, the
+        // view is non-contiguous (RawBuffer.acquire would reject it)
+        // because the write loop assumes tight packing — it indexes
+        // `buffer[row * per_cell_bytes ..]` to get row N.  Calling
+        // np.ascontiguousarray here materializes a compacted copy
+        // when needed and is a no-op when the view is already
+        // contiguous.  Cost: one memcpy per fixed column per write,
+        // sized to the column's actual bytes.  For Object (VLA)
+        // columns, the copy shuffles 8-byte pointers; the heap cells
+        // themselves are untouched.
+        //
+        // FUTURE: a stride-aware FixedColInfo (carrying src_stride
+        // alongside per_cell_bytes and indexing rows by stride) would
+        // avoid this copy entirely.  Worth doing if profiling shows
+        // the copy as a hot path for large structured + VLA inputs.
+        let ascontiguousarray = np.getattr("ascontiguousarray")?;
+        let mut out = Vec::with_capacity(columns.len());
+        for col in columns {
+            let view = data.get_item(col.name.as_str())?;
+            out.push(ascontiguousarray.call1((view,))?);
+        }
+        Ok(out)
+    }
+}
+
+// Maps an inner FITS letter to the numpy dtype kind/itemsize tuple
+// that a VLA cell must have.  Mirrors classify_var_numpy_field but
+// in the inverse direction (write-time validation against the on-disk
+// column type rather than dtype → letter mapping).
+fn vla_cell_expected_dtype(inner_letter: char) -> (&'static str, usize) {
+    match inner_letter {
+        'L' => ("b", 1),
+        'B' => ("u", 1),
+        'I' => ("i", 2),
+        'J' => ("i", 4),
+        'K' => ("i", 8),
+        'E' => ("f", 4),
+        'D' => ("f", 8),
+        'C' => ("c", 8),
+        'M' => ("c", 16),
+        _ => unreachable!(
+            "vla_cell_expected_dtype called with unsupported inner '{}'",
+            inner_letter),
+    }
+}
+
+// Per-row VLA cell metadata captured during the validation pass.
+// nelements is the cell's logical length; bytes_offset_in_heap is
+// the cell's start position in the planned heap layout.  Caller
+// can compute byte_count = nelements * elem_size (and the heap-
+// builder uses the cell's stored ndarray bytes to do the actual
+// big-endian serialization).
+#[derive(Clone, Copy)]
+struct VlaCellPlan {
+    nelements: usize,
+    bytes_offset_in_heap: usize,
+}
+
+// Validate one VLA cell's ndarray + return its element count.  The
+// cell must be a 1-D numpy ndarray with C-contiguous layout and the
+// dtype matching the column's inner letter.  Empty cells (nelements
+// == 0) are accepted (descriptor is just (0, current_heap_offset)).
+fn validate_vla_cell(
+    cell: &Bound<'_, PyAny>,
+    ndarray: &Bound<'_, PyAny>,
+    inner_letter: char,
+    col_name: &str,
+    row_idx: usize,
+) -> PyResult<usize> {
+    if !cell.is_instance(ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "column '{}' row {}: VLA cell must be a numpy ndarray",
+            col_name, row_idx)));
+    }
+    let shape: Vec<usize> = cell.getattr("shape")?.extract()?;
+    if shape.len() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "column '{}' row {}: VLA cell must be 1-D, got shape {:?}",
+            col_name, row_idx, shape)));
+    }
+    let nelements = shape[0];
+    let dtype = cell.getattr("dtype")?;
+    let kind: String = dtype.getattr("kind")?.extract()?;
+    let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
+    let (expected_kind, expected_size) = vla_cell_expected_dtype(inner_letter);
+    if kind != expected_kind || itemsize != expected_size {
+        return Err(PyValueError::new_err(format!(
+            "column '{}' row {}: VLA cell dtype kind '{}' itemsize {} \
+             does not match expected inner type '{}' (kind '{}' \
+             itemsize {})",
+            col_name, row_idx, kind, itemsize, inner_letter,
+            expected_kind, expected_size)));
+    }
+    if nelements > 0 {
+        let flags = cell.getattr("flags")?;
+        let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+        if !c_contig {
+            return Err(PyValueError::new_err(format!(
+                "column '{}' row {}: VLA cell ndarray must be C-contiguous",
+                col_name, row_idx)));
+        }
+    }
+    Ok(nelements)
+}
+
+// Plan the heap layout: walk every VLA cell in row-major order (per
+// row, walk every VLA column) and assign each cell a heap offset.
+// Returns per-column per-row plans plus the TOTAL heap size after
+// this batch (== heap_start_offset + sum of cell bytes).
+// `heap_start_offset` lets the caller start the layout at a non-zero
+// position (used for VLA append, where new cells extend the existing
+// heap rather than replacing it).
+fn plan_vla_heap_layout(
+    columns: &[Column],
+    per_col: &[Bound<'_, PyAny>],
+    nrows: usize,
+    ndarray: &Bound<'_, PyAny>,
+    heap_start_offset: usize,
+) -> PyResult<(Vec<Vec<VlaCellPlan>>, usize)> {
+    let mut plans: Vec<Vec<VlaCellPlan>> = columns.iter()
+        .map(|c| if c.var_kind.is_some() {
+            Vec::with_capacity(nrows)
+        } else {
+            Vec::new()
+        })
+        .collect();
+    let mut cursor = heap_start_offset;
+    for row_idx in 0..nrows {
+        for (col_idx, col) in columns.iter().enumerate() {
+            if col.var_kind.is_none() {
+                continue;
+            }
+            let elem_size = bytes_per_element(col.tform_letter)
+                .unwrap_or(0);
+            let cell = per_col[col_idx].get_item(row_idx)?;
+            let nelements = validate_vla_cell(
+                &cell, ndarray, col.tform_letter, &col.name, row_idx)?;
+            let bytes = nelements * elem_size;
+            plans[col_idx].push(VlaCellPlan {
+                nelements,
+                bytes_offset_in_heap: cursor,
+            });
+            cursor = cursor.checked_add(bytes).ok_or_else(|| {
+                PyValueError::new_err("heap size overflow")
+            })?;
+        }
+    }
+    Ok((plans, cursor))
+}
+
+// Write one VLA cell's bytes into `dst`, byteswapping inner elements
+// (numpy → big-endian on disk).  `dst.len()` must equal
+// `nelements * elem_size`.
+fn serialize_vla_cell(
+    cell: &Bound<'_, PyAny>,
+    inner_letter: char,
+    nelements: usize,
+    dst: &mut [u8],
+) -> PyResult<()> {
+    if nelements == 0 {
+        return Ok(());
+    }
+    let buf = RawBuffer::acquire(cell)?;
+    let src = buf.as_slice();
+    let elem_size = bytes_per_element(inner_letter).unwrap();
+    let total = nelements * elem_size;
+    if src.len() < total {
+        return Err(PyValueError::new_err(format!(
+            "VLA cell buffer length {} smaller than expected {}",
+            src.len(), total)));
+    }
+    let swap_w = byteswap_unit(inner_letter);
+    if inner_letter == 'L' {
+        // numpy bool 0/1 → FITS L 'T'/'F'.  No byteswap.
+        for i in 0..nelements {
+            dst[i] = if src[i] == 0 { b'F' } else { b'T' };
+        }
+    } else if swap_w == 1 {
+        dst[..total].copy_from_slice(&src[..total]);
+    } else {
+        let units = total / swap_w;
+        for u in 0..units {
+            let s = &src[u * swap_w..(u + 1) * swap_w];
+            let d = &mut dst[u * swap_w..(u + 1) * swap_w];
+            for k in 0..swap_w {
+                d[k] = s[swap_w - 1 - k];
+            }
+        }
+    }
+    Ok(())
+}
+
+// Write a P or Q descriptor (nelements, heap_offset) into `dst` as
+// big-endian.  P descriptors are 2 × i32 = 8 bytes; Q descriptors
+// are 2 × i64 = 16 bytes.
+fn write_descriptor(
+    descriptor_kind: char,
+    nelements: usize,
+    heap_offset: usize,
+    dst: &mut [u8],
+) {
+    match descriptor_kind {
+        'P' => {
+            let n = (nelements as i32).to_be_bytes();
+            let off = (heap_offset as i32).to_be_bytes();
+            dst[0..4].copy_from_slice(&n);
+            dst[4..8].copy_from_slice(&off);
+        }
+        'Q' => {
+            let n = (nelements as i64).to_be_bytes();
+            let off = (heap_offset as i64).to_be_bytes();
+            dst[0..8].copy_from_slice(&n);
+            dst[8..16].copy_from_slice(&off);
+        }
+        _ => unreachable!(),
+    }
+}
+
+// Per-column write info for the VLA-aware path.  Fixed and VLA
+// columns are kept in parallel Vec<Option<...>>s indexed by column
+// position so the strip-builder can dispatch without re-classifying.
+struct FixedColInfo {
+    buffer: RawBuffer,
+    per_cell_bytes: usize,
+    transform: WriteTransform,
+}
+
+struct VlaColInfo<'py> {
+    // Per-row (nelements, heap_offset) plans, indexed by input row.
+    plans: Vec<VlaCellPlan>,
+    // The 1-D Object ndarray (held so the heap-serialization pass
+    // can `arr[i]` to get each row's cell).
+    per_col_array: Bound<'py, PyAny>,
+}
+
+// Validate a fixed column's per-column input ndarray against the on-
+// disk column and acquire its raw buffer.  Mirrors
+// acquire_per_column_array but the inputs are already extracted into
+// per-column ndarrays by extract_per_column_inputs, so this function
+// can borrow the buffer directly into the per-column FixedColInfo
+// without going through the shared Vec<RawBuffer> indirection that
+// the prepare_*_input functions need.
+fn build_fixed_col_info(
+    arr: &Bound<'_, PyAny>,
+    ndarray: &Bound<'_, PyAny>,
+    col: &Column,
+    nrows: usize,
+) -> PyResult<FixedColInfo> {
+    if !arr.is_instance(ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': value must be a numpy ndarray", col.name)));
+    }
+    let arr_shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    if arr_shape.is_empty() || arr_shape[0] != nrows {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': array shape {:?} does not have first axis \
+             == nrows ({})", col.name, arr_shape, nrows)));
+    }
+    let per_cell_shape: Vec<usize> = arr_shape[1..].to_vec();
+    let expected_shape = column_expected_shape(col);
+    if per_cell_shape != expected_shape {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': per-cell shape {:?} does not match table \
+             column expected shape {:?}",
+            col.name, per_cell_shape, expected_shape)));
+    }
+    let arr_dtype = arr.getattr("dtype")?;
+    let kind: String = arr_dtype.getattr("kind")?.extract()?;
+    let elem_size: usize = arr_dtype.getattr("itemsize")?.extract()?;
+    let transform = column_transform(col, &kind, elem_size)?;
+    let cell_elements: usize =
+        per_cell_shape.iter().product::<usize>().max(1);
+    let per_cell_bytes = elem_size * cell_elements;
+    let flags = arr.getattr("flags")?;
+    let c_contig: bool = flags.getattr("c_contiguous")?.extract()?;
+    if !c_contig {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': ndarray must be C-contiguous", col.name)));
+    }
+    let buffer = RawBuffer::acquire(arr)?;
+    let expected_bytes = nrows.checked_mul(per_cell_bytes)
+        .ok_or_else(|| PyValueError::new_err("input size overflow"))?;
+    if buffer.as_slice().len() < expected_bytes {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': buffer length {} smaller than expected {}",
+            col.name, buffer.as_slice().len(), expected_bytes)));
+    }
+    Ok(FixedColInfo { buffer, per_cell_bytes, transform })
+}
+
+// Fill one main-data row in `row_buf` from per-column inputs.  Fixed
+// columns copy+transform from their per-column buffer; VLA columns
+// write a descriptor pointing into the planned heap layout, using
+// each column's own var_kind (different VLA columns may use
+// different descriptor sizes in principle, though our writer emits
+// a uniform descriptor= choice at create time).
+fn fill_main_row(
+    columns: &[Column],
+    fixed: &[Option<FixedColInfo>],
+    vla: &[Option<VlaColInfo<'_>>],
+    input_row: usize,
+    row_buf: &mut [u8],
+) -> PyResult<()> {
+    for (col_idx, col) in columns.iter().enumerate() {
+        let dst = &mut row_buf
+            [col.byte_offset..col.byte_offset + col.byte_width];
+        if let Some(vci) = &vla[col_idx] {
+            let plan = vci.plans[input_row];
+            let kind = col.var_kind.unwrap();
+            write_descriptor(
+                kind, plan.nelements, plan.bytes_offset_in_heap, dst);
+        } else if let Some(fci) = &fixed[col_idx] {
+            let src_off = input_row * fci.per_cell_bytes;
+            let src = &fci.buffer.as_slice()
+                [src_off..src_off + fci.per_cell_bytes];
+            apply_transform_cell(
+                &fci.transform, src, dst, &col.name, input_row)?;
+        } else {
+            unreachable!(
+                "column '{}' is neither fixed nor VLA", col.name);
+        }
+    }
+    Ok(())
+}
+
+// Heart of the VLA-aware write path.  Writes `input_nrows` rows of
+// main-table data (with embedded descriptors) starting at
+// `main_start_offset` and the corresponding heap bytes starting at
+// `heap_start_offset` in the file.  Returns the total bytes added
+// to the heap (so the caller can update PCOUNT).
+//
+// The caller is responsible for everything OUTSIDE the bytes this
+// function writes:
+//  - File growth (set_len / shift_file_tail) to make room.
+//  - Header rewrites (PCOUNT, NAXIS2).
+//  - Old-heap relocation for append.
+//
+// Mid-write I/O failures taint the file.
+#[allow(clippy::too_many_arguments)]
+fn write_vla_data_range(
+    columns: &[Column],
+    fixed: &[Option<FixedColInfo>],
+    vla: &[Option<VlaColInfo<'_>>],
+    total_heap_bytes: usize,
+    heap_start_offset_in_heap: usize,
+    file: &FileHandle,
+    main_start_offset: u64,
+    heap_start_offset_in_file: u64,
+    input_nrows: usize,
+    row_width: usize,
+    tainted: &TaintFlag,
+) -> PyResult<usize> {
+    if input_nrows == 0 {
+        return Ok(0);
+    }
+    // Build the heap buffer in memory.  For very large heaps this
+    // could be streamed but for MVP we accumulate; total_heap_bytes
+    // is the upper bound (matches the planner output).
+    let added_heap_bytes = total_heap_bytes - heap_start_offset_in_heap;
+    let mut heap_buf: Vec<u8> = vec![0u8; added_heap_bytes];
+    for (col_idx, col) in columns.iter().enumerate() {
+        let Some(vci) = &vla[col_idx] else { continue; };
+        let elem_size = bytes_per_element(col.tform_letter)
+            .unwrap_or(0);
+        for input_row in 0..input_nrows {
+            let plan = vci.plans[input_row];
+            if plan.nelements == 0 { continue; }
+            let cell = vci.per_col_array.get_item(input_row)?;
+            let local_off =
+                plan.bytes_offset_in_heap - heap_start_offset_in_heap;
+            let n_bytes = plan.nelements * elem_size;
+            let dst = &mut heap_buf[local_off..local_off + n_bytes];
+            serialize_vla_cell(&cell, col.tform_letter, plan.nelements, dst)?;
+        }
+    }
+
+    // Main data strip writer.  Same strip sizing as the fixed path;
+    // each row is built one at a time via fill_main_row (which mixes
+    // fixed-column transforms with VLA descriptor writes).
+    let strip_target_bytes: usize = 1 << 20;
+    let strip_nrows = (strip_target_bytes / row_width.max(1))
+        .max(1).min(input_nrows);
+    let mut strip_buf: Vec<u8> = vec![0u8; strip_nrows * row_width];
+
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(main_start_offset))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+
+    let mut row_start = 0usize;
+    while row_start < input_nrows {
+        let chunk = (input_nrows - row_start).min(strip_nrows);
+        let want = chunk * row_width;
+        if want < strip_buf.len() {
+            strip_buf.truncate(want);
+        }
+        for b in strip_buf.iter_mut() { *b = 0; }
+        for r in 0..chunk {
+            let off = r * row_width;
+            fill_main_row(
+                columns, fixed, vla, row_start + r,
+                &mut strip_buf[off..off + row_width])?;
+        }
+        if let Err(e) = f.write_all(&strip_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during VLA main-data write: {}", e)));
+        }
+        row_start += chunk;
+    }
+
+    // Now write the heap.  Single seek + write; heap_buf can be
+    // large but we already committed to building it in RAM.
+    if !heap_buf.is_empty() {
+        f.seek(SeekFrom::Start(heap_start_offset_in_file))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&heap_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during VLA heap write: {}", e)));
+        }
+    }
+    if let Err(e) = f.flush() {
+        tainted.store(true, Ordering::Release);
+        return Err(PyIOError::new_err(format!(
+            "flush error during VLA write: {}", e)));
+    }
+    Ok(added_heap_bytes)
+}
+
+// VLA-aware append path.  Mirrors the fixed append flow but
+// additionally:
+//   - Plans the heap layout starting at the current PCOUNT (so
+//     descriptors for new rows point to offsets after the existing
+//     heap).
+//   - Relocates the existing heap forward (within the data section)
+//     to sit after the appended main rows.
+//   - Updates PCOUNT alongside NAXIS2 in the header rewrite.
+// Reads the old heap into memory once, before any byte movement,
+// and writes it back to its new position after the new main rows
+// are in place.  For very large heaps this could chunk; MVP is
+// in-RAM for clarity.
+#[allow(clippy::too_many_arguments)]
+fn append_vla_aware(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+    current_nrows: usize,
+    append_nrows: usize,
+    new_nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let per_col = extract_per_column_inputs(py, data, names, columns)?;
+    // Per-column length sanity (each input must have append_nrows rows).
+    for (col_idx, col) in columns.iter().enumerate() {
+        let shape: Vec<usize> =
+            per_col[col_idx].getattr("shape")?.extract()?;
+        if shape.first().copied().unwrap_or(0) != append_nrows {
+            return Err(PyValueError::new_err(format!(
+                "column '{}': input has {} rows but append_nrows={}",
+                col.name, shape.first().copied().unwrap_or(0),
+                append_nrows)));
+        }
+    }
+    let mut fixed: Vec<Option<FixedColInfo>> =
+        columns.iter().map(|_| None).collect();
+    for (col_idx, col) in columns.iter().enumerate() {
+        if col.var_kind.is_none() {
+            fixed[col_idx] = Some(build_fixed_col_info(
+                &per_col[col_idx], &ndarray, col, append_nrows)?);
+        }
+    }
+    let current_pcount = parse_keyword(cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let (plans, total_heap_bytes_after) = plan_vla_heap_layout(
+        columns, &per_col, append_nrows, &ndarray,
+        current_pcount as usize)?;
+    let new_pcount = total_heap_bytes_after as u64;
+    let vla: Vec<Option<VlaColInfo>> = columns.iter().enumerate()
+        .map(|(col_idx, col)| {
+            if col.var_kind.is_some() {
+                Some(VlaColInfo {
+                    plans: plans[col_idx].clone(),
+                    per_col_array: per_col[col_idx].clone(),
+                })
+            } else {
+                None
+            }
+        }).collect();
+
+    let old_main_bytes = (current_nrows * row_width) as u64;
+    let new_main_bytes = (new_nrows * row_width) as u64;
+    let current_data_bytes = old_main_bytes + current_pcount;
+    let new_data_bytes = new_main_bytes + new_pcount;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    // Read OLD heap before any byte movement: the upcoming new-main
+    // write may overwrite part of the old heap's region in place.
+    let old_heap_bytes: Vec<u8> = if current_pcount > 0 {
+        let mut buf = vec![0u8; current_pcount as usize];
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset + old_main_bytes))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut buf)
+            .map_err(|e| PyIOError::new_err(format!(
+                "read error capturing old heap during append: {}", e)))?;
+        buf
+    } else {
+        Vec::new()
+    };
+
+    // Grow data section if needed.  Last-HDU branch uses set_len;
+    // non-last branch shifts and zero-fills the gap (mirrors the
+    // fixed-table append path).
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta, &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Write the appended main rows + new heap bytes.  Heap goes at
+    // the NEW heap position, AFTER where the relocated old heap will
+    // sit (descriptors already encode offsets >= current_pcount).
+    write_vla_data_range(
+        columns, &fixed, &vla, total_heap_bytes_after,
+        current_pcount as usize,
+        &super_.file,
+        data_offset + old_main_bytes,
+        data_offset + new_main_bytes + current_pcount,
+        append_nrows, row_width, &super_.tainted)?;
+
+    // Relocate the captured old heap bytes into their new slot
+    // between the new main rows and the new heap content.
+    if !old_heap_bytes.is_empty() {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset + new_main_bytes))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&old_heap_bytes) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during old-heap relocation: {}", e)));
+        }
+        if let Err(e) = f.flush() {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "flush error during old-heap relocation: {}", e)));
+        }
+    }
+
+    // Update NAXIS2 + PCOUNT cards (disk-write-before-commit).
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    let naxis2_card = card_int(
+        "NAXIS2", new_nrows as i64, "number of rows in table");
+    let naxis2_idx = new_cards.iter()
+        .position(|c| c.len() >= 6 && c[..6].trim() == "NAXIS2")
+        .ok_or_else(|| PyValueError::new_err("header missing NAXIS2"))?;
+    new_cards[naxis2_idx] = naxis2_card.trim_end().to_string();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "header write failed during VLA append: {}", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "header flush failed during VLA append: {}", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
+// Rewrite (or insert) the PCOUNT card in `new_cards` to `new_pcount`.
+// PCOUNT is mandatory in BINTABLE headers so we expect it to exist;
+// fall back to inserting it just before TFIELDS if it's missing,
+// which keeps things sane for hand-built headers.
+fn set_pcount_in_cards(new_cards: &mut Vec<String>, new_pcount: u64) {
+    let card = card_int(
+        "PCOUNT", new_pcount as i64, "size of special data area");
+    let trimmed = card.trim_end().to_string();
+    if let Some(idx) = new_cards.iter().position(|c|
+        c.len() >= 6 && c[..6].trim() == "PCOUNT")
+    {
+        new_cards[idx] = trimmed;
+    } else {
+        let tfields_idx = new_cards.iter().position(|c|
+            c.len() >= 7 && c[..7].trim() == "TFIELDS")
+            .unwrap_or(new_cards.len() - 1);
+        new_cards.insert(tfields_idx, trimmed);
+    }
+}
+
 // Inspect the input + names= kwarg and return the row count it
 // describes, without doing any per-column validation (which would
 // require the columns Vec).  Used by append() before any file
@@ -3530,14 +4418,127 @@ impl TableHDU {
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
 
-        let mut buffers: Vec<RawBuffer> = Vec::new();
-        let prep = dispatch_write_input(
-            py, data, names, &columns, nrows, row_width, &mut buffers)?;
-        let sources = build_sources(&prep.metas, &buffers);
-        write_table_data(
-            &columns, &prep.transforms, &sources, prep.layout_matches,
-            &super_.file, data_offset, nrows, row_width, &super_.tainted,
-        )
+        if !any_var_column(&columns) {
+            let mut buffers: Vec<RawBuffer> = Vec::new();
+            let prep = dispatch_write_input(
+                py, data, names, &columns, nrows, row_width, &mut buffers)?;
+            let sources = build_sources(&prep.metas, &buffers);
+            return write_table_data(
+                &columns, &prep.transforms, &sources, prep.layout_matches,
+                &super_.file, data_offset, nrows, row_width, &super_.tainted,
+            );
+        }
+
+        // VLA-aware bulk write.  Validates fixed + VLA columns,
+        // plans the heap layout from scratch (full overwrite resets
+        // the heap), grows the file if needed, writes main+heap,
+        // updates PCOUNT in the header.
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        let per_col = extract_per_column_inputs(
+            py, data, names, &columns)?;
+        // Per-column input length check: every fixed and VLA column
+        // arrays must have length nrows.
+        for (col_idx, col) in columns.iter().enumerate() {
+            let shape: Vec<usize> =
+                per_col[col_idx].getattr("shape")?.extract()?;
+            if shape.first().copied().unwrap_or(0) != nrows {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}': input has {} rows but table NAXIS2={}",
+                    col.name, shape.first().copied().unwrap_or(0),
+                    nrows)));
+            }
+        }
+        let mut fixed: Vec<Option<FixedColInfo>> =
+            columns.iter().map(|_| None).collect();
+        for (col_idx, col) in columns.iter().enumerate() {
+            if col.var_kind.is_none() {
+                fixed[col_idx] = Some(build_fixed_col_info(
+                    &per_col[col_idx], &ndarray, col, nrows)?);
+            }
+        }
+        let (plans, total_heap_bytes) = plan_vla_heap_layout(
+            &columns, &per_col, nrows, &ndarray, 0)?;
+        let vla: Vec<Option<VlaColInfo>> = columns.iter().enumerate()
+            .map(|(col_idx, col)| {
+                if col.var_kind.is_some() {
+                    Some(VlaColInfo {
+                        plans: plans[col_idx].clone(),
+                        per_col_array: per_col[col_idx].clone(),
+                    })
+                } else {
+                    None
+                }
+            }).collect();
+
+        let current_pcount = parse_keyword(&cards, "PCOUNT")
+            .unwrap_or(0).max(0) as u64;
+        let main_bytes = (nrows * row_width) as u64;
+        let current_data_bytes = main_bytes + current_pcount;
+        let new_data_bytes = main_bytes + total_heap_bytes as u64;
+        let current_padded = round_up_to_block(current_data_bytes);
+        let new_padded = round_up_to_block(new_data_bytes);
+        let current_hdu_end = data_offset + current_padded;
+        let new_hdu_end = data_offset + new_padded;
+
+        if new_hdu_end > current_hdu_end {
+            let delta = new_hdu_end - current_hdu_end;
+            let file_len = {
+                let g = lock_file(&super_.file)?;
+                let f = g.as_ref()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.metadata()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .len()
+            };
+            if file_len > current_hdu_end {
+                shift_file_tail_and_update_offsets(
+                    &super_.file, &super_.layout,
+                    current_hdu_end, delta, &super_.tainted)?;
+                zero_fill_range(
+                    &super_.file, current_hdu_end, delta,
+                    &super_.tainted)?;
+            } else {
+                let mut g = lock_file(&super_.file)?;
+                let f = g.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.set_len(new_hdu_end)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+        }
+
+        let heap_offset_in_file = data_offset + main_bytes;
+        write_vla_data_range(
+            &columns, &fixed, &vla, total_heap_bytes, 0,
+            &super_.file, data_offset, heap_offset_in_file,
+            nrows, row_width, &super_.tainted)?;
+
+        // PCOUNT update — disk-write-before-commit ordering.
+        let mut cards_guard = super_.header.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let mut new_cards = cards_guard.clone();
+        set_pcount_in_cards(&mut new_cards, total_heap_bytes as u64);
+        {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+            let header_offset = data_offset - header_bytes.len() as u64;
+            f.seek(SeekFrom::Start(header_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.write_all(&header_bytes).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "PCOUNT header write failed: {}; close + reopen", e))
+            })?;
+            f.flush().map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "PCOUNT header flush failed: {}; close + reopen", e))
+            })?;
+        }
+        *cards_guard = new_cards;
+        Ok(())
     }
 
     // hdu[key] = value dispatches based on what `key` looks like:
@@ -3628,11 +4629,19 @@ impl TableHDU {
         if append_nrows == 0 {
             return Ok(());
         }
+        let new_nrows = current_nrows + append_nrows;
+
+        if any_var_column(&columns) {
+            return append_vla_aware(
+                py, &super_, &cards, &columns, data, names,
+                current_nrows, append_nrows, new_nrows, row_width,
+                data_offset);
+        }
+
         let mut buffers: Vec<RawBuffer> = Vec::new();
         let prep = dispatch_write_input(
             py, data, names, &columns, append_nrows, row_width,
             &mut buffers)?;
-        let new_nrows = current_nrows + append_nrows;
 
         // Step 2: grow the data section if the new rows push past
         // the current padded extent.  Last-HDU branch (file_len ==

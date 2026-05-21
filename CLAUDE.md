@@ -417,7 +417,14 @@ works for explicit-start writes.  Table write via `__setitem__`
 same way.  `TableHDU.append(rows)` (Phase 3, alias `extend`) grows
 NAXIS2 and the data section to append new rows, shifting the file
 tail and bumping later-HDU offsets when the table is not the last
-HDU on disk.  Detail in the "Table write roadmap" section below.
+HDU on disk.  VLA columns (Phase 4) are supported on both
+`write` and `append`: `create_table_hdu` takes a `var_dtypes={col:
+inner_dtype}` sidecar and an optional `descriptor='P'|'Q'` choice;
+heap layout is planned per write, PCOUNT is updated in the header,
+and append relocates the existing heap forward to make room for
+new main rows.  VLA `__setitem__` is deferred (cell-resize needs
+heap re-layout — see Phase 5).  Detail in the "Table write
+roadmap" section below.
 
 Inspection accessors on HDUs (no I/O, just header parse): every HDU
 has `extname` (Optional[str]), `extver` (int; default 1 per FITS
@@ -498,9 +505,10 @@ against `nomask`.
 
 Plan for getting table creation + writing on par with the image side.
 Reading is mature; Phases 1 (create + bulk write), 2 (__setitem__),
-and 3 (append/extend) have shipped.  Still missing: VLA columns on
-write (Phase 4).  The image side has all four and the patterns
-translate directly.
+3 (append/extend), and 4 (VLA columns on write/append, except
+`__setitem__`) have all shipped.  Only Phase 5 (ASCII tables,
+add/remove columns, VLA `__setitem__`) is deferred.  The image
+side has all four and the patterns translated directly.
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -575,15 +583,91 @@ The dispatch helpers (`dispatch_write_input`, `build_sources`,
 `determine_input_nrows`) are shared between `write` and `append`
 so the input-form handling stays in one place.
 
-**Phase 4 — VLA columns on write.**  Genuinely harder than 1–3.
-`create_table_hdu` accepts numpy Object columns; emits `1Pt(maxlen)`
-TFORMs.  Per-row heap append + descriptor write; THEAP + PCOUNT
-bookkeeping.
+**Phase 4 — VLA columns on write.**  Done for the bulk-write +
+append surfaces.  `__setitem__` for VLA columns is deferred.
+
+**API.**  `create_table_hdu(dtype, ..., var_dtypes=None,
+descriptor=None)`.  The user puts `'O'` for VLA fields in the numpy
+structured dtype and passes a sidecar `var_dtypes={col_name:
+inner_dtype_str}` so we can pick a FITS inner letter (we considered
+extending the dtype-list 3-tuple to carry inner type, but the
+sidecar mirrors the existing `units=` pattern and keeps numpy
+dtypes free of FITS-specific DSL).  `descriptor=` is `'P'`
+(default; 8-byte descriptors, 32-bit nelements/offset, 4 GB heap
+ceiling) or `'Q'` (16-byte, 64-bit, no practical ceiling).  No
+maxlen hint is emitted in TFORM for now (read side already accepts
+both `1PE` and `1PE(100)` shapes).
+
+**Inner types supported.**  Numeric: `B / I / J / K / E / D / C /
+M`; plus `L` (bool).  String VLAs (`PA`) and bit VLAs (`PX`) are
+NOT implemented on write — these are the two cases the read side
+also rejects/has-niche-support-for; defer until a user asks.
+
+**Write path.**  Dispatches on `any_var_column(&columns)`.  No-VLA
+tables take the existing fast/slow strip writer untouched.  With
+any VLA column, the path is:
+
+1. `extract_per_column_inputs` pulls a per-column ndarray out of
+   the input (structured / dict / list+names).  For structured-
+   array input this calls `np.ascontiguousarray` on each per-
+   column field view, because `arr[col_name]` returns a strided
+   view (stride == record itemsize, not field itemsize) that
+   would fail `RawBuffer.acquire`'s C-contiguous check.  Cost is
+   one memcpy per fixed column per write; `ascontiguousarray` is
+   a no-op when the view is already contiguous (dict / list+names
+   inputs pay nothing).  FUTURE: a stride-aware `FixedColInfo`
+   carrying `src_stride` and indexing rows by stride would avoid
+   this copy — worth doing if it ever shows up in a profile.
+2. `build_fixed_col_info` validates each fixed column (same
+   contract as `acquire_per_column_array`).
+3. `plan_vla_heap_layout` walks every VLA cell in row-major
+   per-row order and assigns each a `(nelements, heap_offset)`.
+   The cursor starts at `heap_start_offset` (0 for full write,
+   `current_PCOUNT` for append), and the returned total is the
+   absolute heap end (not just added bytes).
+4. Compute new padded data section size and grow the file if it
+   exceeds the current padded extent.  Same set_len / shift /
+   zero_fill primitives as image grow and fixed-table append.
+5. `write_vla_data_range` does the actual I/O: builds the heap
+   buffer in RAM (size = added bytes; MVP accumulates rather
+   than streaming), then writes main rows + embedded descriptors
+   strip by strip via `fill_main_row`, then seeks to the heap
+   start and writes the heap buffer.
+6. PCOUNT card update via `set_pcount_in_cards` + the standard
+   disk-write-before-commit header rewrite.
+
+**Append path.**  Like fixed append, but the existing heap must
+relocate forward to sit after the appended main rows.  Order:
+
+1. Plan + validate exactly as in write, but with `heap_start_offset
+   = current_PCOUNT`.
+2. Read the old heap into memory BEFORE any write — the upcoming
+   new-main write may overwrite the first `M * row_width` bytes
+   of the old heap region in place.
+3. Grow the file by `delta_padded` (block-aligned) if needed.
+4. `write_vla_data_range` writes new main rows + new heap bytes
+   (at their final position, AFTER the relocated old heap).
+5. Seek + write the captured old heap to its new position
+   `data_offset + new_main_bytes`.
+6. Update NAXIS2 + PCOUNT together via the same header rewrite.
+
+The MVP holds the entire old heap in RAM during step 2-5; a
+chunked back-to-front copy would bound peak memory at strip size,
+trade for code complexity.  Add when a real workload pushes
+heap-in-RAM into pain.
+
+**Refactor debt.**  Both `write()` and `append()` pymethods now
+have a long inline VLA dispatch branch (~100 lines each).
+Bundled into a follow-up cleanup commit — same pattern as the
+post-Phase-1 `dbc7bfc` refactor that pulled
+`append_header_and_data_to_file` + `finalize_hdu` out of
+`create_image_hdu` / `create_table_hdu`.
 
 **Phase 5 — out of scope.**  ASCII tables (rare in modern files);
 adding / removing columns from existing tables (header rewriting
-+ byte shuffling); extending a non-last HDU with VLA columns
-(composition of Phases 3 + 4 — tackle if it ever comes up).
++ byte shuffling); VLA `__setitem__` (resizing a cell forces heap
+re-layout — either rewrite the heap, or always-append-and-orphan
+which bloats; revisit when an actual workload demands it).
 
 ### Design decisions to settle at Phase 1 detail-design time
 
