@@ -244,6 +244,78 @@ fn parse_hdus_from_file(
     Ok(hdus)
 }
 
+// HDU kind tag used by FITS::finalize_hdu to pick the right pyclass
+// constructor when appending a freshly-written HDU.
+enum HduKind {
+    Image,
+    Table,
+}
+
+// Round a byte count up to the next BLOCK_SIZE boundary.  Returns 0
+// when input is 0 (no data section).
+fn data_section_padded(data_size: u64) -> u64 {
+    if data_size == 0 {
+        0
+    } else {
+        ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            * BLOCK_SIZE as u64
+    }
+}
+
+// The five cards that make up an empty primary image HDU
+// (SIMPLE=T, BITPIX=8, NAXIS=0, EXTEND=T, END).  Used both as the
+// auto-primary when create_table_hdu is the first call on a fresh
+// file, and (in the future) anywhere else a placeholder primary is
+// needed.
+fn empty_primary_cards() -> Vec<String> {
+    vec![
+        card_logical("SIMPLE", true, "file conforms to FITS standard"),
+        card_int("BITPIX", 8, "8-bit bytes"),
+        card_int("NAXIS", 0, "number of data axes"),
+        card_logical("EXTEND", true,
+                     "FITS dataset may contain extensions"),
+        pad_to_card("END"),
+    ]
+}
+
+// Append one HDU (header padded to BLOCK_SIZE + zero-allocated data
+// section) to the end of `file`.  Acquires the file lock for the
+// duration of the write, flushes once on exit, and returns the
+// freshly-constructed HduOffsets describing the appended bytes.
+// Caller is responsible for registering the offsets in the file's
+// layout and constructing the matching Py<HDU>.
+fn append_header_and_data_to_file(
+    file: &FileHandle,
+    cards: &[String],
+    data_padded: u64,
+) -> PyResult<Arc<HduOffsets>> {
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    let io_err = |e: std::io::Error| PyIOError::new_err(e.to_string());
+
+    f.seek(SeekFrom::End(0)).map_err(io_err)?;
+    let header_start = f.stream_position().map_err(io_err)?;
+
+    for c in cards {
+        f.write_all(c.as_bytes()).map_err(io_err)?;
+    }
+    let header_bytes_len = cards.len() * CARD_SIZE;
+    let pad_n = (BLOCK_SIZE - header_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
+    if pad_n > 0 {
+        f.write_all(&vec![b' '; pad_n]).map_err(io_err)?;
+    }
+    let header_end = f.stream_position().map_err(io_err)?;
+    if data_padded > 0 {
+        let new_len = header_end + data_padded;
+        f.set_len(new_len).map_err(io_err)?;
+        f.seek(SeekFrom::Start(new_len)).map_err(io_err)?;
+    }
+    f.flush().map_err(io_err)?;
+    let num_blocks = (header_end - header_start) / BLOCK_SIZE as u64;
+    Ok(HduOffsets::new(header_start, num_blocks, header_end))
+}
+
 #[pyclass]
 pub(crate) struct FITS {
     filename: String,
@@ -259,6 +331,66 @@ pub(crate) struct FITS {
     // Per-file taint flag (see TaintFlag).  Owned here; cloned into every
     // HDU and FITSHeader so a mid-write failure anywhere taints the lot.
     tainted: TaintFlag,
+}
+
+// Rust-only helpers on FITS — not exposed to Python.  Used by the
+// create_image_hdu / create_table_hdu / ensure_primary code paths to
+// avoid duplicating the "register HduOffsets + construct Py<HDU> +
+// push to self.hdus" pattern.
+impl FITS {
+    // Register an Arc<HduOffsets> in the file's layout, construct the
+    // matching Py<HDU> (image or table), trim cards to the canonical
+    // in-memory form, and push the HDU onto self.hdus.  The HDU's
+    // index is set to the post-push position automatically.
+    fn finalize_hdu(
+        &mut self,
+        py: Python<'_>,
+        cards: &[String],
+        offsets: Arc<HduOffsets>,
+        kind: HduKind,
+    ) -> PyResult<()> {
+        {
+            let mut lg = self.layout.hdus.lock()
+                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+            lg.push(Arc::clone(&offsets));
+        }
+        // Match what the on-disk parser would yield on a re-read: the
+        // header reader trims trailing whitespace from each 80-char
+        // card.  Cloning that here keeps the in-memory representation
+        // byte-equivalent to a fresh open.
+        let trimmed: Vec<String> = cards.iter()
+            .map(|c| c.trim_end().to_string())
+            .collect();
+        let index = self.hdus.len();
+        let hdu_py: Py<PyAny> = match kind {
+            HduKind::Image => Py::new(py, ImageHDU::new(
+                trimmed, index, self.filename.clone(),
+                offsets, Arc::clone(&self.layout),
+                Arc::clone(&self.file), Arc::clone(&self.tainted),
+            ))?.into(),
+            HduKind::Table => Py::new(py, TableHDU::new(
+                trimmed, index, self.filename.clone(),
+                offsets, Arc::clone(&self.layout),
+                Arc::clone(&self.file), Arc::clone(&self.tainted),
+            ))?.into(),
+        };
+        self.hdus.push(hdu_py);
+        Ok(())
+    }
+
+    // If the file has no HDUs yet, write an empty primary image
+    // (SIMPLE=T NAXIS=0) and register it.  Used by create_table_hdu
+    // (and any future extension-creating method) so that the user
+    // doesn't have to manually create a placeholder primary before
+    // their first extension.
+    fn ensure_primary(&mut self, py: Python<'_>) -> PyResult<()> {
+        if !self.hdus.is_empty() {
+            return Ok(());
+        }
+        let cards = empty_primary_cards();
+        let offsets = append_header_and_data_to_file(&self.file, &cards, 0)?;
+        self.finalize_hdu(py, &cards, offsets, HduKind::Image)
+    }
 }
 
 #[pymethods]
@@ -450,90 +582,17 @@ impl FITS {
         }
         cards.push(pad_to_card("END"));
 
-        let header_bytes_len = cards.len() * CARD_SIZE;
-        let pad_n = (BLOCK_SIZE - header_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
-
         let bytes_per_pixel = (bitpix.abs() / 8) as u64;
         let mut product: u64 = 1;
         for &d in &fits_dims {
             product = product.saturating_mul(d as u64);
         }
         let data_size = if naxis == 0 { 0 } else { bytes_per_pixel * product };
-        let data_padded = if data_size == 0 {
-            0
-        } else {
-            ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
-        };
+        let data_padded = data_section_padded(data_size);
 
-        let (header_offset, data_offset) = {
-            let mut guard = lock_file(&self.file)?;
-            let file = guard.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-
-            file.seek(SeekFrom::End(0))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            let header_start = file.stream_position()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-            for c in &cards {
-                file.write_all(c.as_bytes())
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-            if pad_n > 0 {
-                let padding = vec![b' '; pad_n];
-                file.write_all(&padding)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-
-            let header_end = file.stream_position()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-            if data_padded > 0 {
-                let new_len = header_end + data_padded;
-                file.set_len(new_len)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                file.seek(SeekFrom::Start(new_len))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-
-            file.flush()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-            (header_start, header_end)
-        };
-
-        // Construct the matching ImageHDU in memory and append.  The parser
-        // stores cards with trailing whitespace trimmed; mirror that here so
-        // the in-memory HDU is byte-equivalent to what a re-parse would yield.
-        let stored_cards: Vec<String> = cards.iter()
-            .map(|c| c.trim_end().to_string())
-            .collect();
-
-        let header_block_count = (data_offset - header_offset) / BLOCK_SIZE as u64;
-        let hdu_offsets = HduOffsets::new(
-            header_offset, header_block_count, data_offset,
-        );
-        {
-            let mut layout_guard = self.layout.hdus.lock()
-                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
-            layout_guard.push(Arc::clone(&hdu_offsets));
-        }
-
-        let new_hdu: Py<PyAny> = Py::new(
-            py,
-            ImageHDU::new(
-                stored_cards,
-                self.hdus.len(),
-                self.filename.clone(),
-                hdu_offsets,
-                Arc::clone(&self.layout),
-                Arc::clone(&self.file),
-                Arc::clone(&self.tainted),
-            ),
-        )?.into();
-        self.hdus.push(new_hdu);
-
-        Ok(())
+        let offsets =
+            append_header_and_data_to_file(&self.file, &cards, data_padded)?;
+        self.finalize_hdu(py, &cards, offsets, HduKind::Image)
     }
 
     // Create a new BINTABLE extension HDU.  `dtype` is either a
@@ -571,138 +630,16 @@ impl FITS {
         let (table_cards, row_width) = normalize_and_build_table_header(
             py, dtype, nrows, extname.as_deref(), extver, units,
         )?;
-        let table_header_bytes_len = table_cards.len() * CARD_SIZE;
-        let table_pad =
-            (BLOCK_SIZE - table_header_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
         let data_size = (nrows as u64).saturating_mul(row_width);
-        let data_padded = if data_size == 0 {
-            0
-        } else {
-            ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
-                * BLOCK_SIZE as u64
-        };
+        let data_padded = data_section_padded(data_size);
 
-        // Compose the empty primary header up front so all writes can
-        // happen inside one file-lock acquisition.
-        let primary_cards: Option<Vec<String>> = if self.hdus.is_empty() {
-            Some(vec![
-                card_logical("SIMPLE", true, "file conforms to FITS standard"),
-                card_int("BITPIX", 8, "8-bit bytes"),
-                card_int("NAXIS", 0, "number of data axes"),
-                card_logical("EXTEND", true,
-                             "FITS dataset may contain extensions"),
-                pad_to_card("END"),
-            ])
-        } else {
-            None
-        };
+        // BINTABLE cannot be primary — write an empty primary image
+        // first if the file has no HDUs yet.
+        self.ensure_primary(py)?;
 
-        // Writes: primary (if any), then BINTABLE header (padded), then
-        // zero-allocate the data section via set_len.  All in one lock.
-        let (primary_loc, table_loc) = {
-            let mut guard = lock_file(&self.file)?;
-            let file = guard.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            file.seek(SeekFrom::End(0))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-            let primary_loc = if let Some(ref p_cards) = primary_cards {
-                let p_start = file.stream_position()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                for c in p_cards {
-                    file.write_all(c.as_bytes())
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                }
-                let p_bytes_len = p_cards.len() * CARD_SIZE;
-                let p_pad = (BLOCK_SIZE - p_bytes_len % BLOCK_SIZE) % BLOCK_SIZE;
-                if p_pad > 0 {
-                    file.write_all(&vec![b' '; p_pad])
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                }
-                let p_end = file.stream_position()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                let p_blocks = (p_end - p_start) / BLOCK_SIZE as u64;
-                Some((p_start, p_blocks, p_end))
-            } else {
-                None
-            };
-
-            let t_start = file.stream_position()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            for c in &table_cards {
-                file.write_all(c.as_bytes())
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-            if table_pad > 0 {
-                file.write_all(&vec![b' '; table_pad])
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-            let t_header_end = file.stream_position()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            if data_padded > 0 {
-                let new_len = t_header_end + data_padded;
-                file.set_len(new_len)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                file.seek(SeekFrom::Start(new_len))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            }
-            file.flush()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            let t_blocks = (t_header_end - t_start) / BLOCK_SIZE as u64;
-            (primary_loc, (t_start, t_blocks, t_header_end))
-        };
-
-        // Trim trailing whitespace on stored cards to match what the
-        // parser would yield on a re-read (canonical in-memory form).
-        let trim = |cards: &[String]| -> Vec<String> {
-            cards.iter().map(|c| c.trim_end().to_string()).collect()
-        };
-
-        if let (Some(p_cards), Some((p_start, p_blocks, p_end)))
-            = (primary_cards.as_ref(), primary_loc)
-        {
-            let p_arc = HduOffsets::new(p_start, p_blocks, p_end);
-            {
-                let mut lg = self.layout.hdus.lock()
-                    .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
-                lg.push(Arc::clone(&p_arc));
-            }
-            let img: Py<PyAny> = Py::new(
-                py,
-                ImageHDU::new(
-                    trim(p_cards),
-                    self.hdus.len(),
-                    self.filename.clone(),
-                    p_arc,
-                    Arc::clone(&self.layout),
-                    Arc::clone(&self.file),
-                    Arc::clone(&self.tainted),
-                ),
-            )?.into();
-            self.hdus.push(img);
-        }
-
-        let (t_start, t_blocks, t_end) = table_loc;
-        let t_arc = HduOffsets::new(t_start, t_blocks, t_end);
-        {
-            let mut lg = self.layout.hdus.lock()
-                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
-            lg.push(Arc::clone(&t_arc));
-        }
-        let tab: Py<PyAny> = Py::new(
-            py,
-            TableHDU::new(
-                trim(&table_cards),
-                self.hdus.len(),
-                self.filename.clone(),
-                t_arc,
-                Arc::clone(&self.layout),
-                Arc::clone(&self.file),
-                Arc::clone(&self.tainted),
-            ),
-        )?.into();
-        self.hdus.push(tab);
-        Ok(())
+        let offsets = append_header_and_data_to_file(
+            &self.file, &table_cards, data_padded)?;
+        self.finalize_hdu(py, &table_cards, offsets, HduKind::Table)
     }
 
     // Accept either an integer (positional, with Python-style negative
