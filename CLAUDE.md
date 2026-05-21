@@ -464,17 +464,30 @@ bump only; `RawBuffer::acquire` pins the numpy buffer; native-endian
 writes flow straight from the user's array to disk.  Reverse-
 transform allocates one new array (unavoidable).
 
+General reverse-scaling on write (symmetric with the read side's
+General branch): when an HDU has non-trivial `BSCALE`/`BZERO` that
+isn't the unsigned-int trick (e.g. `BSCALE=0.5, BZERO=10`),
+`write` / `__setitem__` / `extend` accept f8 (physical) input
+alongside BITPIX-native input.  f8 input goes through
+`reverse_general_scaling`: `stored = (physical - BZERO) / BSCALE`.
+For integer BITPIX, non-finite values (NaN/Inf) raise, rounding is
+half-to-even via `np.rint`, and post-rounding values outside the
+BITPIX range raise (no silent saturation, no wrap).  For float
+BITPIX (-32), no rounding/bounds checks — the cast is exact within
+target precision.  BITPIX=64 with non-trivial scaling carries the
+usual f64-precision caveat (i64 values beyond 2^53 lose precision
+through the f8 intermediate); the upper bound check uses 2^63 -
+1024 (largest f64 below 2^63).
+
 **Missing.**
-- **General reverse-scaling on write** — when an HDU has non-trivial
-  BSCALE/BZERO set (not just the unsigned-int trick), `write()` does
-  not yet accept f8 input and reverse-transform via
-  `stored = (physical - BZERO) / BSCALE`.  Lossy (rounding + potential
-  overflow) and rarer in practice; deferred until a user asks.
-- **Scalar broadcast with unsigned trick** — `__setitem__` scalar RHS
+- **Scalar broadcast with scaling** — `__setitem__` scalar RHS
   (`img[k] = 42`) currently goes through `scalar_to_be_bytes` which
   reads the value at the BITPIX dtype; for unsigned-trick HDUs this
-  means the user must pass the BITPIX (signed) value.  Promoting to
-  a 0-d ndarray is a workaround.  Add when there's a use case.
+  means the user must pass the BITPIX (signed) value, and for
+  generally-scaled HDUs the user must pass the stored (pre-scaling)
+  value.  Promoting to a 0-d ndarray (which routes through
+  `normalize_input_dtype` and gets the reverse-transform) is the
+  workaround.  Add when there's a use case.
 - **Tile-compressed image writes (`ZIMAGE`)** — pair with the read
   side; do both at once when ZIMAGE work lands.
 

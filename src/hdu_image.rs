@@ -209,9 +209,10 @@ impl ImageHDU {
         let (bitpix, current_hdu_shape) = parse_image_hdu_shape(&header_snapshot)?;
         let naxis = current_hdu_shape.len();
 
-        // Accept BITPIX-native or (for unsigned-trick HDUs) scaled
-        // dtype; reverse-transform in flight.  Done before any file
-        // mutation so a dtype error leaves the file untouched.
+        // Accept BITPIX-native, or (for scaled HDUs) the scaled
+        // dtype — reverse-transform to BITPIX-native in flight.
+        // Done before any file mutation so a dtype error leaves the
+        // file untouched.
         let data_owned = normalize_input_dtype(py, &header_snapshot, data)?;
         let data = data_owned.bind(py);
         let (_expected_kind, expected_size) = bitpix_to_numpy_kind(bitpix)?;
@@ -790,8 +791,9 @@ fn write_image_data(
     let naxis = hdu_shape.len();
 
     // Single source of truth for input-dtype rules: accepts BITPIX
-    // native dtype directly OR the scaled dtype for HDUs configured
-    // with the unsigned-int trick (then reverse-transforms in flight).
+    // native dtype directly, OR the scaled dtype for HDUs with the
+    // unsigned-int trick, OR f8 (physical) for HDUs with general
+    // BSCALE/BZERO scaling — last two cases reverse-transform in flight.
     let data_owned = normalize_input_dtype(py, header, data)?;
     let data = data_owned.bind(py);
 
@@ -1045,9 +1047,9 @@ fn write_image_slice(
                 rhs_shape, output_shape,
             )));
         }
-        // Accept BITPIX-native or (for unsigned-trick HDUs) scaled
-        // dtype; reverse-transform in flight so the byte-pump below
-        // always sees BITPIX-native bytes.
+        // Accept BITPIX-native, or scaled dtype for scaled HDUs —
+        // reverse-transform in flight so the byte-pump below always
+        // sees BITPIX-native bytes.
         let rhs_owned = normalize_input_dtype(py, header, rhs)?;
         let rhs = rhs_owned.bind(py);
         let dtype = rhs.getattr("dtype")?;
@@ -1272,21 +1274,34 @@ fn normalize_input_dtype(
         return Ok(data.clone().unbind());
     }
 
-    // Allow scaled-dtype input when the HDU has the unsigned-int
-    // trick configured; reverse-transform to BITPIX dtype.
+    // Allow scaled-dtype input when the HDU has scaling configured;
+    // reverse-transform to BITPIX dtype.
     let (bscale, bzero) = parse_bscale_bzero(header);
     let kind = image_scaling_kind(bitpix, bscale, bzero);
-    if kind == ScalingKind::UnsignedTrick {
-        let (scaled_kind, scaled_size) = scaled_dtype_kind_size(bitpix);
-        if input_kind == scaled_kind && input_size == scaled_size {
-            return reverse_unsigned_trick(py, data, bitpix);
+    match kind {
+        ScalingKind::UnsignedTrick => {
+            let (scaled_kind, scaled_size) = scaled_dtype_kind_size(bitpix);
+            if input_kind == scaled_kind && input_size == scaled_size {
+                return reverse_unsigned_trick(py, data, bitpix);
+            }
         }
+        ScalingKind::General => {
+            // f8 (physical) input → reverse-transform to BITPIX dtype.
+            if input_kind == "f" && input_size == 8 {
+                return reverse_general_scaling(
+                    py, data, bitpix, bscale, bzero,
+                );
+            }
+        }
+        ScalingKind::None => {}
     }
 
-    let extra = if kind == ScalingKind::UnsignedTrick {
-        format!(" or scaled '{}'", scaled_image_dtype(bitpix, kind))
-    } else {
-        String::new()
+    let extra = match kind {
+        ScalingKind::UnsignedTrick => {
+            format!(" or scaled '{}'", scaled_image_dtype(bitpix, kind))
+        }
+        ScalingKind::General => " or scaled 'f8'".to_string(),
+        ScalingKind::None => String::new(),
     };
     Err(PyValueError::new_err(format!(
         "data dtype ({}{}) does not match HDU BITPIX={} \
@@ -1335,6 +1350,85 @@ fn reverse_unsigned_trick(
         }
         _ => unreachable!(
             "reverse_unsigned_trick on unexpected BITPIX {}", bitpix
+        ),
+    }
+}
+
+// Inverse of `apply_image_scaling`'s General branch: f8 (physical)
+// input → BITPIX-native dtype output via
+// `stored = (physical - bzero) / bscale`.  For integer BITPIX, non-
+// finite values are rejected, rounding is half-to-even via `np.rint`,
+// and post-rounding bounds violations are rejected too (so e.g.
+// 32767.5 → rint → 32768 against BITPIX=16 raises rather than
+// wrapping).  For float BITPIX (-32/-64), no rounding or bounds
+// check — the cast is exact within the target dtype's precision.
+// Caller must guarantee input dtype is f8 and kind == General.
+fn reverse_general_scaling(
+    py: Python<'_>,
+    arr: &Bound<'_, PyAny>,
+    bitpix: i32,
+    bscale: f64,
+    bzero: f64,
+) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    let shifted = arr.call_method1("__sub__", (bzero,))?;
+    let stored_f8 = shifted.call_method1("__truediv__", (bscale,))?;
+    let native_dtype = bitpix_to_native_dtype(bitpix)?;
+
+    if bitpix < 0 {
+        return Ok(
+            stored_f8.call_method1("astype", (native_dtype,))?.unbind()
+        );
+    }
+
+    let finite = np.call_method1("isfinite", (&stored_f8,))?;
+    let all_finite: bool = finite.call_method0("all")?.extract()?;
+    if !all_finite {
+        return Err(PyValueError::new_err(format!(
+            "cannot write non-finite values (NaN/Inf) to integer \
+             BITPIX={} HDU with BSCALE/BZERO scaling: reverse \
+             transform produced non-finite stored values",
+            bitpix
+        )));
+    }
+
+    let rounded = np.call_method1("rint", (&stored_f8,))?;
+    let (min_f, max_f, min_str, max_str) = bitpix_int_bounds(bitpix);
+    let lt_min = rounded.call_method1("__lt__", (min_f,))?;
+    let gt_max = rounded.call_method1("__gt__", (max_f,))?;
+    let any_lt: bool = lt_min.call_method0("any")?.extract()?;
+    let any_gt: bool = gt_max.call_method0("any")?.extract()?;
+    if any_lt || any_gt {
+        return Err(PyValueError::new_err(format!(
+            "values overflow BITPIX={} stored range [{}, {}] after \
+             reverse BSCALE/BZERO transform (rounded half-to-even)",
+            bitpix, min_str, max_str,
+        )));
+    }
+
+    Ok(rounded.call_method1("astype", (native_dtype,))?.unbind())
+}
+
+// f64 bounds for the BITPIX integer dtypes, plus their literal-int
+// string forms for error messages.  For BITPIX=64 the upper bound is
+// 2^63 - 1024 (largest f64 below 2^63) because i64::MAX (2^63 - 1) is
+// not exactly representable in f64.  Any physical input that would
+// reverse-transform to a value beyond this can't be expressed in f64
+// anyway, so the conservative bound doesn't lose anything reachable.
+fn bitpix_int_bounds(bitpix: i32) -> (f64, f64, &'static str, &'static str) {
+    match bitpix {
+        8 => (0.0, 255.0, "0", "255"),
+        16 => (-32768.0, 32767.0, "-32768", "32767"),
+        32 => (
+            -2147483648.0, 2147483647.0,
+            "-2147483648", "2147483647",
+        ),
+        64 => (
+            -9.223372036854776e18, 9.223372036854775e18,
+            "-9223372036854775808", "9223372036854775807",
+        ),
+        _ => unreachable!(
+            "bitpix_int_bounds on non-integer BITPIX {}", bitpix
         ),
     }
 }
