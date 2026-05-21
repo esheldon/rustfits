@@ -414,7 +414,10 @@ works for explicit-start writes.  Table write via `__setitem__`
 (Phase 2 of the table-write roadmap) covers single-row
 `hdu[i] = record`, slice `hdu[a:b[:s]] = arr`, and whole-column
 `hdu["col"] = arr`; mid-write I/O failures taint the file the
-same way.  Detail in the "Table write roadmap" section below.
+same way.  `TableHDU.append(rows)` (Phase 3, alias `extend`) grows
+NAXIS2 and the data section to append new rows, shifting the file
+tail and bumping later-HDU offsets when the table is not the last
+HDU on disk.  Detail in the "Table write roadmap" section below.
 
 Inspection accessors on HDUs (no I/O, just header parse): every HDU
 has `extname` (Optional[str]), `extver` (int; default 1 per FITS
@@ -494,10 +497,10 @@ against `nomask`.
 ## Table write roadmap
 
 Plan for getting table creation + writing on par with the image side.
-Reading is mature; Phases 1 (create + bulk write) and 2 (__setitem__)
-have shipped.  Still missing: `TableHDU.extend` (Phase 3) and VLA
-columns on write (Phase 4).  The image side has all four and the
-patterns translate directly.
+Reading is mature; Phases 1 (create + bulk write), 2 (__setitem__),
+and 3 (append/extend) have shipped.  Still missing: VLA columns on
+write (Phase 4).  The image side has all four and the patterns
+translate directly.
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -537,14 +540,40 @@ column subset writes `hdu[[c1,c2]] = ...`, fancy row-list writes
 `hdu[[1,3,5]] = ...`, tuple `(row, col)` writes.  Add when a use
 case shows up.
 
-**Phase 3 — `TableHDU.append()` (with `extend` alias).**  Append
-rows.  Primary method name is `append` because that's the natural
-verb for adding rows to a table (matches list/pandas usage);
-`extend` is kept as an alias so generic code that iterates over
-HDUs and calls `.extend(...)` keeps working symmetrically with
-`ImageHDU.extend`.  Mechanics mirror `ImageHDU.extend`: grows
-NAXIS2 in the header, grows the data section, uses
-`shift_file_tail_and_update_offsets` for non-last HDUs.
+**Phase 3 — `TableHDU.append()` (with `extend` alias).**  Done.
+Primary method name is `append` because that's the natural verb
+for adding rows to a table (matches list/pandas usage); `extend`
+is a thin alias that calls through to `append`, kept for symmetry
+with `ImageHDU.extend` so generic code iterating HDUs and calling
+`.extend(...)` keeps working.  Accepts the same three input forms
+as `write`: structured ndarray, dict `{name: ndarray}`, or
+list/tuple of ndarrays with `names=[...]`.
+
+Order is **validate-then-mutate** to keep dtype/shape errors from
+leaving the file half-grown: `determine_input_nrows` + the shared
+`dispatch_write_input` validator run first (acquiring buffers),
+then the file/header are mutated.  Mechanics after validation
+mirror `ImageHDU.extend`:
+
+1. Compute `current_padded` / `new_padded` (block-rounded data
+   bytes) and `delta = new_padded - current_padded`.
+2. If `delta > 0`: last-HDU branch uses `set_len`; non-last branch
+   uses `shift_file_tail_and_update_offsets` (which bumps every
+   later HDU's offsets) followed by `zero_fill_range` on the gap.
+3. Rewrite the NAXIS2 card to disk (disk-write-before-commit
+   ordering with taint on failure), then commit the in-memory
+   cards.
+4. Call `write_table_data` with `start_offset = data_offset +
+   current_nrows * row_width` and `nrows = append_nrows`, reusing
+   the Phase 1/2 fast and slow paths.
+
+Shared `Arc<HduOffsets>` means previously-issued handles to later
+HDUs see the post-shift offsets without re-fetching — same
+transparency as the header-grow path.
+
+The dispatch helpers (`dispatch_write_input`, `build_sources`,
+`determine_input_nrows`) are shared between `write` and `append`
+so the input-form handling stays in one place.
 
 **Phase 4 — VLA columns on write.**  Genuinely harder than 1–3.
 `create_table_hdu` accepts numpy Object columns; emits `1Pt(maxlen)`

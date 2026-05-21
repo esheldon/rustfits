@@ -1136,12 +1136,12 @@ fn parse_image_hdu_shape(header: &[String]) -> PyResult<(i32, Vec<u64>)> {
     Ok((bitpix, hdu_shape))
 }
 
-fn round_up_to_block(n: u64) -> u64 {
+pub(crate) fn round_up_to_block(n: u64) -> u64 {
     let block = BLOCK_SIZE as u64;
     ((n + block - 1) / block) * block
 }
 
-fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
+pub(crate) fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
     let num_blocks = (header.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK;
     let total_size = num_blocks * BLOCK_SIZE;
     let mut out = Vec::with_capacity(total_size);

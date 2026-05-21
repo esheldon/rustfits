@@ -28,10 +28,11 @@ use std::sync::atomic::Ordering;
 
 use crate::common::{
     check_not_tainted, lock_file, parse_keyword, parse_keyword_float,
-    parse_string_keyword,
+    parse_string_keyword, shift_file_tail_and_update_offsets, zero_fill_range,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
+use crate::hdu_image::{round_up_to_block, serialize_header_to_disk_bytes};
 use crate::header::{card_int, card_string, card_uint, pad_to_card};
 
 // All the per-column metadata needed downstream.  byte_offset is the
@@ -3076,6 +3077,103 @@ fn setitem_single_column(
         col, &transform, &source, file, data_offset, nrows, row_width, tainted)
 }
 
+// Inspect the input + names= kwarg and return the row count it
+// describes, without doing any per-column validation (which would
+// require the columns Vec).  Used by append() before any file
+// mutation so the grow + header-update can be sized correctly.
+//
+// For a structured ndarray: data.len() (== shape[0]).
+// For a dict: shape[0] of the first value (per-column consistency
+//   is enforced later by acquire_per_column_array).
+// For a list/tuple: shape[0] of the first element.
+fn determine_input_nrows(
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+) -> PyResult<usize> {
+    if data.is_instance_of::<PyDict>() {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not dict"));
+        }
+        let d = data.cast::<PyDict>()?;
+        let values = d.values();
+        if values.is_empty() {
+            return Err(PyValueError::new_err("data dict is empty"));
+        }
+        let first = values.get_item(0)?;
+        let shape: Vec<usize> = first.getattr("shape")?.extract()?;
+        Ok(shape.first().copied().unwrap_or(0))
+    } else if data.is_instance_of::<PyList>()
+        || data.is_instance_of::<PyTuple>()
+    {
+        if names.is_none() {
+            return Err(PyValueError::new_err(
+                "when data is a list/tuple, names= is required"));
+        }
+        if data.len()? == 0 {
+            return Err(PyValueError::new_err(
+                "data list/tuple is empty"));
+        }
+        let first = data.get_item(0)?;
+        let shape: Vec<usize> = first.getattr("shape")?.extract()?;
+        Ok(shape.first().copied().unwrap_or(0))
+    } else {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not a \
+                 structured ndarray"));
+        }
+        Ok(data.len()?)
+    }
+}
+
+// Run the input-form dispatch + per-column validation shared by
+// TableHDU.write and TableHDU.append.  Caller passes the row count
+// it wants to validate against (NAXIS2 for write, append count for
+// append) and the buffer Vec that will outlive the returned
+// PreparedInput's source references.
+fn dispatch_write_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    names: Option<&Bound<'_, PyAny>>,
+    columns: &[Column],
+    expected_nrows: usize,
+    row_width: usize,
+    buffers: &mut Vec<RawBuffer>,
+) -> PyResult<PreparedInput> {
+    if data.is_instance_of::<PyDict>() {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not dict"));
+        }
+        let d = data.cast::<PyDict>()?;
+        prepare_dict_input(py, d, columns, expected_nrows, buffers)
+    } else if data.is_instance_of::<PyList>()
+        || data.is_instance_of::<PyTuple>()
+    {
+        let names_obj = names.ok_or_else(|| PyValueError::new_err(
+            "when data is a list/tuple, names= is required"))?;
+        prepare_list_names_input(
+            py, data, names_obj, columns, expected_nrows, buffers)
+    } else {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "names= is only valid with list/tuple data, not a \
+                 structured ndarray"));
+        }
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        if !data.is_instance(&ndarray)? {
+            return Err(PyValueError::new_err(
+                "data must be a structured numpy ndarray, a dict \
+                 {name: ndarray}, or a list/tuple of ndarrays with \
+                 names=[...]"));
+        }
+        prepare_structured_input(
+            data, columns, expected_nrows, row_width, buffers)
+    }
+}
+
 // What kind of selection the user passed to TableHDU.__setitem__.
 // Scope is intentionally narrower than __getitem__'s TableKey:
 // multi-column subset writes, fancy row-list writes, and (row, col)
@@ -3432,54 +3530,10 @@ impl TableHDU {
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
 
-        // Dispatch on input form, populating a per-call Vec<RawBuffer>
-        // that outlives the Vec<ColumnSource> built below.
         let mut buffers: Vec<RawBuffer> = Vec::new();
-        let prep = if data.is_instance_of::<PyDict>() {
-            if names.is_some() {
-                return Err(PyValueError::new_err(
-                    "TableHDU.write: names= is only valid with \
-                     list/tuple data, not dict"));
-            }
-            let d = data.cast::<PyDict>()?;
-            prepare_dict_input(py, d, &columns, nrows, &mut buffers)?
-        } else if data.is_instance_of::<PyList>()
-            || data.is_instance_of::<PyTuple>()
-        {
-            let names_obj = names.ok_or_else(|| PyValueError::new_err(
-                "TableHDU.write: when data is a list/tuple, names= is \
-                 required"))?;
-            prepare_list_names_input(
-                py, data, names_obj, &columns, nrows, &mut buffers)?
-        } else {
-            if names.is_some() {
-                return Err(PyValueError::new_err(
-                    "TableHDU.write: names= is only valid with \
-                     list/tuple data, not a structured ndarray"));
-            }
-            let np = py.import("numpy")?;
-            let ndarray = np.getattr("ndarray")?;
-            if !data.is_instance(&ndarray)? {
-                return Err(PyValueError::new_err(
-                    "TableHDU.write: data must be a structured numpy \
-                     ndarray, a dict {name: ndarray}, or a list/tuple of \
-                     ndarrays with names=[...]"));
-            }
-            prepare_structured_input(
-                data, &columns, nrows, row_width, &mut buffers)?
-        };
-
-        // Build the borrow-bearing Vec<ColumnSource> from buffer indexes
-        // + metas; both live in this method's stack frame.
-        let sources: Vec<ColumnSource> = prep.metas.iter()
-            .map(|m| ColumnSource {
-                src_bytes: buffers[m.buffer_idx].as_slice(),
-                src_offset: m.src_offset,
-                src_row_stride: m.src_row_stride,
-                src_total_size: m.src_total_size,
-            })
-            .collect();
-
+        let prep = dispatch_write_input(
+            py, data, names, &columns, nrows, row_width, &mut buffers)?;
+        let sources = build_sources(&prep.metas, &buffers);
         write_table_data(
             &columns, &prep.transforms, &sources, prep.layout_matches,
             &super_.file, data_offset, nrows, row_width, &super_.tainted,
@@ -3532,6 +3586,161 @@ impl TableHDU {
                 py, &columns, &super_.file, data_offset, nrows, row_width,
                 &name, value, &super_.tainted),
         }
+    }
+
+    // Append rows to the table.  Grows NAXIS2 in the header and the
+    // data section to fit the new rows; for HDUs that are not the last
+    // on disk, the file tail is shifted forward and every later HDU's
+    // offsets are bumped in lockstep (shared shift_file_tail primitive
+    // — see CLAUDE.md "Image overflow: in-place data-section grow"
+    // and "Header overflow: in-place file grow").  Accepts the same
+    // three input forms as TableHDU.write: structured ndarray, dict
+    // {name: ndarray}, or list/tuple of ndarrays with names=[...].
+    //
+    // Order of operations is validate-then-mutate: input is fully
+    // validated (columns, dtypes, shapes) before any file or header
+    // bytes are touched, so a dtype mismatch can't leave the file
+    // half-grown.  After validation: grow the file → write the new
+    // NAXIS2 card → write the new rows.  Any mid-write I/O failure
+    // taints the file (close + reopen to recover).
+    #[pyo3(signature = (data, *, names=None))]
+    fn append(
+        slf: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let super_: PyRefMut<HDU> = slf.into_super();
+        check_not_tainted(&super_.tainted)?;
+        let cards = super_.header_snapshot()?;
+        let current_nrows = parse_keyword(&cards, "NAXIS2")
+            .unwrap_or(0).max(0) as usize;
+        let row_width = parse_keyword(&cards, "NAXIS1")
+            .unwrap_or(0).max(0) as usize;
+        let columns = parse_columns(&cards)?;
+        let data_offset = super_.offsets.data_offset();
+
+        // Step 1: determine how many rows the caller is appending,
+        // validate the input fully (without writing).  Both are done
+        // before any file mutation so a dtype error leaves the file
+        // untouched.
+        let append_nrows = determine_input_nrows(data, names)?;
+        if append_nrows == 0 {
+            return Ok(());
+        }
+        let mut buffers: Vec<RawBuffer> = Vec::new();
+        let prep = dispatch_write_input(
+            py, data, names, &columns, append_nrows, row_width,
+            &mut buffers)?;
+        let new_nrows = current_nrows + append_nrows;
+
+        // Step 2: grow the data section if the new rows push past
+        // the current padded extent.  Last-HDU branch (file_len ==
+        // current_hdu_end) uses set_len to zero-extend; non-last
+        // branch shifts the file tail forward and zero-fills the
+        // gap left behind.
+        let current_data_bytes = (current_nrows * row_width) as u64;
+        let new_data_bytes = (new_nrows * row_width) as u64;
+        let current_padded = round_up_to_block(current_data_bytes);
+        let new_padded = round_up_to_block(new_data_bytes);
+        let current_hdu_end = data_offset + current_padded;
+        let new_hdu_end = data_offset + new_padded;
+
+        if new_hdu_end > current_hdu_end {
+            let delta = new_hdu_end - current_hdu_end;
+            let file_len = {
+                let guard = lock_file(&super_.file)?;
+                let file = guard.as_ref()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                file.metadata()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .len()
+            };
+            if file_len > current_hdu_end {
+                shift_file_tail_and_update_offsets(
+                    &super_.file, &super_.layout,
+                    current_hdu_end, delta, &super_.tainted,
+                )?;
+                zero_fill_range(
+                    &super_.file, current_hdu_end, delta, &super_.tainted,
+                )?;
+            } else {
+                let mut guard = lock_file(&super_.file)?;
+                let file = guard.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                file.set_len(new_hdu_end)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+        }
+
+        // Step 3: rewrite the NAXIS2 card on disk, then commit the
+        // in-memory cards.  Disk-write-before-commit ordering with
+        // taint on mid-write failure, same convention as the header-
+        // and image-grow paths.
+        let new_card = card_int(
+            "NAXIS2", new_nrows as i64, "number of rows in table");
+        let mut cards_guard = super_.header.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let mut new_cards = cards_guard.clone();
+        let card_idx = new_cards.iter()
+            .position(|c| c.len() >= 6 && c[..6].trim() == "NAXIS2")
+            .ok_or_else(|| PyValueError::new_err(
+                "header missing NAXIS2"))?;
+        new_cards[card_idx] = new_card.trim_end().to_string();
+
+        {
+            let mut guard = lock_file(&super_.file)?;
+            let file = guard.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+            let header_offset = data_offset - header_bytes.len() as u64;
+            file.seek(SeekFrom::Start(header_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            file.write_all(&header_bytes).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "header write failed during append: {}; close + \
+                     reopen the file to recover", e))
+            })?;
+            file.flush().map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "header flush failed during append: {}; close + \
+                     reopen the file to recover", e))
+            })?;
+        }
+        *cards_guard = new_cards;
+        drop(cards_guard);
+
+        // Step 4: write the appended rows at the end of the existing
+        // data section.  A failure here taints the file (the header
+        // already advertises the larger NAXIS2 but the new rows are
+        // partly or wholly stale).
+        let sources = build_sources(&prep.metas, &buffers);
+        let append_offset = data_offset
+            + (current_nrows * row_width) as u64;
+        write_table_data(
+            &columns, &prep.transforms, &sources, prep.layout_matches,
+            &super_.file, append_offset, append_nrows, row_width,
+            &super_.tainted,
+        ).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            e
+        })
+    }
+
+    // Alias for append().  Kept for symmetry with ImageHDU.extend so
+    // generic code that iterates HDUs and calls .extend(...) on each
+    // continues to work.  The primary table-side name is `append`
+    // because that's the natural verb for adding rows to a table.
+    #[pyo3(signature = (data, *, names=None))]
+    fn extend(
+        slf: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Self::append(slf, py, data, names)
     }
 }
 
