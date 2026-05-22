@@ -10,6 +10,7 @@ from ._rust import (
     FITSHeaderEdit,
     Gzip1,
     Gzip2,
+    Hcompress1,
     Rice1,
     is_protected_key,
 )

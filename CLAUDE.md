@@ -495,9 +495,9 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   `normalize_input_dtype` and gets the reverse-transform) is the
   workaround.  Add when there's a use case.
 - **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 has
-  shipped `Gzip1`, `Gzip2`, and `Rice1` writes (integer ZBITPIX
-  only — float deferred to Phase 8 for quantization).
-  `Hcompress1` and `Plio1` encoders remain.  Compressed
+  shipped `Gzip1`, `Gzip2`, `Rice1`, and `Hcompress1` writes
+  (integer ZBITPIX only — float deferred to Phase 8 for
+  quantization).  `Plio1` encoder remains.  Compressed
   `extend`/`__setitem__` are Phase 9+ (mutation).  See the
   ZIMAGE roadmap for the next pickup.
 
@@ -786,10 +786,10 @@ the reader walks tiles and decodes them.
 **Status:** Phases 1-6 shipped (full read support for all five
 algorithms — RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH,
 PLIO_1 — plus quantized + unquantized floats).  Phase 7
-compressed-write shipped for **GZIP_1, GZIP_2, and RICE_1**;
-HCOMPRESS_1 and PLIO_1 encoders are the remaining Phase 7
-follow-ups.  Phase 8+ (quantized float writes, compressed
-mutation) are own subsystems.  Test fixtures use fitsio for
+compressed-write shipped for **GZIP_1, GZIP_2, RICE_1, and
+HCOMPRESS_1**; PLIO_1 encoder is the remaining Phase 7 follow-up.
+Phase 8+ (quantized float writes, compressed mutation) are own
+subsystems.  Test fixtures use fitsio for
 normal-path round-trips and hand-crafted bytes for synthetic
 fallback-column cases (astropy is also in the env for richer
 cases).
@@ -1181,8 +1181,9 @@ f[1].write(data)
 
 `compress=None` (default) → uncompressed `ImageHDU` (current
 behavior, unchanged).  `compress=Gzip1(...)` / `Gzip2(...)` /
-`Rice1(...)` → `CompressedImageHDU`.  Algorithm objects (`Gzip1`,
-`Gzip2`, `Rice1` shipped; `Hcompress1`/`Plio1` to follow) live in
+`Rice1(...)` / `Hcompress1(...)` → `CompressedImageHDU`.
+Algorithm objects (`Gzip1`, `Gzip2`, `Rice1`, `Hcompress1`
+shipped; `Plio1` to follow) live in
 `src/zimage/compression_config.rs`.  Each is a Rust pyclass exposed
 at `rustfits.<Name>`, validated at construction
 (`Gzip1(blocksize=0)` raises immediately), immutable (no setters).
@@ -1194,15 +1195,15 @@ Dispatch in `fits.rs::create_compressed_image_hdu_impl` goes
 through an internal `CompressionConfigKind` enum that wraps the
 per-algorithm pyclasses.  `CompressionConfigKind::from_pyany`
 tries each variant's `extract::<Gzip1>()` / `extract::<Gzip2>()` /
-`extract::<Rice1>()` in turn — pyo3 0.28 doesn't grow a clean
-"first-match" extractor, so the manual loop is the simplest shape.
-The enum exposes the shared surface (`tile_shape()`, `heap_format()`,
-`zcmptype()`) plus an `extra_z_cards(bitpix)` accessor that returns
-`(ZNAMEn, ZVALn)` pairs to emit alongside the standard ZIMAGE cards
-(RICE_1 emits BLOCKSIZE + BYTEPIX; GZIP variants emit nothing).
-When `Hcompress1`/`Plio1` land, each adds a variant + an arm in
-the four accessor matches; HCOMPRESS would surface SCALE/SMOOTH
-through the same `extra_z_cards` pattern.
+`extract::<Rice1>()` / `extract::<Hcompress1>()` in turn — pyo3
+0.28 doesn't grow a clean "first-match" extractor, so the manual
+loop is the simplest shape.  The enum exposes the shared surface
+(`tile_shape()`, `heap_format()`, `zcmptype()`) plus an
+`extra_z_cards(bitpix)` accessor that returns `(ZNAMEn, ZVALn)`
+pairs to emit alongside the standard ZIMAGE cards (RICE_1 emits
+BLOCKSIZE + BYTEPIX; HCOMPRESS_1 emits SCALE + SMOOTH; GZIP
+variants emit nothing).  When `Plio1` lands, it adds a variant +
+an arm in the four accessor matches.
 
 *Design discussion captured.*  See git log around this commit
 for the full thread: the chosen shape is one unified
@@ -1312,6 +1313,67 @@ file adds **byte-exact heap-comparison tests against fitsio**
 (low-entropy, high-entropy, multi-tile, dtype matrix), a custom
 blocksize test, and the i8-rejected test.
 
+*HCOMPRESS_1 encoder.*  `encode_hcompress` in
+`src/zimage/hcompress.rs` is a byte-exact port of cfitsio's
+`fits_hcompress.c` family (`htrans`, `digitize`, `shuffle`,
+`encode`, `doencode`, `qtree_encode`, `qtree_onebit`,
+`qtree_reduce`, `bufcopy`, `write_bdirect`, plus the
+`output_nbits`/`nybble`/`nnybble` bit-output state).  Internal
+precision tracks the read side: i32 for ZBITPIX = 8/16, i64 for
+ZBITPIX = 32 (the H-transform's intermediate sums can overflow
+i32 for 32-bit input).  ZBITPIX = 64 (i8 dtype) is rejected
+upstream — the FITS Tile Compression Convention has no 64-bit
+HCOMPRESS variant.  SCALE controls quantization (0 or 1 =
+lossless; larger = lossy); SMOOTH is encoder-irrelevant (the
+smoothing pass runs on read only) but its ZNAME card must be
+emitted so the reader knows whether to smooth.  Output is
+byte-exact with cfitsio's encoder across all tested cases.
+
+*HCOMPRESS_1 tile-shape policy.*  Two FITS Tile Compression
+Convention constraints apply: (1) every image dimension must
+have ≥ 4 pixels (HCOMPRESS is a 2-D wavelet); (2) every tile
+along each axis (including the edge tile) must have ≥ 4 pixels.
+The three major writers disagree on how to enforce constraint
+(2): **astropy** raises `ValueError`; **cfitsio** silently
+rewrites the user's tile dim upward (e.g. `tile=16` becomes
+`tile=17` for `naxis=50` to make `50 % 17 = 16` instead of
+`50 % 16 = 2`); **rustfits follows astropy** — explicit is
+safer — but the error message includes the cfitsio-style
+adjusted suggestion so the user can copy it back into their
+config.  Default `tile_shape` (when `Hcompress1(tile_shape=
+None)`) is **not** the FITS row-tiles convention (which would
+always violate constraint 2); instead it ports cfitsio's
+default heuristic in `fits.rs::hcompress_default_slow_tile`:
+whole image when `NAXIS2 ≤ 30`, otherwise the first value from
+`{16, 24, 20, 30, 28, 26, 22, 18, 14}` that leaves a valid
+edge tile, with `17` as the last-resort fallback.  16-row
+stripes are what HST/DECam/HSC files in the wild use (cfitsio
+is the dominant writer of these), so the default matches.
+
+*HCOMPRESS_1 tests.*
+`tests/test_compressed_image_phase7_hcompress_write.py` covers
+accessors after create, dtype matrix (u1/i2/i4), shape matrix
+(divisible 2-D cases), default-tile-shape (small-image,
+large-image stripe, and fallback-when-16-doesn't-work cases),
+lossless + lossy round trips (scale ∈ {4, 8, 16}), SMOOTH=True
+round trip, **byte-exact heap agreement with fitsio** on
+single-tile + multi-tile-with-divisible-dims + valid-edge-tile
+cases for both lossless and lossy, bidirectional fitsio
+cross-check, non-last HDU growth, mixed-algorithm file, and all
+rejection paths (float, i8, unsigned trick, 1-D / 3-D images,
+shape mismatch, start kwarg, dim < 4, tile < 4, and thin edge
+tile with cfitsio-style suggested fix in the error message).
+
+*HCOMPRESS_1 lossy testing gotcha — `hcomp_scale` sign.*  When
+cross-checking against fitsio's writer with a fixed scale (e.g.
+to compare byte-exact heap output at `scale=4`), pass
+`hcomp_scale=-4` (negative).  cfitsio's `hcomp_scale > 0`
+branch multiplies the user value by a per-tile noise estimate
+to derive the actual scale, giving a *different* scale per
+tile; the `hcomp_scale < 0` branch uses the absolute value
+directly as a fixed scale.  Tests in `phase7_hcompress_write.py`
+use the negative form.
+
 **Phase 7 follow-ups (deferred).**  Cold-pickup notes for each
 remaining encoder.  The shape of the work is well established
 by the three shipped algorithms: each adds an `encode_*`
@@ -1331,22 +1393,6 @@ we worked for RICE:
     (matches Rice1 + GZIP/PLIO/HCOMPRESS reads).  Makes testing
     trivial via fitsio cross-write + heap-byte diff.
 
-- **`Hcompress1`** — reference encoders at
-  `<cfitsio>/fits_hcompress.c`: `fits_hcompress` (i32 internal,
-  for BYTEPIX≤4) and `fits_hcompress64` (i64 internal, for
-  BYTEPIX=8).  Unlike RICE, cfitsio **does** ship a 64-bit
-  encoder — so the interop question may resolve to "implement"
-  rather than "reject".  Wire-format details (magic word,
-  SCALE-in-stream, axis convention, SMOOTH adjustment loops)
-  are documented in the Phase 6 read section above and live in
-  `src/zimage/hcompress.rs`; encode is the inverse of decode
-  (forward H-transform → quantize → quadtree-encode per bit
-  plane).  The encoder needs SCALE (int, in stream + ZNAME card)
-  and SMOOTH (bool, ZNAME card) parameters — extend
-  `AlgorithmEncodeParams` and add an `extra_z_cards` entry that
-  emits both (read side parses SMOOTH from ZNAMEn but reads
-  SCALE from the stream; encoder must write SCALE to the stream
-  AND emit it as a ZNAME card for documentation).
 - **`Plio1`** — reference encoder at `<cfitsio>/pliocomp.c::pl_p2li`.
   Wire format documented in the Phase 6 PLIO read section above.
   Niche algorithm (designed for non-negative integer masks

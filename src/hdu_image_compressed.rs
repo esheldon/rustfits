@@ -1083,12 +1083,37 @@ fn parse_rice_params(header: &[String]) -> (Option<u32>, Option<u32>) {
     (blocksize, bytepix)
 }
 
+// Walk ZNAMEn/ZVALn pairs to extract the HCOMPRESS_1 SCALE value.
+// On the read side cfitsio reads SCALE from the compressed stream;
+// the header card is informational only.  On the WRITE side this
+// reader pulls it back out of the header (which create_compressed_
+// image_hdu_impl just emitted from the user's Hcompress1 config)
+// to drive the encoder.  Defaults to 0 (lossless) when absent.
+fn parse_hcompress_scale(header: &[String]) -> i32 {
+    for n in 1.. {
+        let name_key = format!("ZNAME{}", n);
+        let val_key = format!("ZVAL{}", n);
+        let name = parse_string_keyword(header, &name_key);
+        if name.is_none() {
+            break;
+        }
+        if let Some(name) = name.as_deref().map(|s| s.trim()) {
+            if name.eq_ignore_ascii_case("SCALE") {
+                if let Some(v) = parse_keyword(header, &val_key) {
+                    return v as i32;
+                }
+            }
+        }
+    }
+    0
+}
+
 // Walk ZNAMEn/ZVALn pairs to extract the SMOOTH flag for HCOMPRESS_1.
 // SCALE also lives there (ZNAMEn='SCALE') but the decoder reads
 // SCALE directly from the compressed stream (per cfitsio's
-// fits_hdecompress.c line 1076), so we don't need it here — the
-// header value is informational only.  Returns false (no smoothing)
-// when the keyword is absent.
+// fits_hdecompress.c line 1076), so we don't need it here for read
+// — only for the write side (see parse_hcompress_scale).  Returns
+// false (no smoothing) when the keyword is absent.
 fn parse_hcompress_smooth(header: &[String]) -> bool {
     for n in 1.. {
         let name_key = format!("ZNAME{}", n);
@@ -1871,15 +1896,12 @@ fn write_compressed_image_data(
     };
 
     // ----- algorithm-specific encode params -----
-    // RICE_1 needs BLOCKSIZE from the header; the header was just
-    // emitted by create_compressed_image_hdu_impl so the card is
-    // present.  Default 32 matches cfitsio when the card is absent
-    // (which it shouldn't be on our writes, but the read side has
-    // the same fallback).
+    // RICE_1 needs BLOCKSIZE from the header; HCOMPRESS_1 needs
+    // SCALE.  Both keys are emitted by create_compressed_image_hdu_impl
+    // so they're present on rustfits-written files; defaults match
+    // cfitsio when absent (32 / 0 = lossless).
     let (blocksize_opt, _bytepix_header_opt) = parse_rice_params(cards);
-    let encode_params = crate::zimage::AlgorithmEncodeParams {
-        blocksize: blocksize_opt.unwrap_or(32),
-    };
+    let hcompress_scale = parse_hcompress_scale(cards);
 
     // ----- encode all tiles into RAM -----
     let mut heap_bytes: Vec<u8> = Vec::new();
@@ -1916,8 +1938,14 @@ fn write_compressed_image_data(
                 tile_idx, tile_bytes.len(), expected_bytes
             )));
         }
+        let encode_params = crate::zimage::AlgorithmEncodeParams {
+            blocksize: blocksize_opt.unwrap_or(32),
+            tile_shape_numpy: &actual_shape,
+            scale: hcompress_scale,
+        };
         let encoded = crate::zimage::encode_tile_from_bytes(
-            algorithm, &tile_bytes, bytepix, n_pixels, encode_params,
+            algorithm, &tile_bytes, bytepix, n_pixels,
+            zbitpix, encode_params,
         )?;
         let offset = heap_bytes.len() as u64;
         descriptors.push((encoded.len() as u64, offset));

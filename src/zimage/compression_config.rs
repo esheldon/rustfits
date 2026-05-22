@@ -209,6 +209,137 @@ impl Gzip2 {
     }
 }
 
+// ---------- Hcompress1 ----------
+
+/// Configuration for HCOMPRESS_1 tile compression.
+///
+/// 2-D wavelet-like H-transform with quadtree bit-plane encoding.
+/// Designed for astronomical images where the smoothing pass can
+/// substantially reduce visible blockiness at higher compression
+/// ratios.  Supports BYTEPIX ∈ {1, 2, 4} (u1, i2, i4 in numpy
+/// terms); BYTEPIX=8 (i8) is rejected — the FITS Tile Compression
+/// Convention has no 64-bit HCOMPRESS variant and cfitsio's encoder
+/// family doesn't produce one.
+///
+/// Two algorithm parameters: `scale` (quantization level — 0 or 1
+/// for lossless, larger for more compression at the cost of
+/// precision) and `smooth` (post-decompression smoothing pass that
+/// reduces block artifacts — has no effect at `scale <= 1` since
+/// nothing is quantized).  Tiles must be 2-D; 1-D and 3-D images
+/// are rejected at create time.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub(crate) struct Hcompress1 {
+    pub(crate) tile_shape: Option<Vec<u64>>,
+    pub(crate) heap_format: char,
+    pub(crate) scale: i32,
+    pub(crate) smooth: bool,
+}
+
+#[pymethods]
+impl Hcompress1 {
+    /// Build an Hcompress1 compression config.
+    ///
+    /// Parameters
+    /// ----------
+    /// tile_shape : tuple of positive ints, optional
+    ///     Tile dimensions in numpy axis order (slowest first).
+    ///     Must be 2-D when supplied — HCOMPRESS_1 is a 2-D
+    ///     algorithm.  When omitted, defaults to the FITS-
+    ///     convention "row tiles" layout (ZTILE1 = NAXIS1,
+    ///     others = 1) once the image shape is known.
+    /// heap_format : {'P', 'Q'}, default 'P'
+    ///     Heap addressing format.  'P' uses 8-byte descriptors
+    ///     with 32-bit nelements/offset (4 GB heap ceiling).
+    ///     'Q' uses 16-byte descriptors (no practical ceiling)
+    ///     for files whose compressed heap exceeds 4 GB.
+    /// scale : int, default 0
+    ///     Quantization scale.  0 or 1 = lossless.  Larger values
+    ///     divide each H-transform coefficient by `scale`, giving
+    ///     more compression but lower precision.  Must be >= 0.
+    /// smooth : bool, default False
+    ///     Enable the smoothing pass during inverse H-transform on
+    ///     read; reduces visible blockiness at higher scales but
+    ///     adds CPU work on each tile decode.  No effect at
+    ///     scale <= 1.
+    #[new]
+    #[pyo3(signature = (
+        *, tile_shape=None, heap_format=String::from("P"),
+        scale=0, smooth=false,
+    ))]
+    fn new(
+        tile_shape: Option<Vec<i64>>,
+        heap_format: String,
+        scale: i64,
+        smooth: bool,
+    ) -> PyResult<Self> {
+        let tile_shape = validate_tile_shape(tile_shape)?;
+        if let Some(ref ts) = tile_shape {
+            if ts.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "Hcompress1 only supports 2-D tiles; got tile_shape \
+                     with {} dimensions", ts.len()
+                )));
+            }
+        }
+        let heap_format = validate_heap_format(&heap_format)?;
+        if scale < 0 {
+            return Err(PyValueError::new_err(format!(
+                "scale must be >= 0, got {}", scale
+            )));
+        }
+        if scale > i32::MAX as i64 {
+            return Err(PyValueError::new_err(format!(
+                "scale {} exceeds i32::MAX", scale
+            )));
+        }
+        Ok(Hcompress1 {
+            tile_shape,
+            heap_format,
+            scale: scale as i32,
+            smooth,
+        })
+    }
+
+    #[getter]
+    fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.tile_shape {
+            None => py.None(),
+            Some(v) => pyo3::types::PyTuple::new(py, v)
+                .expect("PyTuple::new of u64 always succeeds")
+                .unbind()
+                .into_any(),
+        }
+    }
+
+    #[getter]
+    fn heap_format(&self) -> String {
+        self.heap_format.to_string()
+    }
+
+    #[getter]
+    fn scale(&self) -> i32 {
+        self.scale
+    }
+
+    #[getter]
+    fn smooth(&self) -> bool {
+        self.smooth
+    }
+
+    fn __repr__(&self) -> String {
+        let ts = match &self.tile_shape {
+            None => "None".to_string(),
+            Some(v) => format!("{:?}", v),
+        };
+        format!(
+            "Hcompress1(tile_shape={}, heap_format='{}', scale={}, smooth={})",
+            ts, self.heap_format, self.scale,
+            if self.smooth { "True" } else { "False" },
+        )
+    }
+}
+
 // ---------- Rice1 ----------
 
 /// Configuration for RICE_1 tile compression.

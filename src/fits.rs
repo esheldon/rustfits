@@ -356,6 +356,7 @@ enum CompressionConfigKind {
     Gzip1(crate::zimage::compression_config::Gzip1),
     Gzip2(crate::zimage::compression_config::Gzip2),
     Rice1(crate::zimage::compression_config::Rice1),
+    Hcompress1(crate::zimage::compression_config::Hcompress1),
 }
 
 impl CompressionConfigKind {
@@ -375,10 +376,15 @@ impl CompressionConfigKind {
         {
             return Ok(Self::Rice1(r));
         }
+        if let Ok(h) = bound.extract::<
+            crate::zimage::compression_config::Hcompress1>()
+        {
+            return Ok(Self::Hcompress1(h));
+        }
         Err(pyo3::exceptions::PyTypeError::new_err(
             "compress= must be a compression-config object \
              (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...), \
-             rustfits.Rice1(...))"
+             rustfits.Rice1(...), rustfits.Hcompress1(...))"
         ))
     }
 
@@ -387,6 +393,7 @@ impl CompressionConfigKind {
             Self::Gzip1(g) => &g.tile_shape,
             Self::Gzip2(g) => &g.tile_shape,
             Self::Rice1(r) => &r.tile_shape,
+            Self::Hcompress1(h) => &h.tile_shape,
         }
     }
 
@@ -395,6 +402,7 @@ impl CompressionConfigKind {
             Self::Gzip1(g) => g.heap_format,
             Self::Gzip2(g) => g.heap_format,
             Self::Rice1(r) => r.heap_format,
+            Self::Hcompress1(h) => h.heap_format,
         }
     }
 
@@ -403,14 +411,18 @@ impl CompressionConfigKind {
             Self::Gzip1(_) => "GZIP_1",
             Self::Gzip2(_) => "GZIP_2",
             Self::Rice1(_) => "RICE_1",
+            Self::Hcompress1(_) => "HCOMPRESS_1",
         }
     }
 
     // Algorithm-specific (ZNAMEn, ZVALn) pairs to emit alongside
     // the standard ZIMAGE header cards.  RICE_1 carries BLOCKSIZE
     // and BYTEPIX so the decoder can pick the right parameter
-    // table; GZIP variants have no extras.  Caller supplies the
-    // image BITPIX so we can compute BYTEPIX = bitpix/8.
+    // table; HCOMPRESS_1 carries SCALE and SMOOTH so the decoder
+    // can find the smoothing flag (and so the SCALE is documented
+    // even though the decoder reads it from the stream); GZIP
+    // variants have no extras.  Caller supplies the image BITPIX
+    // so we can compute BYTEPIX = bitpix/8.
     fn extra_z_cards(&self, bitpix: i32) -> Vec<(&'static str, i64)> {
         match self {
             Self::Gzip1(_) | Self::Gzip2(_) => Vec::new(),
@@ -418,8 +430,36 @@ impl CompressionConfigKind {
                 ("BLOCKSIZE", r.blocksize as i64),
                 ("BYTEPIX", (bitpix / 8) as i64),
             ],
+            Self::Hcompress1(h) => vec![
+                ("SCALE", h.scale as i64),
+                ("SMOOTH", if h.smooth { 1 } else { 0 }),
+            ],
         }
     }
+}
+
+// HCOMPRESS_1 default stripe height along the slow axis when the
+// user doesn't pass tile_shape.  Direct port of cfitsio's heuristic
+// in imcompress.c (the `actual_tilesize[0] <= 0` branch under the
+// HCOMPRESS_1 case).  For NAXIS2 ≤ 30 the whole image is one tile
+// (no benefit to striping such a small image); otherwise we pick
+// the first value from the preferred list that leaves a last-tile
+// remainder of 0 or ≥ 4 — i.e., one that doesn't violate the
+// 4-pixel-per-dim minimum.  16 is preferred because it's the
+// cfitsio default everyone sees in HST/DECam/HSC files; 24..14 are
+// nearby alternatives; 17 is the last-resort fallback since it
+// rarely lands the remainder in [1, 3] for typical image heights.
+fn hcompress_default_slow_tile(naxis2: u64) -> u64 {
+    if naxis2 <= 30 {
+        return naxis2;
+    }
+    for &t in &[16u64, 24, 20, 30, 28, 26, 22, 18, 14] {
+        let r = naxis2 % t;
+        if r == 0 || r >= 4 {
+            return t;
+        }
+    }
+    17
 }
 
 // Rust-only helpers on FITS — not exposed to Python.  Used by the
@@ -557,11 +597,43 @@ impl FITS {
                  universally readable."
             ));
         }
+        // HCOMPRESS_1 is a 2-D wavelet algorithm; only 2-D images
+        // are valid.  Also reject bitpix=64 — the FITS Tile
+        // Compression Convention has no 64-bit HCOMPRESS variant
+        // and cfitsio's encoder family stops at i32 input (i64
+        // internal precision).
+        if matches!(cfg, CompressionConfigKind::Hcompress1(_)) {
+            if dims.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "Hcompress1 only supports 2-D images; got {}-D",
+                    dims.len()
+                )));
+            }
+            if bitpix == 64 {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "HCOMPRESS_1 does not support 64-bit pixels (i8 \
+                     dtype): the FITS Tile Compression Convention has \
+                     no 64-bit HCOMPRESS variant. Use Gzip2 for i64 \
+                     imaging data."
+                ));
+            }
+        }
 
-        // Build the tile shape in numpy axis order.  None → FITS-
-        // convention default ("row tiles": ZTILE1=NAXIS1, others=1,
-        // which is `[1, ..., 1, NAXIS_last]` in numpy order since the
-        // numpy-last axis corresponds to FITS-NAXIS1).
+        // Build the tile shape in numpy axis order.
+        //
+        // None → algorithm-specific default:
+        //   - HCOMPRESS_1: cfitsio's default heuristic.  Full image
+        //     along the fast axis; along the slow axis, full image
+        //     when NAXIS2 ≤ 30 (single-tile small-image case), else
+        //     the first value from {16, 24, 20, 30, 28, 26, 22, 18,
+        //     14} that leaves a last-tile remainder of 0 or ≥ 4,
+        //     falling back to 17 (which is unlikely to leave a bad
+        //     remainder).  Matches what HST / DECam / HSC files in
+        //     the wild use (cfitsio is the dominant writer).
+        //   - Other algorithms: FITS-convention "row tiles"
+        //     (ZTILE1=NAXIS1, others=1), which is `[1, ..., 1,
+        //     NAXIS_last]` in numpy order since numpy-last
+        //     corresponds to FITS-NAXIS1.
         let numpy_dims: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
         let tile_shape_numpy: Vec<u64> = match cfg.tile_shape() {
             Some(ts) => {
@@ -574,12 +646,68 @@ impl FITS {
                 ts.clone()
             }
             None => {
-                let n = numpy_dims.len();
-                let mut v = vec![1u64; n];
-                v[n - 1] = numpy_dims[n - 1];
-                v
+                if matches!(cfg, CompressionConfigKind::Hcompress1(_)) {
+                    vec![
+                        hcompress_default_slow_tile(numpy_dims[0]),
+                        numpy_dims[1],
+                    ]
+                } else {
+                    let n = numpy_dims.len();
+                    let mut v = vec![1u64; n];
+                    v[n - 1] = numpy_dims[n - 1];
+                    v
+                }
             }
         };
+
+        // HCOMPRESS_1 tile-shape constraints (FITS Tile Compression
+        // Convention): every dimension must have at least 4 pixels,
+        // and every tile (including the last along each axis) must
+        // have at least 4 pixels.  astropy raises in this case;
+        // cfitsio silently rewrites the tile dim upward.  We follow
+        // astropy — explicit is safer — and suggest the cfitsio-style
+        // adjusted value in the error so the user can just copy it
+        // back into their config.
+        if matches!(cfg, CompressionConfigKind::Hcompress1(_)) {
+            for (axis, (&dim, &tile)) in numpy_dims.iter()
+                .zip(tile_shape_numpy.iter()).enumerate()
+            {
+                if dim < 4 {
+                    return Err(PyValueError::new_err(format!(
+                        "Hcompress1: image axis {} has size {}, below \
+                         the HCOMPRESS_1 minimum of 4 pixels per \
+                         dimension",
+                        axis, dim,
+                    )));
+                }
+                if tile < 4 {
+                    return Err(PyValueError::new_err(format!(
+                        "Hcompress1: tile_shape[{}]={} is below the \
+                         HCOMPRESS_1 minimum of 4 pixels per dimension",
+                        axis, tile,
+                    )));
+                }
+                let remain = dim % tile;
+                if remain > 0 && remain < 4 {
+                    // cfitsio's adjustment: tile += ceil(remain / ndiv)
+                    // where ndiv = dim / tile (integer truncation).
+                    // ndiv >= 1 here because dim >= 4 and remain < 4
+                    // implies tile <= dim - 4 < dim, so dim / tile >= 1.
+                    let ndiv = dim / tile;
+                    let add = (remain + ndiv - 1) / ndiv;
+                    let suggested = tile + add;
+                    return Err(PyValueError::new_err(format!(
+                        "Hcompress1: image axis {} (size {}) with \
+                         tile_shape[{}]={} leaves a last tile of {} \
+                         pixels, below the HCOMPRESS_1 minimum of 4. \
+                         Try tile_shape[{}]={} (last tile {} pixels) \
+                         to satisfy the constraint.",
+                        axis, dim, axis, tile, remain,
+                        axis, suggested, dim % suggested,
+                    )));
+                }
+            }
+        }
 
         let n_tiles = crate::hdu_image_compressed::compute_n_tiles(
             &numpy_dims, &tile_shape_numpy,

@@ -110,21 +110,35 @@ pub(crate) fn decode_tile_to_bytes(
 }
 
 // Algorithm-specific parameters carried alongside the generic
-// (pixel_bytes_be, bytepix) signature for encoding.  Mirror of
-// `AlgorithmParams` on the decode side.  Each algorithm consumes
-// only the fields it cares about — GZIP_1/2 ignore everything in
-// here; RICE_1 uses `blocksize` (number of pixels per Rice block);
-// HCOMPRESS_1 will use scale/smooth when wired.
+// (pixel_bytes_be, bytepix, zbitpix) signature for encoding.
+// Mirror of `AlgorithmParams` on the decode side.  Each algorithm
+// consumes only the fields it cares about — GZIP_1/2 ignore
+// everything in here; RICE_1 uses `blocksize`; HCOMPRESS_1 uses
+// `tile_shape_numpy` and `scale`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AlgorithmEncodeParams {
+pub(crate) struct AlgorithmEncodeParams<'a> {
     // RICE_1: number of pixels per Rice block (default 32 in
-    // cfitsio).  Ignored by GZIP_1/2; required > 0 for RICE.
+    // cfitsio).  Ignored by GZIP_1/2 and HCOMPRESS_1.
     pub blocksize: u32,
+    // HCOMPRESS_1: tile dimensions in numpy axis order (slowest
+    // first).  HCOMPRESS_1 is a 2-D algorithm; the slice MUST have
+    // exactly 2 elements (validated upstream when the user picks
+    // Hcompress1).  Ignored by other algorithms.
+    pub tile_shape_numpy: &'a [u64],
+    // HCOMPRESS_1: quantization scale.  0 or 1 = lossless; larger
+    // values divide each H-transform coefficient by `scale`,
+    // increasing compression at the cost of precision.  Ignored
+    // by other algorithms.
+    pub scale: i32,
 }
 
-impl Default for AlgorithmEncodeParams {
+impl<'a> Default for AlgorithmEncodeParams<'a> {
     fn default() -> Self {
-        AlgorithmEncodeParams { blocksize: 32 }
+        AlgorithmEncodeParams {
+            blocksize: 32,
+            tile_shape_numpy: &[],
+            scale: 0,
+        }
     }
 }
 
@@ -136,15 +150,17 @@ impl Default for AlgorithmEncodeParams {
 // native-endian output).
 //
 // `bytepix` is needed by GZIP_2 to drive its byte-shuffle and by
-// RICE_1 to pick the per-bytepix FSBITS/FSMAX table.  Algorithm-
-// specific params (RICE blocksize, future HCOMPRESS scale/smooth)
-// ride along in `params`.
+// RICE_1 to pick the per-bytepix FSBITS/FSMAX table.  `zbitpix`
+// is needed by HCOMPRESS_1 to pick the i32 vs i64 internal
+// precision.  Algorithm-specific params (RICE blocksize,
+// HCOMPRESS scale + tile_shape_numpy) ride along in `params`.
 pub(crate) fn encode_tile_from_bytes(
     algorithm: CompressionAlgorithm,
     pixel_bytes_be: &[u8],
     bytepix: u32,
     n_pixels: usize,
-    params: AlgorithmEncodeParams,
+    zbitpix: i32,
+    params: AlgorithmEncodeParams<'_>,
 ) -> PyResult<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Gzip1 => gzip::encode_gzip1(pixel_bytes_be),
@@ -154,10 +170,19 @@ pub(crate) fn encode_tile_from_bytes(
         CompressionAlgorithm::Rice1 => {
             rice::encode_rice(pixel_bytes_be, n_pixels, bytepix, params.blocksize)
         }
-        CompressionAlgorithm::Hcompress1 => Err(PyNotImplementedError::new_err(
-            "HCOMPRESS_1 encoding is not yet implemented \
-             (planned: a follow-up sub-phase under Phase 7)"
-        )),
+        CompressionAlgorithm::Hcompress1 => {
+            if params.tile_shape_numpy.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "HCOMPRESS_1 encode: tile shape must be 2-D; got {} \
+                     dimensions", params.tile_shape_numpy.len()
+                )));
+            }
+            let nx = params.tile_shape_numpy[0] as usize;
+            let ny = params.tile_shape_numpy[1] as usize;
+            hcompress::encode_hcompress(
+                pixel_bytes_be, nx, ny, bytepix, zbitpix, params.scale,
+            )
+        }
         CompressionAlgorithm::Plio1 => Err(PyNotImplementedError::new_err(
             "PLIO_1 encoding is not yet implemented \
              (planned: a follow-up sub-phase under Phase 7)"
