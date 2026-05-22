@@ -1072,10 +1072,10 @@ cfitsio synonyms (`GZIP` for `GZIP_1`, `HCOMPRESS` for
 **Phase 6 — HCOMPRESS_1 read.**  Done.
 
 Decoder in `src/zimage/hcompress.rs` — port of cfitsio's
-`fits_hdecompress.c` (reference source at
-`/home/esheldon/git/fitsio/cfitsio-4.6.4`; the function names
-mirror cfitsio exactly so side-by-side diffing during debug
-stays easy).  Both internal-precision paths shipped: i32 for
+`fits_hdecompress.c` (see "Reference sources for byte-exact
+ports" under "Build / dev workflow" for how to obtain the
+cfitsio source; the function names mirror cfitsio exactly so
+side-by-side diffing during debug stays easy).  Both internal-precision paths shipped: i32 for
 ZBITPIX = 8/16, i64 for ZBITPIX = 32 (cfitsio uses i64 internal
 for 32-bit because the H-transform's intermediate sums can
 overflow i32).  ZBITPIX = 64 is unsupported — cfitsio's encoder
@@ -1280,16 +1280,18 @@ build tool:
   pytest, fitsio, astropy, ruff.  Add `pytest-cov` if running
   coverage locally.
 - **Rust toolchain**: rustup (NOT conda).  Local + CI both
-  use rustup; see `feedback_conda_plus_rustup.md` in the
-  user's memory.  Don't add `rust` to `conda-requirements.txt`.
+  use rustup.  Don't add `rust` to `conda-requirements.txt` —
+  conda's rust packaging interacts badly with PyO3's PyFFI
+  linking and is harder to keep in sync with CI.  Install
+  rustup via the standard installer:
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
 - **Build**: `maturin develop` builds the cdylib AND installs
   the editable wheel in one step.  Never use bare `cargo build`
   (won't install into the Python env so Python can't import).
 
 ### Local iteration loop
 
-Chain compile + tests in one command (per the user's
-`feedback_combine_build_and_test.md` memory):
+Chain compile + tests in one command:
 
     tools/cargo-test.sh && maturin develop && pytest tests/<focused>.py
 
@@ -1304,6 +1306,66 @@ Chain compile + tests in one command (per the user's
 - `maturin develop` builds + installs into the conda env.
 - `pytest tests/<focused>.py` for the focused suite during
   iteration; chase with full `pytest` before commit.
+
+### Reference sources for byte-exact ports
+
+Several decoders/encoders in `src/zimage/` are direct ports of
+cfitsio C source (HCOMPRESS, PLIO, RICE, GZIP framing details,
+the Park-Miller dither sequence).  When debugging or extending
+these, side-by-side comparison with cfitsio is the fastest path
+to correctness.
+
+The reference C source lives in the fitsio repo's bundled
+tarball:
+
+1. Clone fitsio (any recent release works; it pins the cfitsio
+   version it ships against):
+   `git clone https://github.com/esheldon/fitsio  ~/git/fitsio`
+2. Untar the bundled `cfitsio-<X>.<Y>.<Z>.tar.gz` next to it:
+   `cd ~/git/fitsio && tar xzf cfitsio-*.tar.gz`
+3. Reference paths in the rest of this document are written as
+   `<cfitsio>/fits_hdecompress.c`, etc.  `<cfitsio>` resolves to
+   the untarred directory (e.g. `~/git/fitsio/cfitsio-4.6.4`).
+
+Notable files for ZIMAGE work:
+
+- `<cfitsio>/fits_hcompress.c` / `fits_hdecompress.c` — HCOMPRESS_1
+  encode/decode + hsmooth.
+- `<cfitsio>/pliocomp.c` — PLIO_1 encode + decode (`pl_p2li` /
+  `pl_l2pi`).
+- `<cfitsio>/ricecomp.c` — RICE_1 encode/decode.
+- `<cfitsio>/imcompress.c` — top-level tile compression dispatch +
+  GZIP / fallback-column wiring.
+- `<cfitsio>/quantize.c` — float quantization, Park-Miller table,
+  dither method selection.
+- `<cfitsio>/fitsio2.h` — internal types and constants
+  (e.g. `BYTE_IMG = 8`, `SHORT_IMG = 16`, `LONG_IMG = 32`).
+
+Function names in `src/zimage/hcompress.rs` (and the future
+`src/zimage/rice.rs` encoder, etc.) mirror the cfitsio names
+exactly so `diff <cfitsio>/fits_hdecompress.c src/zimage/hcompress.rs`
+is a useful debugging tool.
+
+### Performance / large fixture files
+
+The Performance TODO section below mentions a 12 GB GZIP_2
+benchmark file.  That fixture is per-user (lives on the repo
+owner's disk; not committed, not downloadable from CI).  When
+profiling on a fresh machine, generate an equivalent: any large
+real-world float-image survey file (DECam, HSC, etc.) compressed
+with fitsio + `compress='GZIP_2', tile_dims=(<rows>, <cols>)` works.
+Alternatively, synthesize:
+
+```python
+import numpy as np, fitsio
+data = np.random.default_rng(0).standard_normal((30000, 50000),
+                                                dtype=np.float64)
+fitsio.write('big.fits.fz', data,
+             compress='GZIP_2', tile_dims=(100, 100))
+```
+
+The point of the benchmark is throughput on long chunked reads;
+the file's *content* doesn't matter, just its size and tile count.
 
 ### CI
 
@@ -1402,10 +1464,12 @@ this section) is the actual target.
 ## Performance TODO — ZIMAGE chunked-read profiling
 
 **Observation (May 2026, post-Phase-5):** reading a 1.49-billion-
-pixel f8 GZIP_2 ZIMAGE file (`/home/esheldon/data/test-fitsio-cache/test.fits`)
-in chunks via `f[1][lo:hi]` slicing is **roughly 3× slower than
-cfitsio's equivalent read**.  The output is bit-exact; this is
-purely a throughput gap.
+pixel f8 GZIP_2 ZIMAGE file (~12 GB; per-user fixture, not
+committed — see "Performance / large fixture files" under
+"Build / dev workflow" for how to obtain or synthesize an
+equivalent) in chunks via `f[1][lo:hi]` slicing is **roughly 3×
+slower than cfitsio's equivalent read**.  The output is bit-
+exact; this is purely a throughput gap.
 
 No profiling done yet — this is just the baseline observation
 from the read-correctness work.  When we revisit, candidate
