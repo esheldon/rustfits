@@ -1,0 +1,17 @@
+# Dev + test requirements for rustfits.
+#
+# Install with:
+#     conda install --file conda-test-requirements.txt
+#
+# These are NOT needed to use the library — only to run the test
+# suite, format/lint, or build alternative fallback fixtures.
+#
+# fitsio writes the canonical ZIMAGE / RICE_1 / GZIP fixtures used
+# by most of the test suite.  astropy is used for some richer
+# fixture patterns (e.g. the tile-compressed fallback-column
+# tests) and is also a useful cross-check for FITS reads.
+
+pytest
+fitsio
+astropy
+ruff

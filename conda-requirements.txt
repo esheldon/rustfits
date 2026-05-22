@@ -1,0 +1,17 @@
+# Runtime + build requirements for rustfits.
+#
+# Install with:
+#     conda install --file conda-requirements.txt
+#
+# The Rust toolchain (cargo, rustc) is NOT listed here — install
+# it via rustup (https://rustup.rs).  On GitHub Actions runners
+# rustup is preinstalled; the dtolnay/rust-toolchain@stable
+# action also works and pins the toolchain version.
+#
+# Maturin is the build backend declared in pyproject.toml; it
+# shells out to whichever `cargo` is on PATH, so the conda env
+# and the rustup toolchain don't need to know about each other.
+
+python >=3.8
+maturin >=1.0,<2.0
+numpy
