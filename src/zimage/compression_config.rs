@@ -208,3 +208,109 @@ impl Gzip2 {
         )
     }
 }
+
+// ---------- Rice1 ----------
+
+/// Configuration for RICE_1 tile compression.
+///
+/// Rice coding over per-pixel deltas: for each block of `blocksize`
+/// pixels the encoder picks a split parameter k from a per-block
+/// entropy heuristic, encodes the high bits unary and the low k
+/// bits raw.  Strong on smooth-but-noisy integer imagery; cfitsio
+/// uses this as the default compression for many surveys.
+///
+/// Supports BYTEPIX ∈ {1, 2, 4} (u1, i2, i4 in numpy terms).
+/// BYTEPIX=8 (i64) is rejected: no canonical FITS writer produces
+/// such files (cfitsio refuses, astropy silently downcasts to
+/// i32), so they would be unreadable outside rustfits.  Use
+/// Gzip2 for i64 data — within ~5% of RICE compression on real
+/// imagery and universally readable.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub(crate) struct Rice1 {
+    pub(crate) tile_shape: Option<Vec<u64>>,
+    pub(crate) heap_format: char,
+    pub(crate) blocksize: u32,
+}
+
+#[pymethods]
+impl Rice1 {
+    /// Build a Rice1 compression config.
+    ///
+    /// Parameters
+    /// ----------
+    /// tile_shape : tuple of positive ints, optional
+    ///     Tile dimensions in numpy axis order (slowest first).
+    ///     When omitted, defaults to the FITS-convention "row
+    ///     tiles" layout (ZTILE1 = NAXIS1, others = 1) once the
+    ///     image shape is known.
+    /// heap_format : {'P', 'Q'}, default 'P'
+    ///     Heap addressing format.  'P' uses 8-byte descriptors
+    ///     with 32-bit nelements/offset (4 GB heap ceiling).
+    ///     'Q' uses 16-byte descriptors (no practical ceiling).
+    /// blocksize : int, default 32
+    ///     Number of pixels per Rice coding block.  Larger blocks
+    ///     amortise the per-block FS overhead but adapt more
+    ///     slowly to changes in local entropy.  cfitsio uses 32
+    ///     as its default and exposes no knob; some encoders use
+    ///     16 or 64.  Must be > 0.
+    #[new]
+    #[pyo3(signature = (
+        *, tile_shape=None, heap_format=String::from("P"), blocksize=32
+    ))]
+    fn new(
+        tile_shape: Option<Vec<i64>>,
+        heap_format: String,
+        blocksize: i64,
+    ) -> PyResult<Self> {
+        let tile_shape = validate_tile_shape(tile_shape)?;
+        let heap_format = validate_heap_format(&heap_format)?;
+        if blocksize <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "blocksize must be > 0, got {}", blocksize
+            )));
+        }
+        if blocksize > u32::MAX as i64 {
+            return Err(PyValueError::new_err(format!(
+                "blocksize {} exceeds u32::MAX", blocksize
+            )));
+        }
+        Ok(Rice1 {
+            tile_shape,
+            heap_format,
+            blocksize: blocksize as u32,
+        })
+    }
+
+    #[getter]
+    fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.tile_shape {
+            None => py.None(),
+            Some(v) => pyo3::types::PyTuple::new(py, v)
+                .expect("PyTuple::new of u64 always succeeds")
+                .unbind()
+                .into_any(),
+        }
+    }
+
+    #[getter]
+    fn heap_format(&self) -> String {
+        self.heap_format.to_string()
+    }
+
+    #[getter]
+    fn blocksize(&self) -> u32 {
+        self.blocksize
+    }
+
+    fn __repr__(&self) -> String {
+        let ts = match &self.tile_shape {
+            None => "None".to_string(),
+            Some(v) => format!("{:?}", v),
+        };
+        format!(
+            "Rice1(tile_shape={}, heap_format='{}', blocksize={})",
+            ts, self.heap_format, self.blocksize,
+        )
+    }
+}

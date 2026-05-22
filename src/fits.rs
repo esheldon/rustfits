@@ -355,6 +355,7 @@ pub(crate) struct FITS {
 enum CompressionConfigKind {
     Gzip1(crate::zimage::compression_config::Gzip1),
     Gzip2(crate::zimage::compression_config::Gzip2),
+    Rice1(crate::zimage::compression_config::Rice1),
 }
 
 impl CompressionConfigKind {
@@ -369,9 +370,15 @@ impl CompressionConfigKind {
         {
             return Ok(Self::Gzip2(g));
         }
+        if let Ok(r) = bound.extract::<
+            crate::zimage::compression_config::Rice1>()
+        {
+            return Ok(Self::Rice1(r));
+        }
         Err(pyo3::exceptions::PyTypeError::new_err(
             "compress= must be a compression-config object \
-             (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...))"
+             (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...), \
+             rustfits.Rice1(...))"
         ))
     }
 
@@ -379,6 +386,7 @@ impl CompressionConfigKind {
         match self {
             Self::Gzip1(g) => &g.tile_shape,
             Self::Gzip2(g) => &g.tile_shape,
+            Self::Rice1(r) => &r.tile_shape,
         }
     }
 
@@ -386,6 +394,7 @@ impl CompressionConfigKind {
         match self {
             Self::Gzip1(g) => g.heap_format,
             Self::Gzip2(g) => g.heap_format,
+            Self::Rice1(r) => r.heap_format,
         }
     }
 
@@ -393,6 +402,22 @@ impl CompressionConfigKind {
         match self {
             Self::Gzip1(_) => "GZIP_1",
             Self::Gzip2(_) => "GZIP_2",
+            Self::Rice1(_) => "RICE_1",
+        }
+    }
+
+    // Algorithm-specific (ZNAMEn, ZVALn) pairs to emit alongside
+    // the standard ZIMAGE header cards.  RICE_1 carries BLOCKSIZE
+    // and BYTEPIX so the decoder can pick the right parameter
+    // table; GZIP variants have no extras.  Caller supplies the
+    // image BITPIX so we can compute BYTEPIX = bitpix/8.
+    fn extra_z_cards(&self, bitpix: i32) -> Vec<(&'static str, i64)> {
+        match self {
+            Self::Gzip1(_) | Self::Gzip2(_) => Vec::new(),
+            Self::Rice1(r) => vec![
+                ("BLOCKSIZE", r.blocksize as i64),
+                ("BYTEPIX", (bitpix / 8) as i64),
+            ],
         }
     }
 }
@@ -468,9 +493,9 @@ impl FITS {
     // the heap empty (PCOUNT=0) until CompressedImageHDU.write is
     // called.
     //
-    // Phase 7 supports Gzip1 and Gzip2 with integer ZBITPIX
-    // (u1/i2/i4/i8).  Other algorithms and float ZBITPIX raise
-    // NotImplementedError.
+    // Phase 7 supports Gzip1, Gzip2, and Rice1 with integer ZBITPIX
+    // (u1/i2/i4/i8 for GZIP; u1/i2/i4 for RICE).  Other algorithms
+    // and float ZBITPIX raise NotImplementedError.
     fn create_compressed_image_hdu_impl(
         &mut self,
         py: Python<'_>,
@@ -517,6 +542,19 @@ impl FITS {
                  are not yet supported on write; pass the matching \
                  signed dtype (i1→u1 mismatch, u2→i2, u4→i4, u8→i8) \
                  for now, or wait for a Phase 7 follow-up"
+            ));
+        }
+        // RICE_1 rejects bitpix=64 (BYTEPIX=8).  cfitsio has no
+        // 64-bit RICE encoder; producing such files would make
+        // them unreadable outside rustfits.  GZIP_2 typically
+        // gets within ~5% on real i64 imagery.
+        if matches!(cfg, CompressionConfigKind::Rice1(_)) && bitpix == 64 {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "RICE_1 does not support 64-bit pixels (i8 dtype): no \
+                 canonical FITS writer (cfitsio, fitsio, astropy) \
+                 produces such files. Use Gzip2 for i64 imaging data \
+                 — typically within ~5% of RICE compression and \
+                 universally readable."
             ));
         }
 
@@ -592,6 +630,19 @@ impl FITS {
         for (i, &t) in tile_shape_fits.iter().enumerate() {
             cards.push(card_int(&format!("ZTILE{}", i + 1), t as i64,
                                 &format!("tile size on axis {}", i + 1)));
+        }
+        // Algorithm-specific ZNAMEn/ZVALn pairs (RICE BLOCKSIZE +
+        // BYTEPIX; GZIP has none).
+        for (n, (name, val)) in cfg.extra_z_cards(bitpix).iter().enumerate() {
+            let idx = n + 1;
+            cards.push(card_string(
+                &format!("ZNAME{}", idx), name,
+                &format!("compression parameter {}", idx),
+            ));
+            cards.push(card_int(
+                &format!("ZVAL{}", idx), *val,
+                &format!("value of ZNAME{}", idx),
+            ));
         }
         if let Some(name) = extname.as_deref() {
             cards.push(card_string("EXTNAME", name, "name of this HDU"));
@@ -753,9 +804,9 @@ impl FITS {
     // `rustfits.Gzip1(tile_shape=..., heap_format='P')`).  In that case
     // the HDU is created as a tile-compressed image (BINTABLE+ZIMAGE on
     // disk, `CompressedImageHDU` in Python) instead of a plain IMAGE
-    // extension.  Phase 7 supports `Gzip1` and `Gzip2`; other algorithms
-    // (RICE_1, HCOMPRESS_1, PLIO_1) will be added in follow-up
-    // sub-phases.
+    // extension.  Phase 7 supports `Gzip1`, `Gzip2`, and `Rice1`;
+    // the remaining algorithms (HCOMPRESS_1, PLIO_1) will be added
+    // in follow-up sub-phases.
     #[pyo3(signature = (dtype, dims, *, extname=None, extver=None, compress=None))]
     fn create_image_hdu(
         &mut self,

@@ -1175,9 +1175,9 @@ f[1].write(data)
 ```
 
 `compress=None` (default) → uncompressed `ImageHDU` (current
-behavior, unchanged).  `compress=Gzip1(...)` or `Gzip2(...)` →
-`CompressedImageHDU`.  Algorithm objects (`Gzip1`, `Gzip2` shipped;
-`Rice1`/`Hcompress1`/`Plio1` to follow) live in
+behavior, unchanged).  `compress=Gzip1(...)` / `Gzip2(...)` /
+`Rice1(...)` → `CompressedImageHDU`.  Algorithm objects (`Gzip1`,
+`Gzip2`, `Rice1` shipped; `Hcompress1`/`Plio1` to follow) live in
 `src/zimage/compression_config.rs`.  Each is a Rust pyclass exposed
 at `rustfits.<Name>`, validated at construction
 (`Gzip1(blocksize=0)` raises immediately), immutable (no setters).
@@ -1188,15 +1188,16 @@ duplication is trivial and avoids a PyClassInitializer chain.
 Dispatch in `fits.rs::create_compressed_image_hdu_impl` goes
 through an internal `CompressionConfigKind` enum that wraps the
 per-algorithm pyclasses.  `CompressionConfigKind::from_pyany`
-tries each variant's `extract::<Gzip1>()`/`extract::<Gzip2>()`
-in turn — pyo3 0.28 doesn't grow a clean "first-match" extractor,
-so the manual loop is the simplest shape.  The enum exposes the
-small shared surface (`tile_shape()`, `heap_format()`,
-`zcmptype()`) used by header emission and the encoder dispatch.
-When `Rice1`/`Hcompress1`/`Plio1` land, each adds a variant + an
-arm in the three accessor matches; algorithms that need extra
-header cards (RICE BLOCKSIZE/BYTEPIX, HCOMPRESS SCALE/SMOOTH) will
-also need an `algorithm_specific_cards()` accessor or similar.
+tries each variant's `extract::<Gzip1>()` / `extract::<Gzip2>()` /
+`extract::<Rice1>()` in turn — pyo3 0.28 doesn't grow a clean
+"first-match" extractor, so the manual loop is the simplest shape.
+The enum exposes the shared surface (`tile_shape()`, `heap_format()`,
+`zcmptype()`) plus an `extra_z_cards(bitpix)` accessor that returns
+`(ZNAMEn, ZVALn)` pairs to emit alongside the standard ZIMAGE cards
+(RICE_1 emits BLOCKSIZE + BYTEPIX; GZIP variants emit nothing).
+When `Hcompress1`/`Plio1` land, each adds a variant + an arm in
+the four accessor matches; HCOMPRESS would surface SCALE/SMOOTH
+through the same `extra_z_cards` pattern.
 
 *Design discussion captured.*  See git log around this commit
 for the full thread: the chosen shape is one unified
@@ -1217,9 +1218,10 @@ the backend for a fitsio 2.0).  Decisions like the
 `compress='GZIP_1', tile_dims=...` flat-kwarg style — the shim
 absorbs the translation.
 
-*Scope (current).*  `Gzip1` + `Gzip2`; integer ZBITPIX (8/16/32/64)
-only; create + bulk `write` only.  Float ZBITPIX (-32/-64) and
-unsigned-int trick dtypes (i1/u2/u4/u8) raise
+*Scope (current).*  `Gzip1` + `Gzip2` + `Rice1`; integer ZBITPIX
+(8/16/32/64 for GZIP; 8/16/32 for RICE — i8/BYTEPIX=8 rejected,
+see below) only; create + bulk `write` only.  Float ZBITPIX
+(-32/-64) and unsigned-int trick dtypes (i1/u2/u4/u8) raise
 `NotImplementedError`.  `extend` and `__setitem__` still raise
 the original Phase 2 stub message.
 
@@ -1250,39 +1252,71 @@ the inverse of `unshuffle()` from the decoder side — for
 GZIP_1 (we even round-trip the same bytes through the file in
 that case; tests anchor this invariant).  `encode_tile_from_bytes`
 in `src/zimage/mod.rs` grew a `bytepix` parameter to thread the
-pixel width through to the encoder (GZIP_1 ignores it; algorithms
-that need extra per-tile params — RICE BLOCKSIZE, HCOMPRESS
-SCALE/SMOOTH — will need their own extensions when wired).
+pixel width through to the encoder (GZIP_1 ignores it).
 
-*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` (GZIP_1)
-and `tests/test_compressed_image_phase7_gzip2_write.py` (GZIP_2) —
-each covers accessors after create, dtype matrix (u1/i2/i4/i8),
-shape matrix (1-D / 2-D square / 2-D non-square with edge tiles /
-3-D / whole-image single tile), default-tile-shape round trip,
-bidirectional cross-check with fitsio (rustfits-written read by
-fitsio AND fitsio-written read by rustfits, both bit-exact),
-non-last HDU growth (heap shifts later HDU forward, both read fine
-post-reopen), and all rejection paths (float, unsigned trick,
-shape mismatch, start kwarg).  The GZIP_2 file additionally tests
-the bytepix=1 shuffle-collapses-to-GZIP_1 invariant (file sizes
-equal on `u1` input) and the mixed-algorithm case (one GZIP_1 +
-one GZIP_2 HDU in the same file).
+*RICE_1 encoder.*  `encode_rice(pixel_bytes_be, n_pixels, bytepix,
+blocksize)` in `src/zimage/rice.rs` is a byte-exact port of
+cfitsio's `fits_rcomp` / `_short` / `_byte` family.  The
+algorithm: read pixels as sign-extended integers of the natural
+bytepix width into i32 working precision; for each block of up to
+`blocksize` pixels compute ZigZag-mapped deltas, sum them in f64,
+derive the Rice split parameter `fs` from cfitsio's exact dpsum/psum
+heuristic (with per-bytepix psum cast type — u8/u16/u32 caps psum
+at the natural unsigned width); pick one of three branches per
+block (low-entropy: emit `fs=0` marker only; high-entropy: emit
+`fsmax+1` marker + raw bbits-wide diffs; normal Rice: emit `fs+1`
+marker + unary top + raw fs-wide bottom for each pixel).  A small
+MSB-first `BitWriter` (cousin of the existing `BitReader`) handles
+the bit packing.  `encode_tile_from_bytes` grew an
+`AlgorithmEncodeParams { blocksize }` struct (mirror of the
+decode-side `AlgorithmParams`) plus an `n_pixels` arg so RICE knows
+how many integers to pull out of the input bytes.  The output is
+**byte-exact identical to cfitsio's encoder output** on the same
+input — verified across u1/i2/i4 dtypes, multi-tile layouts,
+low-entropy / high-entropy / mixed blocks.
+
+*RICE_1 i8 (BYTEPIX=8) rejected.*  cfitsio's encoder family stops
+at BYTEPIX=4: there is no `fits_rcomp_longlong`, fitsio raises
+"writing TLONGLONG to compressed image is not supported", and
+astropy silently downcasts i64 → i32 before encoding (lossy when
+values exceed the i32 range, no warning).  No production reader
+verifies BYTEPIX=8 RICE streams, so writing them would produce
+files unreadable outside rustfits.  `create_compressed_image_hdu`
+rejects `compress=Rice1()` + i8 dtype upfront with a clear
+`NotImplementedError` pointing at `Gzip2` instead.  Empirical check
+(see git log around this commit): on real i64 imaging patterns
+(smooth + Poisson, smooth + 1e12 bias, wide-spread, sparse),
+Gzip2 lands within ~5% of where i64 RICE would compress, and is
+universally readable.  The encoder itself also rejects bytepix=8
+as a defensive check.
+
+*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` (GZIP_1),
+`tests/test_compressed_image_phase7_gzip2_write.py` (GZIP_2), and
+`tests/test_compressed_image_phase7_rice_write.py` (RICE_1) —
+each covers accessors after create, dtype matrix (u1/i2/i4 +
+i8 for GZIP only), shape matrix (1-D / 2-D square / 2-D non-square
+with edge tiles / 3-D / whole-image single tile), default-tile-shape
+round trip, bidirectional cross-check with fitsio (rustfits-written
+read by fitsio AND fitsio-written read by rustfits, both bit-exact),
+non-last HDU growth (heap shifts later HDU forward), and all
+rejection paths (float, unsigned trick, shape mismatch, start kwarg).
+The GZIP_2 file adds the bytepix=1 shuffle-collapses-to-GZIP_1
+invariant (file sizes equal on `u1` input) and the mixed-algorithm
+case (one GZIP_1 + one GZIP_2 HDU in the same file).  The RICE_1
+file adds **byte-exact heap-comparison tests against fitsio**
+(low-entropy, high-entropy, multi-tile, dtype matrix), a custom
+blocksize test, and the i8-rejected test.
 
 **Phase 7 follow-ups (deferred).**
-- **Remaining encoders** — `Rice1`, `Hcompress1`, `Plio1`.
+- **Remaining encoders** — `Hcompress1`, `Plio1`.
   Each adds an `encode_*` function in the algorithm module, an
   algorithm class in `compression_config.rs`, a variant in the
   `CompressionConfigKind` enum in `fits.rs`, and an entry in
-  the encode dispatch in `src/zimage/mod.rs`.  Header emission
-  carries the algorithm-specific ZNAMEn/ZVALn cards
-  (BLOCKSIZE/BYTEPIX for RICE, SCALE/SMOOTH for HCOMPRESS) —
-  the cleanest extension point is probably an
-  `algorithm_specific_cards()` accessor on
-  `CompressionConfigKind`.  `encode_tile_from_bytes` already
-  carries `bytepix`; algorithms needing more per-tile params
-  (RICE blocksize, HCOMPRESS scale/smooth) will need their own
-  signature extensions or a small AlgorithmEncodeParams struct
-  parallel to the existing `AlgorithmParams` on the decode side.
+  the encode dispatch in `src/zimage/mod.rs`.  HCOMPRESS_1 would
+  surface SCALE + SMOOTH through `extra_z_cards` and would need
+  to extend `AlgorithmEncodeParams` with scale/smooth fields
+  (parallel to the existing decode-side handling).  PLIO_1 has
+  no extra parameters beyond tile_shape/heap_format.
 - **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
   XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
   cards.  Symmetric with `create_image_hdu`'s existing handling

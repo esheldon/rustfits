@@ -28,7 +28,7 @@
 //      8    |  64  |   6    |  53
 
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 
 // (BITS, FSBITS, FSMAX) for the given BYTEPIX.
 fn rice_params(bytepix: u32) -> PyResult<(u32, u32, u32)> {
@@ -223,6 +223,260 @@ pub(crate) fn decode_rice(
         )));
     }
     Ok(cast_i64_to_target_bytes(&out, zbitpix))
+}
+
+// MSB-first bit writer for the RICE_1 encoder.  Cousin of
+// `BitReader`: bits are written into a partial byte from the high
+// end down, flushed whenever the byte fills.  Output is identical
+// (byte-for-byte) to cfitsio's `output_nbits` + `done_outputing_bits`
+// flush — the encoded stream is uniquely determined by the bit
+// sequence, regardless of internal buffer layout.
+struct BitWriter {
+    out: Vec<u8>,
+    cur_byte: u8,
+    bits_used: u32, // 0..7 — bits written into cur_byte so far, MSB side
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        BitWriter { out: Vec::new(), cur_byte: 0, bits_used: 0 }
+    }
+
+    // Write the low `n` bits of `value` MSB-first.  Caller must
+    // pass n <= 64; the high bits beyond n are masked off.
+    fn write_bits(&mut self, value: u64, n: u32) {
+        debug_assert!(n <= 64);
+        if n == 0 {
+            return;
+        }
+        let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let mut value = value & mask;
+        let mut remaining = n;
+        while remaining > 0 {
+            let avail = 8 - self.bits_used;
+            let take = remaining.min(avail);
+            let shift = remaining - take;
+            let mask_u8: u8 = if take == 8 { 0xFF } else { (1u8 << take) - 1 };
+            let top_bits = ((value >> shift) as u8) & mask_u8;
+            self.cur_byte |= top_bits << (avail - take);
+            self.bits_used += take;
+            if shift > 0 {
+                value &= (1u64 << shift) - 1;
+            }
+            remaining -= take;
+            if self.bits_used == 8 {
+                self.out.push(self.cur_byte);
+                self.cur_byte = 0;
+                self.bits_used = 0;
+            }
+        }
+    }
+
+    // Advance the write position by `n` zero bits (no bit-setting
+    // needed; cur_byte is already zero-initialised after each flush).
+    fn write_zeros(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let mut remaining = n;
+        while remaining > 0 {
+            let avail = 8 - self.bits_used;
+            let take = remaining.min(avail);
+            self.bits_used += take;
+            remaining -= take;
+            if self.bits_used == 8 {
+                self.out.push(self.cur_byte);
+                self.cur_byte = 0;
+                self.bits_used = 0;
+            }
+        }
+    }
+
+    // Unary code: `count` zero bits followed by a single `1` bit.
+    fn write_unary(&mut self, count: u32) {
+        self.write_zeros(count);
+        self.write_bits(1, 1);
+    }
+
+    // Flush any partial byte and return the accumulated output.
+    // Trailing bits within the final byte stay zero — matches
+    // cfitsio's `done_outputing_bits` semantic.
+    fn finish(mut self) -> Vec<u8> {
+        if self.bits_used > 0 {
+            self.out.push(self.cur_byte);
+        }
+        self.out
+    }
+}
+
+// Encode one tile to RICE_1-compressed bytes.  Caller passes the
+// tile's pixel bytes in FITS big-endian order (one packed
+// integer per pixel, `bytepix` bytes wide).  Output bytes are
+// byte-exact with cfitsio's `fits_rcomp` / `_short` / `_byte`
+// encoders given the same input.
+//
+// Scope: BYTEPIX ∈ {1, 2, 4}.  Matches cfitsio's encoder family —
+// there is no `fits_rcomp_longlong`, fitsio refuses i64 RICE
+// outright, and astropy silently downcasts i64 to i32 before
+// encoding.  Producing BYTEPIX=8 RICE files would make them
+// unreadable by every canonical FITS tool; we reject upstream so
+// users get a clear error pointing at GZIP_2 instead (which gives
+// within ~5% of i64 RICE's hypothetical compression with no
+// interop cost).
+pub(crate) fn encode_rice(
+    pixel_bytes_be: &[u8],
+    n_pixels: usize,
+    bytepix: u32,
+    blocksize: u32,
+) -> PyResult<Vec<u8>> {
+    if n_pixels == 0 {
+        return Ok(Vec::new());
+    }
+    if blocksize == 0 {
+        return Err(PyValueError::new_err(
+            "RICE encode: BLOCKSIZE must be > 0"
+        ));
+    }
+    if bytepix == 8 {
+        return Err(PyNotImplementedError::new_err(
+            "RICE_1 does not support 64-bit pixels (BYTEPIX=8): no \
+             canonical FITS writer (cfitsio, fitsio, astropy) produces \
+             such files, so they would be unreadable outside rustfits. \
+             Use GZIP_2 for i64 imaging data — typically within ~5% of \
+             RICE compression and universally readable."
+        ));
+    }
+    let (bbits, fsbits, fsmax) = rice_params(bytepix)?;
+    debug_assert!(bbits <= 32);
+
+    let expected_bytes = n_pixels.checked_mul(bytepix as usize)
+        .ok_or_else(|| PyValueError::new_err(
+            "RICE encode: n_pixels * bytepix overflowed usize"
+        ))?;
+    if pixel_bytes_be.len() != expected_bytes {
+        return Err(PyValueError::new_err(format!(
+            "RICE encode: input length {} != n_pixels * bytepix ({})",
+            pixel_bytes_be.len(), expected_bytes
+        )));
+    }
+
+    // Read one pixel from the BE byte stream, sign-extended to i32.
+    // cfitsio's encoder variants work in `int` (32-bit) precision
+    // regardless of pixel width — the truncation happens at the
+    // pdiff assignment back to the natural width.  We mirror that:
+    // `lastpix`/`nextpix` stay in i32, and pdiff is truncated below.
+    let read_pixel = |i: usize| -> i32 {
+        let off = i * bytepix as usize;
+        match bytepix {
+            1 => pixel_bytes_be[off] as i8 as i32,
+            2 => i16::from_be_bytes([
+                pixel_bytes_be[off],
+                pixel_bytes_be[off + 1],
+            ]) as i32,
+            4 => i32::from_be_bytes([
+                pixel_bytes_be[off],
+                pixel_bytes_be[off + 1],
+                pixel_bytes_be[off + 2],
+                pixel_bytes_be[off + 3],
+            ]),
+            _ => unreachable!(),
+        }
+    };
+
+    let mut writer = BitWriter::new();
+
+    // Seed: first pixel as `bbits` bits.  cfitsio's output_nbits
+    // masks to n bits, so sign-extension above doesn't matter for
+    // the seed's on-disk encoding.
+    let seed = read_pixel(0);
+    writer.write_bits(seed as u32 as u64, bbits);
+    let mut lastpix = seed;
+
+    let mut diff_buf: Vec<u32> = Vec::with_capacity(blocksize as usize);
+    let mut i = 0;
+    while i < n_pixels {
+        let thisblock = (blocksize as usize).min(n_pixels - i);
+        diff_buf.clear();
+        let mut pixelsum: f64 = 0.0;
+
+        for j in 0..thisblock {
+            let nextpix = read_pixel(i + j);
+            // pdiff = nextpix - lastpix truncated to the natural
+            // bytepix width, then sign-extended back to i32.  For
+            // bytepix=4 this is identity (the wrapping subtraction
+            // already returns i32); for narrower widths the cast
+            // chain truncates modulo 2^BITS and re-extends.
+            let pdiff_raw = nextpix.wrapping_sub(lastpix);
+            let pdiff: i32 = match bytepix {
+                1 => pdiff_raw as i8 as i32,
+                2 => pdiff_raw as i16 as i32,
+                4 => pdiff_raw,
+                _ => unreachable!(),
+            };
+            // ZigZag: maps signed → unsigned with negative-prefers-odd.
+            // Equivalent to cfitsio's
+            //   (pdiff<0) ? ~(pdiff<<1) : (pdiff<<1)
+            // in int (32-bit) arithmetic — and inverse of our
+            // decoder's `unzigzag`.
+            let zz: u32 = (pdiff as u32).wrapping_shl(1)
+                ^ ((pdiff >> 31) as u32);
+            diff_buf.push(zz);
+            pixelsum += zz as f64;
+            lastpix = nextpix;
+        }
+
+        // Compute the Rice parameter `fs` matching cfitsio's
+        // per-bytepix heuristic exactly.  The cast type of `psum`
+        // (u8 / u16 / u32) caps it at the natural unsigned width
+        // for the bytepix; small dpsum values then drive a small
+        // fs, large ones top out at FSMAX.
+        let dpsum_raw = (pixelsum
+            - (thisblock / 2) as f64
+            - 1.0)
+            / thisblock as f64;
+        let dpsum = if dpsum_raw < 0.0 { 0.0 } else { dpsum_raw };
+        let mut psum: u32 = match bytepix {
+            1 => (dpsum as u8 as u32) >> 1,
+            2 => (dpsum as u16 as u32) >> 1,
+            4 => (dpsum as u32) >> 1,
+            _ => unreachable!(),
+        };
+        let mut fs: u32 = 0;
+        while psum > 0 {
+            fs += 1;
+            psum >>= 1;
+        }
+
+        if fs >= fsmax {
+            // High-entropy: write fsmax+1 (the "raw mode" marker
+            // for this block), then each diff verbatim in bbits.
+            writer.write_bits((fsmax + 1) as u64, fsbits);
+            for &d in &diff_buf {
+                writer.write_bits(d as u64, bbits);
+            }
+        } else if fs == 0 && pixelsum == 0.0 {
+            // Low-entropy: every pixel in the block equals lastpix.
+            // Stored as fs=0; no further bits.
+            writer.write_bits(0, fsbits);
+        } else {
+            // Normal Rice with parameter k=fs.  Each diff splits
+            // into top (unary-coded count of high bits) + bottom
+            // (fs low bits raw).
+            writer.write_bits((fs + 1) as u64, fsbits);
+            let fsmask: u32 = if fs > 0 { (1u32 << fs) - 1 } else { 0 };
+            for &d in &diff_buf {
+                let top = d >> fs;
+                writer.write_unary(top);
+                if fs > 0 {
+                    writer.write_bits((d & fsmask) as u64, fs);
+                }
+            }
+        }
+
+        i += thisblock;
+    }
+
+    Ok(writer.finish())
 }
 
 // Cast a Vec<i64> of decoded pixel values to bytes in the target

@@ -440,8 +440,8 @@ impl CompressedImageHDU {
     // partial tile, which doesn't compose with the encode-once
     // model).  Pass the full image array as `data`.
     //
-    // Phase 7 supports Gzip1 and Gzip2 with integer ZBITPIX
-    // (u1/i2/i4/i8).
+    // Phase 7 supports Gzip1, Gzip2, and Rice1 with integer
+    // ZBITPIX (u1/i2/i4/i8 for GZIP; u1/i2/i4 for RICE).
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -1870,16 +1870,22 @@ fn write_compressed_image_data(
         ))),
     };
 
+    // ----- algorithm-specific encode params -----
+    // RICE_1 needs BLOCKSIZE from the header; the header was just
+    // emitted by create_compressed_image_hdu_impl so the card is
+    // present.  Default 32 matches cfitsio when the card is absent
+    // (which it shouldn't be on our writes, but the read side has
+    // the same fallback).
+    let (blocksize_opt, _bytepix_header_opt) = parse_rice_params(cards);
+    let encode_params = crate::zimage::AlgorithmEncodeParams {
+        blocksize: blocksize_opt.unwrap_or(32),
+    };
+
     // ----- encode all tiles into RAM -----
     let mut heap_bytes: Vec<u8> = Vec::new();
     // descriptors: (nelements, heap_offset) per tile, in tile-index
     // order (FITS row-major, numpy-last-axis fastest).
     let mut descriptors: Vec<(u64, u64)> = Vec::with_capacity(n_tiles as usize);
-    let params = crate::zimage::AlgorithmParams {
-        tile_shape_numpy: &[],  // GZIP doesn't use it; HCOMPRESS overrides per-tile via encode_tile_from_bytes when wired
-        smooth: false,
-    };
-    let _ = params; // currently unused by encode_tile_from_bytes
 
     for tile_idx in 0..n_tiles {
         let (origin, actual_shape) = tile_origin_and_shape(
@@ -1902,8 +1908,8 @@ fn write_compressed_image_data(
         )?;
         let tile_bytes_py = tile_be.call_method0("tobytes")?;
         let tile_bytes: Vec<u8> = tile_bytes_py.extract()?;
-        let expected_bytes = (actual_shape.iter().product::<u64>()
-            * bytepix as u64) as usize;
+        let n_pixels = actual_shape.iter().product::<u64>() as usize;
+        let expected_bytes = n_pixels * bytepix as usize;
         if tile_bytes.len() != expected_bytes {
             return Err(PyValueError::new_err(format!(
                 "internal: tile {} bytes={} expected {}",
@@ -1911,7 +1917,7 @@ fn write_compressed_image_data(
             )));
         }
         let encoded = crate::zimage::encode_tile_from_bytes(
-            algorithm, &tile_bytes, bytepix,
+            algorithm, &tile_bytes, bytepix, n_pixels, encode_params,
         )?;
         let offset = heap_bytes.len() as u64;
         descriptors.push((encoded.len() as u64, offset));

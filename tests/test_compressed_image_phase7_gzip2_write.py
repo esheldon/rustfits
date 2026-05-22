@@ -122,13 +122,15 @@ def test_round_trip_u1_matches_gzip1():
         data = _seq((32, 48), "u1")
         with rustfits.FITS(fn1, "w+") as f:
             f.create_image_hdu(
-                "u1", data.shape,
+                "u1",
+                data.shape,
                 compress=rustfits.Gzip1(tile_shape=(16, 24)),
             )
             f[1].write(data)
         with rustfits.FITS(fn2, "w+") as f:
             f.create_image_hdu(
-                "u1", data.shape,
+                "u1",
+                data.shape,
                 compress=rustfits.Gzip2(tile_shape=(16, 24)),
             )
             f[1].write(data)
@@ -218,7 +220,10 @@ def test_fitsio_written_rustfits_read_matches():
         data = _seq((40, 60), "i4")
         with fitsio.FITS(fn, "rw") as f:
             f.write(
-                data, compress="GZIP_2", tile_dims=(20, 30), qlevel=None,
+                data,
+                compress="GZIP_2",
+                tile_dims=(20, 30),
+                qlevel=None,
             )
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
@@ -243,7 +248,9 @@ def test_compressed_write_shifts_later_hdus():
                 "i4", comp_data.shape, compress=cfg, extname="COMP"
             )
             f.create_image_hdu(
-                "i2", later_data.shape, extname="LATER",
+                "i2",
+                later_data.shape,
+                extname="LATER",
             )
             f[2].write(later_data)
             # Now write the compressed HDU — heap grows, LATER shifts.
@@ -272,12 +279,14 @@ def test_mixed_gzip1_and_gzip2_in_one_file():
         data2 = _seq((48, 32), "i2")
         with rustfits.FITS(fn, "w+") as f:
             f.create_image_hdu(
-                "i4", data1.shape,
+                "i4",
+                data1.shape,
                 compress=rustfits.Gzip1(tile_shape=(16, 24)),
                 extname="G1",
             )
             f.create_image_hdu(
-                "i2", data2.shape,
+                "i2",
+                data2.shape,
                 compress=rustfits.Gzip2(tile_shape=(24, 16)),
                 extname="G2",
             )

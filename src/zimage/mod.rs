@@ -109,6 +109,25 @@ pub(crate) fn decode_tile_to_bytes(
     }
 }
 
+// Algorithm-specific parameters carried alongside the generic
+// (pixel_bytes_be, bytepix) signature for encoding.  Mirror of
+// `AlgorithmParams` on the decode side.  Each algorithm consumes
+// only the fields it cares about — GZIP_1/2 ignore everything in
+// here; RICE_1 uses `blocksize` (number of pixels per Rice block);
+// HCOMPRESS_1 will use scale/smooth when wired.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AlgorithmEncodeParams {
+    // RICE_1: number of pixels per Rice block (default 32 in
+    // cfitsio).  Ignored by GZIP_1/2; required > 0 for RICE.
+    pub blocksize: u32,
+}
+
+impl Default for AlgorithmEncodeParams {
+    fn default() -> Self {
+        AlgorithmEncodeParams { blocksize: 32 }
+    }
+}
+
 // Encode one tile from its native-endian pixel bytes to the
 // algorithm's on-disk compressed bytes.  Mirror of
 // `decode_tile_to_bytes` for the write path.  The caller is
@@ -116,25 +135,25 @@ pub(crate) fn decode_tile_to_bytes(
 // passing in the bytes (matches the decode side, which produces
 // native-endian output).
 //
-// `bytepix` is needed by GZIP_2 to drive its byte-shuffle
-// preprocessor; GZIP_1 ignores it (deflate operates byte-wise).
-// Algorithms that need additional per-tile parameters (HCOMPRESS,
-// RICE) will need their own extensions when wired in follow-up
-// sub-phases.
+// `bytepix` is needed by GZIP_2 to drive its byte-shuffle and by
+// RICE_1 to pick the per-bytepix FSBITS/FSMAX table.  Algorithm-
+// specific params (RICE blocksize, future HCOMPRESS scale/smooth)
+// ride along in `params`.
 pub(crate) fn encode_tile_from_bytes(
     algorithm: CompressionAlgorithm,
     pixel_bytes_be: &[u8],
     bytepix: u32,
+    n_pixels: usize,
+    params: AlgorithmEncodeParams,
 ) -> PyResult<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Gzip1 => gzip::encode_gzip1(pixel_bytes_be),
         CompressionAlgorithm::Gzip2 => {
             gzip::encode_gzip2(pixel_bytes_be, bytepix)
         }
-        CompressionAlgorithm::Rice1 => Err(PyNotImplementedError::new_err(
-            "RICE_1 encoding is not yet implemented \
-             (planned: a follow-up sub-phase under Phase 7)"
-        )),
+        CompressionAlgorithm::Rice1 => {
+            rice::encode_rice(pixel_bytes_be, n_pixels, bytepix, params.blocksize)
+        }
         CompressionAlgorithm::Hcompress1 => Err(PyNotImplementedError::new_err(
             "HCOMPRESS_1 encoding is not yet implemented \
              (planned: a follow-up sub-phase under Phase 7)"

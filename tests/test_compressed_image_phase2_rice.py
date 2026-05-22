@@ -276,15 +276,8 @@ def test_scaled_compressed_hdu():
 
 
 # __getitem__ shipped in Phase 3 — see test_compressed_image_phase3_slice.py.
-
-
-def test_write_raises_not_implemented():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname, _ = _write_rice(tmpdir, (4, 4), "i4")
-        with rustfits.FITS(fname, "r+") as fits:
-            hdu = fits[1]
-            with pytest.raises(NotImplementedError, match="Phase 7"):
-                hdu.write(np.zeros((4, 4), dtype="i4"))
+# write() for Rice1 shipped in the Phase 7 follow-up — see
+# test_compressed_image_phase7_rice_write.py.
 
 
 def test_extend_raises_not_implemented():
