@@ -1066,7 +1066,7 @@ cfitsio synonyms (`GZIP` for `GZIP_1`, `HCOMPRESS` for
   typically emits a header-level ZBLANK for DITHER_2 rather
   than a per-tile column.
 
-**Phase 6 — HCOMPRESS_1 read.**  Done for SMOOTH=0.
+**Phase 6 — HCOMPRESS_1 read.**  Done.
 
 Decoder in `src/zimage/hcompress.rs` — port of cfitsio's
 `fits_hdecompress.c` (reference source at
@@ -1101,22 +1101,22 @@ RICE/GZIP don't: the 2-D tile shape and the SMOOTH flag.  Added
 `get_or_decode_tile`) constructs one and passes it through
 `decode_tile_to_bytes`.  RICE/GZIP ignore both fields.
 
-*SMOOTH=1 is rejected.*  The hsmooth function has six clauses
-in cfitsio (interior + 5 boundary cases) that interpolate
-neighbouring coefficients to soften block artifacts at high
-scales.  The boundary clauses are tedious enough that we ship
-a stub and reject SMOOTH=1 at the dispatch level rather than
-silently producing wrong output.  Every HCOMPRESS file we've
-encountered uses SMOOTH=0; lift this gap when a real workload
-hits it (the qtree decoder + hinv + undigitize are all done,
-so SMOOTH is the only remaining piece for full HCOMPRESS_1
-read parity).
+*SMOOTH=1.*  Ported.  Three adjustment loops (hx / hy / hc) on
+the inverse-H-transform coefficient block; edge coefficients
+left untouched by the loop bounds (start at 2, end at nxtop-2 /
+nytop-2), not by explicit boundary clauses.  Translation note:
+cfitsio's
+   `s = (s>=0) ? (s>>n) : ((s+(2^n-1))>>n)`
+is "divide by 2^n truncating toward zero", which Rust's signed
+`/` does directly — translated as `s / 8` / `s / 64` for
+readability.
 
 *Tests.*  `tests/test_compressed_image_phase6_hcompress.py`
 covers accessors, lossless round-trip on u8/i16/i32, non-square
-edge tiles, default tiles, slicing parity, SMOOTH=1 rejection,
-and bit-exact agreement with cfitsio on a lossy hcomp_scale=4
-fixture.
+edge tiles, default tiles, slicing parity, bit-exact agreement
+with cfitsio on a lossy hcomp_scale=4 fixture, and SMOOTH=1
+round-trip at hcomp_scale={4, 16} for i16 plus hcomp_scale=8
+for the i32 (i64-internal) path.
 
 **Phase 6 follow-up — PLIO_1 read.**  Small self-contained
 run-length decoder for mask/segmentation arrays.  Defer until

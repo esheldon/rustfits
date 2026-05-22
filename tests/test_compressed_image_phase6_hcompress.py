@@ -199,23 +199,61 @@ def test_hcompress_lossy_scale4_matches_cfitsio():
         np.testing.assert_array_equal(our_out, cfitsio_out)
 
 
-# ---------------------- SMOOTH rejection ---------------------------
+# ---------------------- SMOOTH=1 round trip ------------------------
 
 
-def test_hcompress_smooth_rejected_with_clear_message():
-    """The hsmooth boundary clauses haven't been ported yet — SMOOTH=1
-    must raise rather than silently producing wrong output."""
+@pytest.mark.parametrize("hcomp_scale", [4.0, 16.0])
+def test_hcompress_smooth_matches_cfitsio(hcomp_scale):
+    """SMOOTH=1 + lossy: the hsmooth pass must reproduce cfitsio's
+    output bit-exactly.  Tested across two scales so the smoothing
+    has visible effect (smax = scale/2)."""
     with tempfile.TemporaryDirectory() as tmp:
-        shape = (32, 32)
-        fname, _ = _write_hcompress(
-            tmp,
+        shape = (32, 48)
+        # Slowly varying pattern so the smoothing has meaningful
+        # interpolated targets; pure noise would be uninteresting.
+        data = np.fromfunction(
+            lambda i, j: ((i * 11 + j * 5) % 200).astype(np.int16),
             shape,
-            np.int16,
-            tile_dims=(16, 16),
-            hcomp_smooth=1,
-            hcomp_scale=4.0,
         )
+        fname = os.path.join(tmp, "t.fits.fz")
+        with fitsio.FITS(fname, "rw") as f:
+            f.write(
+                data,
+                compress="HCOMPRESS",
+                tile_dims=(16, 24),
+                hcomp_scale=hcomp_scale,
+                hcomp_smooth=1,
+                qlevel=None,
+            )
+        with fitsio.FITS(fname, "r") as f:
+            cfitsio_out = f[1].read()
         with rustfits.FITS(fname, "r") as f:
-            with pytest.raises(Exception) as excinfo:
-                _ = f[1].read()
-        assert "SMOOTH" in str(excinfo.value)
+            our_out = f[1].read()
+        assert our_out.dtype == cfitsio_out.dtype
+        np.testing.assert_array_equal(our_out, cfitsio_out)
+
+
+def test_hcompress_smooth_int32_matches_cfitsio():
+    """SMOOTH=1 on ZBITPIX=32 — exercises the i64-internal path's
+    hsmooth_i64."""
+    with tempfile.TemporaryDirectory() as tmp:
+        shape = (32, 48)
+        data = np.fromfunction(
+            lambda i, j: ((i * 1009 + j * 503) % 50_000).astype(np.int32),
+            shape,
+        )
+        fname = os.path.join(tmp, "t.fits.fz")
+        with fitsio.FITS(fname, "rw") as f:
+            f.write(
+                data,
+                compress="HCOMPRESS",
+                tile_dims=(16, 24),
+                hcomp_scale=8.0,
+                hcomp_smooth=1,
+                qlevel=None,
+            )
+        with fitsio.FITS(fname, "r") as f:
+            cfitsio_out = f[1].read()
+        with rustfits.FITS(fname, "r") as f:
+            our_out = f[1].read()
+        np.testing.assert_array_equal(our_out, cfitsio_out)

@@ -668,22 +668,216 @@ fn unshuffle_i64(a: &mut [i64], n: usize, n2: usize, tmp: &mut [i64]) {
 // interpolation pass that runs inside hinv when SMOOTH=1.  Only
 // active when scale > 1; for scale=0/1 the smoothing math collapses
 // to a no-op anyway, so we skip the call from hinv.
-// Placeholder for the smoothing pass.  `decode_hcompress` rejects
-// SMOOTH=1 up front, so neither i32 nor i64 hinv ever calls
-// hsmooth in practice — the function signatures exist so the hinv
-// body can stay structurally identical to cfitsio.  When SMOOTH
-// support lands, replace these bodies with the full port of
-// cfitsio's `hsmooth` / `hsmooth64`.
-#[allow(unused_variables)]
+// Smoothing pass applied inside the inverse H-transform when
+// SMOOTH=1.  Direct port of cfitsio's `hsmooth` / `hsmooth64`.
+// Walks the (nxtop, nytop) coefficient block in 2x2 chunks and
+// adjusts the hx / hy / hc differences toward their interpolated
+// values, subject to monotonicity constraints and an overall
+// change cap of ±(scale/2).  Edge coefficients are NOT touched —
+// the loops start at 2 and stop at nxtop-2 / nytop-2 by design.
+// scale <= 1 → no-op (smax = 0).
+//
+// Division semantics: cfitsio uses
+//   s = (s>=0) ? (s>>n) : ((s+(2^n-1))>>n)
+// which is signed division truncating toward zero.  Rust's `/`
+// operator on signed ints already truncates toward zero, so we
+// translate the shift-with-bias dance directly into `s / 8` and
+// `s / 64` for readability.
 fn hsmooth_i32(
     a: &mut [i32], nxtop: usize, nytop: usize, ny: usize, scale: i32,
 ) {
+    let smax = scale >> 1;
+    if smax <= 0 { return; }
+    let ny2 = ny << 1;
+
+    // Adjust x difference hx: for i in [2, nxtop-2) step 2, j in [0, nytop) step 2.
+    if nxtop >= 4 {
+        let mut i = 2usize;
+        while i + 2 < nxtop {
+            let row = ny * i;
+            let mut j = 0usize;
+            while j < nytop {
+                let s00 = row + j;
+                let s10 = s00 + ny;
+                let hm = a[s00 - ny2];
+                let h0 = a[s00];
+                let hp = a[s00 + ny2];
+                let mut diff = hp - hm;
+                let dmax = (hp - h0).min(h0 - hm).max(0) << 2;
+                let dmin = (hp - h0).max(h0 - hm).min(0) << 2;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s10] << 3)) / 8;
+                    let s = s.min(smax).max(-smax);
+                    a[s10] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
+
+    // Adjust y difference hy: for i in [0, nxtop) step 2, j in [2, nytop-2) step 2.
+    if nytop >= 4 {
+        let mut i = 0usize;
+        while i < nxtop {
+            let row = ny * i;
+            let mut j = 2usize;
+            while j + 2 < nytop {
+                let s00 = row + j;
+                let hm = a[s00 - 2];
+                let h0 = a[s00];
+                let hp = a[s00 + 2];
+                let mut diff = hp - hm;
+                let dmax = (hp - h0).min(h0 - hm).max(0) << 2;
+                let dmin = (hp - h0).max(h0 - hm).min(0) << 2;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s00 + 1] << 3)) / 8;
+                    let s = s.min(smax).max(-smax);
+                    a[s00 + 1] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
+
+    // Adjust curvature difference hc: for i in [2, nxtop-2) step 2, j in [2, nytop-2) step 2.
+    if nxtop >= 4 && nytop >= 4 {
+        let mut i = 2usize;
+        while i + 2 < nxtop {
+            let row = ny * i;
+            let mut j = 2usize;
+            while j + 2 < nytop {
+                let s00 = row + j;
+                let s10 = s00 + ny;
+                let hmm = a[s00 - ny2 - 2];
+                let hpm = a[s00 + ny2 - 2];
+                let hmp = a[s00 - ny2 + 2];
+                let hpp = a[s00 + ny2 + 2];
+                let h0  = a[s00];
+                let mut diff = hpp + hmm - hmp - hpm;
+                let hx2 = a[s10]     << 1;
+                let hy2 = a[s00 + 1] << 1;
+                let m1 = ((hpp - h0).max(0) - hx2 - hy2)
+                    .min((h0 - hpm).max(0) + hx2 - hy2);
+                let m2 = ((h0 - hmp).max(0) - hx2 + hy2)
+                    .min((hmm - h0).max(0) + hx2 + hy2);
+                let dmax = m1.min(m2) << 4;
+                let m1 = ((hpp - h0).min(0) - hx2 - hy2)
+                    .max((h0 - hpm).min(0) + hx2 - hy2);
+                let m2 = ((h0 - hmp).min(0) - hx2 + hy2)
+                    .max((hmm - h0).min(0) + hx2 + hy2);
+                let dmin = m1.max(m2) << 4;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s10 + 1] << 6)) / 64;
+                    let s = s.min(smax).max(-smax);
+                    a[s10 + 1] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
 }
 
-#[allow(unused_variables)]
 fn hsmooth_i64(
     a: &mut [i64], nxtop: usize, nytop: usize, ny: usize, scale: i32,
 ) {
+    let smax = (scale >> 1) as i64;
+    if smax <= 0 { return; }
+    let ny2 = ny << 1;
+
+    if nxtop >= 4 {
+        let mut i = 2usize;
+        while i + 2 < nxtop {
+            let row = ny * i;
+            let mut j = 0usize;
+            while j < nytop {
+                let s00 = row + j;
+                let s10 = s00 + ny;
+                let hm = a[s00 - ny2];
+                let h0 = a[s00];
+                let hp = a[s00 + ny2];
+                let mut diff = hp - hm;
+                let dmax = (hp - h0).min(h0 - hm).max(0) << 2;
+                let dmin = (hp - h0).max(h0 - hm).min(0) << 2;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s10] << 3)) / 8;
+                    let s = s.min(smax).max(-smax);
+                    a[s10] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
+
+    if nytop >= 4 {
+        let mut i = 0usize;
+        while i < nxtop {
+            let row = ny * i;
+            let mut j = 2usize;
+            while j + 2 < nytop {
+                let s00 = row + j;
+                let hm = a[s00 - 2];
+                let h0 = a[s00];
+                let hp = a[s00 + 2];
+                let mut diff = hp - hm;
+                let dmax = (hp - h0).min(h0 - hm).max(0) << 2;
+                let dmin = (hp - h0).max(h0 - hm).min(0) << 2;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s00 + 1] << 3)) / 8;
+                    let s = s.min(smax).max(-smax);
+                    a[s00 + 1] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
+
+    if nxtop >= 4 && nytop >= 4 {
+        let mut i = 2usize;
+        while i + 2 < nxtop {
+            let row = ny * i;
+            let mut j = 2usize;
+            while j + 2 < nytop {
+                let s00 = row + j;
+                let s10 = s00 + ny;
+                let hmm = a[s00 - ny2 - 2];
+                let hpm = a[s00 + ny2 - 2];
+                let hmp = a[s00 - ny2 + 2];
+                let hpp = a[s00 + ny2 + 2];
+                let h0  = a[s00];
+                let mut diff = hpp + hmm - hmp - hpm;
+                let hx2 = a[s10]     << 1;
+                let hy2 = a[s00 + 1] << 1;
+                let m1 = ((hpp - h0).max(0) - hx2 - hy2)
+                    .min((h0 - hpm).max(0) + hx2 - hy2);
+                let m2 = ((h0 - hmp).max(0) - hx2 + hy2)
+                    .min((hmm - h0).max(0) + hx2 + hy2);
+                let dmax = m1.min(m2) << 4;
+                let m1 = ((hpp - h0).min(0) - hx2 - hy2)
+                    .max((h0 - hpm).min(0) + hx2 - hy2);
+                let m2 = ((h0 - hmp).min(0) - hx2 + hy2)
+                    .max((hmm - h0).min(0) + hx2 + hy2);
+                let dmin = m1.max(m2) << 4;
+                if dmin < dmax {
+                    diff = diff.min(dmax).max(dmin);
+                    let s = (diff - (a[s10 + 1] << 6)) / 64;
+                    let s = s.min(smax).max(-smax);
+                    a[s10 + 1] += s;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
 }
 
 // ===== hinv (inverse H-transform) =====
@@ -1071,14 +1265,6 @@ pub(crate) fn decode_hcompress(
             "HCOMPRESS: unsupported bytepix {} (must be 1, 2, or 4)",
             bytepix
         )));
-    }
-    if smooth {
-        return Err(PyValueError::new_err(
-            "HCOMPRESS: SMOOTH=1 is not yet implemented — the hsmooth \
-             boundary clauses still need porting.  All real-world \
-             HCOMPRESS files we've seen use SMOOTH=0; report if you \
-             hit this in practice.",
-        ));
     }
 
     let n_pixels = nx_numpy * ny_numpy;
