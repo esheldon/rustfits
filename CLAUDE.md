@@ -1066,14 +1066,70 @@ cfitsio synonyms (`GZIP` for `GZIP_1`, `HCOMPRESS` for
   typically emits a header-level ZBLANK for DITHER_2 rather
   than a per-tile column.
 
-**Phase 6+ — HCOMPRESS_1, PLIO_1, then writes.**  Both
-algorithms are real implementation effort and individually
-rare.  Defer until someone asks.  Compressed write is its own
-multi-phase project.  When write lands (Phase 7+), **remove
-the `#[allow(unused_variables)]` on `write`, `extend`, and
-`__setitem__` in hdu_image_compressed.rs** — Phase 2 set them
-because the bodies just raise NotImplementedError; real
-implementations will consume those parameters.
+**Phase 6 — HCOMPRESS_1 read.**  Done for SMOOTH=0.
+
+Decoder in `src/zimage/hcompress.rs` — port of cfitsio's
+`fits_hdecompress.c` (reference source at
+`/home/esheldon/git/fitsio/cfitsio-4.6.4`; the function names
+mirror cfitsio exactly so side-by-side diffing during debug
+stays easy).  Both internal-precision paths shipped: i32 for
+ZBITPIX = 8/16, i64 for ZBITPIX = 32 (cfitsio uses i64 internal
+for 32-bit because the H-transform's intermediate sums can
+overflow i32).  ZBITPIX = 64 is unsupported — cfitsio's encoder
+doesn't write it and the spec has no 64-bit HCOMPRESS variant.
+
+*Wire format gotchas.*  Stream starts with magic `0xDD 0x99`,
+then i32 BE `nx, ny, scale`, then i64 BE `sumall`, then 3 bytes
+of `nbitplanes`, then quadtree-coded bit planes per quadrant.
+**SCALE comes from the stream, not the header** — the
+ZNAMEn='SCALE' / ZVALn header value is informational only and
+cfitsio ignores it in the decode path.  Only **SMOOTH** needs
+header parsing (`parse_hcompress_smooth` in
+hdu_image_compressed.rs, scans ZNAMEn pairs for 'SMOOTH').
+
+*Axis convention.*  In cfitsio's HCOMPRESS code, `ny` is the
+*FITS-fastest* axis (= NAXIS1 = numpy-last) and `nx` is the
+slower one — opposite to "x = horizontal" usage but matching
+the C row-major layout `a[i*ny + j]`.  In numpy order
+(slowest first) that maps cleanly: `nx = tile_shape[0],
+ny = tile_shape[1]`.  No reverse anywhere downstream.
+
+*Dispatch.*  HCOMPRESS needs two extra pieces of info that
+RICE/GZIP don't: the 2-D tile shape and the SMOOTH flag.  Added
+`AlgorithmParams { tile_shape_numpy, smooth }` in
+`src/zimage/mod.rs`; every call site (currently just
+`get_or_decode_tile`) constructs one and passes it through
+`decode_tile_to_bytes`.  RICE/GZIP ignore both fields.
+
+*SMOOTH=1 is rejected.*  The hsmooth function has six clauses
+in cfitsio (interior + 5 boundary cases) that interpolate
+neighbouring coefficients to soften block artifacts at high
+scales.  The boundary clauses are tedious enough that we ship
+a stub and reject SMOOTH=1 at the dispatch level rather than
+silently producing wrong output.  Every HCOMPRESS file we've
+encountered uses SMOOTH=0; lift this gap when a real workload
+hits it (the qtree decoder + hinv + undigitize are all done,
+so SMOOTH is the only remaining piece for full HCOMPRESS_1
+read parity).
+
+*Tests.*  `tests/test_compressed_image_phase6_hcompress.py`
+covers accessors, lossless round-trip on u8/i16/i32, non-square
+edge tiles, default tiles, slicing parity, SMOOTH=1 rejection,
+and bit-exact agreement with cfitsio on a lossy hcomp_scale=4
+fixture.
+
+**Phase 6 follow-up — PLIO_1 read.**  Small self-contained
+run-length decoder for mask/segmentation arrays.  Defer until
+needed.
+
+**Phase 7+ — Compressed image writes.**  Its own multi-phase
+project; needs design discussion (which algorithms, header
+generation, heap layout, write API).  When write lands,
+**remove the `#[allow(unused_variables)]` on `write`,
+`extend`, and `__setitem__` in hdu_image_compressed.rs** —
+Phase 2 set them because the bodies just raise
+NotImplementedError; real implementations will consume those
+parameters.
 
 ## Build / dev workflow
 

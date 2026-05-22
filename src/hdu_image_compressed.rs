@@ -654,6 +654,10 @@ fn read_compressed_image_data(
     let blocksize = blocksize.unwrap_or(32);
     let bytepix = bytepix_from_header.unwrap_or(default_bytepix);
 
+    // HCOMPRESS smoothing flag (ZNAMEn='SMOOTH').  False for any
+    // other algorithm (the decoder dispatch ignores it).
+    let smooth = parse_hcompress_smooth(cards);
+
     // BINTABLE layout.
     let naxis1 = parse_keyword(cards, "NAXIS1")
         .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
@@ -719,7 +723,7 @@ fn read_compressed_image_data(
             py, cache, file_handle, tainted, tile_idx, data_offset,
             naxis1, theap, &cols, algorithm, &actual_shape,
             bytepix, blocksize, stored_zbitpix,
-            zbitpix, quant.as_ref(),
+            zbitpix, quant.as_ref(), smooth,
         )?;
         place_tile_bytes_into_output(
             py, &out_arr, &tile_bytes, dtype_str,
@@ -1050,6 +1054,31 @@ fn parse_rice_params(header: &[String]) -> (Option<u32>, Option<u32>) {
     (blocksize, bytepix)
 }
 
+// Walk ZNAMEn/ZVALn pairs to extract the SMOOTH flag for HCOMPRESS_1.
+// SCALE also lives there (ZNAMEn='SCALE') but the decoder reads
+// SCALE directly from the compressed stream (per cfitsio's
+// fits_hdecompress.c line 1076), so we don't need it here — the
+// header value is informational only.  Returns false (no smoothing)
+// when the keyword is absent.
+fn parse_hcompress_smooth(header: &[String]) -> bool {
+    for n in 1.. {
+        let name_key = format!("ZNAME{}", n);
+        let val_key = format!("ZVAL{}", n);
+        let name = parse_string_keyword(header, &name_key);
+        if name.is_none() {
+            break;
+        }
+        if let Some(name) = name.as_deref().map(|s| s.trim()) {
+            if name.eq_ignore_ascii_case("SMOOTH") {
+                if let Some(v) = parse_keyword(header, &val_key) {
+                    return v != 0;
+                }
+            }
+        }
+    }
+    false
+}
+
 // Given a tile index (0..n_tiles, FITS-row-major), the image
 // shape (numpy order), and the nominal tile shape (numpy order),
 // return the tile's numpy-order origin and its actual shape
@@ -1119,6 +1148,8 @@ fn get_or_decode_tile(
     // there's no quantization in play.
     output_zbitpix: i32,
     quant: Option<&QuantContext>,
+    // HCOMPRESS_1 SMOOTH flag (ignored by every other algorithm).
+    smooth: bool,
 ) -> PyResult<Arc<Vec<u8>>> {
     if let Some(arc) = cache.get(tile_idx) {
         return Ok(arc);
@@ -1182,9 +1213,13 @@ fn get_or_decode_tile(
     let decoded_bytes = match payload {
         TilePayload::PrimaryCompressed { bytes, algorithm }
         | TilePayload::FallbackCompressed { bytes, algorithm } => {
+            let params = crate::zimage::AlgorithmParams {
+                tile_shape_numpy: actual_shape,
+                smooth,
+            };
             crate::zimage::decode_tile_to_bytes(
                 algorithm, &bytes, tile_n_pixels, decode_bp, blocksize,
-                decode_zb,
+                decode_zb, params,
             )?
         }
         TilePayload::Uncompressed { mut bytes } => {
@@ -1576,6 +1611,7 @@ fn slice_compressed_image(
     let (blocksize, bytepix_from_header) = parse_rice_params(cards);
     let blocksize = blocksize.unwrap_or(32);
     let bytepix = bytepix_from_header.unwrap_or(default_bytepix);
+    let smooth = parse_hcompress_smooth(cards);
 
     let naxis1 = parse_keyword(cards, "NAXIS1")
         .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
@@ -1664,7 +1700,7 @@ fn slice_compressed_image(
                 py, cache, file_handle, tainted, tile_idx, data_offset,
                 naxis1, theap, &cols, algorithm, &actual_shape,
                 bytepix, blocksize, stored_zbitpix,
-                zbitpix, quant.as_ref(),
+                zbitpix, quant.as_ref(), smooth,
             )?;
             let pybytes = PyBytes::new(py, &tile_bytes);
             let arr1d = np.call_method1(
