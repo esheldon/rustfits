@@ -129,11 +129,62 @@ pub(crate) fn decode_gzip2(
 // neither fitsio nor astropy expose it at the high-level API
 // either.
 pub(crate) fn encode_gzip1(pixel_bytes_be: &[u8]) -> PyResult<Vec<u8>> {
+    gzip_compress(pixel_bytes_be, "GZIP_1")
+}
+
+// Apply the GZIP_2 byte-shuffle preprocessor (inverse of
+// `unshuffle`).  Groups bytes by significance — all MSBs first,
+// then 2nd-MSBs, ..., then LSBs — which produces longer runs of
+// similar values for deflate to compress.  Mapping:
+//   pixels[i * bytepix + j]  →  out[j * n_pixels + i]
+// for i in 0..n_pixels, j in 0..bytepix.
+fn shuffle(pixels: &[u8], n_pixels: usize, bytepix: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_pixels * bytepix];
+    for j in 0..bytepix {
+        for i in 0..n_pixels {
+            out[j * n_pixels + i] = pixels[i * bytepix + j];
+        }
+    }
+    out
+}
+
+// Encode one tile for GZIP_2: byte-shuffle the input first, then
+// run the GZIP_1 encoder over the shuffled bytes.  For `bytepix=1`
+// the shuffle is a no-op and this collapses to `encode_gzip1`.
+pub(crate) fn encode_gzip2(
+    pixel_bytes_be: &[u8],
+    bytepix: u32,
+) -> PyResult<Vec<u8>> {
+    if !matches!(bytepix, 1 | 2 | 4 | 8) {
+        return Err(PyValueError::new_err(format!(
+            "GZIP_2 encode: unsupported bytepix {} (must be 1/2/4/8)",
+            bytepix
+        )));
+    }
+    if pixel_bytes_be.len() % bytepix as usize != 0 {
+        return Err(PyValueError::new_err(format!(
+            "GZIP_2 encode: input length {} not a multiple of bytepix {}",
+            pixel_bytes_be.len(), bytepix
+        )));
+    }
+    if bytepix == 1 {
+        return gzip_compress(pixel_bytes_be, "GZIP_2");
+    }
+    let n_pixels = pixel_bytes_be.len() / bytepix as usize;
+    let shuffled = shuffle(pixel_bytes_be, n_pixels, bytepix as usize);
+    gzip_compress(&shuffled, "GZIP_2")
+}
+
+// Shared gzip-compress primitive used by both GZIP_1 and GZIP_2
+// encoders.  Caller passes a label so error messages name the
+// algorithm.  Compression level is zlib default (6); see
+// `encode_gzip1` for rationale.
+fn gzip_compress(bytes: &[u8], algo_label: &str) -> PyResult<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(pixel_bytes_be).map_err(|e| {
-        PyValueError::new_err(format!("GZIP_1 encode: write failed: {}", e))
+    encoder.write_all(bytes).map_err(|e| {
+        PyValueError::new_err(format!("{} encode: write failed: {}", algo_label, e))
     })?;
     encoder.finish().map_err(|e| {
-        PyValueError::new_err(format!("GZIP_1 encode: finish failed: {}", e))
+        PyValueError::new_err(format!("{} encode: finish failed: {}", algo_label, e))
     })
 }

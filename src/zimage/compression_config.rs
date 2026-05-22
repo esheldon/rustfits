@@ -133,3 +133,78 @@ impl Gzip1 {
         )
     }
 }
+
+// ---------- Gzip2 ----------
+
+/// Configuration for GZIP_2 tile compression.
+///
+/// Like GZIP_1 but with a byte-shuffle preprocessor applied
+/// before compression: bytes are reordered so that all
+/// most-significant bytes of every pixel come first, then all
+/// second-most-significant bytes, and so on down to the
+/// least-significant.  The shuffle decorrelates the byte
+/// streams, producing longer runs of similar values that
+/// deflate compresses tighter than the interleaved layout of
+/// GZIP_1.  For 1-byte data the shuffle is a no-op, so GZIP_2
+/// and GZIP_1 produce identical output on `u1` images.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub(crate) struct Gzip2 {
+    pub(crate) tile_shape: Option<Vec<u64>>,
+    pub(crate) heap_format: char,
+}
+
+#[pymethods]
+impl Gzip2 {
+    /// Build a Gzip2 compression config.
+    ///
+    /// Parameters
+    /// ----------
+    /// tile_shape : tuple of positive ints, optional
+    ///     Tile dimensions in numpy axis order (slowest first).
+    ///     When omitted, defaults to the FITS-convention "row
+    ///     tiles" layout (ZTILE1 = NAXIS1, others = 1) once the
+    ///     image shape is known.
+    /// heap_format : {'P', 'Q'}, default 'P'
+    ///     Heap addressing format.  'P' uses 8-byte descriptors
+    ///     with 32-bit nelements/offset (4 GB heap ceiling).
+    ///     'Q' uses 16-byte descriptors (no practical ceiling)
+    ///     for files whose compressed heap exceeds 4 GB.
+    #[new]
+    #[pyo3(signature = (*, tile_shape=None, heap_format=String::from("P")))]
+    fn new(
+        tile_shape: Option<Vec<i64>>,
+        heap_format: String,
+    ) -> PyResult<Self> {
+        let tile_shape = validate_tile_shape(tile_shape)?;
+        let heap_format = validate_heap_format(&heap_format)?;
+        Ok(Gzip2 { tile_shape, heap_format })
+    }
+
+    #[getter]
+    fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.tile_shape {
+            None => py.None(),
+            Some(v) => pyo3::types::PyTuple::new(py, v)
+                .expect("PyTuple::new of u64 always succeeds")
+                .unbind()
+                .into_any(),
+        }
+    }
+
+    #[getter]
+    fn heap_format(&self) -> String {
+        self.heap_format.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        let ts = match &self.tile_shape {
+            None => "None".to_string(),
+            Some(v) => format!("{:?}", v),
+        };
+        format!(
+            "Gzip2(tile_shape={}, heap_format='{}')",
+            ts, self.heap_format
+        )
+    }
+}

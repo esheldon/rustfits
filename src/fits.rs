@@ -345,6 +345,58 @@ pub(crate) struct FITS {
     tainted: TaintFlag,
 }
 
+// Internal wrapper over the compression-config pyclasses.  The
+// `compress=` argument to `create_image_hdu` may be any of the
+// per-algorithm config classes (`Gzip1`, `Gzip2`, ...).  Extracting
+// directly to one specific type would force a separate isinstance
+// branch per algorithm at the call site; this enum centralises the
+// "try each known class in turn" logic and exposes the small set of
+// shared accessors (tile shape, heap format, on-disk ZCMPTYPE name).
+enum CompressionConfigKind {
+    Gzip1(crate::zimage::compression_config::Gzip1),
+    Gzip2(crate::zimage::compression_config::Gzip2),
+}
+
+impl CompressionConfigKind {
+    fn from_pyany(bound: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(g) = bound.extract::<
+            crate::zimage::compression_config::Gzip1>()
+        {
+            return Ok(Self::Gzip1(g));
+        }
+        if let Ok(g) = bound.extract::<
+            crate::zimage::compression_config::Gzip2>()
+        {
+            return Ok(Self::Gzip2(g));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "compress= must be a compression-config object \
+             (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...))"
+        ))
+    }
+
+    fn tile_shape(&self) -> &Option<Vec<u64>> {
+        match self {
+            Self::Gzip1(g) => &g.tile_shape,
+            Self::Gzip2(g) => &g.tile_shape,
+        }
+    }
+
+    fn heap_format(&self) -> char {
+        match self {
+            Self::Gzip1(g) => g.heap_format,
+            Self::Gzip2(g) => g.heap_format,
+        }
+    }
+
+    fn zcmptype(&self) -> &'static str {
+        match self {
+            Self::Gzip1(_) => "GZIP_1",
+            Self::Gzip2(_) => "GZIP_2",
+        }
+    }
+}
+
 // Rust-only helpers on FITS — not exposed to Python.  Used by the
 // create_image_hdu / create_table_hdu / ensure_primary code paths to
 // avoid duplicating the "register HduOffsets + construct Py<HDU> +
@@ -416,8 +468,9 @@ impl FITS {
     // the heap empty (PCOUNT=0) until CompressedImageHDU.write is
     // called.
     //
-    // Phase 7 supports Gzip1 + integer ZBITPIX (u1/i2/i4/i8) only.
-    // Other algorithms and float ZBITPIX raise NotImplementedError.
+    // Phase 7 supports Gzip1 and Gzip2 with integer ZBITPIX
+    // (u1/i2/i4/i8).  Other algorithms and float ZBITPIX raise
+    // NotImplementedError.
     fn create_compressed_image_hdu_impl(
         &mut self,
         py: Python<'_>,
@@ -440,14 +493,12 @@ impl FITS {
             ));
         }
 
-        // Extract the compress config.  Currently only Gzip1 is
-        // supported; the isinstance check uses Py<Gzip1>::extract.
+        // Extract the compress config.  Try each supported algorithm
+        // class in turn; the resulting wrapper carries the algorithm
+        // identity (for ZCMPTYPE) and the shared tile_shape /
+        // heap_format params used by both encoders.
         let bound = compress.bind(py);
-        let cfg: crate::zimage::compression_config::Gzip1 = bound.extract()
-            .map_err(|_| pyo3::exceptions::PyTypeError::new_err(
-                "compress= must be a compression-config object \
-                 (e.g. rustfits.Gzip1(...)); Phase 7 supports Gzip1 only"
-            ))?;
+        let cfg = CompressionConfigKind::from_pyany(bound)?;
 
         // Dtype validation: Phase 7 supports BITPIX-direct integer
         // types (u1/i2/i4/i8) only.  Floats deferred to Phase 8
@@ -474,7 +525,7 @@ impl FITS {
         // which is `[1, ..., 1, NAXIS_last]` in numpy order since the
         // numpy-last axis corresponds to FITS-NAXIS1).
         let numpy_dims: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
-        let tile_shape_numpy: Vec<u64> = match &cfg.tile_shape {
+        let tile_shape_numpy: Vec<u64> = match cfg.tile_shape() {
             Some(ts) => {
                 if ts.len() != numpy_dims.len() {
                     return Err(PyValueError::new_err(format!(
@@ -501,8 +552,9 @@ impl FITS {
         // file is fresh — same as create_table_hdu does.
         self.ensure_primary(py)?;
 
-        let descriptor_size: u64 = if cfg.heap_format == 'P' { 8 } else { 16 };
-        let tform_val = if cfg.heap_format == 'P' { "1PB" } else { "1QB" };
+        let heap_format = cfg.heap_format();
+        let descriptor_size: u64 = if heap_format == 'P' { 8 } else { 16 };
+        let tform_val = if heap_format == 'P' { "1PB" } else { "1QB" };
 
         // FITS-order copies of image + tile shapes for the Z* cards.
         let fits_dims: Vec<u64> = numpy_dims.iter().rev().copied().collect();
@@ -527,7 +579,7 @@ impl FITS {
                                "label for column 1"));
         cards.push(card_logical("ZIMAGE", true,
                                 "tile-compressed image"));
-        cards.push(card_string("ZCMPTYPE", "GZIP_1",
+        cards.push(card_string("ZCMPTYPE", cfg.zcmptype(),
                                "compression algorithm"));
         cards.push(card_int("ZBITPIX", bitpix as i64,
                             "image bits per pixel"));
@@ -701,8 +753,9 @@ impl FITS {
     // `rustfits.Gzip1(tile_shape=..., heap_format='P')`).  In that case
     // the HDU is created as a tile-compressed image (BINTABLE+ZIMAGE on
     // disk, `CompressedImageHDU` in Python) instead of a plain IMAGE
-    // extension.  Phase 7 supports `Gzip1` only; other algorithms will
-    // be added in follow-up sub-phases.
+    // extension.  Phase 7 supports `Gzip1` and `Gzip2`; other algorithms
+    // (RICE_1, HCOMPRESS_1, PLIO_1) will be added in follow-up
+    // sub-phases.
     #[pyo3(signature = (dtype, dims, *, extname=None, extver=None, compress=None))]
     fn create_image_hdu(
         &mut self,

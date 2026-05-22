@@ -9,6 +9,7 @@ from ._rust import (
     FITSHeader,
     FITSHeaderEdit,
     Gzip1,
+    Gzip2,
     is_protected_key,
 )
 

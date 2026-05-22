@@ -1175,15 +1175,28 @@ f[1].write(data)
 ```
 
 `compress=None` (default) → uncompressed `ImageHDU` (current
-behavior, unchanged).  `compress=Gzip1(...)` → `CompressedImageHDU`.
-Algorithm objects (`Gzip1` for now; `Gzip2`/`Rice1`/`Hcompress1`/
-`Plio1` to follow) live in `src/zimage/compression_config.rs`.
-Each is a Rust pyclass exposed at `rustfits.<Name>`, validated at
-construction (`Gzip1(blocksize=0)` raises immediately), immutable
-(no setters).  No inheritance — common kwargs (`tile_shape`,
-`heap_format`) are duplicated across each constructor; for 5
-small config classes the duplication is trivial and avoids a
-PyClassInitializer chain.
+behavior, unchanged).  `compress=Gzip1(...)` or `Gzip2(...)` →
+`CompressedImageHDU`.  Algorithm objects (`Gzip1`, `Gzip2` shipped;
+`Rice1`/`Hcompress1`/`Plio1` to follow) live in
+`src/zimage/compression_config.rs`.  Each is a Rust pyclass exposed
+at `rustfits.<Name>`, validated at construction
+(`Gzip1(blocksize=0)` raises immediately), immutable (no setters).
+No inheritance — common kwargs (`tile_shape`, `heap_format`) are
+duplicated across each constructor; for 5 small config classes the
+duplication is trivial and avoids a PyClassInitializer chain.
+
+Dispatch in `fits.rs::create_compressed_image_hdu_impl` goes
+through an internal `CompressionConfigKind` enum that wraps the
+per-algorithm pyclasses.  `CompressionConfigKind::from_pyany`
+tries each variant's `extract::<Gzip1>()`/`extract::<Gzip2>()`
+in turn — pyo3 0.28 doesn't grow a clean "first-match" extractor,
+so the manual loop is the simplest shape.  The enum exposes the
+small shared surface (`tile_shape()`, `heap_format()`,
+`zcmptype()`) used by header emission and the encoder dispatch.
+When `Rice1`/`Hcompress1`/`Plio1` land, each adds a variant + an
+arm in the three accessor matches; algorithms that need extra
+header cards (RICE BLOCKSIZE/BYTEPIX, HCOMPRESS SCALE/SMOOTH) will
+also need an `algorithm_specific_cards()` accessor or similar.
 
 *Design discussion captured.*  See git log around this commit
 for the full thread: the chosen shape is one unified
@@ -1204,7 +1217,7 @@ the backend for a fitsio 2.0).  Decisions like the
 `compress='GZIP_1', tile_dims=...` flat-kwarg style — the shim
 absorbs the translation.
 
-*Scope (current).*  `Gzip1` only; integer ZBITPIX (8/16/32/64)
+*Scope (current).*  `Gzip1` + `Gzip2`; integer ZBITPIX (8/16/32/64)
 only; create + bulk `write` only.  Float ZBITPIX (-32/-64) and
 unsigned-int trick dtypes (i1/u2/u4/u8) raise
 `NotImplementedError`.  `extend` and `__setitem__` still raise
@@ -1229,23 +1242,47 @@ FITS big-endian order; caller (`write_compressed_image_data` in
 `ascontiguousarray(view, ">i4")` etc. — one pass that handles
 dtype + endian together.
 
-*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` —
-accessors after create, dtype matrix (u1/i2/i4/i8), shape matrix
-(1-D / 2-D square / 2-D non-square with edge tiles / 3-D / whole-
-image single tile), default-tile-shape round trip, bidirectional
-cross-check with fitsio (rustfits-written read by fitsio AND
-fitsio-written read by rustfits, both bit-exact), non-last HDU
-growth (heap shifts later HDU forward, both read fine post-
-reopen), and all rejection paths (float, unsigned trick, non-
-config compress, shape mismatch, start kwarg).
+*GZIP_2 encoder.*  `encode_gzip2(pixel_bytes_be, bytepix)` in
+`src/zimage/gzip.rs` runs the GZIP_1 encoder's underlying gzip
+primitive over byte-shuffled input.  The `shuffle()` helper is
+the inverse of `unshuffle()` from the decoder side — for
+`bytepix=1` the shuffle is a no-op and the path collapses to
+GZIP_1 (we even round-trip the same bytes through the file in
+that case; tests anchor this invariant).  `encode_tile_from_bytes`
+in `src/zimage/mod.rs` grew a `bytepix` parameter to thread the
+pixel width through to the encoder (GZIP_1 ignores it; algorithms
+that need extra per-tile params — RICE BLOCKSIZE, HCOMPRESS
+SCALE/SMOOTH — will need their own extensions when wired).
+
+*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` (GZIP_1)
+and `tests/test_compressed_image_phase7_gzip2_write.py` (GZIP_2) —
+each covers accessors after create, dtype matrix (u1/i2/i4/i8),
+shape matrix (1-D / 2-D square / 2-D non-square with edge tiles /
+3-D / whole-image single tile), default-tile-shape round trip,
+bidirectional cross-check with fitsio (rustfits-written read by
+fitsio AND fitsio-written read by rustfits, both bit-exact),
+non-last HDU growth (heap shifts later HDU forward, both read fine
+post-reopen), and all rejection paths (float, unsigned trick,
+shape mismatch, start kwarg).  The GZIP_2 file additionally tests
+the bytepix=1 shuffle-collapses-to-GZIP_1 invariant (file sizes
+equal on `u1` input) and the mixed-algorithm case (one GZIP_1 +
+one GZIP_2 HDU in the same file).
 
 **Phase 7 follow-ups (deferred).**
-- **Other encoders** — `Gzip2`, `Rice1`, `Hcompress1`, `Plio1`.
+- **Remaining encoders** — `Rice1`, `Hcompress1`, `Plio1`.
   Each adds an `encode_*` function in the algorithm module, an
-  algorithm class in `compression_config.rs`, and an entry in
-  the dispatch.  Header emission carries the algorithm-specific
-  ZNAMEn/ZVALn cards (BLOCKSIZE/BYTEPIX for RICE, SCALE/SMOOTH
-  for HCOMPRESS).
+  algorithm class in `compression_config.rs`, a variant in the
+  `CompressionConfigKind` enum in `fits.rs`, and an entry in
+  the encode dispatch in `src/zimage/mod.rs`.  Header emission
+  carries the algorithm-specific ZNAMEn/ZVALn cards
+  (BLOCKSIZE/BYTEPIX for RICE, SCALE/SMOOTH for HCOMPRESS) —
+  the cleanest extension point is probably an
+  `algorithm_specific_cards()` accessor on
+  `CompressionConfigKind`.  `encode_tile_from_bytes` already
+  carries `bytepix`; algorithms needing more per-tile params
+  (RICE blocksize, HCOMPRESS scale/smooth) will need their own
+  signature extensions or a small AlgorithmEncodeParams struct
+  parallel to the existing `AlgorithmParams` on the decode side.
 - **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
   XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
   cards.  Symmetric with `create_image_hdu`'s existing handling

@@ -116,20 +116,23 @@ pub(crate) fn decode_tile_to_bytes(
 // passing in the bytes (matches the decode side, which produces
 // native-endian output).
 //
-// Phase 7 wires GZIP_1 only; the other algorithms raise a clear
-// "planned in Phase ..." error.
+// `bytepix` is needed by GZIP_2 to drive its byte-shuffle
+// preprocessor; GZIP_1 ignores it (deflate operates byte-wise).
+// Algorithms that need additional per-tile parameters (HCOMPRESS,
+// RICE) will need their own extensions when wired in follow-up
+// sub-phases.
 pub(crate) fn encode_tile_from_bytes(
     algorithm: CompressionAlgorithm,
     pixel_bytes_be: &[u8],
+    bytepix: u32,
 ) -> PyResult<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Gzip1 => gzip::encode_gzip1(pixel_bytes_be),
+        CompressionAlgorithm::Gzip2 => {
+            gzip::encode_gzip2(pixel_bytes_be, bytepix)
+        }
         CompressionAlgorithm::Rice1 => Err(PyNotImplementedError::new_err(
             "RICE_1 encoding is not yet implemented \
-             (planned: a follow-up sub-phase under Phase 7)"
-        )),
-        CompressionAlgorithm::Gzip2 => Err(PyNotImplementedError::new_err(
-            "GZIP_2 encoding is not yet implemented \
              (planned: a follow-up sub-phase under Phase 7)"
         )),
         CompressionAlgorithm::Hcompress1 => Err(PyNotImplementedError::new_err(

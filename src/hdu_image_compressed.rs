@@ -440,7 +440,8 @@ impl CompressedImageHDU {
     // partial tile, which doesn't compose with the encode-once
     // model).  Pass the full image array as `data`.
     //
-    // Phase 7 supports Gzip1 only with integer ZBITPIX (u1/i2/i4/i8).
+    // Phase 7 supports Gzip1 and Gzip2 with integer ZBITPIX
+    // (u1/i2/i4/i8).
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -1773,7 +1774,7 @@ fn slice_compressed_image(
 // Bulk-write entry point for CompressedImageHDU.write.  Encodes every
 // tile in RAM, then mutates the file (grow if non-last HDU, write
 // descriptors + heap, update PCOUNT card).  Phase 7 supports GZIP_1
-// only with integer ZBITPIX (u1/i2/i4/i8).
+// and GZIP_2 with integer ZBITPIX (u1/i2/i4/i8).
 //
 // Order:
 //   1. Parse header for shape, tile shape, algorithm, ZBITPIX, heap_format.
@@ -1910,7 +1911,7 @@ fn write_compressed_image_data(
             )));
         }
         let encoded = crate::zimage::encode_tile_from_bytes(
-            algorithm, &tile_bytes,
+            algorithm, &tile_bytes, bytepix,
         )?;
         let offset = heap_bytes.len() as u64;
         descriptors.push((encoded.len() as u64, offset));
