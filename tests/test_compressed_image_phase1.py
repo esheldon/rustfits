@@ -152,7 +152,7 @@ def test_compression_type_rice():
         fname, _ = _write_rice(tmpdir, (4, 4), "i4")
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
-        assert hdu.compression_type == "RICE_1"
+        assert hdu.compression.zcmptype == "RICE_1"
 
 
 def test_tile_shape_explicit():
@@ -167,7 +167,7 @@ def test_tile_shape_explicit():
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
         # FITS order ZTILE1=6, ZTILE2=5 → numpy order (5, 6).
-        assert hdu.tile_shape == (5, 6)
+        assert hdu.compression.tile_shape == (5, 6)
 
 
 def test_n_tiles_explicit():
@@ -299,9 +299,11 @@ def test_repr_contains_compression_info():
         with rustfits.FITS(fname, "r") as fits:
             r = repr(fits[1])
         assert "COMPRESSED_IMAGE_HDU" in r
-        assert "RICE_1" in r
-        assert "tile shape" in r
-        assert "[5, 6]" in r  # numpy-order tile shape
+        # Repr inlines the algorithm-config's own __repr__ via
+        # `compression: Rice1(...)`; the Pythonic class name (not
+        # the FITS-spec ZCMPTYPE) is what shows up.
+        assert "Rice1(" in r
+        assert "tile_shape=[5, 6]" in r
         assert "i4" in r
 
 
@@ -350,4 +352,4 @@ def test_other_compression_types_dispatched(compress, expected):
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
         assert isinstance(hdu, rustfits.CompressedImageHDU)
-        assert hdu.compression_type == expected
+        assert hdu.compression.zcmptype == expected

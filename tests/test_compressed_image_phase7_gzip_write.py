@@ -61,8 +61,8 @@ def test_accessors_after_create():
             assert hdu.shape == (32, 48)
             assert hdu.dtype == np.int32
             assert hdu.bitpix == 32
-            assert hdu.compression_type == "GZIP_1"
-            assert hdu.tile_shape == (16, 16)
+            assert hdu.compression.zcmptype == "GZIP_1"
+            assert hdu.compression.tile_shape == (16, 16)
             assert hdu.extname == "SCI"
             # Before write, PCOUNT is 0 (heap empty).
             assert hdu.header["PCOUNT"] == 0
@@ -129,7 +129,7 @@ def test_round_trip_default_tile_shape():
             f[1].write(data)
             # Default row tiles: ZTILE1 = NAXIS1, others = 1
             # In numpy axis order (slowest first), that's (1, 64).
-            assert f[1].tile_shape == (1, 64)
+            assert f[1].compression.tile_shape == (1, 64)
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
 

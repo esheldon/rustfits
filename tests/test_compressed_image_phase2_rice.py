@@ -193,7 +193,7 @@ def test_default_tile_shape():
             tile_dims=None,
         )
         with rustfits.FITS(fname, "r") as fits:
-            assert fits[1].tile_shape == (1, 15)
+            assert fits[1].compression.tile_shape == (1, 15)
             got = fits[1].read()
         np.testing.assert_array_equal(got, data)
 
@@ -330,8 +330,8 @@ def test_phase1_accessors_still_work():
         assert hdu.ndim == 2
         assert hdu.size == 48
         assert len(hdu) == 6
-        assert hdu.compression_type == "RICE_1"
-        assert hdu.tile_shape == (3, 4)
+        assert hdu.compression.zcmptype == "RICE_1"
+        assert hdu.compression.tile_shape == (3, 4)
         assert hdu.n_tiles == 4
         assert hdu.extname == "SCI"
         assert hdu.extver == 1

@@ -11,6 +11,7 @@ from ._rust import (
     Gzip1,
     Gzip2,
     Hcompress1,
+    Plio1,
     Rice1,
     is_protected_key,
 )

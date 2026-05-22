@@ -806,8 +806,9 @@ decoders).  Detection happens in `parse_hdus_from_file` in
   the base; defines image-side accessors (`shape`, `dtype`,
   `bitpix`, `ndim`, `size`, `__len__`, `unit`) that read the
   Z-prefixed cards instead of NAXIS/BITPIX; and compression-
-  specific accessors (`compression_type`, `tile_shape`,
-  `n_tiles`).
+  specific accessors `compression` (returns the structured
+  config object — see "Compression config" below) and
+  `n_tiles` (storage-layout property).
 - Tile-cache config: `tile_cache_size` getter + `set_tile_cache_size(bytes)`
   setter, default 32 MiB.  Storage of decoded tiles in the LRU
   itself landed in Phase 3 — Phase 1 only held the configured
@@ -1195,15 +1196,59 @@ Dispatch in `fits.rs::create_compressed_image_hdu_impl` goes
 through an internal `CompressionConfigKind` enum that wraps the
 per-algorithm pyclasses.  `CompressionConfigKind::from_pyany`
 tries each variant's `extract::<Gzip1>()` / `extract::<Gzip2>()` /
-`extract::<Rice1>()` / `extract::<Hcompress1>()` in turn — pyo3
-0.28 doesn't grow a clean "first-match" extractor, so the manual
-loop is the simplest shape.  The enum exposes the shared surface
-(`tile_shape()`, `heap_format()`, `zcmptype()`) plus an
-`extra_z_cards(bitpix)` accessor that returns `(ZNAMEn, ZVALn)`
-pairs to emit alongside the standard ZIMAGE cards (RICE_1 emits
-BLOCKSIZE + BYTEPIX; HCOMPRESS_1 emits SCALE + SMOOTH; GZIP
-variants emit nothing).  When `Plio1` lands, it adds a variant +
-an arm in the four accessor matches.
+`extract::<Rice1>()` / `extract::<Hcompress1>()` / `extract::<Plio1>()`
+in turn — pyo3 0.28 doesn't grow a clean "first-match" extractor,
+so the manual loop is the simplest shape.  The enum exposes the
+shared surface (`tile_shape()`, `heap_format()`, `zcmptype()`)
+plus an `extra_z_cards(bitpix)` accessor that returns `(ZNAMEn,
+ZVALn)` pairs to emit alongside the standard ZIMAGE cards (RICE_1
+emits BLOCKSIZE + BYTEPIX; HCOMPRESS_1 emits SCALE + SMOOTH;
+GZIP and PLIO variants emit nothing).  PLIO_1 is currently a
+write-side stub — the config object exists for read-side symmetry
+but `create_image_hdu(compress=Plio1(...))` raises
+`NotImplementedError` at create time until the encoder lands.
+
+**Structured `.compression` API.**  The read-side mirror image of
+`compress=`: every `CompressedImageHDU` exposes a single
+`.compression` getter that returns the same `Gzip1` / `Gzip2` /
+`Rice1` / `Hcompress1` / `Plio1` pyclass instance that would have
+been passed to `create_image_hdu(..., compress=...)` to produce a
+file with the same on-disk parameters.  Round-trip pattern:
+
+```python
+cfg = Rice1(tile_shape=(16, 16), blocksize=64)
+fits.create_image_hdu("i4", shape, compress=cfg)
+assert fits[1].compression == cfg   # __eq__ is field-wise
+```
+
+Backing implementation: `hdu_image_compressed.rs::build_compression_config`
+parses ZCMPTYPE, ZTILEn, TFORM1 (for heap_format), plus the
+algorithm-specific ZNAMEn/ZVALn cards (BLOCKSIZE for RICE,
+SCALE + SMOOTH for HCOMPRESS), and constructs the matching pyclass.
+The flat HDU accessors `compression_type` and `tile_shape` were
+removed in this refactor — use `hdu.compression.zcmptype` and
+`hdu.compression.tile_shape` instead.  `n_tiles` stays on the HDU
+(it's a storage-layout property derived from image_shape +
+tile_shape, not an algorithm parameter).  Tile-cache runtime
+knobs (`tile_cache_size`, `set_tile_cache_size`,
+`clear_tile_cache`) also stay on the HDU.
+
+The HDU repr uses the config object's own `__repr__`:
+
+```
+  compression: Rice1(tile_shape=[16, 16], heap_format='P', blocksize=32)
+```
+
+So the HDU repr stays the single source of truth no matter which
+algorithm-specific parameters apply.  Fallbacks (repr never
+crashes on a malformed file): unrecognized ZCMPTYPE → show the
+raw string verbatim; missing ZCMPTYPE → show `None`.
+
+Config classes also expose:
+- `__eq__` (field-wise; cheap, useful for round-trip patterns).
+- `zcmptype` getter returning the FITS-spec string (`"GZIP_1"`,
+  `"RICE_1"`, ...).  Class name is the Pythonic form (`Gzip1`,
+  `Rice1`); `.zcmptype` returns the FITS string when needed.
 
 *Design discussion captured.*  See git log around this commit
 for the full thread: the chosen shape is one unified

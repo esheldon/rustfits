@@ -58,7 +58,7 @@ def test_plio_compression_type_reported():
         data = _mask_pattern((32, 32), dtype=np.int32)
         fname = _write_plio(tmp, data, tile_dims=(16, 16))
         with rustfits.FITS(fname, "r") as f:
-            assert f[1].compression_type == "PLIO_1"
+            assert f[1].compression.zcmptype == "PLIO_1"
 
 
 # ---------------------- round trip ---------------------------------

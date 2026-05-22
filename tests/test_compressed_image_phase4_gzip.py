@@ -175,7 +175,7 @@ def test_compression_type_accessor(algo, expected):
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
-        assert hdu.compression_type == expected
+        assert hdu.compression.zcmptype == expected
 
 
 # -------------------- slicing -------------------------------------

@@ -97,8 +97,8 @@ def test_accessors_after_create():
             assert type(hdu).__name__ == "CompressedImageHDU"
             assert hdu.shape == (32, 48)
             assert hdu.dtype == np.int32
-            assert hdu.compression_type == "RICE_1"
-            assert hdu.tile_shape == (16, 16)
+            assert hdu.compression.zcmptype == "RICE_1"
+            assert hdu.compression.tile_shape == (16, 16)
             assert hdu.extname == "SCI"
             assert hdu.header["PCOUNT"] == 0
             # ZNAMEn / ZVALn cards for RICE parameters.
@@ -194,7 +194,7 @@ def test_round_trip_default_tile_shape():
         with rustfits.FITS(fn, "w+") as f:
             f.create_image_hdu("i2", data.shape, compress=rustfits.Rice1())
             f[1].write(data)
-            assert f[1].tile_shape == (1, 64)
+            assert f[1].compression.tile_shape == (1, 64)
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
 
@@ -422,8 +422,8 @@ def test_mixed_rice_and_gzip2_in_one_file():
             f[1].write(d1)
             f[2].write(d2)
         with rustfits.FITS(fn, "r") as f:
-            assert f[1].compression_type == "RICE_1"
-            assert f[2].compression_type == "GZIP_2"
+            assert f[1].compression.zcmptype == "RICE_1"
+            assert f[2].compression.zcmptype == "GZIP_2"
             np.testing.assert_array_equal(f[1].read(), d1)
             np.testing.assert_array_equal(f[2].read(), d2)
 

@@ -92,8 +92,8 @@ def test_accessors_after_create():
             assert type(hdu).__name__ == "CompressedImageHDU"
             assert hdu.shape == (32, 48)
             assert hdu.dtype == np.int32
-            assert hdu.compression_type == "HCOMPRESS_1"
-            assert hdu.tile_shape == (16, 16)
+            assert hdu.compression.zcmptype == "HCOMPRESS_1"
+            assert hdu.compression.tile_shape == (16, 16)
             assert hdu.extname == "SCI"
             assert hdu.header["PCOUNT"] == 0
             names = {
@@ -199,7 +199,7 @@ def test_round_trip_default_tile_shape_small_image():
                 compress=rustfits.Hcompress1(),
             )
             f[1].write(data)
-            assert f[1].tile_shape == (20, 64)
+            assert f[1].compression.tile_shape == (20, 64)
             assert f[1].n_tiles == 1
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
@@ -222,7 +222,7 @@ def test_round_trip_default_tile_shape_large_image():
                 compress=rustfits.Hcompress1(),
             )
             f[1].write(data)
-            assert f[1].tile_shape == (16, 64)
+            assert f[1].compression.tile_shape == (16, 64)
             assert f[1].n_tiles == 13
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
@@ -244,7 +244,7 @@ def test_round_trip_default_tile_shape_fallback():
                 compress=rustfits.Hcompress1(),
             )
             f[1].write(data)
-            assert f[1].tile_shape == (24, 64)
+            assert f[1].compression.tile_shape == (24, 64)
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
 
@@ -533,8 +533,8 @@ def test_mixed_hcompress_and_rice_in_one_file():
             f[1].write(d1)
             f[2].write(d2)
         with rustfits.FITS(fn, "r") as f:
-            assert f[1].compression_type == "HCOMPRESS_1"
-            assert f[2].compression_type == "RICE_1"
+            assert f[1].compression.zcmptype == "HCOMPRESS_1"
+            assert f[2].compression.zcmptype == "RICE_1"
             np.testing.assert_array_equal(f[1].read(), d1)
             np.testing.assert_array_equal(f[2].read(), d2)
 

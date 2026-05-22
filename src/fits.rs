@@ -357,6 +357,7 @@ enum CompressionConfigKind {
     Gzip2(crate::zimage::compression_config::Gzip2),
     Rice1(crate::zimage::compression_config::Rice1),
     Hcompress1(crate::zimage::compression_config::Hcompress1),
+    Plio1(crate::zimage::compression_config::Plio1),
 }
 
 impl CompressionConfigKind {
@@ -381,10 +382,16 @@ impl CompressionConfigKind {
         {
             return Ok(Self::Hcompress1(h));
         }
+        if let Ok(p) = bound.extract::<
+            crate::zimage::compression_config::Plio1>()
+        {
+            return Ok(Self::Plio1(p));
+        }
         Err(pyo3::exceptions::PyTypeError::new_err(
             "compress= must be a compression-config object \
              (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...), \
-             rustfits.Rice1(...), rustfits.Hcompress1(...))"
+             rustfits.Rice1(...), rustfits.Hcompress1(...), \
+             rustfits.Plio1(...))"
         ))
     }
 
@@ -394,6 +401,7 @@ impl CompressionConfigKind {
             Self::Gzip2(g) => &g.tile_shape,
             Self::Rice1(r) => &r.tile_shape,
             Self::Hcompress1(h) => &h.tile_shape,
+            Self::Plio1(p) => &p.tile_shape,
         }
     }
 
@@ -403,6 +411,7 @@ impl CompressionConfigKind {
             Self::Gzip2(g) => g.heap_format,
             Self::Rice1(r) => r.heap_format,
             Self::Hcompress1(h) => h.heap_format,
+            Self::Plio1(p) => p.heap_format,
         }
     }
 
@@ -412,6 +421,7 @@ impl CompressionConfigKind {
             Self::Gzip2(_) => "GZIP_2",
             Self::Rice1(_) => "RICE_1",
             Self::Hcompress1(_) => "HCOMPRESS_1",
+            Self::Plio1(_) => "PLIO_1",
         }
     }
 
@@ -425,7 +435,7 @@ impl CompressionConfigKind {
     // so we can compute BYTEPIX = bitpix/8.
     fn extra_z_cards(&self, bitpix: i32) -> Vec<(&'static str, i64)> {
         match self {
-            Self::Gzip1(_) | Self::Gzip2(_) => Vec::new(),
+            Self::Gzip1(_) | Self::Gzip2(_) | Self::Plio1(_) => Vec::new(),
             Self::Rice1(r) => vec![
                 ("BLOCKSIZE", r.blocksize as i64),
                 ("BYTEPIX", (bitpix / 8) as i64),
@@ -582,6 +592,19 @@ impl FITS {
                  are not yet supported on write; pass the matching \
                  signed dtype (i1→u1 mismatch, u2→i2, u4→i4, u8→i8) \
                  for now, or wait for a Phase 7 follow-up"
+            ));
+        }
+        // PLIO_1 write isn't implemented yet (the encoder hasn't
+        // landed).  Reject up-front at create time so the user
+        // doesn't get a partially-created HDU and a confusing
+        // error from .write() later.  The Plio1 pyclass exists
+        // because `hdu.compression` returns it for PLIO_1-
+        // compressed read; the rejection here is a write-side gate.
+        if matches!(cfg, CompressionConfigKind::Plio1(_)) {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "PLIO_1 compressed-write encoder is not yet \
+                 implemented (planned: Phase 7 follow-up). Read of \
+                 PLIO_1-compressed HDUs is fully supported."
             ));
         }
         // RICE_1 rejects bitpix=64 (BYTEPIX=8).  cfitsio has no

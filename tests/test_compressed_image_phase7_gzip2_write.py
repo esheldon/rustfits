@@ -66,8 +66,8 @@ def test_accessors_after_create():
             assert hdu.shape == (32, 48)
             assert hdu.dtype == np.int32
             assert hdu.bitpix == 32
-            assert hdu.compression_type == "GZIP_2"
-            assert hdu.tile_shape == (16, 16)
+            assert hdu.compression.zcmptype == "GZIP_2"
+            assert hdu.compression.tile_shape == (16, 16)
             assert hdu.extname == "SCI"
             # Before write, PCOUNT is 0 (heap empty).
             assert hdu.header["PCOUNT"] == 0
@@ -184,7 +184,7 @@ def test_round_trip_default_tile_shape():
             cfg = rustfits.Gzip2()
             f.create_image_hdu("i2", data.shape, compress=cfg)
             f[1].write(data)
-            assert f[1].tile_shape == (1, 64)
+            assert f[1].compression.tile_shape == (1, 64)
         with rustfits.FITS(fn, "r") as f:
             np.testing.assert_array_equal(f[1].read(), data)
 
@@ -293,8 +293,8 @@ def test_mixed_gzip1_and_gzip2_in_one_file():
             f[1].write(data1)
             f[2].write(data2)
         with rustfits.FITS(fn, "r") as f:
-            assert f[1].compression_type == "GZIP_1"
-            assert f[2].compression_type == "GZIP_2"
+            assert f[1].compression.zcmptype == "GZIP_1"
+            assert f[2].compression.zcmptype == "GZIP_2"
             np.testing.assert_array_equal(f[1].read(), data1)
             np.testing.assert_array_equal(f[2].read(), data2)
 

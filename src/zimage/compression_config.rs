@@ -73,7 +73,7 @@ fn validate_heap_format(heap_format: &str) -> PyResult<char> {
 /// algorithms.  Pairs well with mostly-uniform integer data;
 /// for noisy data RICE_1 typically compresses tighter.
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Gzip1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
@@ -122,6 +122,12 @@ impl Gzip1 {
         self.heap_format.to_string()
     }
 
+    /// FITS-spec ZCMPTYPE string for this algorithm.
+    #[getter]
+    fn zcmptype(&self) -> &'static str {
+        "GZIP_1"
+    }
+
     fn __repr__(&self) -> String {
         let ts = match &self.tile_shape {
             None => "None".to_string(),
@@ -131,6 +137,10 @@ impl Gzip1 {
             "Gzip1(tile_shape={}, heap_format='{}')",
             ts, self.heap_format
         )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -148,7 +158,7 @@ impl Gzip1 {
 /// GZIP_1.  For 1-byte data the shuffle is a no-op, so GZIP_2
 /// and GZIP_1 produce identical output on `u1` images.
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Gzip2 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
@@ -197,6 +207,12 @@ impl Gzip2 {
         self.heap_format.to_string()
     }
 
+    /// FITS-spec ZCMPTYPE string for this algorithm.
+    #[getter]
+    fn zcmptype(&self) -> &'static str {
+        "GZIP_2"
+    }
+
     fn __repr__(&self) -> String {
         let ts = match &self.tile_shape {
             None => "None".to_string(),
@@ -206,6 +222,91 @@ impl Gzip2 {
             "Gzip2(tile_shape={}, heap_format='{}')",
             ts, self.heap_format
         )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+// ---------- Plio1 ----------
+
+/// Configuration for PLIO_1 tile compression (IRAF Pixel List
+/// encoding).  RLE for non-negative integer masks built via
+/// increments; output is i16 BE shorts (TFORM1=`1PI`).  Supports
+/// integer ZBITPIX = 8 / 16 / 32; not meaningful for floats.
+///
+/// Read side: full support — `hdu.compression` returns this
+/// object when ZCMPTYPE=PLIO_1.  Write side: not yet implemented
+/// (the encoder is a Phase 7 follow-up).  Until then, passing
+/// `compress=Plio1(...)` to `create_image_hdu` raises
+/// `NotImplementedError`.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Plio1 {
+    pub(crate) tile_shape: Option<Vec<u64>>,
+    pub(crate) heap_format: char,
+}
+
+#[pymethods]
+impl Plio1 {
+    /// Build a Plio1 compression config.
+    ///
+    /// Parameters
+    /// ----------
+    /// tile_shape : tuple of positive ints, optional
+    ///     Tile dimensions in numpy axis order (slowest first).
+    ///     When omitted, defaults to the FITS-convention "row
+    ///     tiles" layout (ZTILE1 = NAXIS1, others = 1) once the
+    ///     image shape is known.
+    /// heap_format : {'P', 'Q'}, default 'P'
+    ///     Heap addressing format.
+    #[new]
+    #[pyo3(signature = (*, tile_shape=None, heap_format=String::from("P")))]
+    fn new(
+        tile_shape: Option<Vec<i64>>,
+        heap_format: String,
+    ) -> PyResult<Self> {
+        let tile_shape = validate_tile_shape(tile_shape)?;
+        let heap_format = validate_heap_format(&heap_format)?;
+        Ok(Plio1 { tile_shape, heap_format })
+    }
+
+    #[getter]
+    fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.tile_shape {
+            None => py.None(),
+            Some(v) => pyo3::types::PyTuple::new(py, v)
+                .expect("PyTuple::new of u64 always succeeds")
+                .unbind()
+                .into_any(),
+        }
+    }
+
+    #[getter]
+    fn heap_format(&self) -> String {
+        self.heap_format.to_string()
+    }
+
+    /// FITS-spec ZCMPTYPE string for this algorithm.
+    #[getter]
+    fn zcmptype(&self) -> &'static str {
+        "PLIO_1"
+    }
+
+    fn __repr__(&self) -> String {
+        let ts = match &self.tile_shape {
+            None => "None".to_string(),
+            Some(v) => format!("{:?}", v),
+        };
+        format!(
+            "Plio1(tile_shape={}, heap_format='{}')",
+            ts, self.heap_format
+        )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -228,7 +329,7 @@ impl Gzip2 {
 /// nothing is quantized).  Tiles must be 2-D; 1-D and 3-D images
 /// are rejected at create time.
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hcompress1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
@@ -327,6 +428,12 @@ impl Hcompress1 {
         self.smooth
     }
 
+    /// FITS-spec ZCMPTYPE string for this algorithm.
+    #[getter]
+    fn zcmptype(&self) -> &'static str {
+        "HCOMPRESS_1"
+    }
+
     fn __repr__(&self) -> String {
         let ts = match &self.tile_shape {
             None => "None".to_string(),
@@ -337,6 +444,10 @@ impl Hcompress1 {
             ts, self.heap_format, self.scale,
             if self.smooth { "True" } else { "False" },
         )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -357,7 +468,7 @@ impl Hcompress1 {
 /// Gzip2 for i64 data — within ~5% of RICE compression on real
 /// imagery and universally readable.
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rice1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
@@ -434,6 +545,12 @@ impl Rice1 {
         self.blocksize
     }
 
+    /// FITS-spec ZCMPTYPE string for this algorithm.
+    #[getter]
+    fn zcmptype(&self) -> &'static str {
+        "RICE_1"
+    }
+
     fn __repr__(&self) -> String {
         let ts = match &self.tile_shape {
             None => "None".to_string(),
@@ -443,5 +560,9 @@ impl Rice1 {
             "Rice1(tile_shape={}, heap_format='{}', blocksize={})",
             ts, self.heap_format, self.blocksize,
         )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
     }
 }

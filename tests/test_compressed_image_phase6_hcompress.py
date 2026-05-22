@@ -80,13 +80,13 @@ def test_hcompress_accessors_report_correct_metadata():
         )
         with rustfits.FITS(fname, "r") as f:
             hdu = f[1]
-            assert hdu.compression_type == "HCOMPRESS_1"
+            assert hdu.compression.zcmptype == "HCOMPRESS_1"
             assert hdu.shape == shape
             assert hdu.dtype == np.int16
             assert hdu.bitpix == 16
             # tile_shape is numpy order; fitsio's tile_dims arg is
             # numpy order too for square tiles so they match.
-            assert hdu.tile_shape == (16, 16)
+            assert hdu.compression.tile_shape == (16, 16)
 
 
 # ---------------------- lossless round trip ------------------------

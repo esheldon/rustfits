@@ -190,19 +190,33 @@ impl CompressedImageHDU {
 #[pymethods]
 impl CompressedImageHDU {
     // Multi-line repr matching ImageHDU's, with the compression
-    // type and tile shape surfaced.  Reports the *uncompressed*
-    // image dtype + dims (what the user sees after .read()), not
-    // the on-disk BINTABLE.
-    fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
+    // config surfaced on one line via the algorithm's __repr__.
+    // Reports the *uncompressed* image dtype + dims (what the user
+    // sees after .read()), not the on-disk BINTABLE.
+    //
+    // Compression line uses the same single-line repr that
+    // `print(hdu.compression)` shows, so the HDU repr stays the
+    // single source of truth no matter which algorithm-specific
+    // parameters apply (Rice1 has blocksize, Hcompress1 has
+    // scale / smooth, GZIPs have none — all formatted consistently).
+    //
+    // Degraded fallbacks (repr never crashes on a malformed file):
+    //   - ZCMPTYPE present but unrecognized → show the raw string
+    //     verbatim (useful for debugging an unknown algorithm).
+    //   - ZCMPTYPE missing entirely → show `None` (Python idiom).
+    fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let (zbitpix, shape) = parse_compressed_image_shape(&cards)?;
         let dtype = zbitpix_to_native_dtype(zbitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
-        let zcmptype = parse_string_keyword(&cards, "ZCMPTYPE")
-            .unwrap_or_else(|| "(unknown)".to_string());
-        let tile_shape = parse_tile_shape(&cards, &shape);
+
+        let compression_repr = match build_compression_config(py, &cards) {
+            Ok(cfg) => cfg.bind(py).repr()?.extract::<String>()?,
+            Err(_) => parse_string_keyword(&cards, "ZCMPTYPE")
+                .unwrap_or_else(|| "None".to_string()),
+        };
 
         let mut out = String::new();
         out.push_str(&format!("  file: {}\n", super_.filename));
@@ -217,9 +231,7 @@ impl CompressedImageHDU {
         if let Some(u) = bunit {
             out.push_str(&format!("    unit: {}\n", u));
         }
-        out.push_str("  compression:\n");
-        out.push_str(&format!("    type: {}\n", zcmptype));
-        out.push_str(&format!("    tile shape: {:?}\n", tile_shape));
+        out.push_str(&format!("  compression: {}\n", compression_repr));
         Ok(out)
     }
 
@@ -296,33 +308,36 @@ impl CompressedImageHDU {
 
     // ----- compression-specific accessors -----
 
-    // ZCMPTYPE — e.g. "RICE_1", "GZIP_1", "GZIP_2", "HCOMPRESS_1",
-    // "PLIO_1".  Returns None when the keyword is absent (which
-    // would be a malformed compressed HDU, but the accessor is
-    // tolerant so callers can introspect without crashing).
+    // Structured compression config: returns the same Gzip1 /
+    // Gzip2 / Rice1 / Hcompress1 pyclass instance that would have
+    // been passed to `create_image_hdu(..., compress=...)` to
+    // produce a file with the same on-disk parameters.  This is
+    // the single source of truth for "how is this HDU compressed":
+    //
+    //   if isinstance(hdu.compression, rustfits.Rice1):
+    //       print(hdu.compression.blocksize)
+    //
+    // The FITS-spec ZCMPTYPE string is available as
+    // `hdu.compression.zcmptype`; tile shape as
+    // `hdu.compression.tile_shape`.  Two HDUs can be compared with
+    // `hdu_a.compression == hdu_b.compression` (field-wise __eq__).
+    //
+    // Construction cost per access is small (parses cards, builds
+    // a tiny pyclass).  No caching — keep parity with the other
+    // accessors that re-parse the header on each call.
     #[getter]
-    fn compression_type(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_string_keyword(&cards, "ZCMPTYPE"))
-    }
-
-    // Per-tile shape in numpy axis order (slowest first).  Picks up
-    // the FITS convention defaults when ZTILEn is missing (ZTILE1
-    // defaults to ZNAXIS1, others default to 1 → "row tiles").
-    #[getter]
-    fn tile_shape(
+    fn compression(
         slf: PyRef<'_, Self>, py: Python<'_>,
-    ) -> PyResult<Py<PyTuple>> {
+    ) -> PyResult<Py<PyAny>> {
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
-        let (_, image_shape) = parse_compressed_image_shape(&cards)?;
-        let tile_shape = parse_tile_shape(&cards, &image_shape);
-        Ok(PyTuple::new(py, &tile_shape)?.unbind())
+        build_compression_config(py, &cards)
     }
 
     // Total number of tiles in the image: product of
-    // ceil(NAXISn / TILEn).
+    // ceil(NAXISn / TILEn).  Storage-layout property (kept here
+    // rather than on .compression because it's about how the
+    // BINTABLE is laid out, not the algorithm).
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<u64> {
         let super_ = slf.into_super().into_super();
@@ -1131,6 +1146,93 @@ fn parse_hcompress_smooth(header: &[String]) -> bool {
         }
     }
     false
+}
+
+// Build the structured compression-config pyclass instance for a
+// compressed-image HDU's header.  Backs the `.compression` getter
+// on CompressedImageHDU: parses ZCMPTYPE, the tile shape, the heap
+// format from TFORM1, plus algorithm-specific ZNAMEn/ZVALn cards
+// (BLOCKSIZE for RICE, SCALE+SMOOTH for HCOMPRESS), and returns the
+// matching Gzip1 / Gzip2 / Rice1 / Hcompress1 pyclass.  PLIO_1
+// support lands when the encoder ships; until then it falls
+// through to the unknown-algorithm branch.
+//
+// Errors: missing ZCMPTYPE → ValueError; unknown algorithm name →
+// the error from parse_algorithm.  Caller (the .compression getter)
+// surfaces both directly.
+fn build_compression_config(
+    py: Python<'_>, cards: &[String],
+) -> PyResult<Py<PyAny>> {
+    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
+        .ok_or_else(|| PyValueError::new_err(
+            "compressed HDU missing ZCMPTYPE"
+        ))?;
+    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
+
+    let (_, image_shape) = parse_compressed_image_shape(cards)?;
+    let tile_shape = parse_tile_shape(cards, &image_shape);
+
+    // Heap format: 'P' (8-byte descriptors) or 'Q' (16-byte) from
+    // TFORM1.  Defaults to 'P' if TFORM1 is missing (malformed
+    // header, but match the parse-tolerantly convention).
+    let heap_format = parse_string_keyword(cards, "TFORM1")
+        .map(|t| {
+            let trimmed = t.trim();
+            if trimmed.starts_with("1Q") || trimmed.starts_with('Q') {
+                'Q'
+            } else {
+                'P'
+            }
+        })
+        .unwrap_or('P');
+
+    use crate::zimage::compression_config::{
+        Gzip1, Gzip2, Hcompress1, Plio1, Rice1,
+    };
+    use crate::zimage::CompressionAlgorithm;
+    match algorithm {
+        CompressionAlgorithm::Gzip1 => {
+            let cfg = Gzip1 {
+                tile_shape: Some(tile_shape),
+                heap_format,
+            };
+            Ok(Py::new(py, cfg)?.into_any())
+        }
+        CompressionAlgorithm::Gzip2 => {
+            let cfg = Gzip2 {
+                tile_shape: Some(tile_shape),
+                heap_format,
+            };
+            Ok(Py::new(py, cfg)?.into_any())
+        }
+        CompressionAlgorithm::Rice1 => {
+            let (blocksize_opt, _) = parse_rice_params(cards);
+            let cfg = Rice1 {
+                tile_shape: Some(tile_shape),
+                heap_format,
+                blocksize: blocksize_opt.unwrap_or(32),
+            };
+            Ok(Py::new(py, cfg)?.into_any())
+        }
+        CompressionAlgorithm::Hcompress1 => {
+            let scale = parse_hcompress_scale(cards);
+            let smooth = parse_hcompress_smooth(cards);
+            let cfg = Hcompress1 {
+                tile_shape: Some(tile_shape),
+                heap_format,
+                scale,
+                smooth,
+            };
+            Ok(Py::new(py, cfg)?.into_any())
+        }
+        CompressionAlgorithm::Plio1 => {
+            let cfg = Plio1 {
+                tile_shape: Some(tile_shape),
+                heap_format,
+            };
+            Ok(Py::new(py, cfg)?.into_any())
+        }
+    }
 }
 
 // Given a tile index (0..n_tiles, FITS-row-major), the image
