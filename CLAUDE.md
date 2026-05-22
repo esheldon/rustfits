@@ -428,19 +428,15 @@ MaskedArray with `nomask` for consistent return type.  Float BITPIX +
 `mask_blank=True` is rejected up-front because the spec forbids BLANK
 on floating-point arrays.
 
+**Tile-compressed image read** is supported end-to-end for all five
+algorithms (RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH, PLIO_1)
+including quantized + unquantized floats, slicing via `__getitem__`,
+a bytes-bound LRU tile cache, and GZIP and uncompressed fallback
+columns.  Details in the "Tile-compressed images (ZIMAGE)" section
+below.
+
 **Missing.**
-- **Tile-compressed image read** — Phases 1-5 of the ZIMAGE
-  roadmap have landed (`CompressedImageHDU` pyclass, dispatch,
-  accessors, RICE_1 / GZIP_1 / GZIP_2 whole-image read, slicing
-  via `__getitem__`, bytes-bound LRU tile cache, GZIP and
-  uncompressed fallback columns, quantized-float read with
-  NO_DITHER / SUBTRACTIVE_DITHER_1 / SUBTRACTIVE_DITHER_2 + NaN
-  preservation for both f4 and f8, plus the unquantized-float
-  path — ZQUANTIZ='NONE' (astropy convention) and the
-  "ZQUANTIZ set but no ZSCALE/ZZERO columns" case where bytes
-  are raw GZIP-compressed floats).  Phase 6+ covers HCOMPRESS /
-  PLIO + writes.  Full details in the "Tile-compressed images
-  (ZIMAGE)" section below.
+- (None tracked on the image-read side.)
 
 ### Image write
 
@@ -498,8 +494,12 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   value.  Promoting to a 0-d ndarray (which routes through
   `normalize_input_dtype` and gets the reverse-transform) is the
   workaround.  Add when there's a use case.
-- **Tile-compressed image writes (`ZIMAGE`)** — pair with the read
-  side; do both at once when ZIMAGE work lands.
+- **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 has
+  shipped `Gzip1`, `Gzip2`, and `Rice1` writes (integer ZBITPIX
+  only — float deferred to Phase 8 for quantization).
+  `Hcompress1` and `Plio1` encoders remain.  Compressed
+  `extend`/`__setitem__` are Phase 9+ (mutation).  See the
+  ZIMAGE roadmap for the next pickup.
 
 ### Table read
 
@@ -783,11 +783,16 @@ BINTABLE with `ZIMAGE=T` plus Z-prefixed image-shape and tile-
 shape cards.  The user-facing API mirrors `ImageHDU`; internally
 the reader walks tiles and decodes them.
 
-**Status:** Phases 1-5 shipped.  Phase 6+ cover HCOMPRESS_1 /
-PLIO_1 and the write side.  Test fixtures use fitsio for the
-normal-path round-trips and hand-crafted bytes for the
-synthetic fallback-column cases (astropy is also in the env
-if richer fixtures are needed later).
+**Status:** Phases 1-6 shipped (full read support for all five
+algorithms — RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH,
+PLIO_1 — plus quantized + unquantized floats).  Phase 7
+compressed-write shipped for **GZIP_1, GZIP_2, and RICE_1**;
+HCOMPRESS_1 and PLIO_1 encoders are the remaining Phase 7
+follow-ups.  Phase 8+ (quantized float writes, compressed
+mutation) are own subsystems.  Test fixtures use fitsio for
+normal-path round-trips and hand-crafted bytes for synthetic
+fallback-column cases (astropy is also in the env for richer
+cases).
 
 Implementation lives in `src/hdu_image_compressed.rs` (the
 pyclass + dispatch) and `src/zimage/` (algorithm-specific
@@ -1161,7 +1166,7 @@ tiles, and slicing parity.
 All four ZIMAGE compression algorithms (RICE_1, GZIP_1/2,
 HCOMPRESS_1, PLIO_1) now have full read support.
 
-**Phase 7 — Gzip1 compressed image writes.**  Done.
+**Phase 7 — Compressed image writes (Gzip1, Gzip2, Rice1).**  Done.
 
 *API.*  Compression is opted into via a structured config object
 passed to `create_image_hdu`:
@@ -1307,20 +1312,54 @@ file adds **byte-exact heap-comparison tests against fitsio**
 (low-entropy, high-entropy, multi-tile, dtype matrix), a custom
 blocksize test, and the i8-rejected test.
 
-**Phase 7 follow-ups (deferred).**
-- **Remaining encoders** — `Hcompress1`, `Plio1`.
-  Each adds an `encode_*` function in the algorithm module, an
-  algorithm class in `compression_config.rs`, a variant in the
-  `CompressionConfigKind` enum in `fits.rs`, and an entry in
-  the encode dispatch in `src/zimage/mod.rs`.  HCOMPRESS_1 would
-  surface SCALE + SMOOTH through `extra_z_cards` and would need
-  to extend `AlgorithmEncodeParams` with scale/smooth fields
-  (parallel to the existing decode-side handling).  PLIO_1 has
-  no extra parameters beyond tile_shape/heap_format.
+**Phase 7 follow-ups (deferred).**  Cold-pickup notes for each
+remaining encoder.  The shape of the work is well established
+by the three shipped algorithms: each adds an `encode_*`
+function in the algorithm module, an algorithm class in
+`compression_config.rs`, a variant in the `CompressionConfigKind`
+enum in `fits.rs` (touching `tile_shape()` / `heap_format()` /
+`zcmptype()` / `extra_z_cards(bitpix)`), and an arm in the
+encode dispatch in `src/zimage/mod.rs::encode_tile_from_bytes`.
+Before starting any of them, work the same two judgment calls
+we worked for RICE:
+1.  **i8 (BYTEPIX=8) interop**: does the corresponding cfitsio
+    encoder exist for 64-bit pixels?  If no, reject (matches
+    Rice1's call).  If yes, implement.  See `<cfitsio>/...` paths
+    below.
+2.  **Bit-exact vs algorithmic agreement**: port cfitsio's
+    arithmetic exactly so heap bytes match byte-for-byte
+    (matches Rice1 + GZIP/PLIO/HCOMPRESS reads).  Makes testing
+    trivial via fitsio cross-write + heap-byte diff.
+
+- **`Hcompress1`** — reference encoders at
+  `<cfitsio>/fits_hcompress.c`: `fits_hcompress` (i32 internal,
+  for BYTEPIX≤4) and `fits_hcompress64` (i64 internal, for
+  BYTEPIX=8).  Unlike RICE, cfitsio **does** ship a 64-bit
+  encoder — so the interop question may resolve to "implement"
+  rather than "reject".  Wire-format details (magic word,
+  SCALE-in-stream, axis convention, SMOOTH adjustment loops)
+  are documented in the Phase 6 read section above and live in
+  `src/zimage/hcompress.rs`; encode is the inverse of decode
+  (forward H-transform → quantize → quadtree-encode per bit
+  plane).  The encoder needs SCALE (int, in stream + ZNAME card)
+  and SMOOTH (bool, ZNAME card) parameters — extend
+  `AlgorithmEncodeParams` and add an `extra_z_cards` entry that
+  emits both (read side parses SMOOTH from ZNAMEn but reads
+  SCALE from the stream; encoder must write SCALE to the stream
+  AND emit it as a ZNAME card for documentation).
+- **`Plio1`** — reference encoder at `<cfitsio>/pliocomp.c::pl_p2li`.
+  Wire format documented in the Phase 6 PLIO read section above.
+  Niche algorithm (designed for non-negative integer masks
+  built via increments); inputs must be non-negative.  No extra
+  algorithm parameters beyond tile_shape/heap_format.  Output is
+  i16 BE shorts → TFORM1='1PI' (not '1PB' like GZIP/RICE/HCOMPRESS).
 - **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
   XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
   cards.  Symmetric with `create_image_hdu`'s existing handling
-  for uncompressed HDUs.
+  for uncompressed HDUs.  All shipped encoders (GZIP_1/2, RICE_1)
+  currently reject these dtypes upfront in
+  `create_compressed_image_hdu_impl`; the rejection is shared
+  (one branch tests `bzero.is_some()`), so the fix lives there.
 
 **Phase 8 — Quantized float compressed writes.**  Own subsystem.
 Choose ZSCALE/ZZERO per tile, apply dither, optional GZIP
@@ -1412,10 +1451,17 @@ Notable files for ZIMAGE work:
 - `<cfitsio>/fitsio2.h` — internal types and constants
   (e.g. `BYTE_IMG = 8`, `SHORT_IMG = 16`, `LONG_IMG = 32`).
 
-Function names in `src/zimage/hcompress.rs` (and the future
-`src/zimage/rice.rs` encoder, etc.) mirror the cfitsio names
-exactly so `diff <cfitsio>/fits_hdecompress.c src/zimage/hcompress.rs`
-is a useful debugging tool.
+Function names in `src/zimage/hcompress.rs` mirror cfitsio's
+`fits_hdecompress.c` exactly, so `diff <cfitsio>/fits_hdecompress.c
+src/zimage/hcompress.rs` is a useful debugging tool.  The RICE
+encoder in `src/zimage/rice.rs::encode_rice` is a structural port
+of cfitsio's `fits_rcomp` / `_short` / `_byte` family — the
+per-bytepix arithmetic (pdiff truncation, ZigZag, dpsum/psum cast)
+matches byte-for-byte, but the encoder is a single function
+(`encode_rice`) rather than three separate functions and uses a
+clean `BitWriter` rather than cfitsio's `Buffer` struct.  Byte-
+exactness is verified by the heap-comparison tests in
+`tests/test_compressed_image_phase7_rice_write.py`.
 
 ### Performance / large fixture files
 
