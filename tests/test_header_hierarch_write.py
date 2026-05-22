@@ -292,11 +292,13 @@ def test_hierarch_and_standard_keys_coexist():
 def test_update_with_dict_mixed_keys():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
-            fits[0].header.update({
-                "EXPTIME": 5.0,
-                "ESO INS TEMP": (12.5, "[C]"),
-                "OBJECT": "M31",
-            })
+            fits[0].header.update(
+                {
+                    "EXPTIME": 5.0,
+                    "ESO INS TEMP": (12.5, "[C]"),
+                    "OBJECT": "M31",
+                }
+            )
 
             def check(hd):
                 assert hd["EXPTIME"] == 5.0
@@ -381,9 +383,9 @@ def test_hierarch_invalid_chars_rejected():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(ValueError):
-                fits[0].header["ESO INS#TEMP"] = 5    # '#' not allowed
+                fits[0].header["ESO INS#TEMP"] = 5  # '#' not allowed
             with pytest.raises(ValueError):
-                fits[0].header["LONG KEY/PATH"] = 5    # '/' not allowed
+                fits[0].header["LONG KEY/PATH"] = 5  # '/' not allowed
 
 
 def test_hierarch_dot_and_plus_allowed():
@@ -428,7 +430,8 @@ def test_hierarch_long_string_chains():
                 cards = hd.cards
                 # First card is the HIERARCH card.
                 first_idx = next(
-                    i for i, c in enumerate(cards)
+                    i
+                    for i, c in enumerate(cards)
                     if c.startswith("HIERARCH ESO INS DESCRIPTION")
                 )
                 # At least one CONTINUE card follows.
@@ -481,7 +484,8 @@ def test_hierarch_chain_layout_starts_hierarch_then_continue():
             def check(hd):
                 cards = hd.cards
                 first_idx = next(
-                    i for i, c in enumerate(cards)
+                    i
+                    for i, c in enumerate(cards)
                     if c.startswith("HIERARCH ESO INS DESCRIPTION")
                 )
                 chain = [cards[first_idx]]
@@ -535,9 +539,7 @@ def test_del_hierarch_chain_removes_all_cards():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["ESO INS DESC"] = "X" * 200
-            assert any(
-                c.startswith("CONTINUE") for c in fits[0].header.cards
-            )
+            assert any(c.startswith("CONTINUE") for c in fits[0].header.cards)
 
             del fits[0].header["ESO INS DESC"]
 

@@ -115,7 +115,10 @@ def test_extname_present():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            4, 1, [("X", "1J")], extras=["EXTNAME = 'CATALOG '"],
+            4,
+            1,
+            [("X", "1J")],
+            extras=["EXTNAME = 'CATALOG '"],
         )
         _write_file(fname, (primary, b""), (ext, bytes(4)))
         with rustfits.FITS(fname) as fits:
@@ -146,7 +149,9 @@ def test_extver_set():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            4, 1, [("X", "1J")],
+            4,
+            1,
+            [("X", "1J")],
             extras=["EXTNAME = 'SCI     '", "EXTVER  =                    7"],
         )
         _write_file(fname, (primary, b""), (ext, bytes(4)))
@@ -352,7 +357,8 @@ def test_table_ncols():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            4 + 8 + 4, 1,
+            4 + 8 + 4,
+            1,
             [("A", "1J"), ("B", "1D"), ("C", "1J")],
         )
         _write_file(fname, (primary, b""), (ext, bytes(16)))
@@ -366,7 +372,8 @@ def test_table_colnames_preserves_case_and_order():
         fname = os.path.join(tmp, "t.fits")
         primary = _primary_no_data()
         ext = _bintable_ext(
-            4 + 4 + 4, 1,
+            4 + 4 + 4,
+            1,
             [("RA_deg", "1J"), ("Flux", "1J"), ("id", "1J")],
         )
         _write_file(fname, (primary, b""), (ext, bytes(12)))

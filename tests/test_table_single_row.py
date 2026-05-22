@@ -119,7 +119,7 @@ def test_single_row_out_of_range_raises():
         _write_file(fname, (_primary_no_data(), b""), (cards, rows_data))
         with rustfits.FITS(fname) as fits:
             with pytest.raises((ValueError, IndexError)):
-                _ = fits[1][3]   # NAXIS2 == 3, valid indices 0..2
+                _ = fits[1][3]  # NAXIS2 == 3, valid indices 0..2
             with pytest.raises((ValueError, IndexError)):
                 _ = fits[1][-4]
 
@@ -209,8 +209,9 @@ def test_single_row_vla_column_field():
     ]
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
-        _write_file(fname, (_primary_no_data(), b""),
-                    (cards, descriptors + heap))
+        _write_file(
+            fname, (_primary_no_data(), b""), (cards, descriptors + heap)
+        )
         with rustfits.FITS(fname) as fits:
             rec0 = fits[1][0]
             rec1 = fits[1][1]

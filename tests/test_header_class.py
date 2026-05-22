@@ -51,7 +51,7 @@ _EXPECTED_KEYS = [
     "ESO INS TEMP",  # HIERARCH expands to the long-key name
     "LONGSTR",
     "HISTORY",
-    "",             # blank-keyword commentary
+    "",  # blank-keyword commentary
 ]
 
 
@@ -297,8 +297,8 @@ def test_comment_of_matches_to_dict(header):
 def test_repr_mentions_counts(header):
     r = repr(header)
     assert "FITSHeader" in r
-    assert str(len(header)) in r           # unique key count
-    assert str(len(header.cards)) in r     # card count
+    assert str(len(header)) in r  # unique key count
+    assert str(len(header.cards)) in r  # card count
 
 
 def test_str_shows_cards_one_per_line(header):

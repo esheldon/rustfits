@@ -40,7 +40,10 @@ def _write_rice(tmpdir, shape, dtype, tile_dims=None):
 def test_whole_image_slice():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][:, :]
@@ -50,7 +53,10 @@ def test_whole_image_slice():
 def test_partial_2d_slice():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][2:7, 3:8]
@@ -61,7 +67,10 @@ def test_slice_within_single_tile():
     """Slice fits entirely within one tile — only that tile decoded."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -74,7 +83,10 @@ def test_slice_within_single_tile():
 def test_slice_spanning_multiple_tiles():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -87,7 +99,10 @@ def test_slice_spanning_multiple_tiles():
 def test_stepped_slice_2d():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][::2, ::3]
@@ -97,7 +112,10 @@ def test_stepped_slice_2d():
 def test_stepped_slice_with_start_stop():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (20, 20), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (20, 20),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][2:18:3, 1:19:4]
@@ -107,7 +125,10 @@ def test_stepped_slice_with_start_stop():
 def test_mixed_int_and_slice():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -120,7 +141,10 @@ def test_mixed_int_and_slice():
 def test_all_int_returns_scalar():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             v = fits[1][5, 6]
@@ -132,7 +156,10 @@ def test_all_int_returns_scalar():
 def test_all_int_3d_returns_scalar():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (4, 5, 6), "i4", tile_dims=(2, 2, 3),
+            tmpdir,
+            (4, 5, 6),
+            "i4",
+            tile_dims=(2, 2, 3),
         )
         with rustfits.FITS(fname, "r") as fits:
             v = fits[1][1, 2, 3]
@@ -143,7 +170,10 @@ def test_all_int_3d_returns_scalar():
 def test_negative_indices():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -156,7 +186,10 @@ def test_negative_indices():
 def test_ellipsis():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (3, 4, 5), "i4", tile_dims=(3, 4, 5),
+            tmpdir,
+            (3, 4, 5),
+            "i4",
+            tile_dims=(3, 4, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][..., 2:4]
@@ -166,7 +199,10 @@ def test_ellipsis():
 def test_1d_slice():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (50,), "i4", tile_dims=(10,),
+            tmpdir,
+            (50,),
+            "i4",
+            tile_dims=(10,),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -178,7 +214,10 @@ def test_1d_slice():
 def test_3d_slice():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (4, 6, 8), "i4", tile_dims=(2, 3, 4),
+            tmpdir,
+            (4, 6, 8),
+            "i4",
+            tile_dims=(2, 3, 4),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1][1:3, 1:5, 2:6]
@@ -190,7 +229,10 @@ def test_edge_tile_slicing():
     smaller.  Slicing must still produce correct output."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (7, 11), "i4", tile_dims=(3, 4),
+            tmpdir,
+            (7, 11),
+            "i4",
+            tile_dims=(3, 4),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -205,7 +247,10 @@ def test_edge_tile_slicing():
 def test_read_populates_cache():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -220,7 +265,10 @@ def test_subsequent_slice_hits_warm_cache():
     already there)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -233,7 +281,10 @@ def test_subsequent_slice_hits_warm_cache():
 def test_set_tile_cache_size_zero_disables():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -245,7 +296,10 @@ def test_set_tile_cache_size_zero_disables():
 def test_clear_tile_cache():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -263,7 +317,10 @@ def test_lru_eviction_when_over_capacity():
     with tempfile.TemporaryDirectory() as tmpdir:
         # Many 2x2 i4 tiles → each tile = 16 bytes.
         fname, _ = _write_rice(
-            tmpdir, (20, 20), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (20, 20),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -277,7 +334,10 @@ def test_shrinking_capacity_evicts():
     """Setting a smaller cap drops LRU entries to fit."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -290,7 +350,10 @@ def test_shrinking_capacity_evicts():
 def test_default_cache_size():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (4, 4), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (4, 4),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -300,7 +363,10 @@ def test_default_cache_size():
 def test_tile_cache_used_starts_at_zero():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (4, 4), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (4, 4),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -314,7 +380,10 @@ def test_getitem_applies_scaling():
     """__getitem__ always scales (matches table-side convention)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r+") as fits:
             fits[1].header["BSCALE"] = 2.0
@@ -332,7 +401,10 @@ def test_getitem_applies_scaling():
 def test_slice_dtype_matches_image(dtype):
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), dtype, tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            dtype,
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             sub = fits[1][3:7, 3:7]
@@ -346,7 +418,10 @@ def test_slice_dtype_matches_image(dtype):
 def test_empty_slice_returns_empty_array():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             sub = fits[1][5:5, :]
@@ -360,7 +435,10 @@ def test_empty_slice_returns_empty_array():
 def test_setitem_still_raises():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (4, 4), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (4, 4),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(NotImplementedError, match="Phase 7"):
@@ -371,7 +449,10 @@ def test_fancy_list_raises_clear_error():
     """Fancy list indexing isn't supported (matches ImageHDU)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 10), "i4", tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            "i4",
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             with pytest.raises(ValueError, match="unsupported index"):

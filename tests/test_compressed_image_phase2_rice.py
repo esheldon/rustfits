@@ -26,8 +26,9 @@ import rustfits
 fitsio = pytest.importorskip("fitsio")
 
 
-def _write_rice(tmpdir, shape, dtype, tile_dims=None, extname=None,
-                start_value=0):
+def _write_rice(
+    tmpdir, shape, dtype, tile_dims=None, extname=None, start_value=0
+):
     """
     Build a compressed-image fixture with fitsio.  Data is a
     contiguous range starting at `start_value`, then reshaped to
@@ -37,7 +38,9 @@ def _write_rice(tmpdir, shape, dtype, tile_dims=None, extname=None,
     fname = os.path.join(tmpdir, "t.fits.fz")
     n = int(np.prod(shape))
     data = np.arange(
-        start_value, start_value + n, dtype=dtype,
+        start_value,
+        start_value + n,
+        dtype=dtype,
     ).reshape(shape)
     kw = {"compress": "RICE_1"}
     if tile_dims is not None:
@@ -72,7 +75,10 @@ def test_roundtrip_2d(dtype):
     """Various BITPIX, 2-D image with explicit tile shape."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 10), dtype, tile_dims=(5, 5),
+            tmpdir,
+            (10, 10),
+            dtype,
+            tile_dims=(5, 5),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read()
@@ -82,7 +88,10 @@ def test_roundtrip_2d(dtype):
 def test_roundtrip_1d():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (50,), "i4", tile_dims=(50,),
+            tmpdir,
+            (50,),
+            "i4",
+            tile_dims=(50,),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read()
@@ -92,7 +101,10 @@ def test_roundtrip_1d():
 def test_roundtrip_3d():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (4, 6, 8), "i4", tile_dims=(2, 3, 4),
+            tmpdir,
+            (4, 6, 8),
+            "i4",
+            tile_dims=(2, 3, 4),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read()
@@ -103,12 +115,15 @@ def test_roundtrip_negative_values():
     """ZigZag decoding correctly handles negative differences."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits.fz")
-        data = np.array([
-            [-100, 50, -50, 75],
-            [10, -10, 20, -20],
-            [0, -1, 1, -2],
-            [1000, -1000, 500, -500],
-        ], dtype="i4")
+        data = np.array(
+            [
+                [-100, 50, -50, 75],
+                [10, -10, 20, -20],
+                [0, -1, 1, -2],
+                [1000, -1000, 500, -500],
+            ],
+            dtype="i4",
+        )
         with fitsio.FITS(fname, "rw") as f:
             f.write(data, compress="RICE_1", tile_dims=(2, 2))
         with rustfits.FITS(fname, "r") as fits:
@@ -136,7 +151,10 @@ def test_roundtrip_high_entropy():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits.fz")
         data = rng.integers(
-            -1_000_000, 1_000_000, size=(32, 32), dtype="i4",
+            -1_000_000,
+            1_000_000,
+            size=(32, 32),
+            dtype="i4",
         )
         with fitsio.FITS(fname, "rw") as f:
             f.write(data, compress="RICE_1", tile_dims=(16, 16))
@@ -154,7 +172,10 @@ def test_edge_tiles_image_not_multiple_of_tile():
     clipping logic."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (7, 11), "i4", tile_dims=(3, 4),
+            tmpdir,
+            (7, 11),
+            "i4",
+            tile_dims=(3, 4),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read()
@@ -166,7 +187,10 @@ def test_default_tile_shape():
     ZTILE2=1 (row tiles)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (10, 15), "i4", tile_dims=None,
+            tmpdir,
+            (10, 15),
+            "i4",
+            tile_dims=None,
         )
         with rustfits.FITS(fname, "r") as fits:
             assert fits[1].tile_shape == (1, 15)
@@ -178,7 +202,10 @@ def test_whole_image_single_tile():
     """A single tile covering the whole image."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (8, 12), "i4", tile_dims=(8, 12),
+            tmpdir,
+            (8, 12),
+            "i4",
+            tile_dims=(8, 12),
         )
         with rustfits.FITS(fname, "r") as fits:
             assert fits[1].n_tiles == 1
@@ -190,7 +217,10 @@ def test_many_small_tiles():
     """Many tiles to exercise the per-tile loop."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (20, 20), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (20, 20),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r") as fits:
             assert fits[1].n_tiles == 100
@@ -206,7 +236,10 @@ def test_scale_false_returns_native_dtype():
     BSCALE/BZERO applied."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (4, 4), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (4, 4),
+            "i4",
+            tile_dims=(2, 2),
         )
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read(scale=False)
@@ -219,7 +252,10 @@ def test_scaled_compressed_hdu():
     scale=True should apply scaling."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, data = _write_rice(
-            tmpdir, (4, 4), "i4", tile_dims=(2, 2),
+            tmpdir,
+            (4, 4),
+            "i4",
+            tile_dims=(2, 2),
         )
         # BSCALE/BZERO aren't protected; patch them in.
         with rustfits.FITS(fname, "r+") as fits:
@@ -230,7 +266,8 @@ def test_scaled_compressed_hdu():
             raw = fits[1].read(scale=False)
         # scale=True: physical = stored * 2 + 10 (promoted to f8)
         np.testing.assert_array_equal(
-            scaled, data.astype("f8") * 2.0 + 10.0,
+            scaled,
+            data.astype("f8") * 2.0 + 10.0,
         )
         np.testing.assert_array_equal(raw, data)
 
@@ -307,7 +344,10 @@ def test_phase1_accessors_still_work():
     """Phase 2 didn't break the Phase 1 accessor surface."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (6, 8), "i4", tile_dims=(3, 4),
+            tmpdir,
+            (6, 8),
+            "i4",
+            tile_dims=(3, 4),
             extname="SCI",
         )
         with rustfits.FITS(fname, "r") as fits:

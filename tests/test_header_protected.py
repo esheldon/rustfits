@@ -32,40 +32,96 @@ def _new_file(shape=(4, 6), dtype="i4"):
 # ============================================================================
 
 
-@pytest.mark.parametrize("key", [
-    # Image HDU structural
-    "SIMPLE", "XTENSION", "EXTEND", "BITPIX", "NAXIS",
-    "NAXIS1", "NAXIS2", "NAXIS999", "PCOUNT", "GCOUNT", "END",
-    # Binary table structural
-    "TFIELDS", "THEAP", "TFORM1", "TDIM3", "TTYPE1", "TSCAL2",
-    "TZERO5", "TNULL1",
-    # ASCII table structural
-    "TBCOL1",
-    # Random groups
-    "GROUPS", "PTYPE1", "PSCAL1", "PZERO1",
-    # Tiled image compression
-    "ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS", "ZNAXIS1", "ZTILE1",
-    "ZNAME1", "ZVAL1", "ZSIMPLE", "ZEXTEND", "ZBLOCKED", "ZPCOUNT",
-    "ZGCOUNT", "ZHECKSUM", "ZDATASUM", "ZTENSION", "ZQUANTIZ",
-    "ZDITHER0", "ZMASKCMP", "ZBLANK",
-    # Integrity
-    "CHECKSUM", "DATASUM",
-])
+@pytest.mark.parametrize(
+    "key",
+    [
+        # Image HDU structural
+        "SIMPLE",
+        "XTENSION",
+        "EXTEND",
+        "BITPIX",
+        "NAXIS",
+        "NAXIS1",
+        "NAXIS2",
+        "NAXIS999",
+        "PCOUNT",
+        "GCOUNT",
+        "END",
+        # Binary table structural
+        "TFIELDS",
+        "THEAP",
+        "TFORM1",
+        "TDIM3",
+        "TTYPE1",
+        "TSCAL2",
+        "TZERO5",
+        "TNULL1",
+        # ASCII table structural
+        "TBCOL1",
+        # Random groups
+        "GROUPS",
+        "PTYPE1",
+        "PSCAL1",
+        "PZERO1",
+        # Tiled image compression
+        "ZIMAGE",
+        "ZCMPTYPE",
+        "ZBITPIX",
+        "ZNAXIS",
+        "ZNAXIS1",
+        "ZTILE1",
+        "ZNAME1",
+        "ZVAL1",
+        "ZSIMPLE",
+        "ZEXTEND",
+        "ZBLOCKED",
+        "ZPCOUNT",
+        "ZGCOUNT",
+        "ZHECKSUM",
+        "ZDATASUM",
+        "ZTENSION",
+        "ZQUANTIZ",
+        "ZDITHER0",
+        "ZMASKCMP",
+        "ZBLANK",
+        # Integrity
+        "CHECKSUM",
+        "DATASUM",
+    ],
+)
 def test_is_protected_key_recognizes_protected(key):
     assert rustfits.is_protected_key(key) is True
 
 
-@pytest.mark.parametrize("key", [
-    # User metadata that's safe to write
-    "OBJECT", "EXPTIME", "OBSERVER", "DATE-OBS", "TELESCOP",
-    "EXTNAME", "EXTVER", "EXTLEVEL",
-    "BUNIT", "BSCALE", "BZERO",   # image-only, not Tier-1 protected
-    "CTYPE1", "CRVAL1", "CDELT1",
-    # Indexed-family lookalikes that don't match (suffix isn't all digits)
-    "NAXISA", "TFORM1A", "ZNAXISX",
-    # Empty suffix doesn't count as indexed family
-    "TFORM", "TDIM", "TTYPE", "TBCOL",
-])
+@pytest.mark.parametrize(
+    "key",
+    [
+        # User metadata that's safe to write
+        "OBJECT",
+        "EXPTIME",
+        "OBSERVER",
+        "DATE-OBS",
+        "TELESCOP",
+        "EXTNAME",
+        "EXTVER",
+        "EXTLEVEL",
+        "BUNIT",
+        "BSCALE",
+        "BZERO",  # image-only, not Tier-1 protected
+        "CTYPE1",
+        "CRVAL1",
+        "CDELT1",
+        # Indexed-family lookalikes that don't match (suffix isn't all digits)
+        "NAXISA",
+        "TFORM1A",
+        "ZNAXISX",
+        # Empty suffix doesn't count as indexed family
+        "TFORM",
+        "TDIM",
+        "TTYPE",
+        "TBCOL",
+    ],
+)
 def test_is_protected_key_lets_user_keys_through(key):
     assert rustfits.is_protected_key(key) is False
 
@@ -85,17 +141,20 @@ def test_is_protected_key_strips_whitespace():
 # ============================================================================
 
 
-@pytest.mark.parametrize("key,value", [
-    ("BITPIX", 32),
-    ("NAXIS", 3),
-    ("NAXIS1", 999),
-    ("SIMPLE", True),
-    ("CHECKSUM", "abcdefgh"),
-    ("DATASUM", "12345"),
-    ("ZIMAGE", True),
-    ("TFIELDS", 5),
-    ("TFORM3", "1J"),
-])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("BITPIX", 32),
+        ("NAXIS", 3),
+        ("NAXIS1", 999),
+        ("SIMPLE", True),
+        ("CHECKSUM", "abcdefgh"),
+        ("DATASUM", "12345"),
+        ("ZIMAGE", True),
+        ("TFIELDS", 5),
+        ("TFORM3", "1J"),
+    ],
+)
 def test_setitem_rejects_protected_key(key, value):
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
@@ -183,8 +242,14 @@ def test_to_dict_skip_protected_drops_structural_keys():
 
             d = fits[0].header.to_dict(skip_protected=True)
             # Protected keys are gone.
-            for k in ("SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2",
-                      "EXTEND"):
+            for k in (
+                "SIMPLE",
+                "BITPIX",
+                "NAXIS",
+                "NAXIS1",
+                "NAXIS2",
+                "EXTEND",
+            ):
                 assert k not in d
             # User keys are preserved with their value+comment shape.
             assert d["OBJECT"]["value"] == "M31"
@@ -202,7 +267,7 @@ def test_to_dict_skip_protected_drops_continue_chain():
     # unrelated protected key doesn't corrupt the chain.
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
-            fits[0].header["LONG"] = "X" * 200   # produces CONTINUE chain
+            fits[0].header["LONG"] = "X" * 200  # produces CONTINUE chain
 
             d = fits[0].header.to_dict(skip_protected=True)
             # LONG survives intact.
@@ -232,13 +297,13 @@ def test_update_from_fitsheader_silently_skips_protected_keys():
     Copying a header from one HDU to another must drop protected keys
     (NAXIS/BITPIX/etc. of the source) so the destination's own structural
     state is preserved.  User metadata still copies through."""
-    with _new_file(shape=(4, 6), dtype="i4") as a_name, \
-         _new_file(shape=(8, 10), dtype="f4") as b_name:
+    with _new_file(shape=(4, 6), dtype="i4") as a_name, _new_file(
+        shape=(8, 10), dtype="f4"
+    ) as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["OBJECT"] = "M31"
             a[0].header["EXPTIME"] = (5.0, "exposure (s)")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             # a has BITPIX=32, NAXIS1=6, NAXIS2=4; b has BITPIX=-32,
             # NAXIS1=10, NAXIS2=8.  Without auto-skip, the update would
             # raise on the first protected key.
@@ -265,9 +330,8 @@ def test_update_from_fitsheader_skips_checksum_and_datasum():
         # not raise even though a's header carries SIMPLE/BITPIX/NAXIS*.
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["OBJECT"] = "src"
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
-            b[0].header.update(a[0].header)   # must not raise
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
+            b[0].header.update(a[0].header)  # must not raise
             assert b[0].header["OBJECT"] == "src"
 
 
@@ -295,12 +359,12 @@ def test_update_from_dict_still_raises_on_commentary_key():
 
 def test_update_from_fitsheader_inside_edit_skips_protected_keys():
     """Auto-skip also applies inside a batched edit()."""
-    with _new_file(shape=(4, 6), dtype="i4") as a_name, \
-         _new_file(shape=(8, 10), dtype="f4") as b_name:
+    with _new_file(shape=(4, 6), dtype="i4") as a_name, _new_file(
+        shape=(8, 10), dtype="f4"
+    ) as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["OBJECT"] = "M31"
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             with b[0].header.edit() as h:
                 h.update(a[0].header)
             assert b[0].header["OBJECT"] == "M31"

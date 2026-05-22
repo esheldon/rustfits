@@ -48,6 +48,7 @@ def test_open_default_mode_is_read_only():
 
         with rustfits.FITS(fname) as fits:
             import pytest
+
             with pytest.raises((OSError, IOError)):
                 fits[0].header['NEWKEY'] = 1
 

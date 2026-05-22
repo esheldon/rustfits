@@ -206,8 +206,8 @@ def test_edit_position_semantics_match_setitem():
             fits[0].header["OBJECT"] = "M31"
             keys_before = list(fits[0].header)
             with fits[0].header.edit() as h:
-                h["OBJECT"] = "NGC 224"   # update existing
-                h["EXPTIME"] = 5          # new key
+                h["OBJECT"] = "NGC 224"  # update existing
+                h["EXPTIME"] = 5  # new key
             cards = fits[0].header.cards
             assert cards[-1].startswith("END")
             assert cards[-2].startswith("EXPTIME")

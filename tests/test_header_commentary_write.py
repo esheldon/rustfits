@@ -99,18 +99,20 @@ def test_new_comments_cluster_with_existing_ones():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header.add_comment("first")
-            fits[0].header["EXPTIME"] = 5      # regular key in between
+            fits[0].header["EXPTIME"] = 5  # regular key in between
             fits[0].header.add_comment("second")
             cards_same = fits[0].header.cards
         with _read_only(fname) as fits:
             cards_reopen = fits[0].header.cards
         for cards in (cards_same, cards_reopen):
             idx1 = next(
-                i for i, c in enumerate(cards)
+                i
+                for i, c in enumerate(cards)
                 if c.startswith("COMMENT") and "first" in c
             )
             idx2 = next(
-                i for i, c in enumerate(cards)
+                i
+                for i, c in enumerate(cards)
                 if c.startswith("COMMENT") and "second" in c
             )
             assert idx2 == idx1 + 1
@@ -378,8 +380,7 @@ def test_update_default_silently_skips_commentary_in_source():
             a[0].header["OBJECT"] = "M31"
             a[0].header.add_comment("from source")
             a[0].header.add_history("ran step 1")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header)
             assert b[0].header["OBJECT"] == "M31"
             with pytest.raises(KeyError):
@@ -402,18 +403,19 @@ def test_update_copy_commentary_appends_history_and_comment():
             a[0].header.add_comment("from source")
             a[0].header.add_history("did a thing")
             a[0].header.add_history("did another thing")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header, copy_commentary=True)
             assert b[0].header["OBJECT"] == "M31"
             assert b[0].header["COMMENT"] == ["from source"]
             assert b[0].header["HISTORY"] == [
-                "did a thing", "did another thing",
+                "did a thing",
+                "did another thing",
             ]
         with _read_only(b_name) as b:
             assert b[0].header["COMMENT"] == ["from source"]
             assert b[0].header["HISTORY"] == [
-                "did a thing", "did another thing",
+                "did a thing",
+                "did another thing",
             ]
 
 
@@ -422,8 +424,7 @@ def test_update_copy_commentary_appends_blank_commentary():
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header.add_blank("blank-key text")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header, copy_commentary=True)
             assert b[0].header[""] == ["blank-key text"]
 
@@ -432,7 +433,7 @@ def test_update_copy_commentary_preserves_source_card_split():
     """
     A long commentary that the source split across multiple cards stays
     split — one append per source card, no concatenation."""
-    long_text = "X" * 200   # splits into 72 + 72 + 56 = 3 cards
+    long_text = "X" * 200  # splits into 72 + 72 + 56 = 3 cards
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header.add_comment(long_text)
@@ -441,8 +442,7 @@ def test_update_copy_commentary_preserves_source_card_split():
                 1 for c in a[0].header.cards if c.startswith("COMMENT")
             )
             assert n_src == 3
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header, copy_commentary=True)
             n_dst = sum(
                 1 for c in b[0].header.cards if c.startswith("COMMENT")
@@ -461,8 +461,7 @@ def test_update_copy_commentary_repeated_calls_accumulate():
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header.add_history("first run")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header, copy_commentary=True)
             b[0].header.update(a[0].header, copy_commentary=True)
             assert b[0].header["HISTORY"] == ["first run", "first run"]
@@ -477,8 +476,7 @@ def test_update_copy_commentary_coexists_with_dest_commentary():
             a[0].header.add_history("from source")
         with rustfits.FITS(b_name, "r+") as b:
             b[0].header.add_history("from dest")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             b[0].header.update(a[0].header, copy_commentary=True)
             assert b[0].header["HISTORY"] == ["from dest", "from source"]
 
@@ -495,7 +493,8 @@ def test_update_dict_source_still_raises_on_commentary():
                 fits[0].header.update({"COMMENT": "no good"})
             with pytest.raises(ValueError):
                 fits[0].header.update(
-                    {"COMMENT": "no good"}, copy_commentary=True,
+                    {"COMMENT": "no good"},
+                    copy_commentary=True,
                 )
 
 
@@ -507,8 +506,7 @@ def test_update_copy_commentary_inside_edit_batch():
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["OBJECT"] = "M31"
             a[0].header.add_history("from source")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             with b[0].header.edit() as h:
                 h.update(a[0].header, copy_commentary=True)
             assert b[0].header["OBJECT"] == "M31"
@@ -525,8 +523,7 @@ def test_update_default_silently_skips_commentary_inside_edit_batch():
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header["OBJECT"] = "M31"
             a[0].header.add_history("dropped")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             with b[0].header.edit() as h:
                 h.update(a[0].header)
             assert b[0].header["OBJECT"] == "M31"
@@ -541,8 +538,7 @@ def test_update_copy_commentary_edit_rollback_discards_appends():
     with _new_file() as a_name, _new_file() as b_name:
         with rustfits.FITS(a_name, "r+") as a:
             a[0].header.add_history("staged then rolled back")
-        with rustfits.FITS(a_name, "r") as a, \
-             rustfits.FITS(b_name, "r+") as b:
+        with rustfits.FITS(a_name, "r") as a, rustfits.FITS(b_name, "r+") as b:
             with pytest.raises(RuntimeError):
                 with b[0].header.edit() as h:
                     h.update(a[0].header, copy_commentary=True)

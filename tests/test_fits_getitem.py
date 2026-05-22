@@ -113,7 +113,7 @@ def test_string_lookup_supports_extend_on_named_hdu():
         with rustfits.FITS(fname, "r+") as fits:
             new = np.zeros((1, 3), dtype="f8") + 7.0
             fits["SCI"].extend(new)
-            assert fits["SCI"].header["NAXIS2"] == 3   # 2 + 1
+            assert fits["SCI"].header["NAXIS2"] == 3  # 2 + 1
         with rustfits.FITS(fname, "r") as fits:
             assert fits["sci"].header["NAXIS2"] == 3
 

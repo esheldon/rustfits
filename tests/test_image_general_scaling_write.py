@@ -53,10 +53,15 @@ def test_int_roundtrip_via_f8_write():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(5,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(5,),
+            bscale=0.5,
+            bzero=10.0,
         )
         physical = np.array(
-            [10.0, 10.5, 11.0, 11.5, 12.0], dtype="f8",
+            [10.0, 10.5, 11.0, 11.5, 12.0],
+            dtype="f8",
         )
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].write(physical)
@@ -74,7 +79,11 @@ def test_int_stored_values_match_expected():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(4,), bscale=2.0, bzero=0.0,
+            tmpdir,
+            "i2",
+            dims=(4,),
+            bscale=2.0,
+            bzero=0.0,
         )
         physical = np.array([2.0, 4.0, 6.0, 8.0], dtype="f8")
         expected_stored = np.array([1, 2, 3, 4], dtype="i2")
@@ -91,7 +100,11 @@ def test_native_dtype_still_works_on_scaled_hdu():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=10.0, bzero=0.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=10.0,
+            bzero=0.0,
         )
         stored = np.array([7, 8, 9], dtype="i2")
         with rustfits.FITS(fname, "r+") as fits:
@@ -100,7 +113,8 @@ def test_native_dtype_still_works_on_scaled_hdu():
             got_scaled = fits[0].read(scale=True)
         np.testing.assert_array_equal(got_raw, stored)
         np.testing.assert_array_equal(
-            got_scaled, stored.astype("f8") * 10.0,
+            got_scaled,
+            stored.astype("f8") * 10.0,
         )
 
 
@@ -115,7 +129,11 @@ def test_half_to_even_rounding():
     with tempfile.TemporaryDirectory() as tmpdir:
         # BSCALE=2 + BZERO=0 → kind=General; stored = physical / 2.
         fname = _make_scaled(
-            tmpdir, "i2", dims=(5,), bscale=2.0, bzero=0.0,
+            tmpdir,
+            "i2",
+            dims=(5,),
+            bscale=2.0,
+            bzero=0.0,
         )
         # Physical 1.0 → stored 0.5 → 0 (even); 3.0 → 1.5 → 2;
         # 5.0 → 2.5 → 2; 7.0 → 3.5 → 4; 9.0 → 4.5 → 4.
@@ -131,7 +149,11 @@ def test_negative_half_to_even_rounding():
     """Half-to-even with negative values too."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(4,), bscale=2.0, bzero=0.0,
+            tmpdir,
+            "i2",
+            dims=(4,),
+            bscale=2.0,
+            bzero=0.0,
         )
         # -1.0 → -0.5 → 0; -3.0 → -1.5 → -2; -5.0 → -2.5 → -2;
         # -7.0 → -3.5 → -4.
@@ -151,7 +173,11 @@ def test_overflow_int_upper_raises():
     with tempfile.TemporaryDirectory() as tmpdir:
         # BSCALE=1, BZERO=1 → kind=General; stored = physical - 1.
         fname = _make_scaled(
-            tmpdir, "i2", dims=(2,), bscale=1.0, bzero=1.0,
+            tmpdir,
+            "i2",
+            dims=(2,),
+            bscale=1.0,
+            bzero=1.0,
         )
         # Physical 100000 → stored 99999 → out of i2 range.
         physical = np.array([1.0, 100000.0], dtype="f8")
@@ -164,7 +190,11 @@ def test_overflow_int_lower_raises():
     """BITPIX=8 (unsigned) + negative value raises."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "u1", dims=(2,), bscale=1.0, bzero=10.0,
+            tmpdir,
+            "u1",
+            dims=(2,),
+            bscale=1.0,
+            bzero=10.0,
         )
         # Physical 9 → stored -1 → out of u1 range [0, 255].
         physical = np.array([15.0, 9.0], dtype="f8")
@@ -181,7 +211,11 @@ def test_overflow_caught_after_rounding():
     with tempfile.TemporaryDirectory() as tmpdir:
         # BSCALE=1, BZERO=1 → stored = physical - 1.
         fname = _make_scaled(
-            tmpdir, "i2", dims=(1,), bscale=1.0, bzero=1.0,
+            tmpdir,
+            "i2",
+            dims=(1,),
+            bscale=1.0,
+            bzero=1.0,
         )
         # Physical 32768.6 → stored 32767.6 → rint → 32768 → overflow.
         physical = np.array([32768.6], dtype="f8")
@@ -196,7 +230,11 @@ def test_overflow_caught_after_rounding():
 def test_nan_raises_on_int_bitpix():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=0.5,
+            bzero=10.0,
         )
         physical = np.array([10.0, np.nan, 11.0], dtype="f8")
         with rustfits.FITS(fname, "r+") as fits:
@@ -207,7 +245,11 @@ def test_nan_raises_on_int_bitpix():
 def test_inf_raises_on_int_bitpix():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i4", dims=(2,), bscale=2.0, bzero=0.0,
+            tmpdir,
+            "i4",
+            dims=(2,),
+            bscale=2.0,
+            bzero=0.0,
         )
         physical = np.array([1.0, np.inf], dtype="f8")
         with rustfits.FITS(fname, "r+") as fits:
@@ -218,7 +260,11 @@ def test_inf_raises_on_int_bitpix():
 def test_neg_inf_raises_on_int_bitpix():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i4", dims=(2,), bscale=2.0, bzero=0.0,
+            tmpdir,
+            "i4",
+            dims=(2,),
+            bscale=2.0,
+            bzero=0.0,
         )
         physical = np.array([1.0, -np.inf], dtype="f8")
         with rustfits.FITS(fname, "r+") as fits:
@@ -236,7 +282,11 @@ def test_float_bitpix_minus32_with_scaling_roundtrips():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "f4", dims=(4,), bscale=2.0, bzero=5.0,
+            tmpdir,
+            "f4",
+            dims=(4,),
+            bscale=2.0,
+            bzero=5.0,
         )
         physical = np.array([5.0, 7.0, 9.0, 11.0], dtype="f8")
         with rustfits.FITS(fname, "r+") as fits:
@@ -254,7 +304,11 @@ def test_float_bitpix_allows_nan():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "f4", dims=(3,), bscale=2.0, bzero=5.0,
+            tmpdir,
+            "f4",
+            dims=(3,),
+            bscale=2.0,
+            bzero=5.0,
         )
         physical = np.array([5.0, np.nan, 7.0], dtype="f8")
         with rustfits.FITS(fname, "r+") as fits:
@@ -271,18 +325,24 @@ def test_setitem_slice_with_f8_on_scaled_hdu():
     """__setitem__ on a scaled HDU accepts f8 RHS."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(6,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(6,),
+            bscale=0.5,
+            bzero=10.0,
             fill=[0, 0, 0, 0, 0, 0],
         )
         with rustfits.FITS(fname, "r+") as fits:
             fits[0][1:4] = np.array(
-                [10.5, 11.0, 11.5], dtype="f8",
+                [10.5, 11.0, 11.5],
+                dtype="f8",
             )
             got = fits[0].read(scale=True)
         # First, last two untouched; middle three set.
         # Original stored 0 → physical 0*0.5+10 = 10.0.
         expected = np.array(
-            [10.0, 10.5, 11.0, 11.5, 10.0, 10.0], dtype="f8",
+            [10.0, 10.5, 11.0, 11.5, 10.0, 10.0],
+            dtype="f8",
         )
         np.testing.assert_array_equal(got, expected)
 
@@ -294,7 +354,11 @@ def test_extend_with_f8_on_scaled_hdu():
     """ImageHDU.extend accepts f8 input on a scaled HDU."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=0.5,
+            bzero=10.0,
             fill=[0, 0, 0],
         )
         with rustfits.FITS(fname, "r+") as fits:
@@ -305,7 +369,8 @@ def test_extend_with_f8_on_scaled_hdu():
             )
             got = fits[0].read(scale=True)
         expected = np.array(
-            [10.0, 10.0, 10.0, 10.5, 11.0, 11.5], dtype="f8",
+            [10.0, 10.0, 10.0, 10.5, 11.0, 11.5],
+            dtype="f8",
         )
         np.testing.assert_array_equal(got, expected)
 
@@ -320,7 +385,11 @@ def test_error_message_mentions_f8_for_general_scaled():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=0.5,
+            bzero=10.0,
         )
         bogus = np.array([1, 2, 3], dtype="i4")
         with rustfits.FITS(fname, "r+") as fits:
@@ -338,7 +407,11 @@ def test_f4_input_rejected_on_scaled_int_hdu():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=0.5,
+            bzero=10.0,
         )
         # f4 doesn't match i2 (fast path) and doesn't match f8
         # (general-scaling path) — rejected.
@@ -358,10 +431,15 @@ def test_bitpix_64_with_general_scaling_roundtrips():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i8", dims=(3,), bscale=1000.0, bzero=0.0,
+            tmpdir,
+            "i8",
+            dims=(3,),
+            bscale=1000.0,
+            bzero=0.0,
         )
         physical = np.array(
-            [1000.0, 2000.0, 3000.0], dtype="f8",
+            [1000.0, 2000.0, 3000.0],
+            dtype="f8",
         )
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].write(physical)
@@ -369,7 +447,8 @@ def test_bitpix_64_with_general_scaling_roundtrips():
             stored = fits[0].read(scale=False)
         np.testing.assert_array_equal(got, physical)
         np.testing.assert_array_equal(
-            stored, np.array([1, 2, 3], dtype="i8"),
+            stored,
+            np.array([1, 2, 3], dtype="i8"),
         )
 
 
@@ -383,7 +462,11 @@ def test_nan_rejection_leaves_file_untouched():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(3,), bscale=0.5, bzero=10.0,
+            tmpdir,
+            "i2",
+            dims=(3,),
+            bscale=0.5,
+            bzero=10.0,
             fill=[7, 8, 9],
         )
         bad = np.array([10.0, np.nan, 11.0], dtype="f8")
@@ -392,7 +475,8 @@ def test_nan_rejection_leaves_file_untouched():
                 fits[0].write(bad)
             stored = fits[0].read(scale=False)
         np.testing.assert_array_equal(
-            stored, np.array([7, 8, 9], dtype="i2"),
+            stored,
+            np.array([7, 8, 9], dtype="i2"),
         )
 
 
@@ -400,7 +484,11 @@ def test_overflow_rejection_leaves_file_untouched():
     """Overflow rejection also pre-mutation; stored values intact."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = _make_scaled(
-            tmpdir, "i2", dims=(2,), bscale=1.0, bzero=1.0,
+            tmpdir,
+            "i2",
+            dims=(2,),
+            bscale=1.0,
+            bzero=1.0,
             fill=[5, 6],
         )
         bad = np.array([1.0, 100000.0], dtype="f8")
@@ -409,5 +497,6 @@ def test_overflow_rejection_leaves_file_untouched():
                 fits[0].write(bad)
             stored = fits[0].read(scale=False)
         np.testing.assert_array_equal(
-            stored, np.array([5, 6], dtype="i2"),
+            stored,
+            np.array([5, 6], dtype="i2"),
         )

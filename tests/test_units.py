@@ -174,9 +174,7 @@ def test_repr_shows_unit_on_scalar_column():
         with rustfits.FITS(fname) as fits:
             r = repr(fits[1])
             _show(r)
-            flux_line = [
-                ln for ln in r.splitlines() if "flux" in ln
-            ][0]
+            flux_line = [ln for ln in r.splitlines() if "flux" in ln][0]
             assert "f4" in flux_line
             assert "(Jy)" in flux_line
 
@@ -192,9 +190,7 @@ def test_repr_shows_unit_after_shape():
         with rustfits.FITS(fname) as fits:
             r = repr(fits[1])
             _show(r)
-            pos_line = [
-                ln for ln in r.splitlines() if "pos" in ln
-            ][0]
+            pos_line = [ln for ln in r.splitlines() if "pos" in ln][0]
             # Both pieces appear, in the right order.
             assert "array[3]" in pos_line
             assert "(deg)" in pos_line
@@ -211,9 +207,7 @@ def test_repr_no_unit_no_parens():
         with rustfits.FITS(fname) as fits:
             r = repr(fits[1])
             _show(r)
-            count_line = [
-                ln for ln in r.splitlines() if "count" in ln
-            ][0]
+            count_line = [ln for ln in r.splitlines() if "count" in ln][0]
             assert "(" not in count_line
             assert ")" not in count_line
 

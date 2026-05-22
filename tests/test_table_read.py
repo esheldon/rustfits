@@ -17,7 +17,7 @@ import pytest
 import rustfits
 
 
-CARDS_PER_BLOCK = 36   # 2880 / 80
+CARDS_PER_BLOCK = 36  # 2880 / 80
 BLOCK = 2880
 
 
@@ -87,8 +87,12 @@ def test_read_all_basic_numeric_types():
     reasons — either is fine.
     """
     fields = [
-        ("B1", "1B"), ("I1", "1I"), ("J1", "1J"),
-        ("K1", "1K"), ("E1", "1E"), ("D1", "1D"),
+        ("B1", "1B"),
+        ("I1", "1I"),
+        ("J1", "1J"),
+        ("K1", "1K"),
+        ("E1", "1E"),
+        ("D1", "1D"),
     ]
     row_w = 1 + 2 + 4 + 8 + 4 + 8  # 27 bytes/row
     rows_data = b""
@@ -115,7 +119,7 @@ def test_read_all_basic_numeric_types():
 def test_read_all_logical_t_f_other():
     """L: 'T' -> True, 'F' -> False, anything else also False."""
     fields = [("FLAG", "1L")]
-    rows_data = b"T" + b"F" + b"X"   # T, F, garbage
+    rows_data = b"T" + b"F" + b"X"  # T, F, garbage
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, _bintable_cards(1, 3, fields), rows_data)
@@ -153,9 +157,7 @@ def test_read_all_repeat_numeric_column():
         with rustfits.FITS(fname, "r") as fits:
             a = fits[1].read()
             assert a["TRIO"].shape == (3, 3)
-            assert a["TRIO"].tolist() == [
-                [0, 1, 2], [1, 2, 3], [2, 3, 4]
-            ]
+            assert a["TRIO"].tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4]]
 
 
 def test_read_all_single_char_a_column():
@@ -168,7 +170,7 @@ def test_read_all_single_char_a_column():
         with rustfits.FITS(fname, "r") as fits:
             a = fits[1].read()
             assert a["CH"].dtype.kind == "U"
-            assert a["CH"].dtype.itemsize == 4   # numpy U1 == 4 bytes
+            assert a["CH"].dtype.itemsize == 4  # numpy U1 == 4 bytes
             assert a["CH"].tolist() == ["a", "b", "c"]
 
 
@@ -204,7 +206,7 @@ def test_tdim_a_column_string_array():
     TFORM='20A' TDIM='(4,5)' = 5 strings of length 4 per row.
     Numpy field is U4 shape (5,)."""
     fields = [("WORDS", "20A", "(4,5)")]
-    row = b"abcdABCDefghEFGHijkl"   # 5 strings of 4 chars
+    row = b"abcdABCDefghEFGHijkl"  # 5 strings of 4 chars
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, _bintable_cards(20, 1, fields), row)
@@ -269,7 +271,7 @@ def test_columns_duplicate_rejected():
         fname = _three_col_file(tmp)
         with rustfits.FITS(fname, "r") as fits:
             with pytest.raises(ValueError, match="duplicate column name"):
-                fits[1].read(columns=["ID", "id"])   # dup, case-insens
+                fits[1].read(columns=["ID", "id"])  # dup, case-insens
 
 
 def test_columns_empty_list_rejected():
@@ -437,9 +439,7 @@ def test_read_column_multi_element_keeps_shape():
         with rustfits.FITS(fname, "r") as fits:
             t = fits[1].read_column("TRIO")
             assert t.shape == (3, 3)
-            assert t.tolist() == [
-                [0, 1, 2], [1, 2, 3], [2, 3, 4]
-            ]
+            assert t.tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4]]
 
 
 def test_read_column_unknown_name_lists_available():
@@ -464,11 +464,11 @@ def _file_with_dirty_strings(tmp):
     A column with rows that exercise null truncation, rstrip, and
     a non-ASCII byte (Latin-1 'é' = 0xE9) in row 1."""
     names = [
-        b"good    ",          # 4 chars + 4 spaces
-        b"bad\xe9stf ",       # non-ASCII byte 0xE9
-        b"AB\x00DEF  ",       # embedded null then more bytes
-        b"r3      ",          # short with trailing spaces
-        b"\x00\x00\x00\x00\x00\x00\x00\x00",   # all-null
+        b"good    ",  # 4 chars + 4 spaces
+        b"bad\xe9stf ",  # non-ASCII byte 0xE9
+        b"AB\x00DEF  ",  # embedded null then more bytes
+        b"r3      ",  # short with trailing spaces
+        b"\x00\x00\x00\x00\x00\x00\x00\x00",  # all-null
     ]
     assert all(len(n) == 8 for n in names)
     rows_data = b""
@@ -553,10 +553,10 @@ def test_a_column_as_bytes_returns_raw():
             raw = fits[1].read_column("NAME", as_bytes=True)
             assert raw.dtype == np.dtype("S8")
             assert raw[0] == b"good    "
-            assert raw[1] == b"bad\xe9stf "       # non-ASCII preserved
-            assert raw[2] == b"AB\x00DEF  "      # embedded null preserved
+            assert raw[1] == b"bad\xe9stf "  # non-ASCII preserved
+            assert raw[2] == b"AB\x00DEF  "  # embedded null preserved
             assert raw[3] == b"r3      "
-            assert raw[4] == b""                  # numpy strips all-null
+            assert raw[4] == b""  # numpy strips all-null
 
 
 def test_as_bytes_rejected_on_non_character_column():
@@ -601,10 +601,24 @@ def test_x_full_byte_two_rows():
             a = fits[1].read()
             assert a.dtype == np.dtype([("F", "?", (8,))])
             assert a["F"][0].tolist() == [
-                True, False, True, True, False, True, False, False
+                True,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                False,
             ]
             assert a["F"][1].tolist() == [
-                False, False, False, False, True, True, True, True
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
             ]
 
 
@@ -635,7 +649,13 @@ def test_x_partial_byte_padding_bits_ignored():
         with rustfits.FITS(fname, "r") as fits:
             a = fits[1].read()
             assert a["F"][0].tolist() == [
-                True, False, True, False, True, False, True
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
             ]
 
 
@@ -650,8 +670,19 @@ def test_x_multi_byte_with_partial_last_byte():
         with rustfits.FITS(fname, "r") as fits:
             a = fits[1].read()
             assert a["F"][0].tolist() == [
-                True, True, True, True, False, False, False, False,
-                True, False, True, False, True,
+                True,
+                True,
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
             ]
 
 
@@ -675,9 +706,11 @@ def test_x_with_tdim_reshape():
             # TDIM=(2,3), the FORTRAN-indexed element [i,j] (i in [0,2),
             # j in [0,3)) at flat k = i + j*2 maps to numpy [r=j, c=i].
             # So numpy[0] = (b0,b1), numpy[1] = (b2,b3), numpy[2]=(b4,b5).
-            assert a["M"][0].tolist() == [[True, False],
-                                          [True, True],
-                                          [False, False]]
+            assert a["M"][0].tolist() == [
+                [True, False],
+                [True, True],
+                [False, False],
+            ]
 
 
 def test_x_read_column_returns_plain_bool_array():
@@ -691,7 +724,14 @@ def test_x_read_column_returns_plain_bool_array():
             assert col.dtype == np.bool_
             assert col.shape == (1, 8)
             assert col[0].tolist() == [
-                True, True, False, False, False, False, False, False
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
             ]
 
 
@@ -714,8 +754,10 @@ def test_x_mixed_with_other_columns():
     # row 0: ID=10, FLAGS bits = [T,F,T,F,T,F,T,F] = 0b10101010
     # row 1: ID=20, FLAGS bits = [F,T,F,T,F,T,F,T] = 0b01010101
     rows = (
-        struct.pack(">i", 10) + bytes([0b10101010])
-        + struct.pack(">i", 20) + bytes([0b01010101])
+        struct.pack(">i", 10)
+        + bytes([0b10101010])
+        + struct.pack(">i", 20)
+        + bytes([0b01010101])
     )
     fields = [("ID", "1J"), ("FLAGS", "8X")]
     with tempfile.TemporaryDirectory() as tmp:
@@ -725,10 +767,24 @@ def test_x_mixed_with_other_columns():
             a = fits[1].read()
             assert a["ID"].tolist() == [10, 20]
             assert a["FLAGS"][0].tolist() == [
-                True, False, True, False, True, False, True, False
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
             ]
             assert a["FLAGS"][1].tolist() == [
-                False, True, False, True, False, True, False, True
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
             ]
 
 
@@ -741,8 +797,9 @@ def test_x_column_subset_via_getitem():
         with rustfits.FITS(fname, "r") as fits:
             t = fits[1]
             col = t["F"][:]
-            assert col.tolist() == [[True, True, True, True,
-                                     False, False, False, False]]
+            assert col.tolist() == [
+                [True, True, True, True, False, False, False, False]
+            ]
 
 
 def test_x_dtype_property_matches_read():
@@ -1246,9 +1303,7 @@ def test_var_p_float32_basic():
 
 
 def test_var_p_int64():
-    descriptors = (
-        struct.pack(">ii", 2, 0) + struct.pack(">ii", 1, 16)
-    )
+    descriptors = struct.pack(">ii", 2, 0) + struct.pack(">ii", 1, 16)
     heap = struct.pack(">qq", 10**10, -1) + struct.pack(">q", 42)
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -1262,9 +1317,7 @@ def test_var_p_int64():
 
 def test_var_q_descriptor_i64():
     """Q descriptors use two i64 (16 bytes per row)."""
-    descriptors = (
-        struct.pack(">qq", 2, 0) + struct.pack(">qq", 4, 8)
-    )
+    descriptors = struct.pack(">qq", 2, 0) + struct.pack(">qq", 4, 8)
     heap = struct.pack(">ii", 100, 200) + struct.pack(">iiii", 1, 2, 3, 4)
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -1320,9 +1373,7 @@ def test_var_a_non_ascii_error_with_escape_hint():
 
 
 def test_var_a_as_bytes_returns_raw_bytes():
-    descriptors = (
-        struct.pack(">ii", 4, 0) + struct.pack(">ii", 3, 4)
-    )
+    descriptors = struct.pack(">ii", 4, 0) + struct.pack(">ii", 3, 4)
     heap = b"ab\xffc" + b"\x00\x00\x00"
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -1396,8 +1447,8 @@ def test_var_mixed_with_fixed_columns():
     correctly into the same structured array."""
     descriptors = b""
     for nelem, off, ident in [(2, 0, 10), (3, 8, 11), (1, 20, 12)]:
-        descriptors += struct.pack(">i", ident)            # ID (J, 4 bytes)
-        descriptors += struct.pack(">ii", nelem, off)      # VLA descriptor
+        descriptors += struct.pack(">i", ident)  # ID (J, 4 bytes)
+        descriptors += struct.pack(">ii", nelem, off)  # VLA descriptor
     heap = (
         struct.pack(">ff", 1.0, 2.0)
         + struct.pack(">fff", 3.0, 4.0, 5.0)
@@ -1480,7 +1531,8 @@ def test_var_theap_keyword_respected():
     fields = [("X", "1PE(10)")]
     cards = _bintable_cards(row_width, naxis2, fields)
     cards = [
-        f"PCOUNT  = {len(gap) + len(heap):>20d}" if c.startswith("PCOUNT")
+        f"PCOUNT  = {len(gap) + len(heap):>20d}"
+        if c.startswith("PCOUNT")
         else c
         for c in cards
     ]
@@ -1520,10 +1572,7 @@ def test_var_aliased_heap_offset_allowed():
     """
     Two rows pointing at the same heap region must each get their
     own ndarray (correct + safe — no shared mutability)."""
-    descriptors = (
-        struct.pack(">ii", 2, 0)
-        + struct.pack(">ii", 2, 0)
-    )
+    descriptors = struct.pack(">ii", 2, 0) + struct.pack(">ii", 2, 0)
     heap = struct.pack(">ff", 1.5, 2.5)
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -1637,10 +1686,11 @@ def test_scaling_unsigned_int_trick_u32():
 
 def test_scaling_unsigned_int_trick_u64():
     """K (int64) + TZERO=2^63 → uint64, no precision loss."""
-    data = struct.pack(">qqq", -2**63, 0, 2**63 - 1)
+    data = struct.pack(">qqq", -(2**63), 0, 2**63 - 1)
     fields = [("U64", "1K")]
-    cards = _bintable_with_scaling(8, 3, fields,
-                                   {1: ("1", "9223372036854775808")})
+    cards = _bintable_with_scaling(
+        8, 3, fields, {1: ("1", "9223372036854775808")}
+    )
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, cards, data)
@@ -1876,10 +1926,15 @@ def test_scaling_read_column_unsigned_trick():
 
 def test_scaling_dtype_property_promotes():
     fields = [("U16", "1I"), ("F", "1J")]
-    cards = _bintable_with_scaling(6, 0, fields, {
-        1: ("1", "32768"),       # unsigned trick → u2
-        2: ("2.0", "10.0"),      # general → f8
-    })
+    cards = _bintable_with_scaling(
+        6,
+        0,
+        fields,
+        {
+            1: ("1", "32768"),  # unsigned trick → u2
+            2: ("2.0", "10.0"),  # general → f8
+        },
+    )
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, cards, b"")
@@ -1924,11 +1979,10 @@ def test_scaling_getitem_column_subset():
 
 def test_scaling_variable_length_unsigned_trick():
     """1PJ with TSCAL=1, TZERO=2^31 → each heap cell becomes a u4 ndarray."""
-    descriptors = (
-        struct.pack(">ii", 3, 0)
-        + struct.pack(">ii", 2, 12)
-    )
-    heap = struct.pack(">iii", -1, 0, 1) + struct.pack(">ii", -2**31, 2**31 - 1)  # noqa
+    descriptors = struct.pack(">ii", 3, 0) + struct.pack(">ii", 2, 12)
+    heap = struct.pack(">iii", -1, 0, 1) + struct.pack(
+        ">ii", -(2**31), 2**31 - 1
+    )  # noqa
     fields = [("V", "1PJ(10)")]
     row_width = 8
     naxis2 = 2
@@ -2006,4 +2060,5 @@ def test_scaling_variable_length_scale_false():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v"]))

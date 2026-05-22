@@ -13,8 +13,16 @@ top-level surface stays organized in one place.
 from ._rust import FITS, ImageHDU, TableHDU
 
 
-def read(filename, ext=None, *, rows=None, columns=None,
-         scale=True, mask_null=False, header=False):
+def read(
+    filename,
+    ext=None,
+    *,
+    rows=None,
+    columns=None,
+    scale=True,
+    mask_null=False,
+    header=False,
+):
     """
     Open `filename`, read data from one HDU, and return it.
 
@@ -66,8 +74,10 @@ def read(filename, ext=None, *, rows=None, columns=None,
 
         if isinstance(chosen, TableHDU):
             data = chosen.read(
-                rows=rows, columns=columns,
-                scale=scale, mask_null=mask_null,
+                rows=rows,
+                columns=columns,
+                scale=scale,
+                mask_null=mask_null,
             )
         elif isinstance(chosen, ImageHDU):
             data = chosen.read()

@@ -97,7 +97,7 @@ def test_set_bare_value_preserves_existing_comment():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["EXPTIME"] = (5.0, "exposure (s)")
-            fits[0].header["EXPTIME"] = 10.0   # bare value
+            fits[0].header["EXPTIME"] = 10.0  # bare value
         with rustfits.FITS(fname, "r") as fits:
             h = fits[0].header
             assert h["EXPTIME"] == 10.0
@@ -132,7 +132,7 @@ def test_update_existing_key_preserves_position():
             # cannot be set directly — see test_header_protected.py.)
             fits[0].header["OBJECT"] = "M31"
             keys_before = list(fits[0].header)
-            fits[0].header["OBJECT"] = "NGC 224"   # update existing
+            fits[0].header["OBJECT"] = "NGC 224"  # update existing
             keys_after = list(fits[0].header)
         # Same keys in the same order — only OBJECT's value changed.
         assert keys_before == keys_after
@@ -200,10 +200,12 @@ def test_update_with_dict_bare_values():
 def test_update_with_dict_value_comment_tuples():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
-            fits[0].header.update({
-                "EXPTIME": (5.0, "exposure (s)"),
-                "OBJECT":  ("M31", "target"),
-            })
+            fits[0].header.update(
+                {
+                    "EXPTIME": (5.0, "exposure (s)"),
+                    "OBJECT": ("M31", "target"),
+                }
+            )
         with rustfits.FITS(fname, "r") as fits:
             h = fits[0].header
             assert h["EXPTIME"] == 5.0
@@ -249,7 +251,7 @@ def test_setitem_lowercase_key_normalized_to_uppercase():
         with rustfits.FITS(fname, "r") as fits:
             h = fits[0].header
             assert h["EXPTIME"] == 5
-            assert h["exptime"] == 5     # lookup is case-insensitive too
+            assert h["exptime"] == 5  # lookup is case-insensitive too
             assert h["Exptime"] == 5
             # The card on disk is the uppercase form.
             card = next(c for c in h.cards if c.startswith("EXPTIME"))
@@ -295,7 +297,9 @@ def test_header_overflow_triggers_grow():
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             initial_cards = len(h.cards)
-            block_count = (initial_cards + CARDS_PER_BLOCK - 1) // CARDS_PER_BLOCK  # noqa
+            block_count = (
+                initial_cards + CARDS_PER_BLOCK - 1
+            ) // CARDS_PER_BLOCK  # noqa
             capacity = block_count * CARDS_PER_BLOCK
             slots_free = capacity - initial_cards
             for i in range(slots_free):

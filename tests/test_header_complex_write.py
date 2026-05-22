@@ -244,11 +244,13 @@ def test_complex_edit_rollback():
 def test_update_dict_with_complex_values():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
-            fits[0].header.update({
-                "A": complex(1.0, 2.0),
-                "B": (complex(3.0, 4.0), "imp"),
-                "C": 42,
-            })
+            fits[0].header.update(
+                {
+                    "A": complex(1.0, 2.0),
+                    "B": (complex(3.0, 4.0), "imp"),
+                    "C": 42,
+                }
+            )
 
             def check(hd):
                 assert hd["A"] == complex(1.0, 2.0)

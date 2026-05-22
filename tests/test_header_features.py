@@ -70,9 +70,7 @@ def header():
 
 def test_hierarch_keyword(header):
     assert header["ESO INS DET TEMP"] == 12.5
-    assert (
-        header.comment_of("ESO INS DET TEMP") == "instrument temperature"
-    )
+    assert header.comment_of("ESO INS DET TEMP") == "instrument temperature"
     assert header["ESO TEL ALT"] == -20.25
     # HIERARCH should not appear as a standalone key.
     assert "HIERARCH" not in header

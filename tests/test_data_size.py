@@ -131,9 +131,7 @@ def test_gcount_multiplies_data_size():
 
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 3
-            assert (
-                fits.hdus[2].header["EXTNAME"] == "after-gcount"
-            )
+            assert fits.hdus[2].header["EXTNAME"] == "after-gcount"
 
 
 # --------------------------- defaults still work ----------------------------
@@ -171,9 +169,7 @@ def test_image_hdu_unaffected_by_defaults():
 
         with rustfits.FITS(fname, "r") as fits:
             assert len(fits.hdus) == 2
-            assert (
-                fits.hdus[1].header["EXTNAME"] == "after-image"
-            )
+            assert fits.hdus[1].header["EXTNAME"] == "after-image"
 
 
 if __name__ == "__main__":

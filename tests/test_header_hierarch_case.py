@@ -139,7 +139,7 @@ def test_update_existing_key_keeps_original_spelling():
         with rustfits.FITS(fname, "r+") as fits:
             h = fits[0].header
             h["Eso Tel Airm Start"] = 1.0
-            h["ESO TEL AIRM START"] = 2.0   # same key, different case
+            h["ESO TEL AIRM START"] = 2.0  # same key, different case
             cards = h.cards
             # Original spelling preserved; new value committed.
             assert any(
@@ -180,8 +180,7 @@ def test_dict_update_existing_key_keeps_spelling():
             h["Eso Ins Det1 Gain"] = 1.5
             h.update({"ESO INS DET1 GAIN": 2.5})
             assert any(
-                c.startswith("HIERARCH Eso Ins Det1 Gain")
-                for c in h.cards
+                c.startswith("HIERARCH Eso Ins Det1 Gain") for c in h.cards
             )
             assert h["eso ins det1 gain"] == 2.5
 

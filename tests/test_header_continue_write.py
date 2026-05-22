@@ -97,7 +97,7 @@ def test_string_just_over_68_chars_uses_continue():
 def test_long_string_round_trip_no_comment():
     """200-char string round-trips through CONTINUE write/read."""
     with _new_file() as fname:
-        s = ("ABCDEFGHIJ" * 25)[:200]   # 200 chars
+        s = ("ABCDEFGHIJ" * 25)[:200]  # 200 chars
         with rustfits.FITS(fname, "r+") as fits:
             fits[0].header["LONG"] = s
 
@@ -137,8 +137,7 @@ def test_chain_uses_keyword_then_continue_cards():
                 cards = hd.cards
                 # Find the LONG card.
                 first_idx = next(
-                    i for i, c in enumerate(cards)
-                    if c.startswith("LONG")
+                    i for i, c in enumerate(cards) if c.startswith("LONG")
                 )
                 # All cards immediately after, until the chain ends, must be
                 # CONTINUE cards.
@@ -270,12 +269,11 @@ def test_new_chain_lands_before_end():
                 assert cards[-1].startswith("END")
                 # The chain occupies the last few cards before END.
                 first_idx = next(
-                    i for i, c in enumerate(cards)
-                    if c.startswith("LONG")
+                    i for i, c in enumerate(cards) if c.startswith("LONG")
                 )
                 # Every card from first_idx to second-to-last is part of the
                 # chain.
-                for card in cards[first_idx + 1:-1]:
+                for card in cards[first_idx + 1 : -1]:
                     assert card.startswith("CONTINUE")
 
             _check_both(fname, fits, check)

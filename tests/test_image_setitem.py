@@ -24,9 +24,7 @@ def _new_image(tmpdir, dtype, dims, fill=0):
         fits.create_image_hdu(dtype=dtype, dims=tuple(dims))
         if fill != 0:
             n = int(np.prod(dims))
-            fits.hdus[0].write(
-                np.full(n, fill, dtype=dtype).reshape(dims)
-            )
+            fits.hdus[0].write(np.full(n, fill, dtype=dtype).reshape(dims))
     return fname
 
 

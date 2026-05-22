@@ -60,7 +60,7 @@ def test_overflow_does_not_taint():
             slots_free = block_count * CARDS_PER_BLOCK - initial
             for i in range(slots_free):
                 h[f"PAD{i:04d}"] = i
-            h["OVERFLOW"] = 1   # triggers grow, succeeds
+            h["OVERFLOW"] = 1  # triggers grow, succeeds
 
             # Subsequent reads still work — file is not tainted.
             assert h["OVERFLOW"] == 1
@@ -114,6 +114,7 @@ def test_tainted_image_read_refuses():
 
 def test_tainted_image_write_refuses():
     import numpy as np
+
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:
             fits[0]._force_taint()

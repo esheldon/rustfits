@@ -56,7 +56,7 @@ def test_extend_primary_image_preserves_later_hdu_data():
         with rustfits.FITS(fname, "r+") as fits:
             new = np.arange(3 * 7, dtype="i4").reshape(3, 7) + 1000
             fits[0].extend(new)
-            assert fits[0].header["NAXIS2"] == 8   # 5 + 3
+            assert fits[0].header["NAXIS2"] == 8  # 5 + 3
             # Both subsequent HDUs intact.
             np.testing.assert_array_equal(fits[1].read(), arrays[1])
             np.testing.assert_array_equal(fits[2].read(), arrays[2])
@@ -79,7 +79,7 @@ def test_extend_middle_image_shifts_only_later_hdus():
         with rustfits.FITS(fname, "r+") as fits:
             new = (np.arange(4 * 11, dtype="f8") * 0.25).reshape(4, 11)
             fits[1].extend(new)
-            assert fits[1].header["NAXIS2"] == 7   # 3 + 4
+            assert fits[1].header["NAXIS2"] == 7  # 3 + 4
             # HDU 0 unchanged.
             np.testing.assert_array_equal(fits[0].read(), arrays[0])
             # HDU 2 shifted forward but data preserved.
@@ -193,7 +193,7 @@ def test_two_sequential_extends_on_middle_hdu_compose():
             fits[1].extend(new1)
             new2 = (np.arange(3 * 11, dtype="f8") + 200).reshape(3, 11)
             fits[1].extend(new2)
-            assert fits[1].header["NAXIS2"] == 8   # 3 + 2 + 3
+            assert fits[1].header["NAXIS2"] == 8  # 3 + 2 + 3
             np.testing.assert_array_equal(fits[2].read(), arrays[2])
 
         with rustfits.FITS(fname, "r") as fits:

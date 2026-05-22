@@ -159,7 +159,10 @@ def test_tile_shape_explicit():
     """Explicit ZTILE1, ZTILE2 → returned in numpy order."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 12), "i4", tile_dims=(5, 6),
+            tmpdir,
+            (10, 12),
+            "i4",
+            tile_dims=(5, 6),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -171,7 +174,10 @@ def test_n_tiles_explicit():
     """ceil(10/5) * ceil(12/6) = 2 * 2 = 4."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 12), "i4", tile_dims=(5, 6),
+            tmpdir,
+            (10, 12),
+            "i4",
+            tile_dims=(5, 6),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -182,7 +188,10 @@ def test_n_tiles_non_aligned_divisor():
     """ceil(10/3) * ceil(12/4) = 4 * 3 = 12 (tiles overhang)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 12), "i4", tile_dims=(3, 4),
+            tmpdir,
+            (10, 12),
+            "i4",
+            tile_dims=(3, 4),
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -225,7 +234,10 @@ def test_extname_when_unset_returns_none():
 def test_extname_when_set():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (4, 4), "i4", extname="COMP_SCI",
+            tmpdir,
+            (4, 4),
+            "i4",
+            extname="COMP_SCI",
         )
         with rustfits.FITS(fname, "r") as fits:
             hdu = fits[1]
@@ -279,7 +291,10 @@ def test_header_returns_bintable_view():
 def test_repr_contains_compression_info():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname, _ = _write_rice(
-            tmpdir, (10, 12), "i4", tile_dims=(5, 6),
+            tmpdir,
+            (10, 12),
+            "i4",
+            tile_dims=(5, 6),
         )
         with rustfits.FITS(fname, "r") as fits:
             r = repr(fits[1])

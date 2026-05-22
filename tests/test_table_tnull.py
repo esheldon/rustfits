@@ -18,7 +18,7 @@ import pytest
 import rustfits
 
 
-CARDS_PER_BLOCK = 36   # 2880 / 80
+CARDS_PER_BLOCK = 36  # 2880 / 80
 BLOCK = 2880
 
 
@@ -146,8 +146,8 @@ def test_tnull_int32_basic():
 
 def test_tnull_int64_basic():
     fields = [("X", "1K")]
-    data = struct.pack(">qqq", 10**10, -2**63, 10**10 + 1)
-    cards = _bintable_cards(8, 3, fields, extras=[_tnull_card(1, -2**63)])
+    data = struct.pack(">qqq", 10**10, -(2**63), 10**10 + 1)
+    cards = _bintable_cards(8, 3, fields, extras=[_tnull_card(1, -(2**63))])
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_bintable(fname, cards, data)
@@ -268,8 +268,11 @@ def test_tnull_with_unsigned_int_trick():
     # [32768, 0, 65535, 0]
     data = struct.pack(">hhhh", 0, -32768, 32767, -32768)
     fields = [("X", "1I")]
-    extras = [_tscal_card(1, "1"), _tzero_card(1, "32768"),
-              _tnull_card(1, -32768)]
+    extras = [
+        _tscal_card(1, "1"),
+        _tzero_card(1, "32768"),
+        _tnull_card(1, -32768),
+    ]
     cards = _bintable_cards(2, 4, fields, extras=extras)
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -325,10 +328,7 @@ def test_tnull_scale_false():
 def test_tnull_repeat_gt_1_per_element():
     """3J column: per-element mask, shape (n_rows, 3)."""
     fields = [("X", "3J")]
-    rows = (
-        struct.pack(">iii", 1, -1, 3)
-        + struct.pack(">iii", -1, 5, -1)
-    )
+    rows = struct.pack(">iii", 1, -1, 3) + struct.pack(">iii", -1, 5, -1)
     cards = _bintable_cards(12, 2, fields, extras=[_tnull_card(1, -1)])
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
@@ -463,10 +463,7 @@ def test_read_column_tnull_multi_element():
     read_column with mask_null=True on a 3J col → MaskedArray shape
     (n_rows, 3) with per-element mask."""
     fields = [("X", "3J")]
-    rows = (
-        struct.pack(">iii", 1, -1, 3)
-        + struct.pack(">iii", -1, 5, -1)
-    )
+    rows = struct.pack(">iii", 1, -1, 3) + struct.pack(">iii", -1, 5, -1)
     cards = _bintable_cards(12, 2, fields, extras=[_tnull_card(1, -1)])
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
