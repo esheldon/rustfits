@@ -26,8 +26,13 @@ const N_RANDOM: usize = 10000;
 // value still fits in i32.
 const NULL_VALUE_I32: i32 = -2147483647;
 
-// Reverse-dither methods recognised by ZQUANTIZ.  Absence of the
-// keyword is the same as `NoDither` per cfitsio's convention.
+// ZQUANTIZ values that imply some form of quantization was
+// applied.  Absence of the keyword defaults to NoDither when
+// ZSCALE/ZZERO columns are present (cfitsio's convention); when
+// ZQUANTIZ='NONE' (or the columns are absent) no quantization
+// happened at all — the on-disk payload is raw float bytes, not
+// quantized integers, and the caller takes a different code path
+// that skips this module entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DitherMethod {
     NoDither,
@@ -35,11 +40,32 @@ pub(crate) enum DitherMethod {
     SubtractiveDither2,
 }
 
-pub(crate) fn parse_dither_method(zquantiz: Option<&str>) -> PyResult<DitherMethod> {
+// Parse ZQUANTIZ.  Returns `Some(method)` when quantization was
+// applied, `None` when it was not.
+//
+// Per the FITS Tile Compression Convention (Pence et al. 2010
+// plus WG revisions), ZQUANTIZ takes exactly three values:
+// `NO_DITHER`, `SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`.
+// When no quantization is applied the Convention says the
+// keyword should simply be omitted.
+//
+// `NONE` is NOT in the spec but is what astropy's CompImageHDU
+// writes for unquantized float-compressed HDUs.  cfitsio reads
+// it tolerantly.  We accept it for real-world compatibility —
+// astropy-written files in the wild use it.
+//
+// Convention-correct "no quantization" is also signalled by
+// missing ZSCALE/ZZERO columns (regardless of ZQUANTIZ); the
+// caller checks that separately.  Absent ZQUANTIZ + present
+// ZSCALE/ZZERO defaults to NO_DITHER per cfitsio's convention.
+pub(crate) fn parse_dither_method(
+    zquantiz: Option<&str>,
+) -> PyResult<Option<DitherMethod>> {
     match zquantiz.map(|s| s.trim()) {
-        None | Some("NO_DITHER") => Ok(DitherMethod::NoDither),
-        Some("SUBTRACTIVE_DITHER_1") => Ok(DitherMethod::SubtractiveDither1),
-        Some("SUBTRACTIVE_DITHER_2") => Ok(DitherMethod::SubtractiveDither2),
+        Some("NONE") => Ok(None),
+        None | Some("NO_DITHER") => Ok(Some(DitherMethod::NoDither)),
+        Some("SUBTRACTIVE_DITHER_1") => Ok(Some(DitherMethod::SubtractiveDither1)),
+        Some("SUBTRACTIVE_DITHER_2") => Ok(Some(DitherMethod::SubtractiveDither2)),
         Some(other) => Err(PyValueError::new_err(format!(
             "unsupported ZQUANTIZ '{}'", other
         ))),
@@ -260,6 +286,24 @@ mod tests {
             .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(vals, vec![60.0, 110.0, 160.0]);
+    }
+
+    #[test]
+    fn parse_dither_method_handles_no_quantization_signals() {
+        // 'NONE' (astropy's marker) → None (no quantization).
+        assert_eq!(parse_dither_method(Some("NONE")).unwrap(), None);
+        // Whitespace tolerant.
+        assert_eq!(parse_dither_method(Some(" NONE ")).unwrap(), None);
+        // Absent ZQUANTIZ defaults to NO_DITHER (cfitsio's convention
+        // when ZSCALE/ZZERO are present; caller separately checks
+        // those columns).
+        assert_eq!(parse_dither_method(None).unwrap(),
+                   Some(DitherMethod::NoDither));
+        // Explicit NO_DITHER.
+        assert_eq!(parse_dither_method(Some("NO_DITHER")).unwrap(),
+                   Some(DitherMethod::NoDither));
+        // Unknown value rejects.
+        assert!(parse_dither_method(Some("SOMETHING_ELSE")).is_err());
     }
 
     #[test]

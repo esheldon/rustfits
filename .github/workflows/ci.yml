@@ -37,20 +37,26 @@ jobs:
 
   # ----- Rust unit tests --------------------------------------------
   # cargo test runs `#[cfg(test)] mod tests` blocks throughout the
-  # crate — pure-Rust logic with no Python in the loop (PRNG, byte
-  # conversions, parsers).  No conda env needed; just the Rust
-  # toolchain and the cargo cache.
+  # crate — pure-Rust logic (PRNG, byte conversions, parsers).  The
+  # test binary links libpython via PyO3 even though the test
+  # functions themselves don't call Python, so we need Python on
+  # PATH so tools/cargo-test.sh can find libpython's directory via
+  # sysconfig.LIBDIR and prepend it to LD_LIBRARY_PATH.
   rust-test:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python (so libpython is resolvable)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test
+      - name: cargo test (via libpython-aware wrapper)
+        run: tools/cargo-test.sh
 
   # ----- Test matrix ------------------------------------------------
   # Linux only for now (Python 3.12 + 3.14).  macOS was originally

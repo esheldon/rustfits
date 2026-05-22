@@ -321,6 +321,100 @@ def test_3d_quantized():
         _arrays_match(got, ref)
 
 
+# -------------------- unquantized float HDU ------------------------
+#
+# When ZQUANTIZ='NONE' (astropy's convention for "no quantization
+# happened") or ZSCALE/ZZERO columns are absent, the on-disk bytes
+# are raw f4/f8 (compressed by GZIP) — not quantized i32.  The
+# reader must skip dequant in this case and decode at the float
+# bytepix.  Real-world astropy files use this configuration; we hit
+# it on a 12 GB GZIP_2 + f8 sky-mosaic file in the wild.
+
+astropy_fits = pytest.importorskip("astropy.io.fits")
+
+
+def test_unquantized_float_astropy_no_dither_no_columns():
+    """
+    astropy's CompImageHDU with quantize_level=0 writes
+    ZQUANTIZ='NO_DITHER' but emits NO ZSCALE/ZZERO columns —
+    the bytes in COMPRESSED_DATA are raw GZIP-compressed floats.
+    Reader must take the no-quant path (missing columns → dequant
+    skipped).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "t.fits.fz")
+        data = np.arange(64, dtype="f8").reshape(8, 8) * 1.5 - 17.25
+        hdul = astropy_fits.HDUList(
+            [
+                astropy_fits.PrimaryHDU(),
+                astropy_fits.CompImageHDU(
+                    data,
+                    compression_type="GZIP_1",
+                    tile_shape=(4, 4),
+                    quantize_level=0.0,
+                ),
+            ]
+        )
+        hdul.writeto(fname, overwrite=True)
+        with rustfits.FITS(fname, "r") as f:
+            got = f[1].read()
+        assert got.dtype == np.float64
+        np.testing.assert_array_equal(got, data)
+
+
+@pytest.mark.parametrize("compress", ["GZIP_1", "GZIP_2"])
+@pytest.mark.parametrize("dtype", ["f4", "f8"])
+def test_unquantized_float_matrix(compress, dtype):
+    """
+    Unquantized float reads work for both GZIP variants and both
+    float widths.  Bit-exact round-trip since no quantization is
+    in play.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "t.fits.fz")
+        rng = np.random.RandomState(7)
+        data = rng.normal(0, 1, (10, 10)).astype(dtype)
+        hdul = astropy_fits.HDUList(
+            [
+                astropy_fits.PrimaryHDU(),
+                astropy_fits.CompImageHDU(
+                    data,
+                    compression_type=compress,
+                    tile_shape=(5, 5),
+                    quantize_level=0.0,
+                ),
+            ]
+        )
+        hdul.writeto(fname, overwrite=True)
+        with rustfits.FITS(fname, "r") as f:
+            got = f[1].read()
+        assert got.dtype == data.dtype
+        np.testing.assert_array_equal(got, data)
+
+
+def test_unquantized_float_slice():
+    """Slicing an unquantized float HDU also takes the no-quant
+    path and matches astropy's read exactly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "t.fits.fz")
+        data = np.arange(144, dtype="f4").reshape(12, 12)
+        hdul = astropy_fits.HDUList(
+            [
+                astropy_fits.PrimaryHDU(),
+                astropy_fits.CompImageHDU(
+                    data,
+                    compression_type="GZIP_1",
+                    tile_shape=(4, 4),
+                    quantize_level=0.0,
+                ),
+            ]
+        )
+        hdul.writeto(fname, overwrite=True)
+        with rustfits.FITS(fname, "r") as f:
+            got = f[1][3:9, 5:10]
+        np.testing.assert_array_equal(got, data[3:9, 5:10])
+
+
 # -------------------- scale=False on quantized HDU -----------------
 
 
