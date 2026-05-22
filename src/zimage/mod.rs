@@ -4,6 +4,7 @@
 // and GZIP_2; HCOMPRESS_1 / PLIO_1 are Phase 6+ and still raise.
 
 pub(crate) mod gzip;
+pub(crate) mod quantize;
 pub(crate) mod rice;
 
 use pyo3::prelude::*;
@@ -18,12 +19,17 @@ pub(crate) enum CompressionAlgorithm {
     Plio1,
 }
 
+// Map ZCMPTYPE to a CompressionAlgorithm.  Accepts the FITS Tile
+// Compression Convention names plus the older cfitsio synonyms
+// (RICE_ONE, GZIP, HCOMPRESS) that some encoders still emit —
+// fitsio in particular writes RICE_ONE for some quantization
+// configurations.
 pub(crate) fn parse_algorithm(zcmptype: &str) -> PyResult<CompressionAlgorithm> {
     match zcmptype.trim() {
-        "RICE_1" => Ok(CompressionAlgorithm::Rice1),
-        "GZIP_1" => Ok(CompressionAlgorithm::Gzip1),
+        "RICE_1" | "RICE_ONE" => Ok(CompressionAlgorithm::Rice1),
+        "GZIP_1" | "GZIP" => Ok(CompressionAlgorithm::Gzip1),
         "GZIP_2" => Ok(CompressionAlgorithm::Gzip2),
-        "HCOMPRESS_1" => Ok(CompressionAlgorithm::Hcompress1),
+        "HCOMPRESS_1" | "HCOMPRESS" => Ok(CompressionAlgorithm::Hcompress1),
         "PLIO_1" => Ok(CompressionAlgorithm::Plio1),
         other => Err(PyValueError::new_err(format!(
             "unknown ZCMPTYPE '{}'", other

@@ -35,6 +35,23 @@ jobs:
         shell: bash -el {0}
         run: ruff check
 
+  # ----- Rust unit tests --------------------------------------------
+  # cargo test runs `#[cfg(test)] mod tests` blocks throughout the
+  # crate — pure-Rust logic with no Python in the loop (PRNG, byte
+  # conversions, parsers).  No conda env needed; just the Rust
+  # toolchain and the cargo cache.
+  rust-test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test
+
   # ----- Test matrix ------------------------------------------------
   # Linux only for now (Python 3.12 + 3.14).  macOS was originally
   # included but conda-forge's fitsio/cfitsio build crashes during

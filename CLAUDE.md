@@ -429,13 +429,15 @@ MaskedArray with `nomask` for consistent return type.  Float BITPIX +
 on floating-point arrays.
 
 **Missing.**
-- **Tile-compressed image read** — Phases 1-4 of the ZIMAGE
+- **Tile-compressed image read** — Phases 1-5 of the ZIMAGE
   roadmap have landed (`CompressedImageHDU` pyclass, dispatch,
   accessors, RICE_1 / GZIP_1 / GZIP_2 whole-image read, slicing
   via `__getitem__`, bytes-bound LRU tile cache, GZIP and
-  uncompressed fallback columns).  Phase 5 covers quantized
-  floats, Phase 6+ HCOMPRESS/PLIO + writes.  Full details in
-  the "Tile-compressed images (ZIMAGE)" section below.
+  uncompressed fallback columns, quantized-float read with
+  NO_DITHER / SUBTRACTIVE_DITHER_1 / SUBTRACTIVE_DITHER_2 +
+  NaN preservation for both f4 and f8).  Phase 6+ covers
+  HCOMPRESS/PLIO + writes.  Full details in the "Tile-compressed
+  images (ZIMAGE)" section below.
 
 ### Image write
 
@@ -775,13 +777,11 @@ BINTABLE with `ZIMAGE=T` plus Z-prefixed image-shape and tile-
 shape cards.  The user-facing API mirrors `ImageHDU`; internally
 the reader walks tiles and decodes them.
 
-**Status:** Phases 1-4 shipped.  Phase 5 (quantized floats —
-ZSCALE/ZZERO per-tile, dithered or not) is the next pickup;
-Phases 6+ cover HCOMPRESS/PLIO + the write side.  Test
-fixtures use fitsio for the normal-path round-trips and
-hand-crafted bytes for the synthetic fallback-column cases
-(astropy is also in the env if richer fixtures are needed
-later).
+**Status:** Phases 1-5 shipped.  Phase 6+ cover HCOMPRESS_1 /
+PLIO_1 and the write side.  Test fixtures use fitsio for the
+normal-path round-trips and hand-crafted bytes for the
+synthetic fallback-column cases (astropy is also in the env
+if richer fixtures are needed later).
 
 Implementation lives in `src/hdu_image_compressed.rs` (the
 pyclass + dispatch) and `src/zimage/` (algorithm-specific
@@ -947,16 +947,85 @@ the cfitsio constraint is exactly; if the spec allows it,
 our reader is already fine and the only missing piece is
 test fixtures (hand-crafted, or maybe astropy can do it).
 
-**Phase 5 — Quantized floats.**  ZSCALE / ZZERO per-tile
-columns; ZQUANTIZ + ZDITHER0 dither variants.  Trickiest part
-is the dither PRNG (specific to the FITS spec).  Also folded
-in: **`parse_rice_params` widens into a `CompressionContext`**
-that carries per-algorithm params plus optional quantization-
-column offsets (ZSCALE/ZZERO/ZBLANK are per-tile BINTABLE
-columns, not header ZNAMEn/ZVALn pairs).  The outer tile loop
-gains a "apply per-tile dequantization after decode" step;
-overall flow (find columns → tile loop → decode → place) is
-unchanged.
+**Phase 5 — Quantized floats.**  Done.  Reader handles
+ZBITPIX=-32/-64 with `NO_DITHER`, `SUBTRACTIVE_DITHER_1`, and
+`SUBTRACTIVE_DITHER_2` quantization modes.  Bit-for-bit match
+against cfitsio on the full {RICE_1, GZIP_1, GZIP_2} ×
+{f4, f8} × {NO_DITHER, DITHER_1, DITHER_2} matrix.
+
+*Code layout.*  All quantization logic lives in
+`src/zimage/quantize.rs`:
+- `DitherMethod` enum + `parse_dither_method`.
+- `random_table()` initialises the 10000-element Park-Miller
+  table on first use (multiplier 16807, modulus 2^31-1,
+  seed 1).  Lazy via `OnceLock`.
+- `DitherStream` reproduces cfitsio's exact iseed / nextrand
+  advancement (initial `nextrand = floor(table[iseed] * 500)`
+  jump on roll-over) — required for byte-exact agreement with
+  cfitsio's output.
+- `dequantize_to_f32` / `_f64` apply the per-tile formula
+  `(stored - dither + 0.5) * scale + zero`.  For DITHER_2 the
+  reserved value `-2147483647` becomes NaN.
+- 3 unit tests at the bottom of the module (Park-Miller
+  anchor check, NO_DITHER linearity, DITHER_2 NaN handling).
+
+*Integration in `hdu_image_compressed.rs`.*
+- `DataColumns` widened to also hold `zscale_offset_in_row`
+  and `zzero_offset_in_row` (fixed-width `1D` columns located
+  by walking TTYPEn).
+- `QuantContext { method, zdither0, zscale_offset_in_row,
+  zzero_offset_in_row, output_zbitpix }` built when ZBITPIX is
+  float; passed through the tile loop.
+- A new `fetch_tile_payload_and_quant` reads the heap payload
+  AND the per-tile ZSCALE/ZZERO doubles under the same file
+  lock acquire.  Falls back to the old `fetch_tile_payload`
+  helper for the integer path (still present, kept simple).
+- `get_or_decode_tile` decides bytepix and effective ZBITPIX
+  for the decoder, then runs dequantization when the payload
+  came from the primary column on a float HDU.
+- Both `read_compressed_image_data` and
+  `slice_compressed_image` route through the new path; the
+  cache stores final-output bytes (f4/f8 for quantized HDUs),
+  same as the integer path.
+
+*Decoder-vs-output ZBITPIX split.*  Two distinct values are
+in play, and conflating them is a tempting bug:
+- `stored_zbitpix`: what the *decoder* casts to — 32 (i32)
+  for quantized float, same as image ZBITPIX otherwise.
+- `output_zbitpix`: the image-side dtype — -32 / -64 for
+  quantized float, integer ZBITPIX otherwise.
+- `bytepix`: 4 for quantized float (matches stored i32),
+  matches stored_zbitpix/8 otherwise.
+
+*Lossless-fallback convention.*  cfitsio's
+GZIP_COMPRESSED_DATA fallback (and UNCOMPRESSED_DATA) for a
+*float* HDU stores **raw original floats**, not quantized
+i32.  This is the "lossless backup when quantization would
+lose too much" path.  `TilePayload` was split into
+`PrimaryCompressed` / `FallbackCompressed` / `Uncompressed`
+variants so `get_or_decode_tile` can decide: dequant only
+runs when the *primary* column produced bytes.  For the
+fallback paths on float HDUs, bytes are already physical
+floats — the decoder is called with the float bytepix
+(4 or 8 matching ZBITPIX) and dequant is skipped.
+
+*ZCMPTYPE alias accepted.*  fitsio writes `ZCMPTYPE='RICE_ONE'`
+for some quantized-RICE configurations (an older cfitsio
+synonym for `RICE_1`).  `parse_algorithm` in
+`src/zimage/mod.rs` now accepts both names plus other older
+cfitsio synonyms (`GZIP` for `GZIP_1`, `HCOMPRESS` for
+`HCOMPRESS_1`).
+
+*Known follow-ups not blocking the phase:*
+- Header-level ZBLANK on integer compressed images (analog
+  of `mask_blank` on uncompressed) still raises with the
+  "Phase 2" message.  Lift when there's a use case.
+- Per-tile ZBLANK column (column-form rather than header-
+  level) — read code locates it (`find_data_columns` could be
+  widened) but `QuantContext` doesn't carry it yet.  None of
+  the matrix tests exercise this configuration; cfitsio
+  typically emits a header-level ZBLANK for DITHER_2 rather
+  than a per-tile column.
 
 **Phase 6+ — HCOMPRESS_1, PLIO_1, then writes.**  Both
 algorithms are real implementation effort and individually
