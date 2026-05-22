@@ -142,17 +142,23 @@ fn sign_extend(val: u64, nbits: u32) -> i64 {
     ((val << shift) as i64) >> shift
 }
 
-// Decode one RICE_1-compressed tile.  Returns `n_pixels` decoded
+// Decode one RICE_1-compressed tile to target-dtype bytes in
+// numpy native byte order.  The raw decode produces `n_pixels`
 // values widened to i64 in the order the encoder consumed them
-// (row-major FITS order within the tile).  The caller casts the
-// values back to the target dtype and copies them into the
-// assembled output array.
-pub(crate) fn decode(
+// (row-major FITS order within the tile); we then cast each
+// value down to the storage dtype (matching ZBITPIX) and write
+// it out in native byte order.
+//
+// `zbitpix` must be one of 8/16/32/64 — float ZBITPIX is rejected
+// upstream because the decompressor needs the quantization
+// (ZSCALE/ZZERO) layer that Phase 5 will add.
+pub(crate) fn decode_rice(
     compressed: &[u8],
     n_pixels: usize,
     bytepix: u32,
     blocksize: u32,
-) -> PyResult<Vec<i64>> {
+    zbitpix: i32,
+) -> PyResult<Vec<u8>> {
     if n_pixels == 0 {
         return Ok(Vec::new());
     }
@@ -216,5 +222,44 @@ pub(crate) fn decode(
             out.len(), n_pixels
         )));
     }
-    Ok(out)
+    Ok(cast_i64_to_target_bytes(&out, zbitpix))
+}
+
+// Cast a Vec<i64> of decoded pixel values to bytes in the target
+// (stored) dtype, numpy-native byte order.  ZBITPIX must be one
+// of the supported integer values (8/16/32/64); float ZBITPIX is
+// rejected upstream because the quantization layer (ZSCALE/ZZERO,
+// Phase 5) hasn't landed yet.
+fn cast_i64_to_target_bytes(values: &[i64], zbitpix: i32) -> Vec<u8> {
+    match zbitpix {
+        8 => {
+            let mut out = Vec::with_capacity(values.len());
+            for &v in values {
+                out.push(v as u8);
+            }
+            out
+        }
+        16 => {
+            let mut out = Vec::with_capacity(values.len() * 2);
+            for &v in values {
+                out.extend_from_slice(&(v as i16).to_ne_bytes());
+            }
+            out
+        }
+        32 => {
+            let mut out = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                out.extend_from_slice(&(v as i32).to_ne_bytes());
+            }
+            out
+        }
+        64 => {
+            let mut out = Vec::with_capacity(values.len() * 8);
+            for &v in values {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            out
+        }
+        _ => Vec::new(), // unreachable: zbitpix validated upstream
+    }
 }

@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.28" }
 lru = "0.18"
+flate2 = "1"

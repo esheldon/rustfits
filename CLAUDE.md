@@ -429,13 +429,13 @@ MaskedArray with `nomask` for consistent return type.  Float BITPIX +
 on floating-point arrays.
 
 **Missing.**
-- **Tile-compressed image read** — Phases 1-3 of the ZIMAGE roadmap
-  have landed (`CompressedImageHDU` pyclass, dispatch, accessors,
-  RICE_1 whole-image read, slicing via `__getitem__`, bytes-bound
-  LRU tile cache).  Phase 4 (GZIP_1/GZIP_2 + fallback columns) is
-  the next chunk; Phase 5 covers quantized floats, Phase 6+
-  HCOMPRESS/PLIO + writes.  Full details in the "Tile-compressed
-  images (ZIMAGE)" section below.
+- **Tile-compressed image read** — Phases 1-4 of the ZIMAGE
+  roadmap have landed (`CompressedImageHDU` pyclass, dispatch,
+  accessors, RICE_1 / GZIP_1 / GZIP_2 whole-image read, slicing
+  via `__getitem__`, bytes-bound LRU tile cache, GZIP and
+  uncompressed fallback columns).  Phase 5 covers quantized
+  floats, Phase 6+ HCOMPRESS/PLIO + writes.  Full details in
+  the "Tile-compressed images (ZIMAGE)" section below.
 
 ### Image write
 
@@ -775,13 +775,13 @@ BINTABLE with `ZIMAGE=T` plus Z-prefixed image-shape and tile-
 shape cards.  The user-facing API mirrors `ImageHDU`; internally
 the reader walks tiles and decodes them.
 
-**Status:** Phases 1-3 shipped; Phase 4 (GZIP_1/GZIP_2 +
-fallback columns) is the next pickup.  Detailed Phase 4 plan
-is below — it includes file layout, the trait-signature
-refactor required to accommodate GZIP's byte-oriented output,
-the fallback-column data-flow, and exactly which files to
-touch.  Test fixtures use fitsio (`pytest.importorskip` —
-already a dev dep in the env).
+**Status:** Phases 1-4 shipped.  Phase 5 (quantized floats —
+ZSCALE/ZZERO per-tile, dithered or not) is the next pickup;
+Phases 6+ cover HCOMPRESS/PLIO + the write side.  Test
+fixtures use fitsio for the normal-path round-trips and
+hand-crafted bytes for the synthetic fallback-column cases
+(astropy is also in the env if richer fixtures are needed
+later).
 
 Implementation lives in `src/hdu_image_compressed.rs` (the
 pyclass + dispatch) and `src/zimage/` (algorithm-specific
@@ -872,176 +872,80 @@ a missed tile happens under the file lock per tile, but decode
 runs without the file lock — multi-threaded callers don't
 serialize through long decode runs.
 
-**Phase 4 — GZIP_1 / GZIP_2 + fallback columns.**  Next up.
-Pure DEFLATE-based codecs, plus the multi-column refactor.
+**Phase 4 — GZIP_1 / GZIP_2 + fallback columns.**  Done.
+Decoders in `src/zimage/gzip.rs`; trait widened to return
+target-dtype native-order bytes; data-column lookup widened
+to find primary + optional GZIP + optional UNCOMPRESSED
+fallbacks; per-tile dispatch picks the first non-empty
+column.
 
-*Code layout.*  New file `src/zimage/gzip.rs` exposing
-`decode_gzip1(...)` and `decode_gzip2(...)`.  Add `flate2 = "1"`
-to `Cargo.toml` (active crate, well-maintained, pure-Rust
-DEFLATE).  Update `src/zimage/mod.rs` dispatch:
-`CompressionAlgorithm::Gzip1`/`Gzip2` route to the new
-functions instead of raising the "not yet implemented" error
-they raise today.
+*Trait shape.*  `decode_tile_to_i64` was renamed to
+`decode_tile_to_bytes(algorithm, compressed, n_pixels,
+bytepix, blocksize, zbitpix) -> PyResult<Vec<u8>>`.  Each
+decoder owns the entire bytes-to-bytes path including the
+target-dtype cast and host-endian byteswap; the caller just
+caches and places the bytes:
+- RICE: bitstream decode → `cast_i64_to_target_bytes` (now
+  living in rice.rs).
+- GZIP_1: gzip decompress → byteswap (`!cfg!(target_endian
+  = "big")`).
+- GZIP_2: gzip decompress → reverse byte-shuffle → byteswap.
 
-*Trait refactor.*  Currently `decode_tile_to_i64` returns
-`Vec<i64>` and the caller (`get_or_decode_tile` in
-hdu_image_compressed.rs) casts to target-dtype bytes via
-`cast_i64_to_target_bytes`.  That signature is awkward for
-GZIP, whose decompressed output is *already* pixel bytes in
-big-endian on-disk order.  Refactor: rename to
-`decode_tile_to_bytes(...) -> PyResult<Vec<u8>>` returning
-target-dtype bytes in **numpy native byte order**.  Each
-decoder takes responsibility for the final-byte-order layout:
-- RICE: existing decode → `cast_i64_to_target_bytes` (move
-  the helper into rice.rs).
-- GZIP_1: `flate2::Decompress` over the compressed bytes →
-  byteswap big-endian → native bytes.
-- GZIP_2: decompress → un-shuffle bytes (see below) →
-  byteswap → native bytes.
-After the refactor, `cast_i64_to_target_bytes` lives only in
-rice.rs and isn't called from hdu_image_compressed.rs at all.
+*Framing — the spec-vs-reality gotcha.*  The original Phase
+4 plan in this file claimed cfitsio wrote a **zlib** stream
+(magic `0x78 0x9C`) and recommended `ZlibDecoder`.  That was
+wrong: cfitsio calls `deflateInit2` with `windowBits = 15 +
+16`, which selects **gzip** framing (magic `0x1F 0x8B` plus
+the CRC32/ISIZE footer).  We use `flate2::read::GzDecoder`
+in `src/zimage/gzip.rs`; the framing check at the top of
+the test suite confirms this is what fitsio actually writes.
+Future code reading or producing tile-compressed gzip payloads
+should use gzip framing, not raw zlib.
 
-*GZIP_1 algorithm.*  DEFLATE-compressed stream of the tile's
-pixels laid out as raw bytes in **FITS big-endian byte
-order** (NAXIS1 = fast axis varies fastest, same as RICE).
-Decode:
-1. `flate2::read::ZlibDecoder` or `GzDecoder` — but the FITS
-   spec uses the raw zlib/deflate stream, no gzip envelope.
-   `ZlibDecoder` is the right one (handles the standard zlib
-   wrapper that fitsio writes).  Confirm by inspecting a
-   fitsio-written file's first compressed bytes — should
-   start with the zlib magic `0x78 0x9C` (default
-   compression) rather than the gzip magic `0x1F 0x8B`.
-2. Decompressed length = `n_pixels * bytepix` bytes.
-3. Byteswap each `bytepix`-sized chunk in place to native
-   order (use the existing `byteswap_in_place` helper from
-   `src/common.rs` — already a `pub(crate)` symbol).
+*Fallback columns.*  `find_compressed_data_column` became
+`find_data_columns` returning `DataColumns { primary,
+gzip_fallback, uncompressed_fallback }`.  Per-tile dispatch
+lives in `fetch_tile_payload`: it reads the primary
+descriptor first and, if nelements is 0, falls through to
+the GZIP fallback and then the UNCOMPRESSED fallback.  The
+return type is a `TilePayload` enum (`Compressed { bytes,
+algorithm }` vs `Uncompressed { bytes }`) so `get_or_decode_tile`
+knows whether to call the decoder dispatch or just byteswap.
 
-*GZIP_2 byte-shuffle.*  Same as GZIP_1 but with a byte-
-shuffle preprocessor on encode.  The shuffle separates each
-pixel's bytes by significance: all most-significant bytes
-first, then all next-most-significant, ..., then all least-
-significant.  This makes high-order bytes (typically more
-correlated) compress better.  Decode shuffle reverse:
+`ColumnInfo` carries `inner_byte_width` so the descriptor's
+`nelements` field converts to a byte count correctly even
+when the column's inner type isn't byte (`UNCOMPRESSED_DATA`
+can be `1PI`/`1PJ` matching the pixel type, in which case
+nelements counts pixels not bytes).  COMPRESSED_DATA and
+GZIP_COMPRESSED_DATA are always `1PB` so inner_byte_width=1.
 
-```text
-For n_pixels pixels of bytepix bytes each:
-  shuffled[j * n_pixels + i] gets mapped to
-  output[i * bytepix + j]
-  for i in 0..n_pixels, j in 0..bytepix.
-```
+*Test fixtures.*  Normal-path GZIP_1 / GZIP_2 round-trips
+use fitsio.  Fitsio's high-level write API doesn't expose
+fallback-column knobs, so the three fallback tests in
+`tests/test_compressed_image_phase4_gzip.py` build minimal
+FITS files by hand (`_build_fallback_fixture` and friends):
+empty primary descriptor + populated fallback column + a
+hand-built BINTABLE header.  This pattern is reusable for
+any future fallback-related test.
 
-Code sketch:
-```rust
-fn unshuffle(shuffled: &[u8], n_pixels: usize, bytepix: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n_pixels * bytepix];
-    for j in 0..bytepix {
-        for i in 0..n_pixels {
-            out[i * bytepix + j] = shuffled[j * n_pixels + i];
-        }
-    }
-    out
-}
-```
+*Scope boundaries unchanged.*  Phase 4 still supports
+**integer ZBITPIX only** (`8/16/32/64`).  Float ZBITPIX
+with GZIP still raises until Phase 5 (quantization).  The
+GZIP decoders in principle handle any byte width, but with
+no quantization layer the FP storage isn't meaningful yet.
 
-After un-shuffle, the buffer holds pixel data in FITS big-
-endian byte order (same as GZIP_1 post-decompress); byteswap
-to native and return.
-
-*Fallback column refactor (`find_compressed_data_column`).*
-Phase 2/3 finds exactly one column (`COMPRESSED_DATA`) and
-errors when `nelements == 0` for a tile.  In practice the
-encoder may store a tile in a *fallback* column instead:
-- `GZIP_COMPRESSED_DATA` (TFORM `1PB`/`1QB`): GZIP_1 fallback
-  used when the primary algorithm (e.g. RICE_1) doesn't
-  compress a tile better than gzip.
-- `UNCOMPRESSED_DATA` (TFORM `1PI`/`1PJ`/`1PB` etc, type
-  letter matching ZBITPIX): raw pixel bytes, no
-  decompression at all.
-
-Refactor: replace `find_compressed_data_column` with a
-`find_data_columns` returning a struct like:
-```rust
-struct DataColumns {
-    primary: ColumnInfo,                  // COMPRESSED_DATA, required
-    gzip_fallback: Option<ColumnInfo>,    // GZIP_COMPRESSED_DATA, optional
-    uncompressed_fallback: Option<ColumnInfo>,  // UNCOMPRESSED_DATA, optional
-}
-struct ColumnInfo {
-    byte_offset_in_row: u64,
-    is_q: bool,
-}
-```
-
-In `read_tile_compressed_bytes` (or a refactored
-`fetch_tile_payload`), check columns in priority order:
-1. Primary nelements > 0 → decode via primary algorithm
-   (RICE_1 / GZIP_1 / GZIP_2 / HCOMPRESS / PLIO).
-2. Else GZIP fallback nelements > 0 → decode via GZIP_1.
-3. Else uncompressed fallback nelements > 0 → byteswap raw
-   bytes to native, return directly (no decompression).
-4. Else error: "tile N has no data in any column".
-
-The return type from this helper should carry which path was
-taken so the decoder dispatch knows whether to call RICE,
-GZIP_1, GZIP_2, or just byteswap.  A small enum works:
-```rust
-enum TilePayload {
-    Compressed { bytes: Vec<u8>, algorithm: CompressionAlgorithm },
-    Uncompressed { bytes: Vec<u8> },
-}
-```
-
-The cache layer stays unchanged — it stores final target-
-dtype bytes regardless of which path produced them.
-
-*Test fixtures.*  fitsio supports all three on write:
-```python
-fitsio.FITS(fname, 'rw').write(img, compress='GZIP_1', tile_dims=...)
-fitsio.FITS(fname, 'rw').write(img, compress='GZIP_2', tile_dims=...)
-```
-Phase 1 already verified GZIP_1 / GZIP_2 ZIMAGE detection
-works (`test_other_compression_types_dispatched`); the
-NotImplementedError stub there becomes a round-trip test
-once decode lands.
-
-*What stays the same.*  The Phase 3 cache layer, slicing
-path, and per-tile placement code are algorithm-agnostic
-once the decoder returns target-dtype bytes.  No changes
-needed to `slice_compressed_image`, `axis_overlap`,
-`place_tile_bytes_into_output`, `get_or_decode_tile`, or
-the cache itself — they all key off `CompressionAlgorithm`
-through the same dispatch.
-
-*Scope boundaries.*  Phase 4 supports **integer ZBITPIX
-only** (same as Phase 2/3).  Float ZBITPIX with GZIP still
-raises until Phase 5 (quantization).  This is consistent
-with how RICE works today: the algorithm in principle handles
-any width, but the quantization layer is what makes FP
-storage meaningful — defer the combined surface to Phase 5.
-
-*Memory.*  GZIP decompression allocates `n_pixels * bytepix`
-bytes per tile (same as RICE).  Cache layer caps as usual.
-
-*Files Phase 4 will touch.*
-- `Cargo.toml` — add `flate2`.
-- `src/zimage/mod.rs` — wire dispatch.
-- `src/zimage/gzip.rs` — new file.
-- `src/zimage/rice.rs` — move `cast_i64_to_target_bytes`
-  here from hdu_image_compressed.rs; change decode signature
-  to return `Vec<u8>` in native order.
-- `src/hdu_image_compressed.rs` — rename and refactor
-  `find_compressed_data_column` → `find_data_columns`; widen
-  `read_tile_compressed_bytes` (or factor into
-  `fetch_tile_payload`) to consult fallback columns;
-  simplify `get_or_decode_tile` since target-dtype bytes
-  come out of the decoder directly.
-- `tests/test_compressed_image_phase4_gzip.py` — new tests
-  for GZIP_1, GZIP_2 round-trip; fallback-column behavior
-  (synthesize a file with empty primary + populated GZIP
-  fallback).  Probably easiest to generate fallback fixtures
-  with astropy if fitsio doesn't expose the fallback knobs —
-  worth checking fitsio first.
+*Known follow-up — i8 (TLONGLONG) with GZIP.*  fitsio
+refuses to *write* i8 compressed images, raising "writing
+TLONGLONG to compressed image is not supported" (cfitsio
+`imcomp.c`).  This appears to be a cfitsio implementation
+limitation rather than a FITS Tile Compression Convention
+restriction — GZIP is a byte-stream codec with no inherent
+BITPIX dependency, and the rustfits reader path already
+handles `bytepix=8`.  Worth investigating later whether the
+spec actually permits i8 GZIP (highly likely yes) and what
+the cfitsio constraint is exactly; if the spec allows it,
+our reader is already fine and the only missing piece is
+test fixtures (hand-crafted, or maybe astropy can do it).
 
 **Phase 5 — Quantized floats.**  ZSCALE / ZZERO per-tile
 columns; ZQUANTIZ + ZDITHER0 dither variants.  Trickiest part

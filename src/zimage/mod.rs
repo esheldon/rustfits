@@ -1,10 +1,9 @@
 // Tile-decoder dispatch.  Owns the CompressionAlgorithm enum
 // (parsed from ZCMPTYPE) and routes a tile's compressed bytes to
-// the right per-algorithm decoder.  Phase 2 wires RICE_1 only;
-// other algorithms parse correctly (so the accessor on
-// CompressedImageHDU works) but raise NotImplementedError at
-// decode time.
+// the right per-algorithm decoder.  Phase 4 wires RICE_1, GZIP_1,
+// and GZIP_2; HCOMPRESS_1 / PLIO_1 are Phase 6+ and still raise.
 
+pub(crate) mod gzip;
 pub(crate) mod rice;
 
 use pyo3::prelude::*;
@@ -32,33 +31,38 @@ pub(crate) fn parse_algorithm(zcmptype: &str) -> PyResult<CompressionAlgorithm> 
     }
 }
 
-// Decode a single tile's compressed bytes to pixel values widened
-// to i64.  The caller is responsible for casting back to the
-// target BITPIX dtype and placing the tile in the output ndarray.
+// Decode one tile's compressed bytes directly to target-dtype bytes
+// in numpy native byte order, sized `n_pixels * bytepix`.  The
+// caller wraps the buffer as a numpy view and copies it into the
+// assembled output array.
 //
-// Phase 2 implements RICE_1 only.  Other algorithms return a
-// NotImplementedError-equivalent ValueError naming the phase that
-// will add them — see CLAUDE.md "Tile-compressed images (ZIMAGE)
-// roadmap".
-pub(crate) fn decode_tile_to_i64(
+// Each per-algorithm decoder owns the entire bytes-to-bytes path
+// (decompress, byteswap, byte-shuffle reverse, dtype cast).  This
+// keeps dispatch dumb and lets each algorithm decide what's
+// cheapest — RICE goes via Vec<i64> (its natural intermediate),
+// GZIP stays in u8 throughout.
+//
+// `blocksize` is RICE-specific and ignored by GZIP; same for
+// `zbitpix` — RICE needs it to know the target dtype to cast its
+// i64 stream down to, GZIP infers everything from `bytepix`.
+pub(crate) fn decode_tile_to_bytes(
     algorithm: CompressionAlgorithm,
     compressed: &[u8],
     n_pixels: usize,
     bytepix: u32,
     blocksize: u32,
-) -> PyResult<Vec<i64>> {
+    zbitpix: i32,
+) -> PyResult<Vec<u8>> {
     match algorithm {
         CompressionAlgorithm::Rice1 => {
-            rice::decode(compressed, n_pixels, bytepix, blocksize)
+            rice::decode_rice(compressed, n_pixels, bytepix, blocksize, zbitpix)
         }
-        CompressionAlgorithm::Gzip1 => Err(PyValueError::new_err(
-            "GZIP_1 decompression is not yet implemented \
-             (planned: Phase 4 of the ZIMAGE roadmap)"
-        )),
-        CompressionAlgorithm::Gzip2 => Err(PyValueError::new_err(
-            "GZIP_2 decompression is not yet implemented \
-             (planned: Phase 4 of the ZIMAGE roadmap)"
-        )),
+        CompressionAlgorithm::Gzip1 => {
+            gzip::decode_gzip1(compressed, n_pixels, bytepix)
+        }
+        CompressionAlgorithm::Gzip2 => {
+            gzip::decode_gzip2(compressed, n_pixels, bytepix)
+        }
         CompressionAlgorithm::Hcompress1 => Err(PyValueError::new_err(
             "HCOMPRESS_1 decompression is not yet implemented \
              (planned: Phase 6 of the ZIMAGE roadmap)"

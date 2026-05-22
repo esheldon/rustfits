@@ -572,34 +572,17 @@ pub(crate) fn header_has_zimage(header: &[String]) -> bool {
     false
 }
 
-// ====== Phase 2: whole-image read ======
+// ====== Tile read ======
 //
-// REFACTOR NOTE (revisit when Phase 4+ adds more algorithms):
-// Phase 2 only knows about COMPRESSED_DATA.  Two places will
-// need to widen when fallback / quantization columns enter:
-//
-//   1. `find_compressed_data_column` returns *one* column.  When
-//      Phase 4 wires GZIP_COMPRESSED_DATA + UNCOMPRESSED_DATA
-//      fallbacks (used by the encoder when a tile doesn't
-//      benefit from RICE), this becomes a "find all data
-//      columns" call returning offsets for whichever are
-//      present.  The per-tile read then checks each column's
-//      nelements in priority order (primary → GZIP → UNCOMPRESSED)
-//      and dispatches to the corresponding decoder.  Empty
-//      COMPRESSED_DATA on a row currently raises; that error
-//      becomes the "try fallback" path.
-//
-//   2. `parse_rice_params` is RICE-specific.  When Phase 5 adds
-//      quantized floats it needs siblings for ZSCALE/ZZERO/
-//      ZBLANK column positions (each is a per-tile column in
-//      the BINTABLE, not a ZNAMEn/ZVALn pair).  Likely shape:
-//      a `CompressionContext` struct passed through the read
-//      loop, holding per-algorithm params plus optional
-//      quantization-column offsets.
-//
-// Both refactors keep the outer flow (tile loop → decode →
-// place) intact; they just widen the "what to read per row"
-// step.
+// REFACTOR NOTE (revisit when Phase 5 adds quantized floats):
+// `parse_rice_params` is RICE-specific.  When Phase 5 adds
+// quantized floats it needs siblings for ZSCALE/ZZERO/ZBLANK
+// column positions (each is a per-tile column in the BINTABLE,
+// not a ZNAMEn/ZVALn pair).  Likely shape: a
+// `CompressionContext` struct passed through the read loop,
+// holding per-algorithm params plus optional quantization-
+// column offsets.  Outer flow (tile loop → decode → place)
+// stays unchanged.
 
 // Top-level entry point invoked from CompressedImageHDU::read.
 // Walks the BINTABLE one tile at a time, decoding each via the
@@ -608,12 +591,11 @@ pub(crate) fn header_has_zimage(header: &[String]) -> bool {
 // shared image-side scaling machinery so a scaled compressed
 // HDU returns the same dtype as an equivalent uncompressed one.
 //
-// Phase 2 limits (will lift later):
-//   - RICE_1 only (Phase 4 adds GZIP_1/2, Phase 6 HCOMPRESS/PLIO)
+// Current limits (will lift later):
+//   - RICE_1 / GZIP_1 / GZIP_2 supported; HCOMPRESS_1 / PLIO_1 are
+//     Phase 6
 //   - Integer ZBITPIX only (Phase 5 adds quantized floats)
 //   - mask_blank=True rejected (ZBLANK handling is a follow-up)
-//   - Empty COMPRESSED_DATA on a row → error (GZIP_COMPRESSED_DATA
-//     / UNCOMPRESSED_DATA fallback comes with Phase 4)
 fn read_compressed_image_data(
     py: Python<'_>,
     cards: &[String],
@@ -634,19 +616,15 @@ fn read_compressed_image_data(
         ));
     }
 
-    // Algorithm dispatch — Phase 2 supports RICE_1 only.
+    // Algorithm dispatch — RICE_1 / GZIP_1 / GZIP_2 supported.
+    // HCOMPRESS_1 / PLIO_1 fall through the per-algorithm decoder
+    // dispatch in src/zimage/mod.rs and surface its NotImplemented
+    // error.
     let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
         .ok_or_else(|| PyValueError::new_err(
             "compressed HDU missing ZCMPTYPE"
         ))?;
     let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
-    if algorithm != CompressionAlgorithm::Rice1 {
-        return Err(PyNotImplementedError::new_err(format!(
-            "{} decompression is not yet implemented (Phase 2 \
-             supports RICE_1 only; see CLAUDE.md for the roadmap)",
-            zcmptype
-        )));
-    }
 
     // Image shape + bitpix (image-side).
     let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
@@ -692,7 +670,7 @@ fn read_compressed_image_data(
     let theap = parse_keyword(cards, "THEAP")
         .map(|x| x.max(0) as u64)
         .unwrap_or(naxis1 * naxis2);
-    let col = find_compressed_data_column(cards)?;
+    let cols = find_data_columns(cards)?;
 
     // Tile shape + sanity-check against NAXIS2.
     let tile_shape = parse_tile_shape(cards, &image_shape);
@@ -730,7 +708,7 @@ fn read_compressed_image_data(
         );
         let tile_bytes = get_or_decode_tile(
             py, cache, file_handle, tainted, tile_idx, data_offset,
-            naxis1, theap, &col, algorithm, &actual_shape,
+            naxis1, theap, &cols, algorithm, &actual_shape,
             bytepix, blocksize, zbitpix,
         )?;
         place_tile_bytes_into_output(
@@ -753,25 +731,53 @@ fn read_compressed_image_data(
     Ok(final_arr)
 }
 
-// Where the COMPRESSED_DATA column lives in a BINTABLE row.
-struct CompressedDataColumn {
-    // Byte offset of this column's first byte within a row.
+// Per-column descriptor needed to locate and interpret the heap
+// bytes for one tile.  All three ZIMAGE data columns (primary,
+// GZIP fallback, UNCOMPRESSED fallback) are variable-length, so
+// each carries `is_q` (descriptor width) and `inner_byte_width`
+// (size of one heap element, used to convert descriptor
+// nelements → byte count).  COMPRESSED_DATA and
+// GZIP_COMPRESSED_DATA always use byte inner type (B → 1);
+// UNCOMPRESSED_DATA uses whichever inner type matches ZBITPIX
+// (B/I/J/K), so the byte-count math has to consult inner_byte_width.
+struct ColumnInfo {
     byte_offset_in_row: u64,
-    // True if descriptors are 'Q' (16 bytes); false for 'P' (8).
     is_q: bool,
+    inner_byte_width: u64,
 }
 
-// Walk TFORMn / TTYPEn to find the COMPRESSED_DATA column.  All
-// preceding columns contribute their byte width to the offset.
-fn find_compressed_data_column(
-    header: &[String],
-) -> PyResult<CompressedDataColumn> {
+// All three ZIMAGE data columns; primary is required, fallbacks
+// are optional.  Resolved in find_data_columns by walking TTYPEn.
+struct DataColumns {
+    primary: ColumnInfo,
+    gzip_fallback: Option<ColumnInfo>,
+    uncompressed_fallback: Option<ColumnInfo>,
+}
+
+// What we got back from the heap for one tile: either compressed
+// bytes (needing decode via the named algorithm) or already-
+// uncompressed FITS-big-endian pixel bytes (needing only a
+// byteswap to native).
+enum TilePayload {
+    Compressed { bytes: Vec<u8>, algorithm: CompressionAlgorithm },
+    Uncompressed { bytes: Vec<u8> },
+}
+
+// Walk TFORMn / TTYPEn to locate the primary COMPRESSED_DATA
+// column (required) plus the optional GZIP_COMPRESSED_DATA and
+// UNCOMPRESSED_DATA fallback columns.  All preceding columns
+// contribute their byte width to the running offset.
+fn find_data_columns(header: &[String]) -> PyResult<DataColumns> {
     let tfields = parse_keyword(header, "TFIELDS").unwrap_or(0).max(0) as u64;
     if tfields == 0 {
         return Err(PyValueError::new_err(
             "ZIMAGE BINTABLE has TFIELDS=0"
         ));
     }
+    let mut primary: Option<ColumnInfo> = None;
+    let mut gzip_fallback: Option<ColumnInfo> = None;
+    let mut uncompressed_fallback: Option<ColumnInfo> = None;
+
     let mut offset: u64 = 0;
     for i in 1..=tfields {
         let ttype = parse_string_keyword(header, &format!("TTYPE{}", i))
@@ -781,17 +787,23 @@ fn find_compressed_data_column(
                 "ZIMAGE BINTABLE column {} missing TFORM", i
             )))?;
         let width = tform_byte_width(&tform)?;
-        if ttype.trim() == "COMPRESSED_DATA" {
-            return Ok(CompressedDataColumn {
-                byte_offset_in_row: offset,
-                is_q: tform_is_q_descriptor(&tform),
-            });
+        let info = ColumnInfo {
+            byte_offset_in_row: offset,
+            is_q: tform_is_q_descriptor(&tform),
+            inner_byte_width: tform_vla_inner_byte_width(&tform).unwrap_or(1),
+        };
+        match ttype.trim() {
+            "COMPRESSED_DATA" => primary = Some(info),
+            "GZIP_COMPRESSED_DATA" => gzip_fallback = Some(info),
+            "UNCOMPRESSED_DATA" => uncompressed_fallback = Some(info),
+            _ => {}
         }
         offset += width;
     }
-    Err(PyValueError::new_err(
+    let primary = primary.ok_or_else(|| PyValueError::new_err(
         "ZIMAGE BINTABLE missing COMPRESSED_DATA column"
-    ))
+    ))?;
+    Ok(DataColumns { primary, gzip_fallback, uncompressed_fallback })
 }
 
 // Byte width of one row's slot for a given TFORM value.  Handles
@@ -833,6 +845,39 @@ fn tform_byte_width(tform: &str) -> PyResult<u64> {
         other => Err(PyValueError::new_err(format!(
             "unsupported TFORM type '{}' in ZIMAGE BINTABLE", other
         ))),
+    }
+}
+
+// Inner element byte width for a VLA TFORM (`Pt` / `Qt`).  Used
+// to convert a descriptor's `nelements` to a byte count when
+// reading heap payload.  Returns None for non-VLA TFORMs (fixed-
+// width columns don't have an inner type letter, since their
+// repeat count already gives the byte width directly).
+fn tform_vla_inner_byte_width(tform: &str) -> Option<u64> {
+    let trimmed = tform.trim();
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return None;
+    }
+    let outer = bytes[idx] as char;
+    if outer != 'P' && outer != 'Q' {
+        return None;
+    }
+    let inner_idx = idx + 1;
+    if inner_idx >= bytes.len() {
+        return None;
+    }
+    match bytes[inner_idx] as char {
+        'L' | 'A' | 'B' => Some(1),
+        'I' => Some(2),
+        'J' | 'E' => Some(4),
+        'K' | 'D' | 'C' => Some(8),
+        'M' => Some(16),
+        _ => None,
     }
 }
 
@@ -913,16 +958,16 @@ fn tile_origin_and_shape(
     (origin, shape)
 }
 
-// Look up a tile in the cache or, on miss, read + decode + cast
+// Look up a tile in the cache or, on miss, read payload + decode
 // + insert.  Returns the tile's bytes in target (stored) dtype,
 // numpy C-order, ready to be wrapped in a numpy ndarray.  The
 // returned Arc is shared with the cache; both points keep the
 // allocation alive until the consumer drops the reference.
 //
 // File I/O (descriptor read + heap read) is done under the file
-// lock; the lock is released before decode + cast.  The cache
-// lock is taken twice (once for `get`, once for `put`) and held
-// only across in-memory ops.
+// lock; the lock is released before decode.  The cache lock is
+// taken twice (once for `get`, once for `put`) and held only
+// across in-memory ops.
 #[allow(clippy::too_many_arguments)]
 fn get_or_decode_tile(
     _py: Python<'_>,
@@ -933,7 +978,7 @@ fn get_or_decode_tile(
     data_offset: u64,
     naxis1: u64,
     theap: u64,
-    col: &CompressedDataColumn,
+    cols: &DataColumns,
     algorithm: CompressionAlgorithm,
     actual_shape: &[u64],
     bytepix: u32,
@@ -945,114 +990,157 @@ fn get_or_decode_tile(
     }
     check_not_tainted(tainted)?;
 
-    // Read compressed bytes for this tile (descriptor + heap).
-    let compressed = read_tile_compressed_bytes(
-        file_handle, tile_idx, data_offset, naxis1, theap, col,
+    // Read payload (descriptor + heap) under the file lock.  The
+    // returned variant tells us how to interpret the bytes.
+    let payload = fetch_tile_payload(
+        file_handle, tile_idx, data_offset, naxis1, theap, cols, algorithm,
     )?;
 
-    // Decode + cast (no file lock held here).
+    // Decode (no file lock held here).
     let tile_n_pixels: usize = actual_shape.iter()
         .product::<u64>() as usize;
-    let pixels = crate::zimage::decode_tile_to_i64(
-        algorithm, &compressed, tile_n_pixels, bytepix, blocksize,
-    )?;
-    let target_bytes = cast_i64_to_target_bytes(&pixels, zbitpix);
+    let target_bytes = match payload {
+        TilePayload::Compressed { bytes, algorithm } => {
+            crate::zimage::decode_tile_to_bytes(
+                algorithm, &bytes, tile_n_pixels, bytepix, blocksize, zbitpix,
+            )?
+        }
+        TilePayload::Uncompressed { mut bytes } => {
+            let expected = tile_n_pixels.checked_mul(bytepix as usize)
+                .ok_or_else(|| PyValueError::new_err(
+                    "ZIMAGE: tile pixel count * bytepix overflowed usize"
+                ))?;
+            if bytes.len() != expected {
+                return Err(PyValueError::new_err(format!(
+                    "ZIMAGE tile {}: UNCOMPRESSED_DATA payload is {} bytes \
+                     but expected {} ({} pixels * {} bytes/pixel)",
+                    tile_idx, bytes.len(), expected, tile_n_pixels, bytepix
+                )));
+            }
+            if bytepix > 1 && !cfg!(target_endian = "big") {
+                crate::common::byteswap_in_place(&mut bytes, bytepix as usize);
+            }
+            bytes
+        }
+    };
 
     let arc = Arc::new(target_bytes);
     cache.put(tile_idx, Arc::clone(&arc));
     Ok(arc)
 }
 
-// Read one tile's compressed bytes from disk: the row's
-// COMPRESSED_DATA descriptor, then the heap payload.  File lock
-// is held only for the duration of these reads.
-fn read_tile_compressed_bytes(
+// Read one tile's heap payload.  Checks the data columns in
+// priority order: primary COMPRESSED_DATA → GZIP_COMPRESSED_DATA
+// fallback → UNCOMPRESSED_DATA fallback.  Returns whichever has
+// non-zero nelements first, tagged so the caller knows which
+// decoder to run.  All present columns' descriptors are read for
+// the row; reading is cheap (8 or 16 bytes apiece) and keeping a
+// single lock-acquire is simpler than retrying.
+fn fetch_tile_payload(
     file_handle: &FileHandle,
     tile_idx: u64,
     data_offset: u64,
     naxis1: u64,
     theap: u64,
-    col: &CompressedDataColumn,
-) -> PyResult<Vec<u8>> {
+    cols: &DataColumns,
+    algorithm: CompressionAlgorithm,
+) -> PyResult<TilePayload> {
     let mut guard = file_handle.lock()
         .map_err(|_| PyIOError::new_err("file lock poisoned"))?;
     let file = guard.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    let row_offset = data_offset + tile_idx * naxis1;
 
-    let desc_offset = data_offset
-        + tile_idx * naxis1
-        + col.byte_offset_in_row;
+    // Primary column first.
+    let (prim_nelem, prim_off) = read_descriptor(
+        file, row_offset + cols.primary.byte_offset_in_row, cols.primary.is_q,
+    )?;
+    if prim_nelem > 0 {
+        let bytes = read_heap_bytes(
+            file, data_offset + theap + prim_off,
+            prim_nelem.saturating_mul(cols.primary.inner_byte_width),
+        )?;
+        return Ok(TilePayload::Compressed { bytes, algorithm });
+    }
+
+    // GZIP fallback.
+    if let Some(gcol) = &cols.gzip_fallback {
+        let (nelem, off) = read_descriptor(
+            file, row_offset + gcol.byte_offset_in_row, gcol.is_q,
+        )?;
+        if nelem > 0 {
+            let bytes = read_heap_bytes(
+                file, data_offset + theap + off,
+                nelem.saturating_mul(gcol.inner_byte_width),
+            )?;
+            return Ok(TilePayload::Compressed {
+                bytes,
+                algorithm: CompressionAlgorithm::Gzip1,
+            });
+        }
+    }
+
+    // Uncompressed fallback.
+    if let Some(ucol) = &cols.uncompressed_fallback {
+        let (nelem, off) = read_descriptor(
+            file, row_offset + ucol.byte_offset_in_row, ucol.is_q,
+        )?;
+        if nelem > 0 {
+            let bytes = read_heap_bytes(
+                file, data_offset + theap + off,
+                nelem.saturating_mul(ucol.inner_byte_width),
+            )?;
+            return Ok(TilePayload::Uncompressed { bytes });
+        }
+    }
+
+    Err(PyValueError::new_err(format!(
+        "ZIMAGE tile {} has no data in any of COMPRESSED_DATA / \
+         GZIP_COMPRESSED_DATA / UNCOMPRESSED_DATA", tile_idx
+    )))
+}
+
+// Read one variable-length descriptor at the given absolute file
+// offset.  Returns (nelements, heap_offset).  Both `P` (8 bytes,
+// two u32s) and `Q` (16 bytes, two u64s) forms are big-endian.
+fn read_descriptor(
+    file: &mut std::fs::File,
+    desc_offset: u64,
+    is_q: bool,
+) -> PyResult<(u64, u64)> {
     file.seek(SeekFrom::Start(desc_offset))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    let (nelements, heap_offset) = if col.is_q {
+    if is_q {
         let mut buf = [0u8; 16];
         file.read_exact(&mut buf)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         let nelem = u64::from_be_bytes(buf[..8].try_into().unwrap());
         let off = u64::from_be_bytes(buf[8..16].try_into().unwrap());
-        (nelem, off)
+        Ok((nelem, off))
     } else {
         let mut buf = [0u8; 8];
         file.read_exact(&mut buf)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         let nelem = u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64;
         let off = u32::from_be_bytes(buf[4..8].try_into().unwrap()) as u64;
-        (nelem, off)
-    };
-    if nelements == 0 {
-        return Err(PyNotImplementedError::new_err(format!(
-            "ZIMAGE tile {} has empty COMPRESSED_DATA; \
-             GZIP_COMPRESSED_DATA / UNCOMPRESSED_DATA fallback is \
-             not yet implemented (planned: Phase 4 of the ZIMAGE \
-             roadmap)", tile_idx
-        )));
+        Ok((nelem, off))
     }
-
-    let heap_byte_offset = data_offset + theap + heap_offset;
-    let mut compressed = vec![0u8; nelements as usize];
-    file.seek(SeekFrom::Start(heap_byte_offset))
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    file.read_exact(&mut compressed)
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    Ok(compressed)
 }
 
-// Cast a Vec<i64> of decoded pixel values to bytes in the target
-// (stored) dtype, numpy-native byte order.  ZBITPIX must be one
-// of the supported integer values (8/16/32/64); float ZBITPIX is
-// rejected upstream.
-fn cast_i64_to_target_bytes(values: &[i64], zbitpix: i32) -> Vec<u8> {
-    match zbitpix {
-        8 => {
-            let mut out = Vec::with_capacity(values.len());
-            for &v in values {
-                out.push(v as u8);
-            }
-            out
-        }
-        16 => {
-            let mut out = Vec::with_capacity(values.len() * 2);
-            for &v in values {
-                out.extend_from_slice(&(v as i16).to_ne_bytes());
-            }
-            out
-        }
-        32 => {
-            let mut out = Vec::with_capacity(values.len() * 4);
-            for &v in values {
-                out.extend_from_slice(&(v as i32).to_ne_bytes());
-            }
-            out
-        }
-        64 => {
-            let mut out = Vec::with_capacity(values.len() * 8);
-            for &v in values {
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            out
-        }
-        _ => Vec::new(), // unreachable: zbitpix validated upstream
-    }
+// Read `n_bytes` of heap payload starting at the absolute file
+// offset.  Convenience wrapper for the read_descriptor + heap-read
+// pair done in fetch_tile_payload.
+fn read_heap_bytes(
+    file: &mut std::fs::File,
+    heap_byte_offset: u64,
+    n_bytes: u64,
+) -> PyResult<Vec<u8>> {
+    let mut buf = vec![0u8; n_bytes as usize];
+    file.seek(SeekFrom::Start(heap_byte_offset))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    file.read_exact(&mut buf)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(buf)
 }
 
 // Write a cached/decoded tile's bytes into a region of the output
@@ -1189,12 +1277,6 @@ fn slice_compressed_image(
             "compressed HDU missing ZCMPTYPE"
         ))?;
     let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
-    if algorithm != CompressionAlgorithm::Rice1 {
-        return Err(PyNotImplementedError::new_err(format!(
-            "{} decompression is not yet implemented (Phase 2 \
-             supports RICE_1 only)", zcmptype
-        )));
-    }
     let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
     if image_shape.is_empty() {
         return Err(PyValueError::new_err(
@@ -1230,7 +1312,7 @@ fn slice_compressed_image(
     let theap = parse_keyword(cards, "THEAP")
         .map(|x| x.max(0) as u64)
         .unwrap_or(naxis1 * naxis2);
-    let col = find_compressed_data_column(cards)?;
+    let cols = find_data_columns(cards)?;
 
     let tile_shape = parse_tile_shape(cards, &image_shape);
     let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
@@ -1297,7 +1379,7 @@ fn slice_compressed_image(
             // Fetch tile bytes (cache or decode), wrap as ndarray.
             let tile_bytes = get_or_decode_tile(
                 py, cache, file_handle, tainted, tile_idx, data_offset,
-                naxis1, theap, &col, algorithm, &actual_shape,
+                naxis1, theap, &cols, algorithm, &actual_shape,
                 bytepix, blocksize, zbitpix,
             )?;
             let pybytes = PyBytes::new(py, &tile_bytes);
