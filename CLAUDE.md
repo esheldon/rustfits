@@ -434,10 +434,13 @@ on floating-point arrays.
   accessors, RICE_1 / GZIP_1 / GZIP_2 whole-image read, slicing
   via `__getitem__`, bytes-bound LRU tile cache, GZIP and
   uncompressed fallback columns, quantized-float read with
-  NO_DITHER / SUBTRACTIVE_DITHER_1 / SUBTRACTIVE_DITHER_2 +
-  NaN preservation for both f4 and f8).  Phase 6+ covers
-  HCOMPRESS/PLIO + writes.  Full details in the "Tile-compressed
-  images (ZIMAGE)" section below.
+  NO_DITHER / SUBTRACTIVE_DITHER_1 / SUBTRACTIVE_DITHER_2 + NaN
+  preservation for both f4 and f8, plus the unquantized-float
+  path — ZQUANTIZ='NONE' (astropy convention) and the
+  "ZQUANTIZ set but no ZSCALE/ZZERO columns" case where bytes
+  are raw GZIP-compressed floats).  Phase 6+ covers HCOMPRESS /
+  PLIO + writes.  Full details in the "Tile-compressed images
+  (ZIMAGE)" section below.
 
 ### Image write
 
@@ -947,15 +950,26 @@ the cfitsio constraint is exactly; if the spec allows it,
 our reader is already fine and the only missing piece is
 test fixtures (hand-crafted, or maybe astropy can do it).
 
-**Phase 5 — Quantized floats.**  Done.  Reader handles
-ZBITPIX=-32/-64 with `NO_DITHER`, `SUBTRACTIVE_DITHER_1`, and
-`SUBTRACTIVE_DITHER_2` quantization modes.  Bit-for-bit match
-against cfitsio on the full {RICE_1, GZIP_1, GZIP_2} ×
-{f4, f8} × {NO_DITHER, DITHER_1, DITHER_2} matrix.
+**Phase 5 — Quantized floats + unquantized float HDUs.**  Done.
+Reader handles ZBITPIX=-32/-64 across all common shapes:
+- **Quantized**: `NO_DITHER`, `SUBTRACTIVE_DITHER_1`, and
+  `SUBTRACTIVE_DITHER_2` with bit-for-bit cfitsio agreement on
+  the full {RICE_1, GZIP_1, GZIP_2} × {f4, f8} × {NO_DITHER,
+  DITHER_1, DITHER_2} matrix (including NaN preservation
+  through DITHER_2's reserved sentinel).
+- **Unquantized**: ZQUANTIZ='NONE' (astropy's convention for
+  "no quantization happened") and the astropy-quantize_level=0
+  variant where ZQUANTIZ='NO_DITHER' is set but ZSCALE/ZZERO
+  columns are absent.  On-disk bytes are raw GZIP-compressed
+  floats; dequant is skipped.
 
 *Code layout.*  All quantization logic lives in
 `src/zimage/quantize.rs`:
-- `DitherMethod` enum + `parse_dither_method`.
+- `DitherMethod` enum + `parse_dither_method` returning
+  `Option<DitherMethod>` — `None` for ZQUANTIZ='NONE' (the
+  "no quantization happened" signal).  Absent ZQUANTIZ
+  defaults to `Some(NoDither)` per cfitsio's convention when
+  ZSCALE/ZZERO are present.
 - `random_table()` initialises the 10000-element Park-Miller
   table on first use (multiplier 16807, modulus 2^31-1,
   seed 1).  Lazy via `OnceLock`.
@@ -966,23 +980,30 @@ against cfitsio on the full {RICE_1, GZIP_1, GZIP_2} ×
 - `dequantize_to_f32` / `_f64` apply the per-tile formula
   `(stored - dither + 0.5) * scale + zero`.  For DITHER_2 the
   reserved value `-2147483647` becomes NaN.
-- 3 unit tests at the bottom of the module (Park-Miller
-  anchor check, NO_DITHER linearity, DITHER_2 NaN handling).
+- 4 unit tests at the bottom of the module (Park-Miller
+  anchor check, NO_DITHER linearity, DITHER_2 NaN handling,
+  parse_dither_method covering 'NONE' + defaults + unknown).
 
 *Integration in `hdu_image_compressed.rs`.*
 - `DataColumns` widened to also hold `zscale_offset_in_row`
   and `zzero_offset_in_row` (fixed-width `1D` columns located
   by walking TTYPEn).
 - `QuantContext { method, zdither0, zscale_offset_in_row,
-  zzero_offset_in_row, output_zbitpix }` built when ZBITPIX is
-  float; passed through the tile loop.
+  zzero_offset_in_row, output_zbitpix }`.  `build_quant_context`
+  returns `Option<QuantContext>`: `None` when ZQUANTIZ='NONE'
+  OR when ZSCALE/ZZERO columns are missing (the two signals
+  for "no quantization happened" on a float HDU).  For integer
+  HDUs the quant context is always None.
 - A new `fetch_tile_payload_and_quant` reads the heap payload
   AND the per-tile ZSCALE/ZZERO doubles under the same file
-  lock acquire.  Falls back to the old `fetch_tile_payload`
-  helper for the integer path (still present, kept simple).
+  lock acquire (when quant is Some).  Falls back to the old
+  `fetch_tile_payload` helper for the integer / unquantized
+  paths (still present, kept simple).
 - `get_or_decode_tile` decides bytepix and effective ZBITPIX
   for the decoder, then runs dequantization when the payload
-  came from the primary column on a float HDU.
+  came from the primary column AND quant is Some.  A single
+  unified rule: `dequant_applies = primary_payload &&
+  quant.is_some()`.
 - Both `read_compressed_image_data` and
   `slice_compressed_image` route through the new path; the
   cache stores final-output bytes (f4/f8 for quantized HDUs),
@@ -997,6 +1018,11 @@ in play, and conflating them is a tempting bug:
 - `bytepix`: 4 for quantized float (matches stored i32),
   matches stored_zbitpix/8 otherwise.
 
+When dequant doesn't apply (unquantized float HDU, or
+fallback column on a float HDU), the decoder is called with
+`bytepix = float_bytepix` (4 or 8 matching ZBITPIX) instead
+of 4, since the bytes are already physical floats.
+
 *Lossless-fallback convention.*  cfitsio's
 GZIP_COMPRESSED_DATA fallback (and UNCOMPRESSED_DATA) for a
 *float* HDU stores **raw original floats**, not quantized
@@ -1007,7 +1033,20 @@ variants so `get_or_decode_tile` can decide: dequant only
 runs when the *primary* column produced bytes.  For the
 fallback paths on float HDUs, bytes are already physical
 floats — the decoder is called with the float bytepix
-(4 or 8 matching ZBITPIX) and dequant is skipped.
+(4 or 8 matching ZBITPIX) and dequant is skipped.  This
+unifies cleanly with the unquantized-float case: same code
+path, same `dequant_applies = false` outcome.
+
+*ZQUANTIZ='NONE' is NOT in the FITS spec.*  The FITS Tile
+Compression Convention (Pence et al. 2010 + WG revisions)
+defines exactly three ZQUANTIZ values (`NO_DITHER`,
+`SUBTRACTIVE_DITHER_1`, `SUBTRACTIVE_DITHER_2`).  Per spec,
+"no quantization" should be signalled by *omitting* the
+keyword.  But astropy's `CompImageHDU` emits `'NONE'`
+explicitly when writing unquantized float-compressed HDUs,
+and cfitsio reads it tolerantly — so we accept it for
+real-world compatibility.  Documented as a comment in
+`parse_dither_method`.
 
 *ZCMPTYPE alias accepted.*  fitsio writes `ZCMPTYPE='RICE_ONE'`
 for some quantized-RICE configurations (an older cfitsio
@@ -1035,6 +1074,59 @@ the `#[allow(unused_variables)]` on `write`, `extend`, and
 `__setitem__` in hdu_image_compressed.rs** — Phase 2 set them
 because the bodies just raise NotImplementedError; real
 implementations will consume those parameters.
+
+## Build / dev workflow
+
+Three sets of dependencies, three install commands, one
+build tool:
+
+- **Runtime + build deps (Python side)**:
+  `conda install --file conda-requirements.txt` — python,
+  maturin, numpy.  No Rust here.
+- **Dev + test deps**:
+  `conda install --file conda-test-requirements.txt` —
+  pytest, fitsio, astropy, ruff.  Add `pytest-cov` if running
+  coverage locally.
+- **Rust toolchain**: rustup (NOT conda).  Local + CI both
+  use rustup; see `feedback_conda_plus_rustup.md` in the
+  user's memory.  Don't add `rust` to `conda-requirements.txt`.
+- **Build**: `maturin develop` builds the cdylib AND installs
+  the editable wheel in one step.  Never use bare `cargo build`
+  (won't install into the Python env so Python can't import).
+
+### Local iteration loop
+
+Chain compile + tests in one command (per the user's
+`feedback_combine_build_and_test.md` memory):
+
+    tools/cargo-test.sh && maturin develop && pytest tests/<focused>.py
+
+- `tools/cargo-test.sh` wraps `cargo test` so the test binary
+  (which links libpython via PyO3) can find libpython.X.so at
+  runtime.  Bare `cargo test` fails with "libpython3.X.so.1.0:
+  cannot open shared object file" because conda's env
+  activation doesn't put `$CONDA_PREFIX/lib` on
+  `LD_LIBRARY_PATH`.  The wrapper resolves the lib dir via
+  `sysconfig.LIBDIR` and prepends it.  See
+  `tools/cargo-test.sh` for the one-liner.
+- `maturin develop` builds + installs into the conda env.
+- `pytest tests/<focused>.py` for the focused suite during
+  iteration; chase with full `pytest` before commit.
+
+### CI
+
+`.github/workflows/ci.yml` runs five jobs:
+1. `lint` — `ruff format --check` + `ruff check`.
+2. `rust-test` — installs Python via `setup-python` (needed
+   so the wrapper can resolve libpython) and runs
+   `tools/cargo-test.sh`.
+3. `test` matrix — ubuntu × {py3.12, py3.14}, full conda env
+   from the requirements files + `maturin develop` + `pytest`.
+4. `coverage` — single ubuntu/py3.12 leg, uploads Python +
+   Rust coverage to codecov via `cargo-llvm-cov`.
+
+macOS is intentionally absent from the matrix — see "Known
+CI limitations" below.
 
 ## Testing conventions
 
@@ -1114,3 +1206,50 @@ buckets to look at when that happens:
 Don't aim for 100% on `/src`.  90-95% covered + the
 remaining gaps explicitly catalogued (in code comments or
 this section) is the actual target.
+
+## Performance TODO — ZIMAGE chunked-read profiling
+
+**Observation (May 2026, post-Phase-5):** reading a 1.49-billion-
+pixel f8 GZIP_2 ZIMAGE file (`/home/esheldon/data/test-fitsio-cache/test.fits`)
+in chunks via `f[1][lo:hi]` slicing is **roughly 3× slower than
+cfitsio's equivalent read**.  The output is bit-exact; this is
+purely a throughput gap.
+
+No profiling done yet — this is just the baseline observation
+from the read-correctness work.  When we revisit, candidate
+suspects to rule in / out:
+
+- **Per-tile file lock overhead** — `fetch_tile_payload_and_quant`
+  acquires the file mutex for each tile descriptor read; under
+  chunked reads that's one acquire per tile in the slice range.
+  cfitsio uses a single FILE* and no lock.
+- **Per-tile cache mutex** — `TileCache::get` / `put` lock the
+  inner Mutex twice per tile.  Briefly held, but the count
+  adds up on long slices.
+- **`GzDecoder` allocation per tile** — `flate2`'s decoder
+  is constructed fresh per call.  cfitsio reuses a single
+  `z_stream` across tiles in the inner loop.
+- **`place_tile_bytes_into_output` Python round-trips** — for
+  each tile we go Rust → `PyBytes::new` → numpy `frombuffer` →
+  `reshape` → `set_item` on the output ndarray.  That's several
+  PyO3 calls per tile; cfitsio writes directly into the output
+  buffer with a memcpy.
+- **`PyBytes::new` copy** — `frombuffer` views the PyBytes, but
+  `PyBytes::new` itself copies the Rust `Vec<u8>` into a new
+  Python-owned buffer.  A `PyArray` constructor that takes
+  ownership of the Vec would skip this copy.
+- **No I/O pipelining** — tiles are decoded strictly in order
+  with sync reads.  cfitsio also does sync reads but with a
+  warm OS page cache the kernel prefetch helps; we may be
+  paying for cold-cache lookups on first read.
+
+When the time comes: pick the 12 GB GZIP_2 file as the
+benchmark target, use `cargo flamegraph` or `perf` for a
+profile of the slice path, compare against cfitsio's
+`imcomp_decompress_tile` hot loop.  The user-facing target is
+"competitive with cfitsio for typical chunked reads" — not
+necessarily faster, just not dramatically slower.
+
+Do **not** chase this incrementally during ZIMAGE Phase 6+
+feature work — fold it in with the post-feature coverage
+sweep, since both want a quiet codebase to profile.
