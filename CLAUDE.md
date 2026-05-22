@@ -554,12 +554,15 @@ against `nomask`.
 ### Table write
 
 **Supported.**  `FITS.create_table_hdu(dtype, nrows=0, *, extname,
-extver, units, var_dtypes, descriptor)` maps a numpy structured
+extver, units, var_dtypes, heap_format)` maps a numpy structured
 dtype to TFORMn / TDIMn / TUNITn cards.  `var_dtypes={col:
 inner_dtype}` sidecar declares VLA columns (numpy `'O'` field +
-sidecar entry); `descriptor='P'` (default; 8-byte descriptors, 32-bit
-nelements/offset, 4 GB heap ceiling) or `'Q'` (16-byte, no practical
-ceiling).  `TableHDU.write(data)` bulk-writes the table (fixed +
+sidecar entry); `heap_format='P'` (default; 8-byte descriptors,
+32-bit nelements/offset, 4 GB heap ceiling) or `'Q'` (16-byte,
+no practical ceiling).  The parameter was originally called
+`descriptor` — renamed to `heap_format` (Phase 7 prep, 2026-05) so
+the kwarg conveys its purpose (the heap's addressing format)
+rather than the FITS-spec term for `{nelements, offset}` pairs.  `TableHDU.write(data)` bulk-writes the table (fixed +
 VLA columns supported); accepts structured ndarray, dict `{name:
 ndarray}`, or list/tuple of arrays with `names=[...]`.
 `TableHDU.__setitem__` covers single-row `hdu[i] = record`, slice
@@ -691,12 +694,12 @@ so the input-form handling stays in one place.
 append surfaces.  `__setitem__` for VLA columns is deferred.
 
 **API.**  `create_table_hdu(dtype, ..., var_dtypes=None,
-descriptor=None)`.  The user puts `'O'` for VLA fields in the numpy
-structured dtype and passes a sidecar `var_dtypes={col_name:
+heap_format=None)`.  The user puts `'O'` for VLA fields in the
+numpy structured dtype and passes a sidecar `var_dtypes={col_name:
 inner_dtype_str}` so we can pick a FITS inner letter (we considered
 extending the dtype-list 3-tuple to carry inner type, but the
 sidecar mirrors the existing `units=` pattern and keeps numpy
-dtypes free of FITS-specific DSL).  `descriptor=` is `'P'`
+dtypes free of FITS-specific DSL).  `heap_format=` is `'P'`
 (default; 8-byte descriptors, 32-bit nelements/offset, 4 GB heap
 ceiling) or `'Q'` (16-byte, 64-bit, no practical ceiling).  No
 maxlen hint is emitted in TFORM for now (read side already accepts
@@ -1158,14 +1161,111 @@ tiles, and slicing parity.
 All four ZIMAGE compression algorithms (RICE_1, GZIP_1/2,
 HCOMPRESS_1, PLIO_1) now have full read support.
 
-**Phase 7+ — Compressed image writes.**  Its own multi-phase
-project; needs design discussion (which algorithms, header
-generation, heap layout, write API).  When write lands,
-**remove the `#[allow(unused_variables)]` on `write`,
-`extend`, and `__setitem__` in hdu_image_compressed.rs** —
-Phase 2 set them because the bodies just raise
-NotImplementedError; real implementations will consume those
-parameters.
+**Phase 7 — Gzip1 compressed image writes.**  Done.
+
+*API.*  Compression is opted into via a structured config object
+passed to `create_image_hdu`:
+
+```python
+f.create_image_hdu(
+    "i4", (1000, 1000), extname="SCI",
+    compress=rustfits.Gzip1(tile_shape=(100, 100), heap_format="P"),
+)
+f[1].write(data)
+```
+
+`compress=None` (default) → uncompressed `ImageHDU` (current
+behavior, unchanged).  `compress=Gzip1(...)` → `CompressedImageHDU`.
+Algorithm objects (`Gzip1` for now; `Gzip2`/`Rice1`/`Hcompress1`/
+`Plio1` to follow) live in `src/zimage/compression_config.rs`.
+Each is a Rust pyclass exposed at `rustfits.<Name>`, validated at
+construction (`Gzip1(blocksize=0)` raises immediately), immutable
+(no setters).  No inheritance — common kwargs (`tile_shape`,
+`heap_format`) are duplicated across each constructor; for 5
+small config classes the duplication is trivial and avoids a
+PyClassInitializer chain.
+
+*Design discussion captured.*  See git log around this commit
+for the full thread: the chosen shape is one unified
+`create_image_hdu` (Option B) rather than a separate
+`create_compressed_image_hdu` (Option A), with structured config
+in the `compress=` slot rather than flat kwargs.  Decisions:
+(1) `tile_shape` / `heap_format` live on the algorithm object
+(not hoisted onto `create_image_hdu`); (2) Pythonic class names
+(`Gzip1`, not `GZIP_1`); (3) eager validation, immutable objects;
+(4) `heap_format` rather than `descriptor` (the kwarg name in
+`create_table_hdu` was renamed at the same time for consistency).
+
+*Layered architecture.*  rustfits's surface is designed for the
+best ergonomics we can build.  A future `rustfits.compat.fitsio`
+shim will present a fitsio-shaped surface for migrators (or as
+the backend for a fitsio 2.0).  Decisions like the
+`compress=Gzip1(...)` shape don't have to match fitsio's
+`compress='GZIP_1', tile_dims=...` flat-kwarg style — the shim
+absorbs the translation.
+
+*Scope (current).*  `Gzip1` only; integer ZBITPIX (8/16/32/64)
+only; create + bulk `write` only.  Float ZBITPIX (-32/-64) and
+unsigned-int trick dtypes (i1/u2/u4/u8) raise
+`NotImplementedError`.  `extend` and `__setitem__` still raise
+the original Phase 2 stub message.
+
+*Mechanics.*  `CompressedImageHDU.write` encodes every tile into
+RAM first (validate-then-mutate), then mutates the file: grows
+via `shift_file_tail_and_update_offsets` when not the last HDU
+(later HDU offsets bump in lockstep through the shared
+`Arc<FileLayout>`), or `set_len` when it is; writes per-tile
+descriptors into the main data section, then heap bytes; finally
+rewrites the PCOUNT card via the same disk-write-before-commit
++ taint pattern every other write path uses.  Tile cache is
+cleared on each write (cached entries from any prior read are
+stale).
+
+*GZIP_1 encoder.*  `encode_gzip1` in `src/zimage/gzip.rs` uses
+`flate2::write::GzEncoder` with `Compression::default()` (zlib
+level 6 — same as cfitsio/zlib defaults).  Input bytes are in
+FITS big-endian order; caller (`write_compressed_image_data` in
+`hdu_image_compressed.rs`) handles the byteswap via numpy
+`ascontiguousarray(view, ">i4")` etc. — one pass that handles
+dtype + endian together.
+
+*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` —
+accessors after create, dtype matrix (u1/i2/i4/i8), shape matrix
+(1-D / 2-D square / 2-D non-square with edge tiles / 3-D / whole-
+image single tile), default-tile-shape round trip, bidirectional
+cross-check with fitsio (rustfits-written read by fitsio AND
+fitsio-written read by rustfits, both bit-exact), non-last HDU
+growth (heap shifts later HDU forward, both read fine post-
+reopen), and all rejection paths (float, unsigned trick, non-
+config compress, shape mismatch, start kwarg).
+
+**Phase 7 follow-ups (deferred).**
+- **Other encoders** — `Gzip2`, `Rice1`, `Hcompress1`, `Plio1`.
+  Each adds an `encode_*` function in the algorithm module, an
+  algorithm class in `compression_config.rs`, and an entry in
+  the dispatch.  Header emission carries the algorithm-specific
+  ZNAMEn/ZVALn cards (BLOCKSIZE/BYTEPIX for RICE, SCALE/SMOOTH
+  for HCOMPRESS).
+- **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
+  XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
+  cards.  Symmetric with `create_image_hdu`'s existing handling
+  for uncompressed HDUs.
+
+**Phase 8 — Quantized float compressed writes.**  Own subsystem.
+Choose ZSCALE/ZZERO per tile, apply dither, optional GZIP
+lossless fallback column for tiles that quantize poorly.
+
+**Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
+`__setitem__`.  Changing a single pixel requires re-encoding the
+affected tile and possibly re-laying out the heap (same problem
+as VLA-table `__setitem__`, which we explicitly deferred for
+the same reason).  Wait for a real use case.
+
+When write phases beyond 7 land, **remove the
+`#[allow(unused_variables)]` on `extend` and `__setitem__` in
+`hdu_image_compressed.rs`** — Phase 2 set them because the
+bodies just raise NotImplementedError; real implementations
+will consume those parameters.
 
 ## Build / dev workflow
 

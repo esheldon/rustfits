@@ -17,9 +17,11 @@
 // Reference: cfitsio's `imcomp.c` (the gzip / gzip_2 branches in
 // `imcomp_decompress_tile`).
 
-use std::io::Read;
+use std::io::{Read, Write};
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 
@@ -113,4 +115,25 @@ pub(crate) fn decode_gzip2(
         byteswap_in_place(&mut out, bytepix as usize);
     }
     Ok(out)
+}
+
+// Encode one tile for GZIP_1: feed the pixel bytes (in FITS
+// big-endian order — caller's responsibility) to a fresh
+// GzEncoder and collect the gzip-framed output.  Matches cfitsio's
+// `deflateInit2(... windowBits=15+16 ...)` which produces gzip
+// framing rather than raw deflate or zlib (see the Phase 4 notes
+// in CLAUDE.md for the framing gotcha).
+//
+// Compression level is `Compression::default()` (zlib level 6) —
+// same as cfitsio/zlib's default.  Not exposed as a knob yet;
+// neither fitsio nor astropy expose it at the high-level API
+// either.
+pub(crate) fn encode_gzip1(pixel_bytes_be: &[u8]) -> PyResult<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(pixel_bytes_be).map_err(|e| {
+        PyValueError::new_err(format!("GZIP_1 encode: write failed: {}", e))
+    })?;
+    encoder.finish().map_err(|e| {
+        PyValueError::new_err(format!("GZIP_1 encode: finish failed: {}", e))
+    })
 }

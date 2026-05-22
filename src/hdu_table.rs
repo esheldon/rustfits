@@ -4205,7 +4205,7 @@ fn append_fixed_only(
 // PCOUNT is mandatory in BINTABLE headers so we expect it to exist;
 // fall back to inserting it just before TFIELDS if it's missing,
 // which keeps things sane for hand-built headers.
-fn set_pcount_in_cards(new_cards: &mut Vec<String>, new_pcount: u64) {
+pub(crate) fn set_pcount_in_cards(new_cards: &mut Vec<String>, new_pcount: u64) {
     let card = card_int(
         "PCOUNT", new_pcount as i64, "size of special data area");
     let trimmed = card.trim_end().to_string();

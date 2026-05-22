@@ -3,6 +3,7 @@
 // the right per-algorithm decoder.  Phase 4 wires RICE_1, GZIP_1,
 // and GZIP_2; HCOMPRESS_1 / PLIO_1 are Phase 6+ and still raise.
 
+pub(crate) mod compression_config;
 pub(crate) mod gzip;
 pub(crate) mod hcompress;
 pub(crate) mod plio;
@@ -10,7 +11,7 @@ pub(crate) mod quantize;
 pub(crate) mod rice;
 
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompressionAlgorithm {
@@ -105,5 +106,39 @@ pub(crate) fn decode_tile_to_bytes(
         CompressionAlgorithm::Plio1 => {
             plio::decode_plio(compressed, n_pixels, bytepix, zbitpix)
         }
+    }
+}
+
+// Encode one tile from its native-endian pixel bytes to the
+// algorithm's on-disk compressed bytes.  Mirror of
+// `decode_tile_to_bytes` for the write path.  The caller is
+// responsible for byteswapping native → FITS big-endian before
+// passing in the bytes (matches the decode side, which produces
+// native-endian output).
+//
+// Phase 7 wires GZIP_1 only; the other algorithms raise a clear
+// "planned in Phase ..." error.
+pub(crate) fn encode_tile_from_bytes(
+    algorithm: CompressionAlgorithm,
+    pixel_bytes_be: &[u8],
+) -> PyResult<Vec<u8>> {
+    match algorithm {
+        CompressionAlgorithm::Gzip1 => gzip::encode_gzip1(pixel_bytes_be),
+        CompressionAlgorithm::Rice1 => Err(PyNotImplementedError::new_err(
+            "RICE_1 encoding is not yet implemented \
+             (planned: a follow-up sub-phase under Phase 7)"
+        )),
+        CompressionAlgorithm::Gzip2 => Err(PyNotImplementedError::new_err(
+            "GZIP_2 encoding is not yet implemented \
+             (planned: a follow-up sub-phase under Phase 7)"
+        )),
+        CompressionAlgorithm::Hcompress1 => Err(PyNotImplementedError::new_err(
+            "HCOMPRESS_1 encoding is not yet implemented \
+             (planned: a follow-up sub-phase under Phase 7)"
+        )),
+        CompressionAlgorithm::Plio1 => Err(PyNotImplementedError::new_err(
+            "PLIO_1 encoding is not yet implemented \
+             (planned: a follow-up sub-phase under Phase 7)"
+        )),
     }
 }

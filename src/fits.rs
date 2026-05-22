@@ -260,6 +260,7 @@ fn parse_hdus_from_file(
 enum HduKind {
     Image,
     Table,
+    CompressedImage,
 }
 
 // Round a byte count up to the next BLOCK_SIZE boundary.  Returns 0
@@ -384,6 +385,11 @@ impl FITS {
                 offsets, Arc::clone(&self.layout),
                 Arc::clone(&self.file), Arc::clone(&self.tainted),
             ))?.into(),
+            HduKind::CompressedImage => Py::new(py, CompressedImageHDU::new(
+                trimmed, index, self.filename.clone(),
+                offsets, Arc::clone(&self.layout),
+                Arc::clone(&self.file), Arc::clone(&self.tainted),
+            ))?.into(),
         };
         self.hdus.push(hdu_py);
         Ok(())
@@ -401,6 +407,157 @@ impl FITS {
         let cards = empty_primary_cards();
         let offsets = append_header_and_data_to_file(&self.file, &cards, 0)?;
         self.finalize_hdu(py, &cards, offsets, HduKind::Image)
+    }
+
+    // Create a tile-compressed image HDU.  Routes from
+    // `create_image_hdu(..., compress=Gzip1(...))`.  Builds a
+    // BINTABLE-with-ZIMAGE header, allocates the per-tile descriptor
+    // table (n_tiles rows × 8 or 16 bytes) zero-filled, and leaves
+    // the heap empty (PCOUNT=0) until CompressedImageHDU.write is
+    // called.
+    //
+    // Phase 7 supports Gzip1 + integer ZBITPIX (u1/i2/i4/i8) only.
+    // Other algorithms and float ZBITPIX raise NotImplementedError.
+    fn create_compressed_image_hdu_impl(
+        &mut self,
+        py: Python<'_>,
+        dtype: String,
+        dims: Vec<i64>,
+        extname: Option<String>,
+        extver: Option<i64>,
+        compress: Py<PyAny>,
+    ) -> PyResult<()> {
+        for (i, &d) in dims.iter().enumerate() {
+            if d <= 0 {
+                return Err(PyValueError::new_err(format!(
+                    "dimension {} must be > 0, got {}", i, d
+                )));
+            }
+        }
+        if dims.is_empty() {
+            return Err(PyValueError::new_err(
+                "compressed images must have NAXIS >= 1"
+            ));
+        }
+
+        // Extract the compress config.  Currently only Gzip1 is
+        // supported; the isinstance check uses Py<Gzip1>::extract.
+        let bound = compress.bind(py);
+        let cfg: crate::zimage::compression_config::Gzip1 = bound.extract()
+            .map_err(|_| pyo3::exceptions::PyTypeError::new_err(
+                "compress= must be a compression-config object \
+                 (e.g. rustfits.Gzip1(...)); Phase 7 supports Gzip1 only"
+            ))?;
+
+        // Dtype validation: Phase 7 supports BITPIX-direct integer
+        // types (u1/i2/i4/i8) only.  Floats deferred to Phase 8
+        // (quantization); unsigned-int trick types (i1/u2/u4/u8)
+        // deferred until we wire the reverse-cast on the write side.
+        let (bitpix, bzero) = crate::hdu_image::dtype_to_bitpix(&dtype)?;
+        if bitpix < 0 {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "compressed float images are not yet supported \
+                 (planned: Phase 8 — float quantization)"
+            ));
+        }
+        if bzero.is_some() {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "compressed unsigned-int trick dtypes (i1/u2/u4/u8) \
+                 are not yet supported on write; pass the matching \
+                 signed dtype (i1→u1 mismatch, u2→i2, u4→i4, u8→i8) \
+                 for now, or wait for a Phase 7 follow-up"
+            ));
+        }
+
+        // Build the tile shape in numpy axis order.  None → FITS-
+        // convention default ("row tiles": ZTILE1=NAXIS1, others=1,
+        // which is `[1, ..., 1, NAXIS_last]` in numpy order since the
+        // numpy-last axis corresponds to FITS-NAXIS1).
+        let numpy_dims: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
+        let tile_shape_numpy: Vec<u64> = match &cfg.tile_shape {
+            Some(ts) => {
+                if ts.len() != numpy_dims.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "tile_shape has {} dimensions but image has {}",
+                        ts.len(), numpy_dims.len()
+                    )));
+                }
+                ts.clone()
+            }
+            None => {
+                let n = numpy_dims.len();
+                let mut v = vec![1u64; n];
+                v[n - 1] = numpy_dims[n - 1];
+                v
+            }
+        };
+
+        let n_tiles = crate::hdu_image_compressed::compute_n_tiles(
+            &numpy_dims, &tile_shape_numpy,
+        );
+
+        // Compressed images can't be the primary HDU (they're stored
+        // as BINTABLE).  Auto-write an empty primary first if the
+        // file is fresh — same as create_table_hdu does.
+        self.ensure_primary(py)?;
+
+        let descriptor_size: u64 = if cfg.heap_format == 'P' { 8 } else { 16 };
+        let tform_val = if cfg.heap_format == 'P' { "1PB" } else { "1QB" };
+
+        // FITS-order copies of image + tile shapes for the Z* cards.
+        let fits_dims: Vec<u64> = numpy_dims.iter().rev().copied().collect();
+        let tile_shape_fits: Vec<u64> =
+            tile_shape_numpy.iter().rev().copied().collect();
+
+        let mut cards: Vec<String> = Vec::new();
+        cards.push(card_string("XTENSION", "BINTABLE",
+                               "binary table extension"));
+        cards.push(card_int("BITPIX", 8, "8-bit bytes"));
+        cards.push(card_int("NAXIS", 2, "2-dimensional binary table"));
+        cards.push(card_int("NAXIS1", descriptor_size as i64,
+                            "width of table row in bytes"));
+        cards.push(card_int("NAXIS2", n_tiles as i64,
+                            "number of rows in table (= n_tiles)"));
+        cards.push(card_int("PCOUNT", 0, "size of heap in bytes"));
+        cards.push(card_int("GCOUNT", 1, "one data group"));
+        cards.push(card_int("TFIELDS", 1, "number of fields per row"));
+        cards.push(card_string("TFORM1", tform_val,
+                               "VLA byte-array descriptor"));
+        cards.push(card_string("TTYPE1", "COMPRESSED_DATA",
+                               "label for column 1"));
+        cards.push(card_logical("ZIMAGE", true,
+                                "tile-compressed image"));
+        cards.push(card_string("ZCMPTYPE", "GZIP_1",
+                               "compression algorithm"));
+        cards.push(card_int("ZBITPIX", bitpix as i64,
+                            "image bits per pixel"));
+        cards.push(card_int("ZNAXIS", dims.len() as i64,
+                            "image dimensions"));
+        for (i, &d) in fits_dims.iter().enumerate() {
+            cards.push(card_int(&format!("ZNAXIS{}", i + 1), d as i64,
+                                &format!("image axis {}", i + 1)));
+        }
+        for (i, &t) in tile_shape_fits.iter().enumerate() {
+            cards.push(card_int(&format!("ZTILE{}", i + 1), t as i64,
+                                &format!("tile size on axis {}", i + 1)));
+        }
+        if let Some(name) = extname.as_deref() {
+            cards.push(card_string("EXTNAME", name, "name of this HDU"));
+        }
+        if let Some(ver) = extver {
+            cards.push(card_int("EXTVER", ver, "extension version"));
+        }
+        cards.push(pad_to_card("END"));
+
+        // Main data section: one descriptor per tile, all zeroes
+        // (nelements=0, offset=0) until CompressedImageHDU.write
+        // populates them.  Heap is empty (PCOUNT=0).
+        let data_size = descriptor_size.saturating_mul(n_tiles);
+        let data_padded = data_section_padded(data_size);
+
+        let offsets =
+            append_header_and_data_to_file(&self.file, &cards, data_padded)?;
+        self.finalize_hdu(py, &cards, offsets, HduKind::CompressedImage)
     }
 }
 
@@ -539,7 +696,14 @@ impl FITS {
     // HDU created becomes the primary HDU (SIMPLE=T, EXTEND=T); subsequent
     // calls produce 'IMAGE' extensions.  The data section is allocated as
     // zeros via sparse file extension.
-    #[pyo3(signature = (dtype, dims, extname=None, extver=None))]
+    //
+    // `compress`, when non-None, is a compression-config object (e.g.
+    // `rustfits.Gzip1(tile_shape=..., heap_format='P')`).  In that case
+    // the HDU is created as a tile-compressed image (BINTABLE+ZIMAGE on
+    // disk, `CompressedImageHDU` in Python) instead of a plain IMAGE
+    // extension.  Phase 7 supports `Gzip1` only; other algorithms will
+    // be added in follow-up sub-phases.
+    #[pyo3(signature = (dtype, dims, *, extname=None, extver=None, compress=None))]
     fn create_image_hdu(
         &mut self,
         py: Python<'_>,
@@ -547,7 +711,13 @@ impl FITS {
         dims: Vec<i64>,
         extname: Option<String>,
         extver: Option<i64>,
+        compress: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        if let Some(cfg) = compress {
+            return self.create_compressed_image_hdu_impl(
+                py, dtype, dims, extname, extver, cfg,
+            );
+        }
         for (i, &d) in dims.iter().enumerate() {
             if d <= 0 {
                 return Err(PyValueError::new_err(format!(
@@ -645,7 +815,7 @@ impl FITS {
     #[pyo3(signature = (
         dtype, nrows=0, *,
         extname=None, extver=None, units=None,
-        var_dtypes=None, descriptor=None
+        var_dtypes=None, heap_format=None
     ))]
     fn create_table_hdu(
         &mut self,
@@ -656,19 +826,23 @@ impl FITS {
         extver: Option<i64>,
         units: Option<&Bound<'_, PyDict>>,
         var_dtypes: Option<&Bound<'_, PyDict>>,
-        descriptor: Option<String>,
+        heap_format: Option<String>,
     ) -> PyResult<()> {
         if nrows < 0 {
             return Err(PyValueError::new_err(format!(
                 "create_table_hdu: nrows must be >= 0, got {}", nrows)));
         }
-        // descriptor is 'P' (default) or 'Q'.  Only relevant when any
-        // VLA columns are declared; ignored otherwise.
-        let desc_char = match descriptor.as_deref() {
+        // heap_format is 'P' (default — 8-byte descriptors, 4 GB heap
+        // ceiling) or 'Q' (16-byte, no practical ceiling).  Only
+        // relevant when any VLA columns are declared; ignored
+        // otherwise.  The name refers to how the VLA heap is
+        // addressed in the BINTABLE row; values match the FITS
+        // TFORM letter (`1PE` vs `1QE`).
+        let desc_char = match heap_format.as_deref() {
             None | Some("P") | Some("p") => 'P',
             Some("Q") | Some("q") => 'Q',
             Some(other) => return Err(PyValueError::new_err(format!(
-                "create_table_hdu: descriptor must be 'P' or 'Q', got '{}'",
+                "create_table_hdu: heap_format must be 'P' or 'Q', got '{}'",
                 other))),
         };
         let (table_cards, row_width) = normalize_and_build_table_header(

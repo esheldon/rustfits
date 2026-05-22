@@ -24,7 +24,7 @@
 // BINTABLE NAXIS2 > 0; empty image → n_tiles = 0 → NAXIS2 = 0.
 // So no override needed.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,11 +34,15 @@ use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::types::{PyBytes, PySlice, PyTuple};
 
 use crate::common::{
-    check_not_tainted, parse_keyword, parse_string_keyword,
-    FileHandle, FileLayout, HduOffsets, TaintFlag,
+    check_not_tainted, lock_file, parse_keyword, parse_string_keyword,
+    shift_file_tail_and_update_offsets,
+    FileHandle, FileLayout, HduOffsets, TaintFlag, BLOCK_SIZE,
 };
 use crate::hdu::HDU;
-use crate::hdu_image::{normalize_slice_key, AxisSlice, ImageHDU};
+use crate::hdu_image::{
+    normalize_slice_key, serialize_header_to_disk_bytes, AxisSlice, ImageHDU,
+};
+use crate::hdu_table::set_pcount_in_cards;
 use crate::zimage::CompressionAlgorithm;
 
 // 32 MiB by default — large enough to cache a few hundred typical
@@ -427,17 +431,41 @@ impl CompressedImageHDU {
     // path that would otherwise inherit ImageHDU's uncompressed
     // implementation, since those would happily blast bytes into
     // the BINTABLE data area and produce a corrupt file.
+    // Bulk-write a compressed image.  Encodes every tile in RAM
+    // first (validate-then-mutate), then grows the file as needed,
+    // writes the per-tile descriptors into the main data section
+    // and the encoded bytes into the heap, and rewrites the PCOUNT
+    // card.  `start=` is not supported on compressed images (every
+    // tile is encoded independently; partial writes would mean a
+    // partial tile, which doesn't compose with the encode-once
+    // model).  Pass the full image array as `data`.
+    //
+    // Phase 7 supports Gzip1 only with integer ZBITPIX (u1/i2/i4/i8).
     #[pyo3(signature = (data, start=None))]
-    #[allow(unused_variables)]
     fn write(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         data: &Bound<'_, PyAny>,
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "writing tile-compressed images is not yet implemented \
-             (planned: Phase 7+ of the ZIMAGE roadmap)."
-        ))
+        if start.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "start= is not supported for compressed-image writes; \
+                 the encoder operates per-tile and partial writes would \
+                 mean partial tiles, which don't compose with the \
+                 single-pass encode model"
+            ));
+        }
+        let cache = Arc::clone(&slf.cache);
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        write_compressed_image_data(
+            py, data, &cards,
+            &super_.offsets,
+            &super_.file, &super_.layout, &super_.tainted,
+            &cache,
+            &super_.header,
+        )
     }
 
     #[pyo3(signature = (data, start=None))]
@@ -514,7 +542,7 @@ fn parse_tile_shape(header: &[String], image_shape: &[u64]) -> Vec<u64> {
 
 // Product of ceil(image / tile) across all axes.  A zero in either
 // shape collapses the product to 0 (no tiles).
-fn compute_n_tiles(image_shape: &[u64], tile_shape: &[u64]) -> u64 {
+pub(crate) fn compute_n_tiles(image_shape: &[u64], tile_shape: &[u64]) -> u64 {
     if image_shape.is_empty() {
         return 0;
     }
@@ -1738,4 +1766,323 @@ fn slice_compressed_image(
     } else {
         Ok(scaled)
     }
+}
+
+// ====== Compressed write (Phase 7) ======
+
+// Bulk-write entry point for CompressedImageHDU.write.  Encodes every
+// tile in RAM, then mutates the file (grow if non-last HDU, write
+// descriptors + heap, update PCOUNT card).  Phase 7 supports GZIP_1
+// only with integer ZBITPIX (u1/i2/i4/i8).
+//
+// Order:
+//   1. Parse header for shape, tile shape, algorithm, ZBITPIX, heap_format.
+//   2. Validate the input ndarray (shape, dtype).
+//   3. Encode all tiles into RAM → descriptors + heap.  (Validate-then-
+//      mutate: any error from here back leaves the file untouched.)
+//   4. Grow the file if (main_size + heap_size, block-padded) exceeds
+//      the current padded data extent.  Use shift_file_tail when not
+//      the last HDU; set_len when it is.
+//   5. Write descriptors into the main data section + heap bytes
+//      immediately after.
+//   6. Rewrite the header in place with the updated PCOUNT.
+//   7. Commit the in-memory cards and clear the tile cache.
+//
+// Taint semantics match the rest of the write paths: anything before
+// the first file mutation can fail without tainting; failures inside
+// the shift / write / header rewrite taint and the user has to
+// close+reopen.
+#[allow(clippy::too_many_arguments)]
+fn write_compressed_image_data(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    cards: &[String],
+    offsets: &Arc<HduOffsets>,
+    file_handle: &FileHandle,
+    layout: &FileLayout,
+    tainted: &TaintFlag,
+    cache: &TileCache,
+    cards_arc: &Arc<Mutex<Vec<String>>>,
+) -> PyResult<()> {
+    check_not_tainted(tainted)?;
+
+    // ----- header parse -----
+    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
+        .ok_or_else(|| PyValueError::new_err(
+            "compressed HDU missing ZCMPTYPE"
+        ))?;
+    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
+    let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
+    if image_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "compressed HDU has ZNAXIS=0 (no image data)"
+        ));
+    }
+    if zbitpix < 0 {
+        return Err(PyNotImplementedError::new_err(
+            "compressed float-image writes are not yet supported \
+             (planned: Phase 8 — float quantization)"
+        ));
+    }
+    let bytepix: u32 = match zbitpix {
+        8 => 1, 16 => 2, 32 => 4, 64 => 8,
+        other => return Err(PyValueError::new_err(format!(
+            "unsupported ZBITPIX {} for compressed write", other
+        ))),
+    };
+    let tile_shape = parse_tile_shape(cards, &image_shape);
+    let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
+
+    // Determine heap_format from TFORM1.  Encoder needs to know
+    // 'P' (8-byte descriptors, u32 fields) vs 'Q' (16-byte, u64).
+    let tform1 = parse_string_keyword(cards, "TFORM1")
+        .ok_or_else(|| PyValueError::new_err(
+            "compressed HDU missing TFORM1"
+        ))?;
+    let tform1_trim = tform1.trim();
+    let heap_is_q = tform1_trim.starts_with("1Q")
+        || tform1_trim.starts_with('Q');
+    let descriptor_size: u64 = if heap_is_q { 16 } else { 8 };
+
+    // ----- input ndarray validation -----
+    let np = py.import("numpy")?;
+    let ascontig = np.call_method1("ascontiguousarray", (data,))?;
+    let in_shape: Vec<usize> = ascontig.getattr("shape")?.extract()?;
+    let expected_shape: Vec<usize> =
+        image_shape.iter().map(|&d| d as usize).collect();
+    if in_shape != expected_shape {
+        return Err(PyValueError::new_err(format!(
+            "compressed image write: input shape {:?} != image shape {:?}",
+            in_shape, expected_shape
+        )));
+    }
+    // Convert to the expected on-disk dtype in big-endian order in
+    // one pass.  numpy's astype handles dtype matching + byteswap
+    // atomically; we don't need to babysit it.
+    let be_dtype = match zbitpix {
+        8  => ">u1",
+        16 => ">i2",
+        32 => ">i4",
+        64 => ">i8",
+        other => return Err(PyValueError::new_err(format!(
+            "unsupported ZBITPIX {} for compressed write", other
+        ))),
+    };
+
+    // ----- encode all tiles into RAM -----
+    let mut heap_bytes: Vec<u8> = Vec::new();
+    // descriptors: (nelements, heap_offset) per tile, in tile-index
+    // order (FITS row-major, numpy-last-axis fastest).
+    let mut descriptors: Vec<(u64, u64)> = Vec::with_capacity(n_tiles as usize);
+    let params = crate::zimage::AlgorithmParams {
+        tile_shape_numpy: &[],  // GZIP doesn't use it; HCOMPRESS overrides per-tile via encode_tile_from_bytes when wired
+        smooth: false,
+    };
+    let _ = params; // currently unused by encode_tile_from_bytes
+
+    for tile_idx in 0..n_tiles {
+        let (origin, actual_shape) = tile_origin_and_shape(
+            tile_idx, &image_shape, &tile_shape,
+        );
+        // Build slice tuple data[origin[0]:origin[0]+shape[0], ...]
+        let slice_objs: Vec<Bound<'_, PySlice>> = origin.iter()
+            .zip(actual_shape.iter())
+            .map(|(&o, &s)| PySlice::new(
+                py, o as isize, (o + s) as isize, 1,
+            ))
+            .collect();
+        let slice_tuple = PyTuple::new(py, &slice_objs)?;
+        let tile_view = ascontig.get_item(slice_tuple)?;
+        // ascontiguousarray(view, be_dtype) gives us a contiguous
+        // big-endian buffer in one numpy call; cheap when input is
+        // already contiguous + native, a single copy when not.
+        let tile_be = np.call_method1(
+            "ascontiguousarray", (tile_view, be_dtype),
+        )?;
+        let tile_bytes_py = tile_be.call_method0("tobytes")?;
+        let tile_bytes: Vec<u8> = tile_bytes_py.extract()?;
+        let expected_bytes = (actual_shape.iter().product::<u64>()
+            * bytepix as u64) as usize;
+        if tile_bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "internal: tile {} bytes={} expected {}",
+                tile_idx, tile_bytes.len(), expected_bytes
+            )));
+        }
+        let encoded = crate::zimage::encode_tile_from_bytes(
+            algorithm, &tile_bytes,
+        )?;
+        let offset = heap_bytes.len() as u64;
+        descriptors.push((encoded.len() as u64, offset));
+        heap_bytes.extend(encoded);
+    }
+    let total_heap_bytes = heap_bytes.len() as u64;
+
+    // ----- compute file extents -----
+    let data_offset = offsets.data_offset();
+    let main_bytes = descriptor_size.saturating_mul(n_tiles);
+    let new_data_size = main_bytes.saturating_add(total_heap_bytes);
+    let new_padded = if new_data_size == 0 {
+        0
+    } else {
+        ((new_data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            * BLOCK_SIZE as u64
+    };
+    // Current data extent = file size between data_offset and the next
+    // HDU's header_offset (or EOF if this is the last HDU).  We can
+    // approximate via "is the data section padded enough?" — we know
+    // the HDU's allocated size from layout/EOF.
+    let current_hdu_end = {
+        let guard = layout.hdus.lock()
+            .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+        // Find this HDU's index by matching offsets.  We don't have
+        // an index passed in, but Arc equality works since they share.
+        let mut found_next: Option<u64> = None;
+        let mut found_self = false;
+        for h in guard.iter() {
+            if found_self {
+                found_next = Some(h.header_offset());
+                break;
+            }
+            if Arc::ptr_eq(h, offsets) {
+                found_self = true;
+            }
+        }
+        match found_next {
+            Some(end) => end,
+            None => {
+                // Last HDU — current_hdu_end is the file length.
+                let g = lock_file(file_handle)?;
+                let f = g.as_ref()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.metadata()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .len()
+            }
+        }
+    };
+    let current_padded_data = current_hdu_end.saturating_sub(data_offset);
+    let new_hdu_end = data_offset + new_padded;
+
+    // ----- grow if needed -----
+    if new_padded > current_padded_data {
+        let delta = new_padded - current_padded_data;
+        // file_len lets us tell if there are bytes after this HDU
+        // that need to be shifted forward.
+        let file_len = {
+            let g = lock_file(file_handle)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            // Non-last HDU — shift the tail forward; later HDU
+            // offsets bump via the shared FileLayout.
+            shift_file_tail_and_update_offsets(
+                file_handle, layout, current_hdu_end, delta, tainted,
+            )?;
+        } else {
+            // Last HDU — extend the file in place.
+            let mut g = lock_file(file_handle)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // ----- write descriptors + heap -----
+    {
+        let mut g = lock_file(file_handle)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "compressed write: seek to data_offset failed: {}", e))
+            })?;
+        // Descriptors in tile-index order.  P: (u32 nelem BE, u32 off BE).
+        // Q: (u64 nelem BE, u64 off BE).
+        let mut desc_buf: Vec<u8> =
+            Vec::with_capacity((descriptor_size * n_tiles) as usize);
+        for &(nel, off) in &descriptors {
+            if heap_is_q {
+                desc_buf.extend_from_slice(&nel.to_be_bytes());
+                desc_buf.extend_from_slice(&off.to_be_bytes());
+            } else {
+                if nel > u32::MAX as u64 || off > u32::MAX as u64 {
+                    tainted.store(true, Ordering::Release);
+                    return Err(PyValueError::new_err(format!(
+                        "compressed write: P-descriptor overflow (nelem={}, \
+                         offset={}); use heap_format='Q' for heaps > 4 GB",
+                        nel, off
+                    )));
+                }
+                desc_buf.extend_from_slice(&(nel as u32).to_be_bytes());
+                desc_buf.extend_from_slice(&(off as u32).to_be_bytes());
+            }
+        }
+        f.write_all(&desc_buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed write: descriptor write failed: {}", e))
+        })?;
+        f.write_all(&heap_bytes).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed write: heap write failed: {}", e))
+        })?;
+        // Zero-pad to the block boundary so the data section is FITS-
+        // conforming.  Cheap: at most BLOCK_SIZE-1 bytes.
+        let written = main_bytes + total_heap_bytes;
+        if new_padded > written {
+            let pad = vec![0u8; (new_padded - written) as usize];
+            f.write_all(&pad).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "compressed write: data pad write failed: {}", e))
+            })?;
+        }
+        f.flush().map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed write: flush failed: {}", e))
+        })?;
+    }
+
+    // ----- header rewrite (PCOUNT update) -----
+    let mut cards_guard = cards_arc.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, total_heap_bytes);
+    {
+        let mut g = lock_file(file_handle)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        // header_offset stays valid; PCOUNT rewrite doesn't change
+        // the header block count.
+        let header_offset = offsets.header_offset();
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header flush failed: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+
+    // Any tiles cached from earlier reads are now stale.
+    cache.clear();
+
+    Ok(())
 }

@@ -8,6 +8,7 @@ from ._rust import (
     AsciiTableHDU,
     FITSHeader,
     FITSHeaderEdit,
+    Gzip1,
     is_protected_key,
 )
 

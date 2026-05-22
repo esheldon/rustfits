@@ -46,14 +46,14 @@ def test_create_emits_pE_tform_and_zero_pcount():
             assert f[1].header["PCOUNT"] == 0
 
 
-def test_descriptor_q_opt_in():
-    """Passing descriptor='Q' produces 1QE (16-byte descriptors)."""
+def test_heap_format_q_opt_in():
+    """Passing heap_format='Q' produces 1QE (16-byte descriptors)."""
     with tempfile.TemporaryDirectory() as td:
         fn = os.path.join(td, "t.fits")
         dt = np.dtype([("lc", "O")])
         with rustfits.FITS(fn, "w+") as f:
             f.create_table_hdu(
-                dt, nrows=0, var_dtypes={"lc": "f4"}, descriptor="Q"
+                dt, nrows=0, var_dtypes={"lc": "f4"}, heap_format="Q"
             )
             assert f[1].header["TFORM1"] == "1QE"
             assert f[1].header["NAXIS1"] == 16
@@ -80,14 +80,14 @@ def test_unknown_var_dtypes_key_rejected():
                 f.create_table_hdu(dt, nrows=0, var_dtypes={"missing": "f4"})
 
 
-def test_bad_descriptor_rejected():
+def test_bad_heap_format_rejected():
     with tempfile.TemporaryDirectory() as td:
         fn = os.path.join(td, "t.fits")
         dt = np.dtype([("lc", "O")])
         with rustfits.FITS(fn, "w+") as f:
             with pytest.raises(ValueError, match="must be 'P' or 'Q'"):
                 f.create_table_hdu(
-                    dt, nrows=0, var_dtypes={"lc": "f4"}, descriptor="R"
+                    dt, nrows=0, var_dtypes={"lc": "f4"}, heap_format="R"
                 )
 
 
