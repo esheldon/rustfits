@@ -1010,3 +1010,38 @@ Worth keeping an eye on the failing test
 (`tests/test_compressed_image_phase1.py`'s
 `test_other_compression_types_dispatched` was the first to
 abort) when the time comes.
+
+## Coverage TODO — sweep once feature-complete
+
+First codecov run (commit `cf619a2`, May 2026) reported
+`/rustfits` (Python) at 100% and `/src` (Rust) at 89.61%.
+The Python number is mostly informational — `rustfits/*.py`
+is just re-exports plus a thin `convenience.read`, so all
+the real logic lives in Rust and the 89.61% is the one
+worth moving.
+
+Plan: **don't chase coverage incrementally** during
+feature work.  Wait until we're past the feature-complete
+threshold for the current phase set (probably some time
+after ZIMAGE Phase 5+6 and image/table write parity is
+done), then do one focused coverage-driven sweep.  Two
+buckets to look at when that happens:
+
+- **Cheap wins (the "dishonest" miss bucket)** — branches
+  that one extra test would exercise (a specific TFORM
+  case, an edge tile in a 1-D image, a `__setitem__`
+  permutation we never hit).  A 30-min pass usually moves
+  the library 90% → ~95%.
+- **Honest gaps (the "fault injection" bucket)** — mid-
+  write `flush()` failures, OS-level I/O errors, taint-
+  flag re-rejections, malformed-file branches.  These need
+  either real fault injection (LD_PRELOAD-style write
+  intercept, or a faulty-file-system test harness) or
+  hand-crafted broken FITS fixtures.  Some of these
+  branches *should* stay uncovered — they're the panic-on-
+  impossible variants that exist for safety — so the
+  judgment is which ones are worth the test cost.
+
+Don't aim for 100% on `/src`.  90-95% covered + the
+remaining gaps explicitly catalogued (in code comments or
+this section) is the actual target.
