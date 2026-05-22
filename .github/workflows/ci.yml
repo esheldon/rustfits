@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded in-progress runs for the same branch / PR — keeps
+# the queue from piling up when you push twice in quick succession.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----- Lint -------------------------------------------------------
+  # Runs ruff format-check and ruff check on the Python sources.  No
+  # Rust toolchain or build needed — fast feedback on style.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: rustfits-lint
+          create-args: >-
+            python=3.12
+            ruff
+          cache-environment: true
+          init-shell: bash
+      - name: ruff format --check
+        shell: bash -el {0}
+        run: ruff format --check
+      - name: ruff check
+        shell: bash -el {0}
+        run: ruff check
+
+  # ----- Test matrix ------------------------------------------------
+  # Linux + macOS, Python 3.12 + 3.14.  Each leg installs from the
+  # conda-requirements files (matches local dev exactly), pulls Rust
+  # from rustup via dtolnay's action, builds with maturin develop,
+  # runs pytest.
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches target/ and ~/.cargo across runs — first build is full,
+      # subsequent builds are incremental.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up conda env (python ${{ matrix.python }})
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: rustfits-test
+          create-args: >-
+            python=${{ matrix.python }}
+          cache-environment: true
+          init-shell: bash
+
+      - name: Install conda deps
+        shell: bash -el {0}
+        run: |
+          micromamba install -y -c conda-forge \
+            --file conda-requirements.txt \
+            --file conda-test-requirements.txt
+
+      - name: maturin develop
+        shell: bash -el {0}
+        run: maturin develop
+
+      - name: pytest
+        shell: bash -el {0}
+        run: pytest
+
+  # ----- Coverage (single config) ----------------------------------
+  # Python coverage via pytest-cov + Rust coverage via cargo-llvm-cov.
+  # Only runs on one OS / Python combo — coverage instrumentation
+  # roughly doubles compile time and the report doesn't change across
+  # platforms.  Both reports get uploaded to codecov in one action.
+  coverage:
+    name: Coverage (linux, py3.12 → codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Set up conda env (python 3.12)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: rustfits-cov
+          create-args: >-
+            python=3.12
+          cache-environment: true
+          init-shell: bash
+
+      - name: Install conda deps + pytest-cov
+        shell: bash -el {0}
+        run: |
+          micromamba install -y -c conda-forge \
+            --file conda-requirements.txt \
+            --file conda-test-requirements.txt \
+            pytest-cov
+
+      # cargo-llvm-cov show-env emits the RUSTFLAGS / LLVM_PROFILE_FILE
+      # / CARGO_LLVM_COV_TARGET_DIR that the instrumented build needs.
+      # Source it once so the cdylib built by maturin AND the .profraw
+      # files written by pytest land where `cargo llvm-cov report`
+      # expects them.  The whole pipeline runs in one shell because
+      # `source <(...)` only affects the current shell — splitting it
+      # across CI steps would lose the env.
+      - name: Build + test with coverage, emit lcov
+        shell: bash -el {0}
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          maturin develop
+          pytest --cov=rustfits --cov-report=xml
+          cargo llvm-cov report --lcov --output-path rust-coverage.lcov
+
+      - name: Upload coverage to codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: rust-coverage.lcov,coverage.xml
+          flags: rust,python
+          fail_ci_if_error: false
+          # CODECOV_TOKEN is optional for public repos but recommended
+          # by codecov to avoid rate-limiting.  Add it under
+          # Settings → Secrets → Actions once you've connected the
+          # repo at codecov.io.
+          token: ${{ secrets.CODECOV_TOKEN }}
