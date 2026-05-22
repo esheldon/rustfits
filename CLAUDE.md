@@ -988,3 +988,25 @@ with rustfits.FITS(fname, "r") as fits:
 
 Or a `_check_both(fname, fits, predicate)` helper for tests with multiple
 assertions.  Either is fine.
+
+## Known CI limitations
+
+**macOS dropped from the test matrix (May 2026).**  The CI
+workflow at `.github/workflows/ci.yml` originally ran
+`{ubuntu-latest, macos-latest} x {python 3.12, 3.14}`.  Every
+macOS leg crashed during the first test that asks fitsio to
+write a compressed-image fixture: libmalloc detected a bad
+free inside cfitsio's `ffbinit`, called from
+`PyFITSObject_create_image_hdu`.  Both py3.12 and py3.14
+hit it, so it's macOS-specific (conda-forge build of fitsio
+or cfitsio), not Python-version specific.  Linux is
+unaffected.
+
+The repo owner is upstream on fitsio and plans to fix the
+macOS build there.  Once a fixed fitsio is released on
+conda-forge, re-add `macos-latest` to the `test.matrix.os`
+list in `.github/workflows/ci.yml` and delete this note.
+Worth keeping an eye on the failing test
+(`tests/test_compressed_image_phase1.py`'s
+`test_other_compression_types_dispatched` was the first to
+abort) when the time comes.

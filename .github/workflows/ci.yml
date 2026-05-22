@@ -36,17 +36,20 @@ jobs:
         run: ruff check
 
   # ----- Test matrix ------------------------------------------------
-  # Linux + macOS, Python 3.12 + 3.14.  Each leg installs from the
-  # conda-requirements files (matches local dev exactly), pulls Rust
-  # from rustup via dtolnay's action, builds with maturin develop,
-  # runs pytest.
+  # Linux only for now (Python 3.12 + 3.14).  macOS was originally
+  # included but conda-forge's fitsio/cfitsio build crashes during
+  # the test-fixture write step (libmalloc bad-free in cfitsio's
+  # ffbinit, hit by every test that uses fitsio to write a fixture).
+  # The user is upstream on fitsio and plans to fix it there; once
+  # released, re-add macos-latest to the os matrix and re-enable the
+  # macOS note in CLAUDE.md.  See "Known CI limitations" there.
   test:
     name: Test (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
