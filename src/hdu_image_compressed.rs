@@ -1963,6 +1963,11 @@ fn write_compressed_image_data(
 
     // Determine heap_format from TFORM1.  Encoder needs to know
     // 'P' (8-byte descriptors, u32 fields) vs 'Q' (16-byte, u64).
+    // Inner type matters too: '1PB'/'1QB' (byte) is used by
+    // GZIP/RICE/HCOMPRESS, '1PI'/'1QI' (i16 short) by PLIO.  For
+    // VLA descriptors the `nelements` field counts ELEMENTS of the
+    // inner type, not bytes — so we divide encoded.len() by
+    // `inner_byte_width` when filling descriptors.
     let tform1 = parse_string_keyword(cards, "TFORM1")
         .ok_or_else(|| PyValueError::new_err(
             "compressed HDU missing TFORM1"
@@ -1971,6 +1976,8 @@ fn write_compressed_image_data(
     let heap_is_q = tform1_trim.starts_with("1Q")
         || tform1_trim.starts_with('Q');
     let descriptor_size: u64 = if heap_is_q { 16 } else { 8 };
+    let inner_byte_width: u64 = tform_vla_inner_byte_width(tform1_trim)
+        .unwrap_or(1);
 
     // ----- input ndarray validation -----
     let np = py.import("numpy")?;
@@ -2049,8 +2056,19 @@ fn write_compressed_image_data(
             algorithm, &tile_bytes, bytepix, n_pixels,
             zbitpix, encode_params,
         )?;
+        // Descriptor nelements counts ELEMENTS of the inner type
+        // (bytes for `1PB`, i16 shorts for `1PI`).  The encoder
+        // always returns whole elements, so this divides cleanly.
+        if encoded.len() as u64 % inner_byte_width != 0 {
+            return Err(PyValueError::new_err(format!(
+                "internal: encoded tile {} bytes={} not a multiple \
+                 of inner_byte_width={}",
+                tile_idx, encoded.len(), inner_byte_width,
+            )));
+        }
+        let nelements = encoded.len() as u64 / inner_byte_width;
         let offset = heap_bytes.len() as u64;
-        descriptors.push((encoded.len() as u64, offset));
+        descriptors.push((nelements, offset));
         heap_bytes.extend(encoded);
     }
     let total_heap_bytes = heap_bytes.len() as u64;

@@ -594,17 +594,16 @@ impl FITS {
                  for now, or wait for a Phase 7 follow-up"
             ));
         }
-        // PLIO_1 write isn't implemented yet (the encoder hasn't
-        // landed).  Reject up-front at create time so the user
-        // doesn't get a partially-created HDU and a confusing
-        // error from .write() later.  The Plio1 pyclass exists
-        // because `hdu.compression` returns it for PLIO_1-
-        // compressed read; the rejection here is a write-side gate.
-        if matches!(cfg, CompressionConfigKind::Plio1(_)) {
+        // PLIO_1: integer-only (mask data); floats deferred to
+        // Phase 8 anyway, but reject explicitly here so the error
+        // says PLIO instead of generic "compressed float images
+        // are not yet supported".  Also reject i8 (bitpix=64) —
+        // PLIO has no 64-bit variant.
+        if matches!(cfg, CompressionConfigKind::Plio1(_)) && bitpix == 64 {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "PLIO_1 compressed-write encoder is not yet \
-                 implemented (planned: Phase 7 follow-up). Read of \
-                 PLIO_1-compressed HDUs is fully supported."
+                "PLIO_1 does not support 64-bit pixels (i8 dtype): \
+                 PLIO is designed for mask images with small \
+                 non-negative integer values; use i2 or i4 instead."
             ));
         }
         // RICE_1 rejects bitpix=64 (BYTEPIX=8).  cfitsio has no
@@ -741,9 +740,20 @@ impl FITS {
         // file is fresh — same as create_table_hdu does.
         self.ensure_primary(py)?;
 
+
         let heap_format = cfg.heap_format();
         let descriptor_size: u64 = if heap_format == 'P' { 8 } else { 16 };
-        let tform_val = if heap_format == 'P' { "1PB" } else { "1QB" };
+        // Heap inner type: GZIP/RICE/HCOMPRESS write raw bytes
+        // (TFORM1='1PB'/'1QB'); PLIO writes i16 BE shorts
+        // (TFORM1='1PI'/'1QI').  The read-side dispatch already
+        // handles both via tform_vla_inner_byte_width.
+        let tform_val = match (heap_format, &cfg) {
+            ('P', CompressionConfigKind::Plio1(_)) => "1PI",
+            ('Q', CompressionConfigKind::Plio1(_)) => "1QI",
+            ('P', _) => "1PB",
+            ('Q', _) => "1QB",
+            _ => unreachable!("heap_format validated to P or Q"),
+        };
 
         // FITS-order copies of image + tile shapes for the Z* cards.
         let fits_dims: Vec<u64> = numpy_dims.iter().rev().copied().collect();

@@ -495,11 +495,11 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   `normalize_input_dtype` and gets the reverse-transform) is the
   workaround.  Add when there's a use case.
 - **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 has
-  shipped `Gzip1`, `Gzip2`, `Rice1`, and `Hcompress1` writes
-  (integer ZBITPIX only — float deferred to Phase 8 for
-  quantization).  `Plio1` encoder remains.  Compressed
-  `extend`/`__setitem__` are Phase 9+ (mutation).  See the
-  ZIMAGE roadmap for the next pickup.
+  shipped all five integer-ZBITPIX encoders: `Gzip1`, `Gzip2`,
+  `Rice1`, `Hcompress1`, and `Plio1`.  Float ZBITPIX deferred to
+  Phase 8 for quantization.  Compressed `extend`/`__setitem__`
+  are Phase 9+ (mutation).  Only follow-up is unsigned-int trick
+  dtypes (i1/u2/u4/u8) on the compressed-write side.
 
 ### Table read
 
@@ -786,10 +786,9 @@ the reader walks tiles and decodes them.
 **Status:** Phases 1-6 shipped (full read support for all five
 algorithms — RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH,
 PLIO_1 — plus quantized + unquantized floats).  Phase 7
-compressed-write shipped for **GZIP_1, GZIP_2, RICE_1, and
-HCOMPRESS_1**; PLIO_1 encoder is the remaining Phase 7 follow-up.
-Phase 8+ (quantized float writes, compressed mutation) are own
-subsystems.  Test fixtures use fitsio for
+compressed-write shipped for **all five** integer-ZBITPIX
+encoders: GZIP_1, GZIP_2, RICE_1, HCOMPRESS_1, PLIO_1.  Phase 8+
+(quantized float writes, compressed mutation) are own subsystems.  Test fixtures use fitsio for
 normal-path round-trips and hand-crafted bytes for synthetic
 fallback-column cases (astropy is also in the env for richer
 cases).
@@ -1182,9 +1181,9 @@ f[1].write(data)
 
 `compress=None` (default) → uncompressed `ImageHDU` (current
 behavior, unchanged).  `compress=Gzip1(...)` / `Gzip2(...)` /
-`Rice1(...)` / `Hcompress1(...)` → `CompressedImageHDU`.
-Algorithm objects (`Gzip1`, `Gzip2`, `Rice1`, `Hcompress1`
-shipped; `Plio1` to follow) live in
+`Rice1(...)` / `Hcompress1(...)` / `Plio1(...)` →
+`CompressedImageHDU`.  Algorithm objects (`Gzip1`, `Gzip2`,
+`Rice1`, `Hcompress1`, `Plio1` — all shipped) live in
 `src/zimage/compression_config.rs`.  Each is a Rust pyclass exposed
 at `rustfits.<Name>`, validated at construction
 (`Gzip1(blocksize=0)` raises immediately), immutable (no setters).
@@ -1203,10 +1202,10 @@ shared surface (`tile_shape()`, `heap_format()`, `zcmptype()`)
 plus an `extra_z_cards(bitpix)` accessor that returns `(ZNAMEn,
 ZVALn)` pairs to emit alongside the standard ZIMAGE cards (RICE_1
 emits BLOCKSIZE + BYTEPIX; HCOMPRESS_1 emits SCALE + SMOOTH;
-GZIP and PLIO variants emit nothing).  PLIO_1 is currently a
-write-side stub — the config object exists for read-side symmetry
-but `create_image_hdu(compress=Plio1(...))` raises
-`NotImplementedError` at create time until the encoder lands.
+GZIP and PLIO variants emit nothing).  PLIO uses TFORM1='1PI'
+(i16 inner type) rather than '1PB' (byte) used by the others —
+the encoder produces big-endian i16 shorts, and descriptor
+nelements counts shorts not bytes.
 
 **Structured `.compression` API.**  The read-side mirror image of
 `compress=`: every `CompressedImageHDU` exposes a single
@@ -1419,6 +1418,43 @@ tile; the `hcomp_scale < 0` branch uses the absolute value
 directly as a fixed scale.  Tests in `phase7_hcompress_write.py`
 use the negative form.
 
+*PLIO_1 encoder.*  `encode_plio` in `src/zimage/plio.rs` is a
+byte-exact port of cfitsio's `pl_p2li` from
+`<cfitsio>/pliocomp.c`.  The SPP/f2c source's goto soup is
+replaced by a single `while` loop with explicit state and
+linear emit logic — much easier to read than cfitsio's labelled
+control flow.  The opcode dispatch matches the read side
+(0=zero-run, 1=set-high-pv, 2/3=±pv, 4=solid-pv-run,
+5=zero-run-with-trailing-pv, 6/7=set-and-write-single-pixel);
+single-pixel run combinations (opcodes 5/6/7) are emitted via
+the same `+ 20481` / `| 16384` modifications cfitsio uses on
+the previous word.  PLIO is integer-only (ZBITPIX 8/16/32; no
+64-bit variant in the FITS Tile Compression Convention);
+inputs must be non-negative (encoder rejects negatives with a
+clear error), and pv must fit in 2^27 - 1 (encoder rejects
+larger values rather than silently truncating as cfitsio does).
+
+*PLIO_1 TFORM and descriptor mechanics.*  PLIO writes its
+heap as i16 big-endian shorts (TFORM1='1PI' or '1QI'), unlike
+the other algorithms which use byte-inner TFORM1='1PB'/'1QB'.
+The descriptor's `nelements` field counts ELEMENTS of the
+inner type, not bytes — so on the write side
+`write_compressed_image_data` divides `encoded.len()` by
+`inner_byte_width` (= 2 for PLIO, 1 for the others) when
+filling descriptors.  The read side already worked correctly
+because `tform_vla_inner_byte_width` returns the right value.
+
+*PLIO_1 tests.*  `tests/test_compressed_image_phase7_plio_write.py`
+covers accessors after create (including TFORM1='1PI'
+verification), dtype matrix (u1/i2/i4), shape matrix, default
+tile shape, degenerate cases (all-zeros, all-solid, large-pv,
+sparse single-pixel), **byte-exact heap agreement with fitsio**
+across mask-style and degenerate inputs, bidirectional fitsio
+cross-check, non-last HDU growth, mixed-algorithm file
+(Plio1 + Gzip2), and rejection paths (float, i8, unsigned
+trick, negative pixels, values > 2^27, shape mismatch, start
+kwarg).
+
 **Phase 7 follow-ups (deferred).**  Cold-pickup notes for each
 remaining encoder.  The shape of the work is well established
 by the three shipped algorithms: each adds an `encode_*`
@@ -1438,19 +1474,14 @@ we worked for RICE:
     (matches Rice1 + GZIP/PLIO/HCOMPRESS reads).  Makes testing
     trivial via fitsio cross-write + heap-byte diff.
 
-- **`Plio1`** — reference encoder at `<cfitsio>/pliocomp.c::pl_p2li`.
-  Wire format documented in the Phase 6 PLIO read section above.
-  Niche algorithm (designed for non-negative integer masks
-  built via increments); inputs must be non-negative.  No extra
-  algorithm parameters beyond tile_shape/heap_format.  Output is
-  i16 BE shorts → TFORM1='1PI' (not '1PB' like GZIP/RICE/HCOMPRESS).
 - **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
   XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
   cards.  Symmetric with `create_image_hdu`'s existing handling
   for uncompressed HDUs.  All shipped encoders (GZIP_1/2, RICE_1)
   currently reject these dtypes upfront in
-  `create_compressed_image_hdu_impl`; the rejection is shared
-  (one branch tests `bzero.is_some()`), so the fix lives there.
+  `create_compressed_image_hdu_impl` (now also PLIO_1 and
+  HCOMPRESS_1 — all five algorithms share the rejection); the
+  branch tests `bzero.is_some()`, so the fix lives there.
 
 **Phase 8 — Quantized float compressed writes.**  Own subsystem.
 Choose ZSCALE/ZZERO per tile, apply dither, optional GZIP

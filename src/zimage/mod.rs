@@ -11,7 +11,7 @@ pub(crate) mod quantize;
 pub(crate) mod rice;
 
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::PyValueError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompressionAlgorithm {
@@ -183,9 +183,8 @@ pub(crate) fn encode_tile_from_bytes(
                 pixel_bytes_be, nx, ny, bytepix, zbitpix, params.scale,
             )
         }
-        CompressionAlgorithm::Plio1 => Err(PyNotImplementedError::new_err(
-            "PLIO_1 encoding is not yet implemented \
-             (planned: a follow-up sub-phase under Phase 7)"
-        )),
+        CompressionAlgorithm::Plio1 => {
+            plio::encode_plio(pixel_bytes_be, n_pixels, bytepix, zbitpix)
+        }
     }
 }
