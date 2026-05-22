@@ -1118,9 +1118,45 @@ with cfitsio on a lossy hcomp_scale=4 fixture, and SMOOTH=1
 round-trip at hcomp_scale={4, 16} for i16 plus hcomp_scale=8
 for the i32 (i64-internal) path.
 
-**Phase 6 follow-up — PLIO_1 read.**  Small self-contained
-run-length decoder for mask/segmentation arrays.  Defer until
-needed.
+**Phase 6 — PLIO_1 read.**  Done.
+
+Decoder in `src/zimage/plio.rs` — port of cfitsio's `pl_l2pi`
+(`pliocomp.c`).  The cfitsio source is f2c-generated SPP with
+heavy goto control flow; the Rust port replaces it with a
+straightforward `match` on the opcode (top 4 bits of each
+encoded word).
+
+*Wire format.*  Stream is big-endian i16 shorts: 7-short header
+(magic word `-100` at index [2] marks the modern format; an
+older format puts a positive length there) followed by RLE data
+words.  Each data word's top 4 bits select one of 8 opcodes:
+zero runs (0, 5), set-high-pv (1 — consumes the next word for
+the upper 16 bits of pv), increment/decrement pv (2, 3),
+solid-pv run (4), single-pixel write with pv += data (6) or
+pv -= data (7).
+
+*Output type.*  Decoder produces `Vec<i32>` (PLIO is designed
+for non-negative integer masks; values are built up through
+increments from a starting pv=1).  Cast to the target dtype
+follows the same shape as hcompress's: supports ZBITPIX = 8,
+16, 32; rejects float ZBITPIX (PLIO doesn't make sense for
+floats).
+
+*Column TFORM.*  PLIO stores the compressed-data column as
+`1PI` (VLA of i16 shorts) instead of the `1PB` used by RICE /
+GZIP / HCOMPRESS.  No special-casing needed at the dispatch
+layer — `tform_vla_inner_byte_width` returns 2 for 'I' so
+`fetch_tile_payload_inner` correctly reads `nelements * 2`
+bytes from the heap.
+
+*Tests.*  `tests/test_compressed_image_phase6_plio.py` covers
+the compression_type accessor, bit-exact agreement with cfitsio
+on u8/i16/i32 mask-style fixtures (mostly zero with random
+runs), all-zero tiles (header-only encoded stream), solid-value
+tiles, and slicing parity.
+
+All four ZIMAGE compression algorithms (RICE_1, GZIP_1/2,
+HCOMPRESS_1, PLIO_1) now have full read support.
 
 **Phase 7+ — Compressed image writes.**  Its own multi-phase
 project; needs design discussion (which algorithms, header

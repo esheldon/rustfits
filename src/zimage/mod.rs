@@ -5,6 +5,7 @@
 
 pub(crate) mod gzip;
 pub(crate) mod hcompress;
+pub(crate) mod plio;
 pub(crate) mod quantize;
 pub(crate) mod rice;
 
@@ -101,9 +102,8 @@ pub(crate) fn decode_tile_to_bytes(
                 compressed, nx, ny, bytepix, zbitpix, params.smooth,
             )
         }
-        CompressionAlgorithm::Plio1 => Err(PyValueError::new_err(
-            "PLIO_1 decompression is not yet implemented \
-             (planned: Phase 6 of the ZIMAGE roadmap)"
-        )),
+        CompressionAlgorithm::Plio1 => {
+            plio::decode_plio(compressed, n_pixels, bytepix, zbitpix)
+        }
     }
 }

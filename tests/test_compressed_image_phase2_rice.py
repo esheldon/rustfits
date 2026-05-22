@@ -305,27 +305,6 @@ def test_setitem_raises_not_implemented():
                 hdu[0:2, 0:2] = np.zeros((2, 2), dtype="i4")
 
 
-# -------------------- non-RICE/GZIP compression rejected -----------
-
-
-@pytest.mark.parametrize("compress", ["PLIO_1"])
-def test_unsupported_compression_read_rejects(compress):
-    """
-    PLIO_1 (and HCOMPRESS_1, which fitsio can't currently write
-    via the high-level API) still raise the per-algorithm decoder
-    error.  GZIP_1 / GZIP_2 used to live here; they moved to
-    test_compressed_image_phase4_gzip.py once Phase 4 landed.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = os.path.join(tmpdir, "t.fits.fz")
-        data = np.arange(16, dtype="i4").reshape(4, 4)
-        with fitsio.FITS(fname, "rw") as f:
-            f.write(data, compress=compress, tile_dims=(2, 2))
-        with rustfits.FITS(fname, "r") as fits:
-            with pytest.raises(ValueError, match=compress):
-                fits[1].read()
-
-
 # -------------------- mask_blank rejection -------------------------
 
 
