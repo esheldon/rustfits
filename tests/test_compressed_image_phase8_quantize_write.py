@@ -132,22 +132,19 @@ def test_round_trip_dither1(dtype):
         assert np.abs(out - data).max() < 1.5
 
 
-def test_default_quantize_for_float():
-    """quantize=None on a float HDU uses the default Quantize
-    (level=4.0, method='dither1', seed=0)."""
+def test_quantize_none_requires_gzip():
+    """quantize=None on a float HDU without compress=Gzip1 or Gzip2
+    is rejected with a clear error.  Other algorithms (Rice1,
+    Hcompress1, Plio1) cannot round-trip raw float bytes."""
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
-        data = _smooth((20, 20), seed=33)
         with rustfits.FITS(fn, "w+") as f:
-            f.create_image_hdu(
-                "f4",
-                data.shape,
-                compress=rustfits.Rice1(tile_shape=(20, 20)),
-            )
-            f[1].write(data)
-            assert f[1].header["ZQUANTIZ"] == "SUBTRACTIVE_DITHER_1"
-            out = f[1].read()
-        assert np.abs(out - data).max() < 1.5
+            with pytest.raises(ValueError, match="unquantized float"):
+                f.create_image_hdu(
+                    "f4",
+                    (20, 20),
+                    compress=rustfits.Rice1(tile_shape=(20, 20)),
+                )
 
 
 # ---------------------- fitsio interop -----------------------------

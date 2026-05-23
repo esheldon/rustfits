@@ -2224,20 +2224,33 @@ fn write_compressed_image_data(
     let (blocksize_opt, _bytepix_header_opt) = parse_rice_params(cards);
     let hcompress_scale = parse_hcompress_scale(cards);
 
+    // ----- detect unquantized-float mode -----
+    // Signal: float HDU + single-column schema (TFIELDS=1).
+    // Works for both freshly-created HDUs (we set TFIELDS=1 at
+    // create time when quantize=None) and reopened files.
+    // Unquantized-float files store raw GZIP-compressed float
+    // bytes directly in COMPRESSED_DATA — same single-column
+    // layout as integer HDUs.  Astropy's quantize_level=0 output
+    // matches this exactly.
+    let tfields = parse_keyword(cards, "TFIELDS").unwrap_or(0) as u64;
+    let is_unquantized_float = is_float && tfields == 1;
+    let is_quantized_float = is_float && !is_unquantized_float;
+
     // ----- float-only quantize setup -----
-    // For float HDUs we need:
+    // For quantized float HDUs we need:
     //   - DitherMethod from ZQUANTIZ
     //   - ZDITHER0 seed
     //   - qlevel from the create-time Quantize config (the FITS
     //     spec records method+seed only, not the level)
-    let (quant_method, zdither0, qlevel) = if is_float {
+    // Skipped entirely for unquantized floats: there's no dither
+    // stream and no quantization step.
+    let (quant_method, zdither0, qlevel) = if is_quantized_float {
         let zq = parse_string_keyword(cards, "ZQUANTIZ");
         let method = crate::zimage::quantize::parse_dither_method(
             zq.as_deref(),
-        )?.ok_or_else(|| PyNotImplementedError::new_err(
-            "compressed-float write with ZQUANTIZ='NONE' \
-             (unquantized) is not yet supported; pass quantize= \
-             with a method other than 'none'"
+        )?.ok_or_else(|| PyValueError::new_err(
+            "quantized-float HDU has ZQUANTIZ='NONE' but the schema \
+             has 4 columns (ZSCALE/ZZERO present).  Malformed file."
         ))?;
         let zd = parse_keyword(cards, "ZDITHER0").unwrap_or(1).max(1);
         let level = quantize_config.lock()
@@ -2251,22 +2264,29 @@ fn write_compressed_image_data(
 
     // ----- per-tile encode loop -----
     //
-    // For each tile we either:
-    //   - encode through the chosen algorithm → primary_heap, or
-    //   - (float-only) fall back to GZIP-compressed raw float
-    //     bytes → fallback_heap when quantize returns None.
-    // The two heaps are concatenated below; fallback offsets are
-    // bumped by primary_heap.len() so descriptors point at the
-    // right place in the combined heap.
-    //
-    // Integer / float dispatch lives in `encode_tile_int` /
-    // `encode_tile_float`; HDU-invariant params travel in
-    // IntTileCtx / FloatTileCtx, leaving this loop to just
-    // extract tile bytes and call the right helper.
-    let int_ctx = if !is_float {
+    // Three dispatch modes:
+    //   - Integer HDU OR unquantized float: route through
+    //     `encode_tile_int` (single-column primary heap, no
+    //     ZSCALE/ZZERO, no fallback).  For unquantized floats,
+    //     bytepix is the float width (4 or 8); GZIP_1/GZIP_2
+    //     treat the bytes opaquely.
+    //   - Quantized float: route through `encode_tile_float`
+    //     which may quantize → primary_heap OR fall back to
+    //     GZIP-compressed raw float bytes → fallback_heap.
+    // HDU-invariant params travel in IntTileCtx / FloatTileCtx,
+    // leaving this loop to just extract tile bytes and call the
+    // right helper.
+    let int_ctx = if !is_quantized_float {
+        // For unquantized floats, use float_bytepix; for integer
+        // HDUs, use the integer bytepix.
+        let effective_bytepix = if is_unquantized_float {
+            float_bytepix
+        } else {
+            bytepix
+        };
         Some(IntTileCtx {
             algorithm,
-            bytepix,
+            bytepix: effective_bytepix,
             zbitpix,
             inner_byte_width,
             blocksize: blocksize_opt.unwrap_or(32),
@@ -2275,7 +2295,7 @@ fn write_compressed_image_data(
     } else {
         None
     };
-    let float_ctx = if is_float {
+    let float_ctx = if is_quantized_float {
         Some(FloatTileCtx {
             algorithm,
             zbitpix,
@@ -2325,13 +2345,17 @@ fn write_compressed_image_data(
             )));
         }
 
-        let row = if is_float {
+        let row = if is_quantized_float {
             encode_tile_float(
                 float_ctx.as_ref().unwrap(),
                 &tile_bytes, tile_idx, &actual_shape, n_pixels,
                 &mut primary_heap, &mut fallback_heap,
             )?
         } else {
+            // Integer HDU OR unquantized float — both route
+            // through encode_tile_int.  Unquantized float feeds
+            // raw float bytes through GZIP_1/GZIP_2 (the encoder
+            // treats them opaquely).
             encode_tile_int(
                 int_ctx.as_ref().unwrap(),
                 &tile_bytes, tile_idx, &actual_shape, n_pixels,
@@ -2342,7 +2366,10 @@ fn write_compressed_image_data(
     }
 
     // Combine the two heaps.  Bump fallback offsets so they land
-    // in the right position of the concatenated heap.
+    // in the right position of the concatenated heap.  Only the
+    // quantized-float path produces a non-empty fallback heap;
+    // for integer + unquantized-float paths fallback_heap is
+    // empty and this loop is a no-op.
     let primary_size = primary_heap.len() as u64;
     let fallback_size = fallback_heap.len() as u64;
     let total_heap_bytes = primary_size + fallback_size;
@@ -2354,11 +2381,12 @@ fn write_compressed_image_data(
 
     // ----- compute file extents -----
     let data_offset = offsets.data_offset();
-    // Main data section = NAXIS1 (row width) × n_tiles.  Row width
-    // depends on the column layout: 1 VLA descriptor for integer
-    // HDUs, primary + ZSCALE + ZZERO + fallback descriptor for
-    // floats.
-    let row_width: u64 = if is_float {
+    // Main data section = NAXIS1 (row width) × n_tiles.  Row
+    // width depends on the column layout: single descriptor for
+    // integer HDUs and unquantized-float HDUs (both TFIELDS=1);
+    // primary + ZSCALE + ZZERO + fallback descriptor for
+    // quantized-float HDUs (TFIELDS=4).
+    let row_width: u64 = if is_quantized_float {
         descriptor_size + 8 + 8 + descriptor_size
     } else {
         descriptor_size
@@ -2483,7 +2511,7 @@ fn write_compressed_image_data(
                 tainted.store(true, Ordering::Release);
                 return Err(e);
             }
-            if is_float {
+            if is_quantized_float {
                 desc_buf.extend_from_slice(&row.zscale.to_be_bytes());
                 desc_buf.extend_from_slice(&row.zzero.to_be_bytes());
                 if let Err(e) = push_desc(

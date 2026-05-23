@@ -598,17 +598,17 @@ impl Rice1 {
 ///     Larger `level` = finer steps = higher fidelity + larger
 ///     compressed output.  cfitsio's default is 4.0 (with
 ///     dithering) or 16.0 (without).  Negative values mean
-///     "fixed bscale = -level" (skip noise estimation).  Zero
-///     means "no quantization" — the tile's raw float bytes are
-///     stored to a GZIP fallback column losslessly.
+///     "fixed bscale = -level" (skip noise estimation).
 /// method : str, default 'dither1'
-///     Dithering scheme: 'none' (no quantization at all, equivalent
-///     to level=0), 'no_dither' (NO_DITHER: simple round-to-
+///     Dithering scheme: 'no_dither' (NO_DITHER: simple round-to-
 ///     nearest, no dither), 'dither1' (SUBTRACTIVE_DITHER_1: add
 ///     a pseudorandom offset before rounding so quantization noise
 ///     is white), 'dither2' (SUBTRACTIVE_DITHER_2: like dither1
 ///     but reserves a sentinel for NaN so float-NaN survives the
 ///     round-trip).  cfitsio's default is SUBTRACTIVE_DITHER_1.
+///     To skip quantization entirely (lossless raw float GZIP),
+///     pass `quantize=None` (or omit the kwarg) to
+///     `create_image_hdu` — do NOT construct a `Quantize` at all.
 /// seed : int, default 0
 ///     ZDITHER0 random seed, recorded as a header card.  Zero
 ///     means "pick one automatically" at create time (cfitsio
@@ -624,12 +624,13 @@ pub(crate) struct Quantize {
 }
 
 // Method enum mirrors the FITS Tile Compression Convention
-// ZQUANTIZ values plus the cfitsio-tolerated 'NONE' (astropy
-// emits it for unquantized-float HDUs; we accept it on both
-// read and write).
+// ZQUANTIZ values.  "No quantization" is signalled at the
+// `create_image_hdu` call site by passing `quantize=None`
+// (or omitting the kwarg) — there is no Quantize variant for
+// that case, since constructing a Quantize implies the user
+// wants quantization with some dither method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuantizeMethod {
-    None_,              // no quantization, store as raw GZIP
     NoDither,           // ZQUANTIZ='NO_DITHER'
     SubtractiveDither1, // ZQUANTIZ='SUBTRACTIVE_DITHER_1'
     SubtractiveDither2, // ZQUANTIZ='SUBTRACTIVE_DITHER_2'
@@ -638,7 +639,6 @@ pub(crate) enum QuantizeMethod {
 impl QuantizeMethod {
     pub(crate) fn parse(s: &str) -> PyResult<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "none" => Ok(Self::None_),
             "no_dither" | "nodither" => Ok(Self::NoDither),
             "dither1" | "dither_1" | "subtractive_dither_1" => {
                 Ok(Self::SubtractiveDither1)
@@ -648,7 +648,10 @@ impl QuantizeMethod {
             }
             other => Err(PyValueError::new_err(format!(
                 "Quantize: unknown method '{}'; expected one of \
-                 'none', 'no_dither', 'dither1', 'dither2'",
+                 'no_dither', 'dither1', 'dither2'.  For \
+                 unquantized lossless storage, pass quantize=None \
+                 (or omit the kwarg) instead of constructing a \
+                 Quantize.",
                 other
             ))),
         }
@@ -657,7 +660,6 @@ impl QuantizeMethod {
     /// Canonical FITS-spec ZQUANTIZ string for this method.
     pub(crate) fn zquantiz(&self) -> &'static str {
         match self {
-            Self::None_ => "NONE",
             Self::NoDither => "NO_DITHER",
             Self::SubtractiveDither1 => "SUBTRACTIVE_DITHER_1",
             Self::SubtractiveDither2 => "SUBTRACTIVE_DITHER_2",
@@ -667,7 +669,6 @@ impl QuantizeMethod {
     /// Pythonic short name (matches the kwarg value).
     pub(crate) fn short_name(&self) -> &'static str {
         match self {
-            Self::None_ => "none",
             Self::NoDither => "no_dither",
             Self::SubtractiveDither1 => "dither1",
             Self::SubtractiveDither2 => "dither2",

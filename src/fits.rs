@@ -592,31 +592,26 @@ impl FITS {
 
         // Dtype validation:
         //   - integer types (u1/i2/i4/i8) go via the BITPIX-direct
-        //     path; quantize= is ignored (and rejected if passed).
-        //   - float types (f4/f8) require a Quantize config (the
-        //     default fills in if the user didn't pass one); the
-        //     emitted BINTABLE schema includes ZSCALE/ZZERO columns
-        //     plus an optional GZIP fallback.
+        //     path; quantize= is rejected.
+        //   - float types (f4/f8) optionally take a Quantize config.
+        //     With a Quantize, tiles get lossy quantization to i32
+        //     then compressed (4-column BINTABLE schema).  Without
+        //     (quantize=None or omitted), tiles are stored as raw
+        //     float bytes through GZIP_1/GZIP_2 losslessly
+        //     (single-column schema).  Lossy compression is opt-in
+        //     to avoid silently throwing away precision on
+        //     scientific data.
         //   - unsigned-int trick types (i1/u2/u4/u8) are deferred.
         let (bitpix, bzero) = crate::hdu_image::dtype_to_bitpix(&dtype)?;
         let is_float = bitpix < 0;
         let quantize_cfg: Option<crate::zimage::compression_config::Quantize> =
             if is_float {
-                // Float: use the user's Quantize, or the default
-                // (level=4.0, method='dither1', seed=0).
-                let q = match quantize {
-                    Some(qpy) => qpy.extract::<
+                match quantize {
+                    Some(qpy) => Some(qpy.extract::<
                         crate::zimage::compression_config::Quantize
-                    >(py)?,
-                    None => crate::zimage::compression_config::Quantize {
-                        level: 4.0,
-                        method:
-                            crate::zimage::compression_config::QuantizeMethod
-                                ::SubtractiveDither1,
-                        seed: 0,
-                    },
-                };
-                Some(q)
+                    >(py)?),
+                    None => None, // unquantized lossless float path
+                }
             } else {
                 if quantize.is_some() {
                     return Err(PyValueError::new_err(
@@ -627,6 +622,7 @@ impl FITS {
                 }
                 None
             };
+        let is_unquantized_float = is_float && quantize_cfg.is_none();
         if bzero.is_some() {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "compressed unsigned-int trick dtypes (i1/u2/u4/u8) \
@@ -691,6 +687,35 @@ impl FITS {
                      imaging data."
                 ));
             }
+        }
+        // Unquantized floats require GZIP_1 or GZIP_2: only the
+        // byte-stream codecs round-trip raw float bytes bit-exact.
+        // RICE_1 / HCOMPRESS_1 are integer-only algorithms; astropy
+        // accepts the combination but the round-trip silently
+        // corrupts the data (the algorithms reinterpret float bit
+        // patterns as integers).  This check fires AFTER the
+        // algorithm-specific rejections above so that PLIO + float
+        // (etc.) gets its more-specific error message — those errors
+        // hold regardless of quantize.
+        if is_unquantized_float
+            && !matches!(
+                cfg,
+                CompressionConfigKind::Gzip1(_)
+                    | CompressionConfigKind::Gzip2(_),
+            )
+        {
+            return Err(PyValueError::new_err(format!(
+                "unquantized float compression (quantize=None) \
+                 requires compress=Gzip1(...) or compress=Gzip2(...). \
+                 Got compress={}.  Other algorithms only round-trip \
+                 quantized integer streams; using them on raw float \
+                 bytes silently corrupts the data.  Either pass \
+                 quantize=Quantize(...) to enable lossy quantization, \
+                 or switch to compress=Gzip2(...) for lossless \
+                 float compression (typically 3-5% better than Gzip1 \
+                 on float data thanks to byte-shuffling).",
+                cfg.zcmptype(),
+            )));
         }
 
         // Build the tile shape in numpy axis order.
@@ -809,24 +834,27 @@ impl FITS {
 
         // Column layout depends on whether quantization is in play:
         //
-        //   Integer ZBITPIX:
+        //   Integer ZBITPIX or unquantized float (quantize=None):
         //     col 1: COMPRESSED_DATA  (1PB / 1QB / 1PI / 1QI)
         //
-        //   Float ZBITPIX (always has quantize_cfg = Some):
+        //   Quantized float (quantize=Quantize(...)):
         //     col 1: COMPRESSED_DATA       (primary tform, quantized i32 stream)
         //     col 2: ZSCALE                (1D, per-tile bscale)
         //     col 3: ZZERO                 (1D, per-tile bzero)
         //     col 4: GZIP_COMPRESSED_DATA  (1PB / 1QB, lossless float fallback)
         //
-        // For the float layout the GZIP fallback column is always
-        // present at column 4 so any tile that can't be quantized
-        // can store raw float bytes losslessly.  Empty descriptor
-        // (nelements=0) on tiles that DID quantize cleanly.
+        // For the quantized-float layout the GZIP fallback column is
+        // always present at column 4 so any tile that can't be
+        // quantized can store raw float bytes losslessly.  Empty
+        // descriptor (nelements=0) on tiles that DID quantize
+        // cleanly.  Unquantized floats use the same single-column
+        // layout as integers — astropy's quantize_level=0 schema.
+        let is_quantized = quantize_cfg.is_some();
         let gzip_fallback_tform = if heap_format == 'P' { "1PB" } else { "1QB" };
-        let n_columns: u64 = if is_float { 4 } else { 1 };
+        let n_columns: u64 = if is_quantized { 4 } else { 1 };
         // Row width in bytes: VLA columns contribute `descriptor_size`
         // bytes each; fixed-width ZSCALE/ZZERO contribute 8 bytes each.
-        let naxis1: u64 = if is_float {
+        let naxis1: u64 = if is_quantized {
             descriptor_size + 8 + 8 + descriptor_size
         } else {
             descriptor_size
@@ -854,7 +882,7 @@ impl FITS {
                                "compressed data descriptor"));
         cards.push(card_string("TTYPE1", "COMPRESSED_DATA",
                                "label for column 1"));
-        if is_float {
+        if is_quantized {
             cards.push(card_string("TFORM2", "1D",
                                    "per-tile linear-scale factor"));
             cards.push(card_string("TTYPE2", "ZSCALE",
