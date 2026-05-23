@@ -454,6 +454,183 @@ impl ImageHDU {
             &super_.file, &slices, value, &super_.tainted,
         )
     }
+
+    // ----- FITS checksum convention -----
+    //
+    // add_datasum: compute DATASUM from the data section, update
+    // the card on disk + in memory.  add_checksum: add_datasum
+    // first, then compute the full HDU checksum and encode it
+    // into the CHECKSUM card.  verify_datasum / verify_checksum
+    // return True/False/None (None = card absent).  Manual
+    // semantics — checksums become stale after write/__setitem__/
+    // extend; users must re-run add_checksum after mutations.
+
+    fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_: PyRef<HDU> = slf.into_super();
+        checksum_hdu_add_datasum(&super_, "DATASUM")
+    }
+
+    fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_: PyRef<HDU> = slf.into_super();
+        checksum_hdu_add_checksum(&super_, "CHECKSUM", "DATASUM")
+    }
+
+    fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_: PyRef<HDU> = slf.into_super();
+        checksum_hdu_verify_datasum(&super_, "DATASUM")
+    }
+
+    fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_: PyRef<HDU> = slf.into_super();
+        checksum_hdu_verify_checksum(&super_, "CHECKSUM")
+    }
+}
+
+// ----- shared HDU-level checksum helpers -----
+//
+// Used by ImageHDU + TableHDU directly (BLANK→DATASUM /
+// CHECKSUM keys) and by CompressedImageHDU under different
+// keys (ZDATASUM / ZHECKSUM), but the latter computes against
+// the conceptual UNCOMPRESSED bytes, not the on-disk BINTABLE
+// — so it implements its own dispatch and only shares the
+// card-rewrite + disk-IO scaffolding indirectly.
+
+// Read the entire on-disk data section (padded to BLOCK_SIZE)
+// for this HDU.  Used by every checksum operation that needs
+// raw bytes.  Returns 0 bytes for HDUs with no data section.
+pub(crate) fn read_padded_data_section(
+    super_: &HDU,
+) -> PyResult<Vec<u8>> {
+    let data_offset = super_.offsets.data_offset();
+    let bytes_count = data_section_padded_size_for(super_)?;
+    if bytes_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; bytes_count as usize];
+    let mut g = lock_file(&super_.file)?;
+    let f = g
+        .as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(data_offset))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    f.read_exact(&mut buf)
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(buf)
+}
+
+// Compute the padded byte-size of the data section for any HDU
+// type the checksum routines care about (image, table,
+// compressed BINTABLE).  Uses NAXIS / NAXISn / PCOUNT / GCOUNT
+// — generic to FITS HDU layout.
+fn data_section_padded_size_for(super_: &HDU) -> PyResult<u64> {
+    let cards = super_.header_snapshot()?;
+    let naxis: i64 = parse_keyword(&cards, "NAXIS").unwrap_or(0);
+    if naxis == 0 {
+        return Ok(0);
+    }
+    let bitpix: i64 = parse_keyword(&cards, "BITPIX").ok_or_else(|| {
+        PyValueError::new_err("HDU header missing BITPIX")
+    })?;
+    let bytes_per_pixel = (bitpix.unsigned_abs() / 8) as u64;
+    let mut nelements: u64 = 1;
+    for i in 1..=naxis {
+        let n: i64 = parse_keyword(&cards, &format!("NAXIS{}", i))
+            .unwrap_or(0)
+            .max(0);
+        nelements = nelements.saturating_mul(n as u64);
+    }
+    // BINTABLE: PCOUNT may be > 0 (heap follows main data).
+    let pcount: u64 =
+        parse_keyword(&cards, "PCOUNT").unwrap_or(0).max(0) as u64;
+    let gcount: u64 =
+        parse_keyword(&cards, "GCOUNT").unwrap_or(1).max(1) as u64;
+    let data_size = bytes_per_pixel
+        .saturating_mul(nelements)
+        .saturating_mul(gcount)
+        .saturating_add(pcount);
+    Ok(round_up_to_block(data_size))
+}
+
+pub(crate) fn checksum_hdu_add_datasum(
+    super_: &HDU, datasum_key: &str,
+) -> PyResult<()> {
+    let data_bytes = read_padded_data_section(super_)?;
+    let sum = crate::checksum::compute_datasum_of(&data_bytes);
+    let cards = super_.header_snapshot()?;
+    let new_cards =
+        crate::checksum::cards_with_datasum(&cards, sum, datasum_key);
+    commit_header_update(super_, new_cards)
+}
+
+pub(crate) fn checksum_hdu_add_checksum(
+    super_: &HDU, checksum_key: &str, datasum_key: &str,
+) -> PyResult<()> {
+    let data_bytes = read_padded_data_section(super_)?;
+    let datasum = crate::checksum::compute_datasum_of(&data_bytes);
+    let cards = super_.header_snapshot()?;
+    // First put DATASUM in (so the checksum step sees its bytes
+    // in the header buffer).
+    let cards = crate::checksum::cards_with_datasum(
+        &cards, datasum, datasum_key,
+    );
+    // Then compute CHECKSUM against (header with placeholder +
+    // data) and encode the complement.
+    let new_cards = crate::checksum::cards_with_checksum(
+        &cards, datasum, checksum_key,
+    );
+    commit_header_update(super_, new_cards)
+}
+
+pub(crate) fn checksum_hdu_verify_datasum(
+    super_: &HDU, datasum_key: &str,
+) -> PyResult<Option<bool>> {
+    let cards = super_.header_snapshot()?;
+    let Some(expected_str) = parse_string_keyword(&cards, datasum_key)
+    else {
+        return Ok(None);
+    };
+    let Some(expected) =
+        crate::checksum::parse_datasum(expected_str.trim())
+    else {
+        return Ok(None);
+    };
+    let data_bytes = read_padded_data_section(super_)?;
+    let computed = crate::checksum::compute_datasum_of(&data_bytes);
+    Ok(Some(computed == expected))
+}
+
+pub(crate) fn checksum_hdu_verify_checksum(
+    super_: &HDU, checksum_key: &str,
+) -> PyResult<Option<bool>> {
+    let cards = super_.header_snapshot()?;
+    if parse_string_keyword(&cards, checksum_key).is_none() {
+        return Ok(None);
+    }
+    let data_bytes = read_padded_data_section(super_)?;
+    let total =
+        crate::checksum::compute_hdu_checksum(&cards, &data_bytes);
+    Ok(Some(total == 0xFFFF_FFFF))
+}
+
+// Rewrite the header on disk with `new_cards` and commit to
+// memory.  Uses rewrite_header_to_disk so a header that grows
+// past its reserved blocks gets in-place expansion (same machinery
+// the FITSHeader edit path uses).
+pub(crate) fn commit_header_update(
+    super_: &HDU, new_cards: Vec<String>,
+) -> PyResult<()> {
+    let mut header_guard = super_.header.lock().map_err(|_| {
+        PyIOError::new_err("header lock poisoned")
+    })?;
+    crate::header::rewrite_header_to_disk(
+        &super_.file,
+        &super_.offsets,
+        &super_.layout,
+        &new_cards,
+        &super_.tainted,
+    )?;
+    *header_guard = new_cards;
+    Ok(())
 }
 
 // Allocate a numpy array sized + typed to this HDU and fill it with the

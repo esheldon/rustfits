@@ -4407,6 +4407,31 @@ fn column_repr_info(col: &Column) -> (String, Option<String>) {
 
 #[pymethods]
 impl TableHDU {
+    // FITS checksum convention.  Same 4 methods as ImageHDU and
+    // same semantics; cards are CHECKSUM + DATASUM.  Manual —
+    // re-run add_checksum after write/append/__setitem__.
+    fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_datasum(&super_, "DATASUM")
+    }
+
+    fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_checksum(
+            &super_, "CHECKSUM", "DATASUM",
+        )
+    }
+
+    fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_datasum(&super_, "DATASUM")
+    }
+
+    fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_checksum(&super_, "CHECKSUM")
+    }
+
     // Multi-line, fitsio-style repr.  Shows file, extension, type,
     // EXTNAME (if present), row count, and per-column dtype + shape
     // annotation.  Column lines are dynamically aligned to the longest

@@ -21,6 +21,7 @@ mod hdu_table;
 mod hdu_ascii_table;
 mod zimage;
 mod fits;
+mod checksum;
 
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;

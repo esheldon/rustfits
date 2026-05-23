@@ -1012,7 +1012,7 @@ fn collect_update_actions(
 // acquired below (and inside the shift helper).  Taint semantics: pre-I/O
 // failures don't taint; write_all/flush failures (and any mid-shift failure)
 // do.  See CLAUDE.md "Tainted-header state" and "Header overflow / grow".
-fn rewrite_header_to_disk(
+pub(crate) fn rewrite_header_to_disk(
     file_handle: &FileHandle,
     offsets: &HduOffsets,
     layout: &FileLayout,
@@ -1214,10 +1214,25 @@ pub(crate) fn card_string(key: &str, value: &str, comment: &str) -> String {
     };
     let quoted = format!("'{}'", padded);
     let head = format!("{:<8}= {}", key, quoted);
+    // FITS-convention fixed-format string card: the slash that
+    // introduces the comment should sit at column 32 (byte 31),
+    // with any space between the value's closing quote and the
+    // slash filled with spaces.  Matches cfitsio + astropy
+    // byte-exactly — important for CHECKSUM verification, which
+    // depends on the encoded sum of the whole header.  For long
+    // string values that already overrun column 32 (e.g.,
+    // multi-line HIERARCH or CONTINUE-chained values) we fall
+    // back to a single space separator.
     let body = if comment.is_empty() {
         head
     } else {
-        format!("{} / {}", head, comment)
+        const COMMENT_COL: usize = 31; // 0-indexed byte where '/' lives
+        if head.len() <= COMMENT_COL {
+            let pad = " ".repeat(COMMENT_COL - head.len());
+            format!("{}{}/ {}", head, pad, comment)
+        } else {
+            format!("{} / {}", head, comment)
+        }
     };
     pad_to_card(&body)
 }
