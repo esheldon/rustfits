@@ -1600,75 +1600,83 @@ port of cfitsio's qsort tie-breaking; not worth doing absent a
 specific need.
 
 *Pending follow-up: implement `Quantize(method='none')` write
-path.*  The kwarg is currently accepted at create time and writes
-`ZQUANTIZ='NONE'` to the header, but `.write(data)` raises
-`NotImplementedError` (see `hdu_image_compressed.rs` near the
-`compressed-float write with ZQUANTIZ='NONE'` message).  The
-intent is: every tile stored losslessly as GZIP-1 compressed
-raw float bytes in the GZIP_COMPRESSED_DATA column, no
-quantization at all.
+path.*  The kwarg is currently accepted at create time and
+writes `ZQUANTIZ='NONE'` to the header, but `.write(data)`
+raises `NotImplementedError` (see `hdu_image_compressed.rs`
+near the `compressed-float write with ZQUANTIZ='NONE'`
+message).  The intent: every tile stored losslessly as GZIP_1
+compressed raw float bytes, no quantization at all.
 
-The design has four interacting standards-compliance × UX
-choices that need a decision before coding.  Standards
-landscape:
+**Design (settled 2026-05-23 after empirical astropy
+investigation).**
 
-|  | FITS spec | cfitsio | astropy |
+Standards landscape (corrected from prior CLAUDE.md notes —
+astropy 7.2.0's actual behavior was different):
+
+|  | FITS spec | cfitsio | astropy (7.2.0) |
 |--|--|--|--|
-| ZQUANTIZ for unquantized | omit | omit OR `'NONE'` | `'NONE'` |
-| ZCMPTYPE | spec silent | reflects user's choice (e.g. `RICE_1` even when nothing gets RICE'd) | same |
-| Schema | varies | typically still 4 columns | typically still 4 columns |
-| Inner GZIP for fallback | GZIP_1 | GZIP_1 | GZIP_1 |
+| ZQUANTIZ for unquantized | optional; absent → defaults to `NO_DITHER` | absent OR `'NO_DITHER'` | `'NO_DITHER'` |
+| ZCMPTYPE | mandatory; must name algorithm | reflects user's choice | reflects user's choice (with quantize_level=0 → GZIP_1 only) |
+| Schema for unquantized GZIP | spec doesn't mandate | n/a (typically quantized) | single COMPRESSED_DATA column with raw GZIP'd float bytes |
+| `'NONE'` as ZQUANTIZ value | NOT in spec | tolerated on read | not emitted |
 
-Read-side already handles both signals (`ZQUANTIZ='NONE'`
-explicit AND absent + missing ZSCALE/ZZERO columns).
+Empirical findings from astropy 7.2.0 with `quantize_level=0,
+compression_type='GZIP_1'`:
+- ZQUANTIZ='NO_DITHER' on disk (NOT 'NONE' as older notes
+  suggested; NOT absent either).
+- Single COMPRESSED_DATA column (1PB) with GZIP-compressed
+  raw float bytes per tile.
+- No ZSCALE, no ZZERO, no GZIP_COMPRESSED_DATA fallback.
+- Astropy reads bit-exact with ZQUANTIZ absent OR present.
 
-Open decisions (waiting on user input):
+**Decisions:**
 
-1.  **`ZCMPTYPE` value when `method='none'`.**
-    - (A) Honor `compress=` even though every tile actually
-      gets GZIP_1 in the fallback column.  Matches cfitsio /
-      astropy convention; misleading header.
-    - (B, my recommendation) Require `compress=Gzip1(...)` and
-      reject other algorithms with a clear error.  Header
-      matches reality; teaches the user the relationship.
+1.  **ZCMPTYPE.**  Require `compress=Gzip1(...)`; reject
+    other algorithms with a clear error pointing at Gzip1.
+    ZCMPTYPE='GZIP_1' on disk.  Honest header (every tile
+    really is GZIP_1-compressed); user is forced to think
+    about the relationship.
 
-2.  **`ZQUANTIZ` keyword.**
-    - (A, my recommendation) Emit `'NONE'`.  Matches astropy
-      in the wild; our reader already accepts it; explicit
-      "I considered quantization and chose not to".
-    - (B) Omit `ZQUANTIZ` entirely (strict spec).
+2.  **ZQUANTIZ.**  Omit entirely.  FITS Tile Compression
+    Convention says ZQUANTIZ is optional and defaults to
+    NO_DITHER when absent; both astropy and cfitsio read
+    omitted ZQUANTIZ correctly.  No reason to introduce the
+    non-spec 'NONE' value.
 
-3.  **Column layout.**
-    - (A, my recommendation) Keep the 4-column schema same as
-      the quantized case (COMPRESSED_DATA + ZSCALE + ZZERO +
-      GZIP_COMPRESSED_DATA).  ZSCALE/ZZERO get placeholder
-      values (1.0 / 0.0) per row.  Consistency wins over the
-      small per-tile overhead.
-    - (B) Drop ZSCALE/ZZERO when `method='none'`; emit a
-      2-column schema (COMPRESSED_DATA + GZIP_COMPRESSED_DATA).
-      Strict-spec; creates two different schemas for
-      "compressed float HDU".
+3.  **Schema.**  Single COMPRESSED_DATA column (1PB for
+    heap_format='P', 1QB for 'Q') containing GZIP-compressed
+    raw float bytes per tile.  No ZSCALE, no ZZERO, no
+    GZIP_COMPRESSED_DATA fallback.  Matches astropy's layout
+    exactly; smallest files; simplest dispatch (the existing
+    reader code already handles this case — `find_data_columns`
+    returns just `primary`, `quant` evaluates to `None` because
+    ZSCALE/ZZERO columns are absent, decoder is called with
+    float bytepix, no dequant applied).
 
-4.  **Headers to skip.**  Regardless of which schema we pick,
-    `ZDITHER0` and `ZBLANK` should NOT be emitted when
-    `method='none'` (no dither stream is in use, no quantized
-    NaN sentinel to mark).
+4.  **Skip ZDITHER0 + ZBLANK.**  No dither stream is in use;
+    no quantized-NaN sentinel to mark.  Both keywords absent.
 
-If all my recommendations are accepted (B / A / A / skip both),
-the implementation is small:
+**Implementation sketch:**
+
   - `fits.rs::create_compressed_image_hdu_impl`: when
     `quantize_cfg.method == None_`, validate
     `matches!(cfg, CompressionConfigKind::Gzip1(_))` (clear
-    error otherwise); skip ZDITHER0 + ZBLANK emission.
+    error otherwise); emit single-column schema
+    (TFIELDS=1, TFORM1=1PB/1QB, TTYPE1=COMPRESSED_DATA);
+    skip ZQUANTIZ + ZDITHER0 + ZBLANK emission.
   - `hdu_image_compressed.rs::encode_tile_float`: when
-    `method == None_`, skip `quantize_double/float` entirely
-    and route every tile to the GZIP fallback (the existing
-    `qt_opt = None` branch already does the right thing).
+    `method == None_`, skip `quantize_double/float` entirely;
+    GZIP_1-encode the raw float bytes and place directly in
+    the primary COMPRESSED_DATA descriptor (NOT routed through
+    the GZIP fallback column).  Different code path from the
+    quantized-with-fallback case.
   - Replace the current `NotImplementedError` in
     `write_compressed_image_data` with the dispatch above.
-  - Tests: round-trip across f4/f8, fitsio cross-read agreement,
-    confirm ZDITHER0 + ZBLANK absent, confirm every primary
-    descriptor empty.
+  - Tests: round-trip across f4/f8, astropy cross-read
+    agreement (rustfits writes → astropy reads bit-exact and
+    vice versa), fitsio cross-read agreement, confirm
+    ZQUANTIZ + ZDITHER0 + ZBLANK absent, confirm TFIELDS=1
+    + COMPRESSED_DATA is the only column.
 
 **Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
 `__setitem__`.  Changing a single pixel requires re-encoding the
