@@ -1512,6 +1512,13 @@ reject `quantize=` with a clear error; float HDUs without
 strings for method names; FITS-spec ZQUANTIZ values are
 available via `quantize.zquantiz`.
 
+**Note (forward-looking, not yet implemented):** this API
+shape is changing in the follow-up implementation below.  The
+`method='none'` variant will be removed; `quantize=None` (or
+omitting the kwarg) will signal "no quantization, lossless raw
+float GZIP."  See the "*Pending follow-up: implement
+`quantize=None`*" section below for full details.
+
 *Schema.*  Float HDUs emit a 4-column BINTABLE:
 
   | column | TFORM | role |
@@ -1599,24 +1606,56 @@ per-tile.  Heap-byte equality would require a more painstaking
 port of cfitsio's qsort tie-breaking; not worth doing absent a
 specific need.
 
-*Pending follow-up: implement `Quantize(method='none')` write
-path.*  The kwarg is currently accepted at create time and
-writes `ZQUANTIZ='NONE'` to the header, but `.write(data)`
-raises `NotImplementedError` (see `hdu_image_compressed.rs`
-near the `compressed-float write with ZQUANTIZ='NONE'`
-message).  The intent: every tile stored losslessly as GZIP_1
-compressed raw float bytes, no quantization at all.
+*Pending follow-up: implement `quantize=None` (unquantized
+float compressed) write path.*  The Quantize config currently
+accepts `method='none'` at create time and writes
+`ZQUANTIZ='NONE'` to the header, but `.write(data)` raises
+`NotImplementedError` (see `hdu_image_compressed.rs` near the
+`compressed-float write with ZQUANTIZ='NONE'` message).  This
+follow-up reshapes the API and implements the write path.
 
-**Design (settled 2026-05-23 after empirical astropy
-investigation).**
+**API change.**  The original `Quantize(method='none')` shape
+is dropped in favor of using the `quantize=` kwarg's value to
+signal whether quantization happens at all:
 
-Standards landscape (corrected from prior CLAUDE.md notes —
-astropy 7.2.0's actual behavior was different):
+|  | Behavior |
+|--|----------|
+| float HDU, omit `quantize=` (default) | NO quantization — lossless raw float GZIP |
+| float HDU, `quantize=None` | NO quantization — lossless raw float GZIP (explicit) |
+| float HDU, `quantize=Quantize(...)` | quantize with these params |
+| integer HDU, `quantize=` anything | error (quantize= invalid for integers) |
+
+This is a **breaking change from earlier Phase 8 behavior**
+(which defaulted to `Quantize()` = dither1 for float HDUs).
+Decision rationale:
+- Lossy compression on scientific float data should be opted
+  into explicitly, not silently applied.
+- We have no users yet, so the break costs nothing.
+- The `QuantizeMethod::None_` variant is removed; `Quantize`
+  only accepts the three real dither methods.
+
+**Compress requirement for unquantized floats.**  Empirically
+verified (astropy 7.2.0 + each algorithm at `quantize_level=0`):
+
+| compress= | unquantized float behavior | Allow with quantize=None? |
+|-----------|---------------------------|---------------------------|
+| Gzip1     | bit-exact lossless | YES |
+| Gzip2     | bit-exact lossless, ~3-5% better than Gzip1 (byte-shuffle helps on float bit patterns) | YES |
+| Rice1     | astropy writes it, but round-trip is NOT bit-exact (Rice coding on float bit patterns produces garbage) | NO — reject |
+| Hcompress1| astropy writes it, but round-trip is NOT bit-exact (H-transform is integer wavelet) | NO — reject |
+| Plio1     | astropy hard-rejects (mask-only) | NO — reject |
+
+So `quantize=None` requires `compress=Gzip1(...)` OR
+`compress=Gzip2(...)`.  The byte-shuffle in GZIP_2 helps on
+float data, so we allow both.
+
+**Standards landscape (corrected from prior CLAUDE.md notes —
+astropy 7.2.0's actual behavior was different).**
 
 |  | FITS spec | cfitsio | astropy (7.2.0) |
 |--|--|--|--|
 | ZQUANTIZ for unquantized | optional; absent → defaults to `NO_DITHER` | absent OR `'NO_DITHER'` | `'NO_DITHER'` |
-| ZCMPTYPE | mandatory; must name algorithm | reflects user's choice | reflects user's choice (with quantize_level=0 → GZIP_1 only) |
+| ZCMPTYPE for unquantized | mandatory; must name algorithm | reflects user's choice | reflects user's choice (any algorithm — though only GZIP gives bit-exact) |
 | Schema for unquantized GZIP | spec doesn't mandate | n/a (typically quantized) | single COMPRESSED_DATA column with raw GZIP'd float bytes |
 | `'NONE'` as ZQUANTIZ value | NOT in spec | tolerated on read | not emitted |
 
@@ -1631,11 +1670,12 @@ compression_type='GZIP_1'`:
 
 **Decisions:**
 
-1.  **ZCMPTYPE.**  Require `compress=Gzip1(...)`; reject
-    other algorithms with a clear error pointing at Gzip1.
-    ZCMPTYPE='GZIP_1' on disk.  Honest header (every tile
-    really is GZIP_1-compressed); user is forced to think
-    about the relationship.
+1.  **`compress=` requirement.**  When `quantize=None` (or
+    omitted) on a float HDU, require `compress=Gzip1(...)` OR
+    `compress=Gzip2(...)`.  Reject the other algorithms with
+    a clear error pointing at Gzip1/Gzip2 (since they silently
+    corrupt unquantized float data per the empirical table
+    above).  ZCMPTYPE on disk reflects the chosen algorithm.
 
 2.  **ZQUANTIZ.**  Omit entirely.  FITS Tile Compression
     Convention says ZQUANTIZ is optional and defaults to
@@ -1658,25 +1698,32 @@ compression_type='GZIP_1'`:
 
 **Implementation sketch:**
 
-  - `fits.rs::create_compressed_image_hdu_impl`: when
-    `quantize_cfg.method == None_`, validate
-    `matches!(cfg, CompressionConfigKind::Gzip1(_))` (clear
-    error otherwise); emit single-column schema
-    (TFIELDS=1, TFORM1=1PB/1QB, TTYPE1=COMPRESSED_DATA);
-    skip ZQUANTIZ + ZDITHER0 + ZBLANK emission.
-  - `hdu_image_compressed.rs::encode_tile_float`: when
-    `method == None_`, skip `quantize_double/float` entirely;
-    GZIP_1-encode the raw float bytes and place directly in
-    the primary COMPRESSED_DATA descriptor (NOT routed through
-    the GZIP fallback column).  Different code path from the
-    quantized-with-fallback case.
+  - `src/zimage/compression_config.rs`: remove
+    `QuantizeMethod::None_` variant; update `Quantize::__new__`
+    to accept only `'no_dither' | 'dither1' | 'dither2'`.
+  - `fits.rs::create_compressed_image_hdu_impl`: drop the
+    default-to-`Quantize()` behavior for float HDUs.  When
+    `quantize` is None and `is_float`: validate
+    `matches!(cfg, Gzip1(_) | Gzip2(_))` (clear error
+    otherwise); emit single-column schema (TFIELDS=1,
+    TFORM1=1PB/1QB, TTYPE1=COMPRESSED_DATA); skip ZQUANTIZ +
+    ZDITHER0 + ZBLANK emission.
+  - `hdu_image_compressed.rs::write_compressed_image_data`:
+    detect "unquantized float mode" via `is_float && TFIELDS==1`
+    (signal works for both freshly-created and reopened HDUs).
+    In that mode, route through `encode_tile_int` with the
+    GZIP_1/GZIP_2 algorithm + float bytepix — the encoder
+    treats the bytes as opaque, and the descriptor emission
+    is single-column.
   - Replace the current `NotImplementedError` in
     `write_compressed_image_data` with the dispatch above.
-  - Tests: round-trip across f4/f8, astropy cross-read
-    agreement (rustfits writes → astropy reads bit-exact and
-    vice versa), fitsio cross-read agreement, confirm
-    ZQUANTIZ + ZDITHER0 + ZBLANK absent, confirm TFIELDS=1
-    + COMPRESSED_DATA is the only column.
+  - Tests: round-trip across f4/f8 × {Gzip1, Gzip2},
+    astropy cross-read agreement (rustfits writes → astropy
+    reads bit-exact and vice versa), fitsio cross-read
+    agreement, confirm ZQUANTIZ + ZDITHER0 + ZBLANK absent,
+    confirm TFIELDS=1 + COMPRESSED_DATA is the only column,
+    confirm Rice1/Hcompress1/Plio1 + quantize=None all reject
+    with the new error message.
 
 **Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
 `__setitem__`.  Changing a single pixel requires re-encoding the
