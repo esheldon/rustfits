@@ -559,6 +559,7 @@ def test_i8_hcompress_rejected():
 # float-compressed writes are now supported via quantize=.  See
 # tests/test_compressed_image_phase8_quantize_write.py.
 
+
 def test_unsigned_trick_dtype_rejected():
     """u2/u4/u8/i1 not yet supported on the compressed-write side."""
     with tempfile.TemporaryDirectory() as tmp:

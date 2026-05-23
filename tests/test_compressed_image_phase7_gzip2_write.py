@@ -306,6 +306,7 @@ def test_mixed_gzip1_and_gzip2_in_one_file():
 # float-compressed writes are now supported via quantize=.  See
 # tests/test_compressed_image_phase8_quantize_write.py.
 
+
 def test_unsigned_trick_dtype_rejected():
     """
     u2/u4/u8/i1 writes raise NotImplementedError until the
