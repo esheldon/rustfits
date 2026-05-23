@@ -504,8 +504,11 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   or Gzip2).  Unsigned-int trick dtypes (i1/u2/u4/u8) work on
   compressed writes for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
   excluded — the reverse XOR produces negatives PLIO can't
-  encode).  Compressed `extend`/`__setitem__` are Phase 9+
-  (mutation).
+  encode).  `CompressedImageHDU.extend(data)` appends rows along
+  numpy axis 0 (integer + unsigned-trick + unquantized-float
+  HDUs; quantized-float deferred).  No `start=` kwarg —
+  in-place writes are `__setitem__`'s job.  Compressed
+  `__setitem__` is Phase 9+.
 
 ### Table read
 
@@ -1703,17 +1706,47 @@ growth, omit-kwarg semantics, rejections (Rice1/Hcompress1
 generic, Plio1 algorithm-specific, removed
 `Quantize(method='none')` spelling).
 
-**Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
-`__setitem__`.  Changing a single pixel requires re-encoding the
-affected tile and possibly re-laying out the heap (same problem
-as VLA-table `__setitem__`, which we explicitly deferred for
-the same reason).  Wait for a real use case.
+**Phase 9 — `CompressedImageHDU.extend(data)`.**  Shipped
+2026-05-23 for integer, unsigned-int trick, and unquantized-float
+HDUs (all 5 algorithms except PLIO_1 paired with unsigned trick).
+Quantized-float extend is the remaining gap.
 
-When write phases beyond 7 land, **remove the
-`#[allow(unused_variables)]` on `extend` and `__setitem__` in
-`hdu_image_compressed.rs`** — Phase 2 set them because the
-bodies just raise NotImplementedError; real implementations
-will consume those parameters.
+API: `extend(data)` — no `start=` kwarg.  In-place writes to
+existing tile rows are `__setitem__`'s job (re-encode affected
+tiles); extend only appends along numpy axis 0.  Partial-last-tile
+case is supported: the boundary tile is decoded, combined with the
+first portion of new data, and re-encoded.  Old boundary-tile
+heap bytes become orphans (left in place; descriptors no longer
+point at them).
+
+Implementation in `hdu_image_compressed.rs::extend_compressed_image_data`
+(file-private, mirrors `write_compressed_image_data`).  Mechanics:
+pre-read existing main + heap into RAM; encode boundary tiles
+(decode via cache → byte-concat with new portion → encode); encode
+new tile rows; grow file (shift later HDUs or set_len); write
+updated main table + relocated heap + appended heap; rewrite
+header (NAXIS2 + PCOUNT + ZNAXIS<last>).  Same taint contract as
+write: pre-shift failures don't taint; failures inside the write
+loop do.
+
+Tests in `tests/test_compressed_image_extend.py` (46 cases):
+1-D + 2-D + 3-D extends, tile-aligned and partial-last-tile,
+dtype matrix (u1/i2/i4 + unsigned trick i1/u2/u4), algorithm
+matrix (Gzip1/Gzip2/Rice1/Hcompress1), multiple sequential
+extends, astropy cross-read, non-last HDU growth, unquantized
+float, all rejection paths.
+
+**Phase 9+ — `CompressedImageHDU.__setitem__` (still deferred).**
+Changing a single pixel requires re-encoding the affected tile
+and possibly re-laying out the heap (same problem as VLA-table
+`__setitem__`, which we explicitly deferred for the same reason).
+Wait for a real use case.
+
+When `__setitem__` lands, **remove the
+`#[allow(unused_variables)]` on `__setitem__` in
+`hdu_image_compressed.rs`** — Phase 2 set it because the body
+just raises NotImplementedError; real implementations will
+consume those parameters.
 
 ## Build / dev workflow
 

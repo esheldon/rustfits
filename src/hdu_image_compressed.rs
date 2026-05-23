@@ -498,17 +498,30 @@ impl CompressedImageHDU {
         )
     }
 
-    #[pyo3(signature = (data, start=None))]
-    #[allow(unused_variables)]
+    // No `start=` kwarg, unlike ImageHDU.extend: writing to existing
+    // tile rows is __setitem__'s job (re-encode the affected tiles
+    // in place).  extend only appends at the end of the slow axis.
     fn extend(
         slf: PyRef<'_, Self>,
+        py: Python<'_>,
         data: &Bound<'_, PyAny>,
-        start: Option<Vec<i64>>,
     ) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "extending tile-compressed images is not yet implemented \
-             (planned: Phase 7+ of the ZIMAGE roadmap)."
-        ))
+        let cache = Arc::clone(&slf.cache);
+        let quantize_config = Arc::clone(&slf.quantize_config);
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        extend_compressed_image_data(
+            py,
+            data,
+            &cards,
+            &super_.offsets,
+            &super_.file,
+            &super_.layout,
+            &super_.tainted,
+            &cache,
+            &super_.header,
+            &quantize_config,
+        )
     }
 
     #[allow(unused_variables)]
@@ -2684,5 +2697,677 @@ fn write_compressed_image_data(
     // Any tiles cached from earlier reads are now stale.
     cache.clear();
 
+    Ok(())
+}
+
+// Update an existing standard-keyword int card to a new value in
+// place, preserving its position and (best-effort) comment text.
+// No-op if the card isn't present — caller must guarantee it
+// exists, which holds for the cards we update at extend time
+// (NAXIS2 / PCOUNT / ZNAXISn are all mandatory).
+fn update_int_card(cards: &mut Vec<String>, key: &str, value: i64) {
+    let key_uc = key.to_uppercase();
+    if let Some(idx) = cards.iter().position(|c| {
+        c.len() >= 8 && c[..8].trim().to_uppercase() == key_uc
+    }) {
+        // Best-effort preserve the comment after the '/'.
+        let existing = &cards[idx];
+        let comment = existing
+            .find('/')
+            .map(|p| existing[p + 1..].trim().to_string())
+            .unwrap_or_default();
+        cards[idx] = crate::header::card_int(key, value, &comment);
+    }
+}
+
+// Append new rows along the slow axis (numpy axis 0) of a
+// tile-compressed image.  Existing tiles outside the last tile row
+// are preserved untouched; the partial last tile row (if any) gets
+// re-encoded to absorb new data; truly new tile rows are encoded
+// fresh.  See CLAUDE.md "Compressed extend" for the full design.
+//
+// On-disk mechanics:
+//   1. Pre-read existing main descriptor table + heap into RAM (we
+//      have to move them; reading first means an I/O failure here
+//      leaves the file unchanged).
+//   2. Update boundary tile descriptors in the in-memory main buf
+//      to point at re-encoded heap bytes (which live in the
+//      appended portion of the new heap).
+//   3. Grow file (shift later HDUs if non-last; set_len if last).
+//   4. Write:
+//        data_offset                        : updated main table
+//        data_offset + new_main_bytes       : old heap (relocated)
+//        + old_pcount                       : appended heap (boundary
+//                                              re-encoded + new
+//                                              tile bytes)
+//      + block-padding.
+//   5. Rewrite header to update NAXIS2 + PCOUNT + ZNAXIS<last>.
+//
+// Heap layout note: the old boundary-tile bytes stay in the old
+// heap (now orphaned — descriptors no longer point at them).
+// Slightly bloats files when boundary re-encoding happens, but
+// keeps the file logically valid and is dramatically simpler than
+// rewriting the whole heap with the old tiles' bytes removed.
+#[allow(clippy::too_many_arguments)]
+fn extend_compressed_image_data(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    cards: &[String],
+    offsets: &Arc<HduOffsets>,
+    file_handle: &FileHandle,
+    layout: &FileLayout,
+    tainted: &TaintFlag,
+    cache: &TileCache,
+    cards_arc: &Arc<Mutex<Vec<String>>>,
+    _quantize_config: &Arc<
+        Mutex<Option<crate::zimage::compression_config::Quantize>>,
+    >,
+) -> PyResult<()> {
+    check_not_tainted(tainted)?;
+
+    // ----- header parse -----
+    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE").ok_or_else(|| {
+        PyValueError::new_err("compressed HDU missing ZCMPTYPE")
+    })?;
+    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
+    let (zbitpix, old_image_shape) = parse_compressed_image_shape(cards)?;
+    if old_image_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "compressed HDU has ZNAXIS=0 (no image data)",
+        ));
+    }
+    let is_float = zbitpix < 0;
+    let tfields = parse_keyword(cards, "TFIELDS").unwrap_or(0) as u64;
+    // Quantized-float HDUs use the 4-column schema (with ZSCALE +
+    // ZZERO + GZIP_COMPRESSED_DATA fallback).  Extend on that schema
+    // needs to grow the fixed-width columns too and keep the dither
+    // stream consistent across the boundary — deferred for now.
+    let is_quantized_float = is_float && tfields == 4;
+    if is_quantized_float {
+        return Err(PyNotImplementedError::new_err(
+            "extend on quantized-float compressed images is not yet \
+             supported (quantize=Quantize(...) HDUs).  Integer and \
+             unquantized-float (quantize=None) HDUs work.",
+        ));
+    }
+    let is_unquantized_float = is_float;
+
+    let bytepix: u32 = match zbitpix {
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        64 => 8,
+        -32 => 4,
+        -64 => 8,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported ZBITPIX {} for compressed extend",
+                other
+            )))
+        }
+    };
+
+    let tile_shape = parse_tile_shape(cards, &old_image_shape);
+    let old_n_tiles = compute_n_tiles(&old_image_shape, &tile_shape);
+
+    let tform1 = parse_string_keyword(cards, "TFORM1").ok_or_else(|| {
+        PyValueError::new_err("compressed HDU missing TFORM1")
+    })?;
+    let tform1_trim = tform1.trim();
+    let heap_is_q =
+        tform1_trim.starts_with("1Q") || tform1_trim.starts_with('Q');
+    let descriptor_size: u64 = if heap_is_q { 16 } else { 8 };
+    let inner_byte_width: u64 =
+        tform_vla_inner_byte_width(tform1_trim).unwrap_or(1);
+
+    let old_pcount =
+        parse_keyword(cards, "PCOUNT").unwrap_or(0).max(0) as u64;
+
+    let (blocksize_opt, _) = parse_rice_params(cards);
+    let blocksize = blocksize_opt.unwrap_or(32);
+    let hcompress_scale = parse_hcompress_scale(cards);
+
+    // Single-column schema confirmed above (we rejected the quantized
+    // 4-column path), so row_width = descriptor_size.
+    let row_width = descriptor_size;
+    let old_main_bytes = row_width.saturating_mul(old_n_tiles);
+    let data_offset = offsets.data_offset();
+
+    // ----- input validation -----
+    let np = py.import("numpy")?;
+    let ascontig0 = np.call_method1("ascontiguousarray", (data,))?;
+    let in_shape: Vec<usize> = ascontig0.getattr("shape")?.extract()?;
+    let naxis = old_image_shape.len();
+    if in_shape.len() != naxis {
+        return Err(PyValueError::new_err(format!(
+            "compressed extend: input has {} axes, HDU has {}",
+            in_shape.len(),
+            naxis,
+        )));
+    }
+    if in_shape[0] == 0 {
+        return Err(PyValueError::new_err(
+            "compressed extend: data.shape[0] must be > 0",
+        ));
+    }
+    // Only axis 0 may grow; remaining axes must match exactly.
+    for axis in 1..naxis {
+        if in_shape[axis] as u64 != old_image_shape[axis] {
+            return Err(PyValueError::new_err(format!(
+                "compressed extend: data shape[{}]={} != image \
+                 shape[{}]={} (only the slow axis (numpy axis 0) \
+                 can grow)",
+                axis, in_shape[axis], axis, old_image_shape[axis],
+            )));
+        }
+    }
+
+    // Reverse-transform if the HDU has unsigned-int trick BSCALE/BZERO.
+    // For unquantized-float and integer-no-trick HDUs this is a pass-
+    // through.  Float HDUs never carry BSCALE/BZERO (forbidden by
+    // the spec) so we skip the helper.
+    let ascontig_owned = if !is_float {
+        normalize_compressed_input_dtype(py, &ascontig0, cards, zbitpix)?
+    } else {
+        ascontig0.clone().unbind()
+    };
+    let ascontig = ascontig_owned.bind(py);
+
+    // ----- compute new layout -----
+    let old_naxis0 = old_image_shape[0];
+    let added = in_shape[0] as u64;
+    let new_naxis0 = old_naxis0 + added;
+    let mut new_image_shape = old_image_shape.clone();
+    new_image_shape[0] = new_naxis0;
+    let new_n_tiles = compute_n_tiles(&new_image_shape, &tile_shape);
+
+    let t_r = tile_shape[0];
+    let n_old_tile_rows_slow = (old_naxis0 + t_r - 1) / t_r;
+    let n_tiles_per_row_slow: u64 = {
+        let mut prod = 1u64;
+        for ax in 1..naxis {
+            let n_along = (old_image_shape[ax] + tile_shape[ax] - 1)
+                / tile_shape[ax];
+            prod *= n_along;
+        }
+        prod
+    };
+
+    // Boundary tiles: the LAST tile row of the OLD image is a
+    // boundary iff old_naxis0 is not a multiple of T_r.  Those
+    // tiles need re-encoding because their actual shape grows in
+    // the NEW image (old partial → fuller or full).  When
+    // old_naxis0 % T_r == 0 there are no boundary tiles.
+    let has_boundary = old_naxis0 > 0 && old_naxis0 % t_r != 0;
+    let boundary_range: Option<(u64, u64)> = if has_boundary {
+        let start = (n_old_tile_rows_slow - 1) * n_tiles_per_row_slow;
+        let end = n_old_tile_rows_slow * n_tiles_per_row_slow;
+        Some((start, end))
+    } else {
+        None
+    };
+    // Tiles in [first_new_tile, new_n_tiles) are entirely new (no
+    // overlap with any old tile).  Tiles in [0, first_new_tile) are
+    // either unchanged or boundary.
+    let first_new_tile = match boundary_range {
+        Some((_, end)) => end,
+        None => old_n_tiles,
+    };
+
+    // ----- encode setup -----
+    let int_ctx = IntTileCtx {
+        algorithm,
+        bytepix,
+        zbitpix,
+        inner_byte_width,
+        blocksize,
+        hcompress_scale,
+    };
+    let be_dtype = match zbitpix {
+        8 => ">u1",
+        16 => ">i2",
+        32 => ">i4",
+        64 => ">i8",
+        -32 => ">f4",
+        -64 => ">f8",
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported ZBITPIX {} for compressed extend",
+                other
+            )))
+        }
+    };
+    let _ = is_unquantized_float; // (signal kept for future quant-extend)
+
+    // ----- encode boundary tiles -----
+    // For each boundary tile, decode the existing partial tile via
+    // the cache machinery, slice the new data portion that falls
+    // into the same tile, concatenate (byte-concat along axis 0 in
+    // C-order = byte concatenation), and re-encode.  The new
+    // descriptor goes into boundary_updates; the encoded bytes
+    // accumulate in appended_heap.
+    let mut appended_heap: Vec<u8> = Vec::new();
+    let mut boundary_updates: Vec<(u64, TileRow)> = Vec::new();
+    let mut new_descs: Vec<TileRow> = Vec::new();
+
+    if let Some((b_start, b_end)) = boundary_range {
+        let cols = find_data_columns(cards)?;
+        let theap = parse_keyword(cards, "THEAP")
+            .map(|x| x.max(0) as u64)
+            .unwrap_or(row_width * old_n_tiles);
+        for tile_idx in b_start..b_end {
+            let (origin, new_actual_shape) =
+                tile_origin_and_shape(tile_idx, &new_image_shape, &tile_shape);
+            let (_, old_actual_shape) =
+                tile_origin_and_shape(tile_idx, &old_image_shape, &tile_shape);
+            // Decode the existing partial tile (native-endian bytes
+            // in BITPIX-native dtype, numpy C-order).
+            let old_bytes_arc = get_or_decode_tile(
+                py,
+                cache,
+                file_handle,
+                tainted,
+                tile_idx,
+                data_offset,
+                row_width,
+                theap,
+                &cols,
+                algorithm,
+                &old_actual_shape,
+                bytepix,
+                blocksize,
+                zbitpix,
+                zbitpix,
+                None,
+                false,
+            )?;
+
+            // Slice the corresponding portion of new data:
+            //   axis 0: data rows [0, new_actual_shape[0] - old_actual_shape[0])
+            //   axes 1..N: the tile's column extent (origin[ax]..origin[ax]+shape[ax])
+            let new_rows_in_tile =
+                new_actual_shape[0] - old_actual_shape[0];
+            let slice_objs: Vec<Bound<'_, PySlice>> = (0..naxis)
+                .map(|ax| {
+                    if ax == 0 {
+                        PySlice::new(py, 0, new_rows_in_tile as isize, 1)
+                    } else {
+                        let o = origin[ax] as isize;
+                        let s = new_actual_shape[ax] as isize;
+                        PySlice::new(py, o, o + s, 1)
+                    }
+                })
+                .collect();
+            let slice_tuple = PyTuple::new(py, &slice_objs)?;
+            let new_part_view = ascontig.get_item(slice_tuple)?;
+            // Convert new portion to BE bytes
+            let new_part_be =
+                np.call_method1("ascontiguousarray", (new_part_view, be_dtype))?;
+            let new_part_bytes_py = new_part_be.call_method0("tobytes")?;
+            let new_part_be_bytes: Vec<u8> = new_part_bytes_py.extract()?;
+
+            // Convert old bytes (native-endian, from cache) to BE
+            let native_dtype = zbitpix_to_native_dtype(zbitpix)?;
+            let old_pyb = PyBytes::new(py, &old_bytes_arc);
+            let old_arr_flat =
+                np.call_method1("frombuffer", (old_pyb, native_dtype))?;
+            let old_shape_tuple = PyTuple::new(py, &old_actual_shape)?;
+            let old_arr =
+                old_arr_flat.call_method1("reshape", (old_shape_tuple,))?;
+            let old_be =
+                np.call_method1("ascontiguousarray", (old_arr, be_dtype))?;
+            let old_be_bytes: Vec<u8> =
+                old_be.call_method0("tobytes")?.extract()?;
+
+            // Byte-concat (axis 0 concat in C-order = byte concat
+            // because axis 0 is the OUTER dim).
+            let mut combined_be: Vec<u8> = Vec::with_capacity(
+                old_be_bytes.len() + new_part_be_bytes.len(),
+            );
+            combined_be.extend_from_slice(&old_be_bytes);
+            combined_be.extend_from_slice(&new_part_be_bytes);
+
+            let n_pixels: usize =
+                new_actual_shape.iter().product::<u64>() as usize;
+            let row = encode_tile_int(
+                &int_ctx,
+                &combined_be,
+                tile_idx,
+                &new_actual_shape,
+                n_pixels,
+                &mut appended_heap,
+            )?;
+            boundary_updates.push((tile_idx, row));
+        }
+    }
+
+    // ----- encode truly-new tile rows -----
+    for tile_idx in first_new_tile..new_n_tiles {
+        let (origin, new_actual_shape) =
+            tile_origin_and_shape(tile_idx, &new_image_shape, &tile_shape);
+        // The tile's data lives entirely in the input array,
+        // offset by old_naxis0 along axis 0.
+        let data_axis0_start = origin[0].saturating_sub(old_naxis0);
+        let data_axis0_end = data_axis0_start + new_actual_shape[0];
+        let slice_objs: Vec<Bound<'_, PySlice>> = (0..naxis)
+            .map(|ax| {
+                if ax == 0 {
+                    PySlice::new(
+                        py,
+                        data_axis0_start as isize,
+                        data_axis0_end as isize,
+                        1,
+                    )
+                } else {
+                    let o = origin[ax] as isize;
+                    let s = new_actual_shape[ax] as isize;
+                    PySlice::new(py, o, o + s, 1)
+                }
+            })
+            .collect();
+        let slice_tuple = PyTuple::new(py, &slice_objs)?;
+        let tile_view = ascontig.get_item(slice_tuple)?;
+        let tile_be =
+            np.call_method1("ascontiguousarray", (tile_view, be_dtype))?;
+        let tile_bytes_py = tile_be.call_method0("tobytes")?;
+        let tile_bytes: Vec<u8> = tile_bytes_py.extract()?;
+        let n_pixels: usize =
+            new_actual_shape.iter().product::<u64>() as usize;
+        let row = encode_tile_int(
+            &int_ctx,
+            &tile_bytes,
+            tile_idx,
+            &new_actual_shape,
+            n_pixels,
+            &mut appended_heap,
+        )?;
+        new_descs.push(row);
+    }
+
+    // ----- shift descriptor offsets into the combined-heap frame -----
+    // appended_heap offsets start at 0 (relative to the start of
+    // appended).  The combined heap is [old_heap; appended], so
+    // absolute offsets are old_pcount + offset_in_appended.
+    for (_, row) in boundary_updates.iter_mut() {
+        row.primary_off += old_pcount;
+    }
+    for row in new_descs.iter_mut() {
+        row.primary_off += old_pcount;
+    }
+
+    // ----- compute new file extents -----
+    let new_main_bytes = row_width.saturating_mul(new_n_tiles);
+    let new_pcount = old_pcount + appended_heap.len() as u64;
+    let new_data_size = new_main_bytes + new_pcount;
+    let new_padded = if new_data_size == 0 {
+        0
+    } else {
+        ((new_data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            * BLOCK_SIZE as u64
+    };
+    let current_hdu_end = {
+        let guard = layout
+            .hdus
+            .lock()
+            .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+        let mut found_next: Option<u64> = None;
+        let mut found_self = false;
+        for h in guard.iter() {
+            if found_self {
+                found_next = Some(h.header_offset());
+                break;
+            }
+            if Arc::ptr_eq(h, offsets) {
+                found_self = true;
+            }
+        }
+        match found_next {
+            Some(end) => end,
+            None => {
+                let g = lock_file(file_handle)?;
+                let f = g
+                    .as_ref()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.metadata()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .len()
+            }
+        }
+    };
+    let current_padded_data = current_hdu_end.saturating_sub(data_offset);
+    let new_hdu_end = data_offset + new_padded;
+
+    // ----- read existing main descriptor table + heap into RAM -----
+    // (Done BEFORE the grow so that an I/O failure here leaves the
+    // file untouched.  After this point all errors taint.)
+    let mut old_main_buf: Vec<u8> = vec![0; old_main_bytes as usize];
+    let mut old_heap_buf: Vec<u8> = vec![0; old_pcount as usize];
+    {
+        let mut g = lock_file(file_handle)?;
+        let f = g
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        if old_main_bytes > 0 {
+            f.seek(SeekFrom::Start(data_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut old_main_buf).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "compressed extend: read old main: {}",
+                    e
+                ))
+            })?;
+        }
+        if old_pcount > 0 {
+            f.seek(SeekFrom::Start(data_offset + old_main_bytes))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut old_heap_buf).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "compressed extend: read old heap: {}",
+                    e
+                ))
+            })?;
+        }
+    }
+
+    // Apply boundary descriptor updates to old_main_buf in place.
+    // Descriptor format: P → u32 nelem BE + u32 off BE (8 bytes);
+    // Q → u64 nelem BE + u64 off BE (16 bytes).
+    for (tile_idx, row) in &boundary_updates {
+        let desc_offset = (tile_idx * row_width) as usize;
+        write_descriptor(
+            &mut old_main_buf,
+            desc_offset,
+            heap_is_q,
+            row.primary_nelem,
+            row.primary_off,
+        )?;
+    }
+
+    // Serialize new tile descriptors into a buffer.
+    let mut new_descs_buf: Vec<u8> = Vec::with_capacity(
+        (new_descs.len() as u64 * row_width) as usize,
+    );
+    for row in &new_descs {
+        let mut tmp = vec![0u8; row_width as usize];
+        write_descriptor(
+            &mut tmp,
+            0,
+            heap_is_q,
+            row.primary_nelem,
+            row.primary_off,
+        )?;
+        new_descs_buf.extend_from_slice(&tmp);
+    }
+
+    // ----- grow the file if needed -----
+    if new_padded > current_padded_data {
+        let delta = new_padded - current_padded_data;
+        let file_len = {
+            let g = lock_file(file_handle)?;
+            let f = g
+                .as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                file_handle,
+                layout,
+                current_hdu_end,
+                delta,
+                tainted,
+            )?;
+        } else {
+            let mut g = lock_file(file_handle)?;
+            let f = g
+                .as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // ----- write the new layout to disk -----
+    {
+        let mut g = lock_file(file_handle)?;
+        let f = g
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset)).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: seek to data_offset failed: {}",
+                e
+            ))
+        })?;
+        // Main descriptor table: [existing (with updated boundary
+        // descriptors)] + [new tile descriptors].
+        f.write_all(&old_main_buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: write old main: {}",
+                e
+            ))
+        })?;
+        f.write_all(&new_descs_buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: write new descs: {}",
+                e
+            ))
+        })?;
+        // Heap at the new position: [old heap (relocated)] +
+        // [appended (boundary re-encodes + new tiles)].
+        f.seek(SeekFrom::Start(data_offset + new_main_bytes)).map_err(
+            |e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "compressed extend: seek to new heap: {}",
+                    e
+                ))
+            },
+        )?;
+        f.write_all(&old_heap_buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: write old heap: {}",
+                e
+            ))
+        })?;
+        f.write_all(&appended_heap).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: write appended heap: {}",
+                e
+            ))
+        })?;
+        // Block-pad to FITS block boundary.
+        let written = new_main_bytes + new_pcount;
+        if new_padded > written {
+            let pad = vec![0u8; (new_padded - written) as usize];
+            f.write_all(&pad).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "compressed extend: pad: {}",
+                    e
+                ))
+            })?;
+        }
+        f.flush().map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!("compressed extend: flush: {}", e))
+        })?;
+    }
+
+    // ----- header rewrite (PCOUNT + NAXIS2 + ZNAXIS<last>) -----
+    let mut cards_guard = cards_arc
+        .lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    update_int_card(&mut new_cards, "NAXIS2", new_n_tiles as i64);
+    // numpy axis 0 = slowest = FITS NAXIS<znaxis> (highest-numbered).
+    let znaxis = naxis;
+    let zaxis_key = format!("ZNAXIS{}", znaxis);
+    update_int_card(&mut new_cards, &zaxis_key, new_naxis0 as i64);
+    {
+        let mut g = lock_file(file_handle)?;
+        let f = g
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = offsets.header_offset();
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: header write failed: {}; close + reopen",
+                e
+            ))
+        })?;
+        f.flush().map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed extend: header flush failed: {}; close + reopen",
+                e
+            ))
+        })?;
+    }
+    *cards_guard = new_cards;
+
+    // Boundary tiles' content changed (and any cached new tiles
+    // would be inconsistent with the new heap layout anyway).
+    cache.clear();
+
+    Ok(())
+}
+
+// Write a single VLA descriptor (nelem + offset, P or Q format) into
+// `buf` at `at`.  Used by extend's descriptor table updates.
+fn write_descriptor(
+    buf: &mut [u8],
+    at: usize,
+    heap_is_q: bool,
+    nel: u64,
+    off: u64,
+) -> PyResult<()> {
+    if heap_is_q {
+        buf[at..at + 8].copy_from_slice(&nel.to_be_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&off.to_be_bytes());
+    } else {
+        if nel > u32::MAX as u64 || off > u32::MAX as u64 {
+            return Err(PyValueError::new_err(format!(
+                "compressed extend: P-descriptor overflow \
+                 (nelem={}, offset={}); use heap_format='Q' for \
+                 heaps > 4 GB",
+                nel, off,
+            )));
+        }
+        buf[at..at + 4].copy_from_slice(&(nel as u32).to_be_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&(off as u32).to_be_bytes());
+    }
     Ok(())
 }
