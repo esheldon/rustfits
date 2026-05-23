@@ -432,17 +432,8 @@ def test_empty_slice_returns_empty_array():
 # -------------------- still rejects what should --------------------
 
 
-def test_setitem_still_raises():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname, _ = _write_rice(
-            tmpdir,
-            (4, 4),
-            "i4",
-            tile_dims=(2, 2),
-        )
-        with rustfits.FITS(fname, "r+") as fits:
-            with pytest.raises(NotImplementedError, match="Phase 7"):
-                fits[1][0:2, 0:2] = np.zeros((2, 2), dtype="i4")
+# test_setitem_still_raises: removed — CompressedImageHDU.__setitem__
+# is now supported.  See tests/test_compressed_image_setitem.py.
 
 
 def test_fancy_list_raises_clear_error():

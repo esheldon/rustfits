@@ -506,9 +506,11 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   excluded — the reverse XOR produces negatives PLIO can't
   encode).  `CompressedImageHDU.extend(data)` appends rows along
   numpy axis 0 (integer + unsigned-trick + unquantized-float
-  HDUs; quantized-float deferred).  No `start=` kwarg —
-  in-place writes are `__setitem__`'s job.  Compressed
-  `__setitem__` is Phase 9+.
+  HDUs).  `CompressedImageHDU.__setitem__` modifies pixels
+  in place via the same slice surface as `__getitem__` (single
+  pixel, row/col, contiguous slices, stepped slices, scalar
+  broadcast, array RHS).  Quantized-float `extend` and
+  `__setitem__` deferred until a real workload pushes for them.
 
 ### Table read
 
@@ -1736,17 +1738,43 @@ matrix (Gzip1/Gzip2/Rice1/Hcompress1), multiple sequential
 extends, astropy cross-read, non-last HDU growth, unquantized
 float, all rejection paths.
 
-**Phase 9+ — `CompressedImageHDU.__setitem__` (still deferred).**
-Changing a single pixel requires re-encoding the affected tile
-and possibly re-laying out the heap (same problem as VLA-table
-`__setitem__`, which we explicitly deferred for the same reason).
-Wait for a real use case.
+**Phase 9 — `CompressedImageHDU.__setitem__(key, value)`.**
+Shipped 2026-05-23 for integer, unsigned-int trick, and
+unquantized-float HDUs.  Quantized-float `__setitem__` deferred
+(same scope cut as quantized extend).
 
-When `__setitem__` lands, **remove the
-`#[allow(unused_variables)]` on `__setitem__` in
-`hdu_image_compressed.rs`** — Phase 2 set it because the body
-just raises NotImplementedError; real implementations will
-consume those parameters.
+API: same slice surface as `__getitem__` (slice / int / ellipsis
+per axis, stepped slices, mixed combinations).  RHS is a scalar
+(numpy broadcasts across the selection) or an ndarray whose
+shape exactly matches the selection's output shape.  Unsigned-
+int trick HDUs accept the scaled dtype (e.g. u2 on a u2-trick
+HDU) and reverse-transform via `normalize_compressed_input_dtype`.
+
+Implementation in `hdu_image_compressed.rs::setitem_compressed_image`
+(file-private, mirrors `extend_compressed_image_data`'s shape
+but simpler — no descriptor table growth, no heap relocation).
+Mechanics: for each tile that overlaps the selection (via the
+same `axis_overlap` helper `__getitem__` uses), decode existing
+tile → wrap in numpy (with `.copy()` since `frombuffer` is
+read-only) → numpy `set_item` with the appropriate RHS portion
+→ re-encode → append to heap.  Modified-tile heap bytes become
+orphans (left in place; descriptors no longer reference them).
+PCOUNT grows; file may grow if past the padded extent.  Same
+taint discipline as extend.
+
+Tests in `tests/test_compressed_image_setitem.py` (29 cases):
+single-pixel writes (1-D and 2-D), row/col writes, multi-tile
+contiguous slices, scalar broadcast, stepped slices, 3-D,
+dtype matrix including unsigned trick, algorithm matrix,
+unquantized float, multiple sequential modifications, astropy
+cross-read, non-last HDU growth, empty-slice no-op, all
+rejection paths.
+
+**Heap orphaning trade-off.**  After many `__setitem__` calls
+modifying the same tiles, the heap grows monotonically with
+orphaned bytes.  A future "compact" / "repack" operation could
+rewrite the heap with only live tiles, but isn't worth the
+complexity until a workload demonstrably needs it.
 
 ## Build / dev workflow
 

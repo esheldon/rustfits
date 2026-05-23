@@ -285,13 +285,9 @@ def test_scaled_compressed_hdu():
 # See tests/test_compressed_image_extend.py.
 
 
-def test_setitem_raises_not_implemented():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname, _ = _write_rice(tmpdir, (4, 4), "i4")
-        with rustfits.FITS(fname, "r+") as fits:
-            hdu = fits[1]
-            with pytest.raises(NotImplementedError, match="Phase 7"):
-                hdu[0:2, 0:2] = np.zeros((2, 2), dtype="i4")
+# test_setitem_raises_not_implemented: removed — CompressedImageHDU.__setitem__
+# is now supported (integer + unsigned-trick + unquantized-float HDUs).
+# See tests/test_compressed_image_setitem.py.
 
 
 # -------------------- mask_blank rejection -------------------------
