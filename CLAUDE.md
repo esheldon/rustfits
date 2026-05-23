@@ -485,6 +485,25 @@ usual f64-precision caveat (i64 values beyond 2^53 lose precision
 through the f8 intermediate); the upper bound check uses 2^63 -
 1024 (largest f64 below 2^63).
 
+**BLANK / MaskedArray support** (uncompressed; symmetric with
+compressed — see the ZIMAGE section).  `create_image_hdu(...,
+blank=<sentinel>)` emits the `BLANK` card (in stored space after
+the unsigned-int trick transform); rejected for float dtypes.
+`hdu.read(mask_blank=True)` returns a `numpy.ma.MaskedArray`
+masking pixels matching `BLANK` (comparison in stored space, per
+spec).  `write` / `__setitem__` / `extend` accept
+`numpy.ma.MaskedArray` input; masked positions auto-fill with the
+sentinel from the header (NaN for float HDUs).  See "BLANK /
+ZBLANK + MaskedArray support" under the ZIMAGE section for the
+shared `unwrap_masked_input` helper.
+
+**Tile-compressed image writes (`ZIMAGE`)** — feature-complete.
+See the ZIMAGE section for the full surface: all 5 algorithms,
+all integer + unsigned-trick + unquantized-float + quantized-
+float dtypes, `extend(data)`, `__setitem__`, `blank=` /
+`mask_blank=True` / MaskedArray input, `Gzip1(level=)` /
+`Gzip2(level=)`.
+
 **Missing.**
 - **Scalar broadcast with scaling** — `__setitem__` scalar RHS
   (`img[k] = 42`) currently goes through `scalar_to_be_bytes` which
@@ -494,30 +513,6 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   value.  Promoting to a 0-d ndarray (which routes through
   `normalize_input_dtype` and gets the reverse-transform) is the
   workaround.  Add when there's a use case.
-- **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 shipped
-  all five integer-ZBITPIX encoders (`Gzip1`, `Gzip2`, `Rice1`,
-  `Hcompress1`, `Plio1`); Phase 8 added float ZBITPIX writes via
-  the new `Quantize` config object (`compress=Rice1(...)` +
-  `quantize=Quantize(level=..., method=..., seed=...)`) plus
-  unquantized float writes via `quantize=None` (single-column
-  COMPRESSED_DATA with raw GZIP'd float bytes; requires Gzip1
-  or Gzip2).  Unsigned-int trick dtypes (i1/u2/u4/u8) work on
-  compressed writes for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
-  excluded — the reverse XOR produces negatives PLIO can't
-  encode).  `CompressedImageHDU.extend(data)` appends rows along
-  numpy axis 0; `CompressedImageHDU.__setitem__` modifies
-  pixels in place via the same slice surface as `__getitem__`
-  (single pixel, row/col, contiguous slices, stepped slices,
-  scalar broadcast, array RHS).  Both work for integer +
-  unsigned-trick + unquantized-float + **quantized-float**
-  HDUs.  Quantized mutation reuses each tile's existing
-  per-tile bscale/bzero/dither seed via
-  `requantize_*_fixed_scale` so unchanged pixels round-trip
-  with NO compounding quantization loss — verified bit-exact
-  in tests.  Values that don't fit the existing per-tile scale
-  are rejected with a clear error that names the recovery
-  options (recreate the file with a coarser `Quantize(level=)`
-  or with `quantize=None` for lossless storage).
 
 ### Table read
 
@@ -801,17 +796,48 @@ BINTABLE with `ZIMAGE=T` plus Z-prefixed image-shape and tile-
 shape cards.  The user-facing API mirrors `ImageHDU`; internally
 the reader walks tiles and decodes them.
 
-**Status:** Phases 1-6 shipped (full read support for all five
-algorithms — RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH,
-PLIO_1 — plus quantized + unquantized floats).  Phase 7
-compressed-write shipped for **all five** integer-ZBITPIX
-encoders: GZIP_1, GZIP_2, RICE_1, HCOMPRESS_1, PLIO_1.  Phase 8
-shipped float writes (quantized via Quantize config; lossless
-GZIP fallback for unquantizable tiles).  Phase 9+ (compressed
-mutation) is the remaining subsystem.  Test fixtures use fitsio for
-normal-path round-trips and hand-crafted bytes for synthetic
-fallback-column cases (astropy is also in the env for richer
-cases).
+**Status: feature-complete for typical workloads.**
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1 | Detection + accessors + tile cache | ✅ Shipped |
+| 2-3 | RICE_1 read + slicing + LRU cache | ✅ Shipped |
+| 4 | GZIP_1 / GZIP_2 reads + fallback columns | ✅ Shipped |
+| 5 | Quantized + unquantized float reads (all 3 dither methods) | ✅ Shipped |
+| 6 | HCOMPRESS_1 + PLIO_1 reads | ✅ Shipped |
+| 7 | All 5 algorithms' integer-ZBITPIX writes | ✅ Shipped |
+| 7b | Unsigned-int trick (i1/u2/u4/u8) on writes | ✅ Shipped |
+| 8 | Quantized + unquantized float writes (`Quantize` config; `quantize=None`) | ✅ Shipped |
+| 9 | `extend(data)` + `__setitem__` (integer + unsigned-trick + unquantized-float) | ✅ Shipped |
+| 9q | `extend` + `__setitem__` for quantized-float (no compounding loss) | ✅ Shipped |
+| 10a | `blank=` + `mask_blank=True` + MaskedArray input | ✅ Shipped |
+| 10b | `Gzip1(level=)` / `Gzip2(level=)` (custom zlib level) | ✅ Shipped |
+
+**Open follow-ups (low priority):**
+
+- **Heap repack/compact** — after many `__setitem__` calls, the
+  heap accumulates orphaned bytes.  A `repack()` method could
+  rewrite the heap with only live tiles.  Workload-driven.
+- **ZHECKSUM / ZDATASUM** — per-tile integrity keywords defined
+  by the Tile Compression Convention.  Readers handle their
+  absence fine; writing them is a small follow-up.
+- **Per-tile ZBLANK column** — today only header-level ZBLANK
+  works.  The convention also allows a per-tile column.  Rare
+  in practice; defer until a real file needs it.
+- **`mask_blank=True` for quantized-float compressed reads** —
+  currently rejected with a "float forbidden" error consistent
+  with the uncompressed path.  Float HDUs use NaN; this would
+  only matter if a user wanted ZBLANK semantics on the i32
+  stored stream.  Defer.
+- **Performance** — chunked-read of large GZIP_2 float files is
+  ~3× slower than cfitsio.  See "Performance TODO" below.
+- **Byte-exact heap agreement with cfitsio on quantized floats**
+  — decoded values are bit-exact; raw heap bytes differ by qsort
+  tie-breaking quirks.  Not worth fixing absent a specific need.
+
+Test fixtures use fitsio for normal-path round-trips and hand-
+crafted bytes for synthetic fallback-column cases (astropy is
+also in the env for richer cases).
 
 Implementation lives in `src/hdu_image_compressed.rs` (the
 pyclass + dispatch) and `src/zimage/` (algorithm-specific
@@ -862,14 +888,14 @@ Also landed: **inheritance restructure** —
 CompressedImageHDU, so `isinstance(hdu, ImageHDU)` is True
 on a compressed HDU.  Accessor `into_super()` calls step
 through both parents (`slf.into_super().into_super()`).
-ImageHDU's data-access methods are overridden:
-- `read` → the Phase 2 decoder (now Phase 3, cache-aware).
-- `__getitem__` → Phase 3's slice path.
-- `write` / `extend` / `__setitem__` → `NotImplementedError`
-  until compressed writes (Phase 7+).  These overrides have
-  `#[allow(unused_variables)]` because the bodies don't use
-  their parameters yet — remove when the methods get real
-  implementations.
+ImageHDU's data-access methods are overridden by compressed-
+specific implementations:
+- `read` → the cache-aware tile decoder.
+- `__getitem__` → tile-by-tile slice path.
+- `write` → the bulk-write encoder (Phase 7 / 8).
+- `extend` → append-along-axis-0 with partial-last-tile
+  re-encoding (Phase 9).
+- `__setitem__` → in-place pixel modification (Phase 9).
 
 Phase 2 follow-ups (not blocking):
 - **Add CompressedImageHDU cases to tests/test_repr.py** —
@@ -1475,41 +1501,22 @@ cross-check, non-last HDU growth, mixed-algorithm file
 trick, negative pixels, values > 2^27, shape mismatch, start
 kwarg).
 
-**Phase 7 follow-ups (deferred).**  Cold-pickup notes for each
-remaining encoder.  The shape of the work is well established
-by the three shipped algorithms: each adds an `encode_*`
-function in the algorithm module, an algorithm class in
-`compression_config.rs`, a variant in the `CompressionConfigKind`
-enum in `fits.rs` (touching `tile_shape()` / `heap_format()` /
-`zcmptype()` / `extra_z_cards(bitpix)`), and an arm in the
-encode dispatch in `src/zimage/mod.rs::encode_tile_from_bytes`.
-Before starting any of them, work the same two judgment calls
-we worked for RICE:
-1.  **i8 (BYTEPIX=8) interop**: does the corresponding cfitsio
-    encoder exist for 64-bit pixels?  If no, reject (matches
-    Rice1's call).  If yes, implement.  See `<cfitsio>/...` paths
-    below.
-2.  **Bit-exact vs algorithmic agreement**: port cfitsio's
-    arithmetic exactly so heap bytes match byte-for-byte
-    (matches Rice1 + GZIP/PLIO/HCOMPRESS reads).  Makes testing
-    trivial via fitsio cross-write + heap-byte diff.
-
-- ~~**Unsigned-int trick on write (i1/u2/u4/u8)**~~ — **Shipped
-  2026-05-23.**  Works for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
-  is rejected because the reverse XOR produces signed stored
-  values that include negatives, which PLIO's non-negative
-  encoder can't represent).  Implementation: re-uses
-  `hdu_image.rs::reverse_unsigned_trick`; the compressed-write
-  path's new `normalize_compressed_input_dtype` helper dispatches
-  fast-path (BITPIX-native input pass-through) vs reverse-XOR
-  based on the input dtype and the HDU's BSCALE/BZERO.  BSCALE/
-  BZERO cards are emitted at create time in
-  `create_compressed_image_hdu_impl` using the same pattern as
-  the uncompressed path.  See
-  `tests/test_compressed_image_unsigned_trick.py` (33 cases).
-  *Known limitation (not new):* astropy returns f8 (with
-  precision loss) on u8 + BZERO=2^63 — also affects uncompressed
-  u8.  rustfits's own round-trip is bit-exact.
+**Unsigned-int trick on write (i1/u2/u4/u8).**  Shipped
+2026-05-23.  Works for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1 is
+rejected because the reverse XOR produces signed stored values
+that include negatives, which PLIO's non-negative encoder can't
+represent).  Implementation: reuses
+`hdu_image.rs::reverse_unsigned_trick`; the compressed-write
+path's `normalize_compressed_input_dtype` helper dispatches
+fast-path (BITPIX-native input pass-through) vs reverse-XOR
+based on the input dtype and the HDU's BSCALE/BZERO.  BSCALE/
+BZERO cards are emitted at create time in
+`create_compressed_image_hdu_impl` using the same pattern as
+the uncompressed path.  See
+`tests/test_compressed_image_unsigned_trick.py` (33 cases).
+*Known limitation (not new):* astropy returns f8 (with
+precision loss) on u8 + BZERO=2^63 — also affects uncompressed
+u8.  rustfits's own round-trip is bit-exact.
 
 **Phase 8 — Quantized float compressed writes.**  Shipped (read +
 write).
@@ -1602,17 +1609,6 @@ fallback on constant input, ZBLANK absent for integer HDUs,
 seed=0 → on-disk default of 1, rejection paths (integer dtype,
 no compress).  Plus 18 Rust-side unit tests anchoring the noise
 estimator + per-pixel quantize against round-trip math.
-
-*Known follow-up: refactor `write_compressed_image_data`.*  The
-function grew unwieldy in Phase 8 commit 2 (int and float
-branches inline, embedded TileRow struct).  Captured in the
-function's REFACTOR TODO comment and in the project's task list:
-hoist TileRow to a module-level struct, extract
-`encode_tile_int` / `encode_tile_float` helpers each returning
-`(TileRow, primary_bytes, fallback_bytes)`, reduce the main
-dispatcher to "loop + call helper + accumulate + write
-descriptors".  Land on top of the commit 3 dither-matrix tests
-so behavior is anchored before the refactor.
 
 *Known limitation: byte-exact heap agreement with cfitsio.*  The
 fitsio cross-read tests assert **physical-pixel-value** agreement
