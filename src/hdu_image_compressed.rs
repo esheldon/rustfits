@@ -769,12 +769,24 @@ fn read_compressed_image_data(
 ) -> PyResult<Py<PyAny>> {
     check_not_tainted(tainted)?;
 
-    if mask_blank {
-        return Err(PyNotImplementedError::new_err(
-            "mask_blank on tile-compressed images requires ZBLANK \
-             handling, not yet implemented (planned as a small \
-             follow-up after Phase 2 of the ZIMAGE roadmap)."
-        ));
+    // mask_blank parallels the uncompressed ImageHDU behavior, but
+    // uses ZBLANK instead of BLANK (per the FITS Tile Compression
+    // Convention).  Forbidden on float ZBITPIX — the spec says
+    // BLANK is integer-only, NaN serves the same role for floats.
+    // (For quantized-float compressed HDUs, the ZBLANK card stores
+    // cfitsio's NaN sentinel value -2147483647 in i32 stored
+    // space, but that's separate from the integer-pixel mask
+    // semantics; NaN is already preserved on dequantize, so float
+    // mask_blank stays rejected here too.)
+    let (zbitpix_early, _) = parse_compressed_image_shape(cards)?;
+    if mask_blank && zbitpix_early < 0 {
+        return Err(PyValueError::new_err(format!(
+            "mask_blank=True is not valid on float ZBITPIX ({}); the \
+             FITS standard forbids BLANK on floating-point arrays \
+             (NaN serves that role).  Use mask_blank=False, or \
+             post-process with numpy.isnan.",
+            zbitpix_early
+        )));
     }
 
     // Algorithm dispatch — RICE_1 / GZIP_1 / GZIP_2 supported.
@@ -892,9 +904,21 @@ fn read_compressed_image_data(
         )?;
     }
 
+    // Compute the blank mask BEFORE scaling (stored space, per
+    // the FITS spec — ZBLANK names the raw on-disk sentinel).
+    // For integer ZBITPIX this is a simple `arr == ZBLANK` mask;
+    // the float branch was rejected at the top.
+    let mask_opt = if mask_blank {
+        crate::hdu_image::compute_blank_mask_for_key(
+            cards, &out_arr, "ZBLANK",
+        )?
+    } else {
+        None
+    };
+
     // Apply BSCALE/BZERO (same dispatch the uncompressed path uses).
     let unbound = out_arr.unbind();
-    let final_arr = if scale {
+    let scaled = if scale {
         let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
         let kind = crate::hdu_image::image_scaling_kind(zbitpix, bscale, bzero);
         crate::hdu_image::apply_image_scaling(
@@ -903,7 +927,12 @@ fn read_compressed_image_data(
     } else {
         unbound
     };
-    Ok(final_arr)
+
+    if mask_blank {
+        crate::hdu_image::wrap_in_masked_array(py, scaled, mask_opt)
+    } else {
+        Ok(scaled)
+    }
 }
 
 // Per-column descriptor needed to locate and interpret the heap
@@ -2407,6 +2436,14 @@ fn write_compressed_image_data(
     let inner_byte_width: u64 = tform_vla_inner_byte_width(tform1_trim)
         .unwrap_or(1);
 
+    // ----- MaskedArray entry -----
+    // If `data` is a numpy.ma.MaskedArray, fill masked positions
+    // with the appropriate sentinel (NaN for float HDUs; ZBLANK
+    // from the header for integer HDUs).  No-op for plain ndarrays.
+    let unmasked =
+        crate::hdu_image::unwrap_masked_input(py, data, cards, true)?;
+    let data = unmasked.bind(py);
+
     // ----- input ndarray validation -----
     let np = py.import("numpy")?;
     let ascontig0 = np.call_method1("ascontiguousarray", (data,))?;
@@ -2994,6 +3031,11 @@ fn extend_compressed_image_data(
         } else {
             None
         };
+
+    // ----- MaskedArray entry -----
+    let unmasked =
+        crate::hdu_image::unwrap_masked_input(py, data, cards, true)?;
+    let data = unmasked.bind(py);
 
     // ----- input validation -----
     let np = py.import("numpy")?;
@@ -3897,6 +3939,14 @@ fn setitem_compressed_image(
     if slices.iter().any(|s| s.count == 0) {
         return Ok(());
     }
+
+    // ----- MaskedArray entry -----
+    // If value is a numpy.ma.MaskedArray, fill masked positions
+    // with the appropriate sentinel before the rest of the
+    // pipeline.  No-op for plain ndarray / scalar RHS.
+    let unmasked_value =
+        crate::hdu_image::unwrap_masked_input(py, value, cards, true)?;
+    let value = unmasked_value.bind(py);
 
     // ----- RHS validation + dtype normalization -----
     let np = py.import("numpy")?;

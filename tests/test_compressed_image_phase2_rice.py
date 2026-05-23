@@ -290,15 +290,9 @@ def test_scaled_compressed_hdu():
 # See tests/test_compressed_image_setitem.py.
 
 
-# -------------------- mask_blank rejection -------------------------
-
-
-def test_mask_blank_rejected_with_clear_message():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname, _ = _write_rice(tmpdir, (4, 4), "i4")
-        with rustfits.FITS(fname, "r") as fits:
-            with pytest.raises(NotImplementedError, match="ZBLANK"):
-                fits[1].read(mask_blank=True)
+# test_mask_blank_rejected_with_clear_message: removed —
+# mask_blank=True is now supported on compressed integer reads.
+# See tests/test_blank_mask.py.
 
 
 # -------------------- repr / accessors after Phase 2 ---------------

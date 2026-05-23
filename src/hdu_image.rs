@@ -209,6 +209,10 @@ impl ImageHDU {
         let (bitpix, current_hdu_shape) = parse_image_hdu_shape(&header_snapshot)?;
         let naxis = current_hdu_shape.len();
 
+        // MaskedArray entry — fill masked positions with sentinel.
+        let unmasked = unwrap_masked_input(py, data, &header_snapshot, false)?;
+        let data = unmasked.bind(py);
+
         // Accept BITPIX-native, or (for scaled HDUs) the scaled
         // dtype — reverse-transform to BITPIX-native in flight.
         // Done before any file mutation so a dtype error leaves the
@@ -528,14 +532,18 @@ fn read_image_data(
     }
 }
 
-// Compute a per-pixel bool mask of `arr == BLANK`.  Returns None when
-// the BLANK keyword is absent (caller wraps the data with nomask for
-// consistent return type without an unused mask allocation).
-fn compute_blank_mask(
+// Compute a per-pixel bool mask of `arr == <header[key]>`.  Returns
+// None when the keyword is absent (caller wraps the data with nomask
+// for consistent return type without an unused mask allocation).
+// Used for both `BLANK` (uncompressed images) and `ZBLANK` (tile-
+// compressed images) — the spec mandates the integer sentinel
+// comparison happens in stored space (pre-scaling).
+pub(crate) fn compute_blank_mask_for_key(
     header: &[String],
     arr: &Bound<'_, PyAny>,
+    key: &str,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let Some(blank) = parse_keyword(header, "BLANK") else {
+    let Some(blank) = parse_keyword(header, key) else {
         return Ok(None);
     };
     // arr == blank: numpy broadcasts the Python int against arr's
@@ -545,10 +553,109 @@ fn compute_blank_mask(
     Ok(Some(mask.unbind()))
 }
 
+fn compute_blank_mask(
+    header: &[String],
+    arr: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    compute_blank_mask_for_key(header, arr, "BLANK")
+}
+
 // Wrap a plain ndarray in numpy.ma.MaskedArray.  None mask → nomask
 // (no allocation overhead, but the return type stays MaskedArray for
 // consistency).  Mirrors `wrap_masked` in hdu_table.rs.
-fn wrap_in_masked_array(
+// MaskedArray input handling for write/__setitem__/extend.
+//
+// User-facing API: pass a numpy.ma.MaskedArray to any write entry
+// point; masked positions are auto-filled with the appropriate
+// sentinel before encoding.  Sentinel source:
+//   - Float dtype: NaN (always available, regardless of header).
+//   - Integer dtype: header keyword (BLANK for uncompressed,
+//     ZBLANK for compressed), in STORED space — transformed to
+//     PHYSICAL space for the fill since the user's MaskedArray
+//     is in their dtype (which may be u2/u4/etc. after the
+//     unsigned-int trick).
+//   - Integer dtype with no BLANK/ZBLANK in header: clear error
+//     pointing user at create_image_hdu(..., blank=...).
+//
+// Returns the underlying ndarray when input is not a MaskedArray
+// (zero overhead for the common case) or when the mask is
+// `nomask` (no masked positions to fill).
+//
+// Single entry point shared by all 6 write paths (uncompressed +
+// compressed × write/extend/__setitem__).  Each call site is a
+// one-line `let data = unwrap_masked_input(py, data, header,
+// is_compressed)?.bind(py)` — the helper internally parses
+// BITPIX/ZBITPIX and BSCALE/BZERO from the header.
+pub(crate) fn unwrap_masked_input(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    header: &[String],
+    is_compressed: bool,
+) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    let ma_mod = np.getattr("ma")?;
+    let is_ma: bool = ma_mod
+        .call_method1("isMaskedArray", (data,))?
+        .extract()?;
+    if !is_ma {
+        return Ok(data.clone().unbind());
+    }
+    // Get the mask; if it's the nomask singleton, no fill is needed
+    // and we can return the underlying data directly.
+    let mask = data.getattr("mask")?;
+    let nomask = ma_mod.getattr("nomask")?;
+    if mask.is(&nomask) {
+        return Ok(data.getattr("data")?.unbind());
+    }
+    // Also handle the case where mask is a bool array but all-False —
+    // `.any()` is cheap and lets us skip the fill.
+    let any_masked: bool = mask.call_method0("any")?.extract()?;
+    if !any_masked {
+        return Ok(data.getattr("data")?.unbind());
+    }
+
+    // Determine is_float from the image-side BITPIX (BITPIX for
+    // uncompressed, ZBITPIX for compressed).
+    let bitpix_key = if is_compressed { "ZBITPIX" } else { "BITPIX" };
+    let bitpix: i32 = parse_keyword(header, bitpix_key).ok_or_else(|| {
+        PyValueError::new_err(format!("header missing {}", bitpix_key))
+    })? as i32;
+    let is_float = bitpix < 0;
+
+    // Determine the fill value.
+    let fill_value: Py<PyAny> = if is_float {
+        // NaN works for both f4 and f8 (numpy.ma.filled casts the
+        // scalar to the array's dtype).
+        np.getattr("nan")?.unbind()
+    } else {
+        let key = if is_compressed { "ZBLANK" } else { "BLANK" };
+        let Some(stored) = parse_keyword(header, key) else {
+            return Err(PyValueError::new_err(format!(
+                "MaskedArray input requires {} to be set in the \
+                 header so masked positions can be filled with the \
+                 sentinel value.  Set it at create time with \
+                 `create_image_hdu(..., blank=<sentinel>)`, or fill \
+                 the masked positions yourself before write.",
+                key,
+            )));
+        };
+        // Transform stored space → physical space (the user's
+        // dtype).  Identity for plain integer dtypes; addition of
+        // BZERO for unsigned-trick dtypes.
+        let (_bs, bz) = parse_bscale_bzero(header);
+        let physical = if bz == 0.0 {
+            stored
+        } else {
+            ((stored as f64) + bz) as i64
+        };
+        physical.into_pyobject(py)?.unbind().into_any()
+    };
+
+    let filled = data.call_method1("filled", (fill_value,))?;
+    Ok(filled.unbind())
+}
+
+pub(crate) fn wrap_in_masked_array(
     py: Python<'_>,
     data: Py<PyAny>,
     mask: Option<Py<PyAny>>,
@@ -790,11 +897,18 @@ fn write_image_data(
     let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
     let naxis = hdu_shape.len();
 
+    // MaskedArray-aware entry: if `data` is a numpy.ma.MaskedArray,
+    // fill masked positions with the appropriate sentinel (NaN for
+    // floats; BLANK from the header for integers).  No-op for plain
+    // ndarrays.
+    let unmasked = unwrap_masked_input(py, data, header, false)?;
+    let unmasked_bound = unmasked.bind(py);
+
     // Single source of truth for input-dtype rules: accepts BITPIX
     // native dtype directly, OR the scaled dtype for HDUs with the
     // unsigned-int trick, OR f8 (physical) for HDUs with general
     // BSCALE/BZERO scaling — last two cases reverse-transform in flight.
-    let data_owned = normalize_input_dtype(py, header, data)?;
+    let data_owned = normalize_input_dtype(py, header, unmasked_bound)?;
     let data = data_owned.bind(py);
 
     let dtype = data.getattr("dtype")?;
@@ -1004,6 +1118,13 @@ fn write_image_slice(
     let bpp = (bitpix.abs() / 8) as u64;
     let bpp_usize = bpp as usize;
     let naxis = hdu_shape.len();
+
+    // MaskedArray entry — fill masked positions with sentinel before
+    // the per-strip byte-pump below.  No-op for plain ndarray or
+    // scalar (the scalar broadcast branch never sees a MaskedArray
+    // because np.ndim(scalar) == 0).
+    let unmasked = unwrap_masked_input(py, rhs, header, false)?;
+    let rhs = unmasked.bind(py);
 
     // The slice's output shape (in numpy axis order) — what an
     // equivalent read would return.  Used for RHS shape validation.

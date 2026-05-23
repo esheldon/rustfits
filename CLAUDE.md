@@ -1785,6 +1785,59 @@ orphaned bytes.  A future "compact" / "repack" operation could
 rewrite the heap with only live tiles, but isn't worth the
 complexity until a workload demonstrably needs it.
 
+**BLANK / ZBLANK + MaskedArray support.**  Shipped 2026-05-23
+for both compressed and uncompressed image HDUs.
+
+API:
+- `create_image_hdu(..., blank=<sentinel>)` — emits `BLANK`
+  (uncompressed) or `ZBLANK` (compressed integer) so reads
+  with `mask_blank=True` find the sentinel.  Value is in
+  PHYSICAL space (user's dtype); transformed to STORED space
+  for the card when the unsigned-int trick is in play (e.g.,
+  user passes `blank=65535` for `u2`, card lands as
+  `BLANK=32767` because the on-disk i2 storage XORs the sign
+  bit).  Rejected on float dtypes (FITS spec forbids BLANK
+  on floats; NaN serves that role).
+- `hdu.read(mask_blank=True)` — returns
+  `numpy.ma.MaskedArray` with True at pixels whose stored value
+  equals BLANK/ZBLANK.  Comparison happens in stored space
+  (pre-scaling) per FITS spec.  Rejected on float ZBITPIX.
+  Already worked for uncompressed; this PR enables it for
+  compressed integer HDUs.  When the keyword is absent the
+  return is still a MaskedArray (consistent return type) but
+  with `nomask`.
+- `write` / `__setitem__` / `extend` accept
+  `numpy.ma.MaskedArray` input on both compressed and
+  uncompressed HDUs.  Masked positions are auto-filled with
+  the sentinel from the header (BLANK or ZBLANK in physical
+  space) — error if the header has no sentinel and the input
+  is integer.  For float HDUs, fill value is NaN (no header
+  dependency).  All-False masks short-circuit (no header
+  lookup needed; just unwrap to underlying data).
+
+Implementation: single shared helper
+`hdu_image.rs::unwrap_masked_input(py, data, header, is_compressed)`
+runs at the top of all 6 write entry points (uncompressed +
+compressed × write/extend/__setitem__).  The helper internally
+parses BITPIX/ZBITPIX (image-side) and BSCALE/BZERO to
+determine the fill semantics — caller passes only a one-line
+preamble.  Read-side reuses
+`compute_blank_mask_for_key(header, arr, key)` generalized
+from the existing `compute_blank_mask`.
+
+Tests in `tests/test_blank_mask.py` (27 cases): round-trip
+across u1/i2/i4 × {compressed Gzip1/Gzip2/Rice1, uncompressed};
+unsigned-int trick interaction; MaskedArray input on all 6
+write paths; float-NaN fill; all rejection paths; astropy +
+fitsio cross-read of rustfits-written ZBLANK files.
+
+Interop notes (verified empirically): astropy 7.2.0 promotes
+integer + BLANK/ZBLANK reads to f64 + NaN (rather than
+returning a MaskedArray); fitsio reads the file fine but
+doesn't auto-mask.  Neither tool has a clean MaskedArray write
+API for compressed images — rustfits's `blank=` kwarg + auto-
+fill behavior is the friendlier shape.
+
 **Quantized-float mutation (extend + __setitem__).**  Shipped
 2026-05-23.  When extending or mutating a tile that was
 originally stored in the **primary** (quantized i32) column,

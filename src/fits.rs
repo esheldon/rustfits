@@ -283,6 +283,62 @@ fn data_section_padded(data_size: u64) -> u64 {
     }
 }
 
+// Convert a user-supplied BLANK/ZBLANK value from PHYSICAL space
+// (the user's dtype) to STORED space (the on-disk BITPIX).  For
+// plain integer dtypes (no unsigned trick) physical == stored and
+// this is the identity.  For unsigned-trick dtypes
+// (i1/u2/u4/u8) it subtracts BZERO so the card matches what's on
+// disk after reverse_unsigned_trick has XOR'd the sign bit.
+//
+// Validates the stored value fits the signed BITPIX range
+// [BITPIX_min, BITPIX_max].  Rejects float BITPIX (BLANK is
+// spec-forbidden on floating-point arrays).
+fn physical_blank_to_stored(
+    physical: i64, bitpix: i32, bzero: Option<f64>,
+) -> PyResult<i64> {
+    if bitpix < 0 {
+        return Err(PyValueError::new_err(format!(
+            "blank= is not valid on float BITPIX ({}); the FITS \
+             standard forbids BLANK on floating-point arrays \
+             (NaN serves that role).  Omit blank= for float images.",
+            bitpix
+        )));
+    }
+    // Transform to stored space.  For unsigned-trick: stored =
+    // physical - BZERO (cast through f64 because BZERO=2^63 for u8
+    // is exactly representable in f64 but overflows i64).
+    let stored: i64 = match bzero {
+        None => physical,
+        Some(bz) => {
+            let s = (physical as f64) - bz;
+            if !s.is_finite() {
+                return Err(PyValueError::new_err(format!(
+                    "blank value {} produces a non-finite stored \
+                     value after the unsigned-int trick transform",
+                    physical
+                )));
+            }
+            s as i64
+        }
+    };
+    let (lo, hi) = match bitpix {
+        8 => (0i64, 255i64),         // u1, no trick → unsigned range
+        16 => (i16::MIN as i64, i16::MAX as i64),
+        32 => (i32::MIN as i64, i32::MAX as i64),
+        64 => (i64::MIN, i64::MAX),
+        _ => unreachable!("integer BITPIX expected, got {}", bitpix),
+    };
+    if stored < lo || stored > hi {
+        return Err(PyValueError::new_err(format!(
+            "blank value {} (stored as {} after any unsigned-trick \
+             transform) is outside the legal BITPIX={} stored range \
+             [{}, {}]",
+            physical, stored, bitpix, lo, hi,
+        )));
+    }
+    Ok(stored)
+}
+
 // The five cards that make up an empty primary image HDU
 // (SIMPLE=T, BITPIX=8, NAXIS=0, EXTEND=T, END).  Used both as the
 // auto-primary when create_table_hdu is the first call on a fresh
@@ -569,6 +625,7 @@ impl FITS {
         extver: Option<i64>,
         compress: Py<PyAny>,
         quantize: Option<Py<PyAny>>,
+        blank: Option<i64>,
     ) -> PyResult<()> {
         for (i, &d) in dims.iter().enumerate() {
             if d <= 0 {
@@ -984,6 +1041,29 @@ impl FITS {
             };
             cards.push(bz_card);
         }
+        // ZBLANK sentinel for "missing" integer pixels.  Same physical
+        // → stored transform as the uncompressed path.  Per the FITS
+        // Tile Compression Convention, ZBLANK replaces BLANK for
+        // compressed integer images; the stored value is in the
+        // signed-BITPIX (i.e., post-XOR) integer space.  Reject on
+        // quantized float — those HDUs already emit their own ZBLANK
+        // (cfitsio NaN sentinel) and the user shouldn't override it.
+        if let Some(b) = blank {
+            if is_float {
+                return Err(PyValueError::new_err(
+                    "blank= is not valid on float dtypes (compressed). \
+                     For quantized-float HDUs, NaN is automatically \
+                     preserved via the i32 sentinel; for unquantized \
+                     float HDUs (quantize=None), NaN is preserved \
+                     directly in the lossless float bytes.  Omit \
+                     blank=.",
+                ));
+            }
+            let stored = physical_blank_to_stored(b, bitpix, bzero)?;
+            cards.push(card_int(
+                "ZBLANK", stored,
+                "integer sentinel for blank pixels"));
+        }
         cards.push(pad_to_card("END"));
 
         // Main data section: one descriptor per tile, all zeroes
@@ -1158,7 +1238,7 @@ impl FITS {
     // method='dither1', seed=0).
     #[pyo3(signature = (
         dtype, dims, *, extname=None, extver=None,
-        compress=None, quantize=None,
+        compress=None, quantize=None, blank=None,
     ))]
     fn create_image_hdu(
         &mut self,
@@ -1169,10 +1249,11 @@ impl FITS {
         extver: Option<i64>,
         compress: Option<Py<PyAny>>,
         quantize: Option<Py<PyAny>>,
+        blank: Option<i64>,
     ) -> PyResult<()> {
         if let Some(cfg) = compress {
             return self.create_compressed_image_hdu_impl(
-                py, dtype, dims, extname, extver, cfg, quantize,
+                py, dtype, dims, extname, extver, cfg, quantize, blank,
             );
         }
         if quantize.is_some() {
@@ -1244,6 +1325,17 @@ impl FITS {
                     "offset for unsigned-int storage")
             };
             cards.push(bz_card);
+        }
+        // BLANK sentinel for "missing" integer pixels.  User passes
+        // the value in PHYSICAL space (their dtype).  Transform to
+        // STORED space (the on-disk BITPIX) before emitting the
+        // card — for unsigned-trick dtypes this means subtracting
+        // BZERO so the card reflects the on-disk i2/i4 value.
+        if let Some(b) = blank {
+            let stored = physical_blank_to_stored(b, bitpix, bzero)?;
+            cards.push(card_int(
+                "BLANK", stored,
+                "integer sentinel for blank pixels"));
         }
         cards.push(pad_to_card("END"));
 
