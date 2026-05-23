@@ -494,12 +494,15 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   value.  Promoting to a 0-d ndarray (which routes through
   `normalize_input_dtype` and gets the reverse-transform) is the
   workaround.  Add when there's a use case.
-- **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 has
-  shipped all five integer-ZBITPIX encoders: `Gzip1`, `Gzip2`,
-  `Rice1`, `Hcompress1`, and `Plio1`.  Float ZBITPIX deferred to
-  Phase 8 for quantization.  Compressed `extend`/`__setitem__`
-  are Phase 9+ (mutation).  Only follow-up is unsigned-int trick
-  dtypes (i1/u2/u4/u8) on the compressed-write side.
+- **Tile-compressed image writes (`ZIMAGE`)** — Phase 7 shipped
+  all five integer-ZBITPIX encoders (`Gzip1`, `Gzip2`, `Rice1`,
+  `Hcompress1`, `Plio1`); Phase 8 added float ZBITPIX writes via
+  the new `Quantize` config object (`compress=Rice1(...)` +
+  `quantize=Quantize(level=..., method=..., seed=...)`).
+  Compressed `extend`/`__setitem__` are Phase 9+ (mutation).
+  Remaining follow-ups: unsigned-int trick dtypes
+  (i1/u2/u4/u8) on the compressed-write side; PLIO_1 + float
+  (rejected — non-negative-only encoder).
 
 ### Table read
 
@@ -787,8 +790,10 @@ the reader walks tiles and decodes them.
 algorithms — RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1 with SMOOTH,
 PLIO_1 — plus quantized + unquantized floats).  Phase 7
 compressed-write shipped for **all five** integer-ZBITPIX
-encoders: GZIP_1, GZIP_2, RICE_1, HCOMPRESS_1, PLIO_1.  Phase 8+
-(quantized float writes, compressed mutation) are own subsystems.  Test fixtures use fitsio for
+encoders: GZIP_1, GZIP_2, RICE_1, HCOMPRESS_1, PLIO_1.  Phase 8
+shipped float writes (quantized via Quantize config; lossless
+GZIP fallback for unquantizable tiles).  Phase 9+ (compressed
+mutation) is the remaining subsystem.  Test fixtures use fitsio for
 normal-path round-trips and hand-crafted bytes for synthetic
 fallback-column cases (astropy is also in the env for richer
 cases).
@@ -1483,9 +1488,116 @@ we worked for RICE:
   HCOMPRESS_1 — all five algorithms share the rejection); the
   branch tests `bzero.is_some()`, so the fix lives there.
 
-**Phase 8 — Quantized float compressed writes.**  Own subsystem.
-Choose ZSCALE/ZZERO per tile, apply dither, optional GZIP
-lossless fallback column for tiles that quantize poorly.
+**Phase 8 — Quantized float compressed writes.**  Shipped (read +
+write).
+
+*API.*  Quantization parameters live in a separate `Quantize`
+config object passed alongside the algorithm:
+
+```python
+fits.create_image_hdu(
+    "f4", shape,
+    compress=Rice1(tile_shape=(100, 100)),
+    quantize=Quantize(level=4.0, method="dither1", seed=0),
+)
+```
+
+Kwargs: `level` (default 4.0 = "N sigma per quanta"; negative =
+fixed bscale = -level; 0 = no quantization, all tiles route to
+GZIP fallback), `method` (`'none'` / `'no_dither'` /
+`'dither1'` / `'dither2'`; default `'dither1'` matches cfitsio),
+`seed` (ZDITHER0; 0 → on-disk default of 1).  Integer HDUs
+reject `quantize=` with a clear error; float HDUs without
+`quantize=` use the default `Quantize()`.  Pythonic kebab-style
+strings for method names; FITS-spec ZQUANTIZ values are
+available via `quantize.zquantiz`.
+
+*Schema.*  Float HDUs emit a 4-column BINTABLE:
+
+  | column | TFORM | role |
+  |--------|-------|------|
+  | COMPRESSED_DATA       | 1PB / 1QB / 1PI / 1QI | quantized i32 → algorithm output |
+  | ZSCALE                | 1D                    | per-tile bscale |
+  | ZZERO                 | 1D                    | per-tile bzero  |
+  | GZIP_COMPRESSED_DATA  | 1PB / 1QB             | lossless raw float fallback |
+
+Plus ZQUANTIZ (NO_DITHER / SUBTRACTIVE_DITHER_1 /
+SUBTRACTIVE_DITHER_2), ZDITHER0, and ZBLANK = -2147483647
+(NULL_VALUE_I32 sentinel).  The FITS Tile Compression Convention
+records method + seed only — not the qlevel — so the
+`CompressedImageHDU` carries `quantize_config: Arc<Mutex<Option<
+Quantize>>>` populated at create time and consulted by
+`.write()`.  Reopened HDUs get `None` and fall back to qlevel=4.0
+(cfitsio's default).
+
+*Quantize / dequantize algorithm.*  Direct ports of cfitsio's
+`fits_quantize_float` / `_double` and the `FnNoise5_float` /
+`_double` MAD noise estimator.  Per-tile noise = min of 2nd / 3rd
+/ 5th-order Median Absolute Differences (Pence MAD-to-sigma
+normalization constants 1.0483579 / 0.6052697 / 0.1772048);
+bscale = noise / qlevel; bzero chosen to keep the quantized
+range inside i32 minus 10 reserved sentinels.  Per-pixel:
+DITHER_2 reserves NULL_VALUE_I32 for NaN and ZERO_VALUE_I32 for
+exact-zero floats; the other methods just reserve NULL_VALUE_I32
+for NaN.  The dither stream (Park-Miller PRNG, same one already
+shared with the decoder) advances per-pixel regardless of
+sentinel hits to stay synced with the encoder.
+
+*GZIP fallback.*  When `quantize_float` returns `None` (constant
+tile, range too wide for i32, fewer than 2 pixels), the tile's
+raw float bytes are GZIP-1 compressed and stored in the
+GZIP_COMPRESSED_DATA column; the primary descriptor stays empty
+(nelements=0).  The read side already routed empty primary to
+the fallback column in Phase 4, so no read changes needed.
+
+*PLIO + float rejected.*  PLIO's encoder requires non-negative
+inputs.  Quantization produces an i32 stream with negative
+values (bzero shifts the range), which PLIO can't represent.
+The `create_compressed_image_hdu_impl` dispatch rejects the
+combination up-front with a clear error pointing the user at
+Gzip2 or Rice1.
+
+*Lossless decoder fix.*  Phase 5 had a latent bug — only
+SUBTRACTIVE_DITHER_2 in `dequantize_to_f32/_f64` checked
+NULL_VALUE_I32 → NaN; NoDither and SUBTRACTIVE_DITHER_1 silently
+turned the sentinel into a giant negative number.  Phase 8
+commit 3 added the missing checks to both branches.  No
+existing tests caught the gap because no Phase 5 fixture had
+NULL_VALUE_I32 in the stored stream under NoDither or DITHER_1.
+
+*Tests (`test_compressed_image_phase8_quantize_write.py`).*  29
+cases covering: schema (TFORM / TTYPE / ZQUANTIZ / ZDITHER0 /
+ZBLANK cards), round-trip across f4/f8 + (NO_DITHER, DITHER_1,
+DITHER_2), default Quantize defaults, fitsio cross-read agreement
+across the (algorithm, method) matrix, DITHER_2 exact-zero
+preservation, NaN round-trip for all three methods, GZIP
+fallback on constant input, ZBLANK absent for integer HDUs,
+seed=0 → on-disk default of 1, rejection paths (integer dtype,
+no compress).  Plus 18 Rust-side unit tests anchoring the noise
+estimator + per-pixel quantize against round-trip math.
+
+*Known follow-up: refactor `write_compressed_image_data`.*  The
+function grew unwieldy in Phase 8 commit 2 (int and float
+branches inline, embedded TileRow struct).  Captured in the
+function's REFACTOR TODO comment and in the project's task list:
+hoist TileRow to a module-level struct, extract
+`encode_tile_int` / `encode_tile_float` helpers each returning
+`(TileRow, primary_bytes, fallback_bytes)`, reduce the main
+dispatcher to "loop + call helper + accumulate + write
+descriptors".  Land on top of the commit 3 dither-matrix tests
+so behavior is anchored before the refactor.
+
+*Known limitation: byte-exact heap agreement with cfitsio.*  The
+fitsio cross-read tests assert **physical-pixel-value** agreement
+(bit-exact decoded output), not raw-heap-byte equality.  The
+two writers can pick slightly different bscale on the same input
+because cfitsio's per-row diff arrays are f32 while ours are
+f32 (matched on f32 path) but the cross-row averaging order
+differs subtly with `qsort` stability quirks.  The decoded
+result is still identical because ZSCALE/ZZERO are recorded
+per-tile.  Heap-byte equality would require a more painstaking
+port of cfitsio's qsort tie-breaking; not worth doing absent a
+specific need.
 
 **Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
 `__setitem__`.  Changing a single pixel requires re-encoding the

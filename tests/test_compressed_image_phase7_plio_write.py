@@ -450,7 +450,15 @@ def test_i8_plio_rejected():
 
 
 def test_float_compress_rejected():
-    """Float ZBITPIX rejected — PLIO is integer-only."""
+    """
+    PLIO + float rejected.  PLIO encodes mask data with
+    non-negative integer values; quantize_float produces an i32
+    stream with negative values (bzero shifts the range), which
+    PLIO can't represent.  We reject at create time so the user
+    gets a clear error instead of a downstream "pixel is negative"
+    failure from the encoder.  Other algorithms now accept float
+    via quantize=; PLIO is the one exception.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
         with rustfits.FITS(fn, "w+") as f:
