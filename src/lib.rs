@@ -29,7 +29,9 @@ use crate::hdu_image_compressed::CompressedImageHDU;
 use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::fits::FITS;
-use crate::zimage::compression_config::{Gzip1, Gzip2, Hcompress1, Plio1, Rice1};
+use crate::zimage::compression_config::{
+    Gzip1, Gzip2, Hcompress1, Plio1, Quantize, Rice1,
+};
 
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -48,6 +50,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Rice1>()?;
     m.add_class::<Hcompress1>()?;
     m.add_class::<Plio1>()?;
+    m.add_class::<Quantize>()?;
     m.add_function(wrap_pyfunction!(py_is_protected_key, m)?)?;
     Ok(())
 }

@@ -566,3 +566,162 @@ impl Rice1 {
         self == other
     }
 }
+
+// ---------- Quantize ----------
+
+/// Quantization parameters for float-image compression.
+///
+/// FITS Tile Compression of floating-point images works by
+/// quantizing each tile to i32, then compressing the quantized
+/// values with one of the integer compression algorithms
+/// (`Rice1`, `Gzip1`, `Hcompress1`, etc.).  This pyclass carries
+/// the quantization parameters separately from the algorithm
+/// config:
+///
+///     fits.create_image_hdu(
+///         "f4", shape,
+///         compress=Rice1(tile_shape=(100, 100)),
+///         quantize=Quantize(level=4.0, method="dither1"),
+///     )
+///
+/// The orthogonal split mirrors cfitsio's separate
+/// `fits_set_quantize_level` / `fits_set_quantize_method` calls.
+/// Integer HDUs never see `quantize=`; float HDUs use a default
+/// `Quantize` when the argument is omitted.
+///
+/// Parameters
+/// ----------
+/// level : float, default 4.0
+///     Quantization level.  Positive values mean "N sigma per
+///     quanta": the per-tile bscale is set to `tile_noise / level`
+///     so each quantization step covers `1/level` of the noise.
+///     Larger `level` = finer steps = higher fidelity + larger
+///     compressed output.  cfitsio's default is 4.0 (with
+///     dithering) or 16.0 (without).  Negative values mean
+///     "fixed bscale = -level" (skip noise estimation).  Zero
+///     means "no quantization" — the tile's raw float bytes are
+///     stored to a GZIP fallback column losslessly.
+/// method : str, default 'dither1'
+///     Dithering scheme: 'none' (no quantization at all, equivalent
+///     to level=0), 'no_dither' (NO_DITHER: simple round-to-
+///     nearest, no dither), 'dither1' (SUBTRACTIVE_DITHER_1: add
+///     a pseudorandom offset before rounding so quantization noise
+///     is white), 'dither2' (SUBTRACTIVE_DITHER_2: like dither1
+///     but reserves a sentinel for NaN so float-NaN survives the
+///     round-trip).  cfitsio's default is SUBTRACTIVE_DITHER_1.
+/// seed : int, default 0
+///     ZDITHER0 random seed, recorded as a header card.  Zero
+///     means "pick one automatically" at create time (cfitsio
+///     uses a checksum of the data).  Positive values are passed
+///     through verbatim — useful when reproducible output across
+///     runs matters.
+#[pyclass]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Quantize {
+    pub(crate) level: f64,
+    pub(crate) method: QuantizeMethod,
+    pub(crate) seed: i64,
+}
+
+// Method enum mirrors the FITS Tile Compression Convention
+// ZQUANTIZ values plus the cfitsio-tolerated 'NONE' (astropy
+// emits it for unquantized-float HDUs; we accept it on both
+// read and write).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuantizeMethod {
+    None_,              // no quantization, store as raw GZIP
+    NoDither,           // ZQUANTIZ='NO_DITHER'
+    SubtractiveDither1, // ZQUANTIZ='SUBTRACTIVE_DITHER_1'
+    SubtractiveDither2, // ZQUANTIZ='SUBTRACTIVE_DITHER_2'
+}
+
+impl QuantizeMethod {
+    pub(crate) fn parse(s: &str) -> PyResult<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None_),
+            "no_dither" | "nodither" => Ok(Self::NoDither),
+            "dither1" | "dither_1" | "subtractive_dither_1" => {
+                Ok(Self::SubtractiveDither1)
+            }
+            "dither2" | "dither_2" | "subtractive_dither_2" => {
+                Ok(Self::SubtractiveDither2)
+            }
+            other => Err(PyValueError::new_err(format!(
+                "Quantize: unknown method '{}'; expected one of \
+                 'none', 'no_dither', 'dither1', 'dither2'",
+                other
+            ))),
+        }
+    }
+
+    /// Canonical FITS-spec ZQUANTIZ string for this method.
+    pub(crate) fn zquantiz(&self) -> &'static str {
+        match self {
+            Self::None_ => "NONE",
+            Self::NoDither => "NO_DITHER",
+            Self::SubtractiveDither1 => "SUBTRACTIVE_DITHER_1",
+            Self::SubtractiveDither2 => "SUBTRACTIVE_DITHER_2",
+        }
+    }
+
+    /// Pythonic short name (matches the kwarg value).
+    pub(crate) fn short_name(&self) -> &'static str {
+        match self {
+            Self::None_ => "none",
+            Self::NoDither => "no_dither",
+            Self::SubtractiveDither1 => "dither1",
+            Self::SubtractiveDither2 => "dither2",
+        }
+    }
+}
+
+#[pymethods]
+impl Quantize {
+    #[new]
+    #[pyo3(signature = (
+        *, level=4.0, method=String::from("dither1"), seed=0,
+    ))]
+    fn new(level: f64, method: String, seed: i64) -> PyResult<Self> {
+        let method = QuantizeMethod::parse(&method)?;
+        if !level.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "Quantize: level must be finite, got {}", level
+            )));
+        }
+        Ok(Quantize { level, method, seed })
+    }
+
+    #[getter]
+    fn level(&self) -> f64 {
+        self.level
+    }
+
+    #[getter]
+    fn method(&self) -> &'static str {
+        self.method.short_name()
+    }
+
+    #[getter]
+    fn seed(&self) -> i64 {
+        self.seed
+    }
+
+    /// FITS-spec ZQUANTIZ string this Quantize would emit on
+    /// write — exposed for symmetry with the algorithm-config
+    /// classes' `zcmptype`.
+    #[getter]
+    fn zquantiz(&self) -> &'static str {
+        self.method.zquantiz()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Quantize(level={}, method='{}', seed={})",
+            self.level, self.method.short_name(), self.seed,
+        )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+}
