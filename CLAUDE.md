@@ -504,15 +504,23 @@ float dtypes, `extend(data)`, `__setitem__`, `blank=` /
 `mask_blank=True` / MaskedArray input, `Gzip1(level=)` /
 `Gzip2(level=)`.
 
+**Scalar broadcast with scaling.**  `__setitem__` scalar RHS
+(`img[k] = 42`) on a scaled HDU accepts the value in user-facing
+space — same rule as the ndarray RHS path.  For unsigned-trick
+HDUs (e.g. u2 stored as i2 + BZERO=32768) the user passes the
+unsigned value (50000 works on a u2 HDU); for generally-scaled
+HDUs the user passes the f8 physical value, and the same
+`reverse_general_scaling` used by the ndarray path applies (with
+its rint + bounds check on integer BITPIX, finite-check
+rejection for NaN/Inf on integer BITPIX).  No-scaling HDUs take
+the original BITPIX-direct fast path (extract scalar at native
+dtype, no asarray round-trip).  Implementation: `scalar_to_be_bytes`
+in `hdu_image.rs` dispatches on `image_scaling_kind`; the scaled
+branch promotes the scalar to a 0-d ndarray of the scaled dtype
+and routes through `normalize_input_dtype`.
+
 **Missing.**
-- **Scalar broadcast with scaling** — `__setitem__` scalar RHS
-  (`img[k] = 42`) currently goes through `scalar_to_be_bytes` which
-  reads the value at the BITPIX dtype; for unsigned-trick HDUs this
-  means the user must pass the BITPIX (signed) value, and for
-  generally-scaled HDUs the user must pass the stored (pre-scaling)
-  value.  Promoting to a 0-d ndarray (which routes through
-  `normalize_input_dtype` and gets the reverse-transform) is the
-  workaround.  Add when there's a use case.
+- (None tracked on the uncompressed image-write side.)
 
 ### Table read
 

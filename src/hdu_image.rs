@@ -1236,11 +1236,52 @@ fn write_image_data(
 }
 
 // Encode a Python scalar (int/float, numpy scalar, or 0-d ndarray)
-// into FITS on-disk bytes (big-endian) for the given BITPIX.  Out-of-
-// range values fail the relevant `extract::<...>()` with OverflowError;
-// type mismatches (e.g. float -> int dtype) fail with TypeError.
-// Both surface unmodified to the caller, which is what we want.
-fn scalar_to_be_bytes(value: &Bound<'_, PyAny>, bitpix: i32) -> PyResult<Vec<u8>> {
+// into FITS on-disk bytes (big-endian).  Honours BSCALE/BZERO scaling:
+// scaled HDUs (unsigned-int trick or general) accept the scalar in
+// user-facing space (e.g. a u2 value on a BITPIX=16 + BZERO=32768 HDU,
+// or an f8 physical value on a generally-scaled HDU) and the reverse
+// transform runs in flight — the same rule as the ndarray RHS path.
+// No-scaling HDUs take the BITPIX-direct fast path below.
+fn scalar_to_be_bytes(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    header: &[String],
+    bitpix: i32,
+) -> PyResult<Vec<u8>> {
+    let (bscale, bzero) = parse_bscale_bzero(header);
+    let kind = image_scaling_kind(bitpix, bscale, bzero);
+    if matches!(kind, ScalingKind::None) {
+        return scalar_to_be_bytes_native(value, bitpix);
+    }
+
+    // Scaled HDU.  Promote the scalar to a 0-d ndarray of the SCALED
+    // (user-facing) dtype, then route through normalize_input_dtype so
+    // the reverse transform is shared with the ndarray write path.
+    let np = py.import("numpy")?;
+    let scaled_dtype = scaled_image_dtype(bitpix, kind);
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("dtype", scaled_dtype)?;
+    let arr = np.call_method("asarray", (value,), Some(&kwargs))?;
+    let normalized = normalize_input_dtype(py, header, &arr)?;
+    let native = normalized.bind(py);
+
+    // 0-d ndarray → BITPIX-native big-endian bytes.
+    let bpp = (bitpix.abs() / 8) as usize;
+    let needs_swap = bpp > 1 && !cfg!(target_endian = "big");
+    let be = if needs_swap {
+        native.call_method0("byteswap")?
+    } else {
+        native.clone()
+    };
+    let bytes: Vec<u8> = be.call_method0("tobytes")?.extract()?;
+    Ok(bytes)
+}
+
+// BITPIX-direct scalar encoder used when the HDU has no BSCALE/BZERO
+// scaling.  Out-of-range values fail the relevant `extract::<...>()`
+// with OverflowError; type mismatches (e.g. float -> int dtype) fail
+// with TypeError.  Both surface unmodified to the caller.
+fn scalar_to_be_bytes_native(value: &Bound<'_, PyAny>, bitpix: i32) -> PyResult<Vec<u8>> {
     Ok(match bitpix {
         8 => {
             let v: u8 = value.extract()?;
@@ -1331,7 +1372,7 @@ fn write_image_slice(
     // we build a one-strip buffer and reuse it; for ndarray we copy +
     // byteswap the whole thing once and slice strip-by-strip below.
     let (source_bytes, per_strip): (Vec<u8>, bool) = if is_scalar {
-        let pixel_bytes = scalar_to_be_bytes(rhs, bitpix)?;
+        let pixel_bytes = scalar_to_be_bytes(py, rhs, header, bitpix)?;
         let mut strip = Vec::with_capacity(strip_bytes);
         for _ in 0..strip_pixels {
             strip.extend_from_slice(&pixel_bytes);
