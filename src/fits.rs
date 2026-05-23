@@ -219,9 +219,13 @@ fn parse_hdus_from_file(
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_compressed_image {
+            // Reopened from disk: quantize_config is None.  Write
+            // path falls back to default qlevel=4.0; method+seed
+            // recover from ZQUANTIZ + ZDITHER0 cards.
             Py::new(py, CompressedImageHDU::new(
                 header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
+                None,
             ))?.into()
         } else if is_binary_table {
             Py::new(py, TableHDU::new(
@@ -256,11 +260,16 @@ fn parse_hdus_from_file(
 }
 
 // HDU kind tag used by FITS::finalize_hdu to pick the right pyclass
-// constructor when appending a freshly-written HDU.
+// constructor when appending a freshly-written HDU.  The
+// `CompressedImage` variant carries the create-time `Quantize`
+// config (None for integer compressed HDUs; Some for float ones)
+// so the encoder can recover the user's qlevel at write time —
+// the FITS Tile Compression Convention only records the method
+// and seed on disk, not the level.
 enum HduKind {
     Image,
     Table,
-    CompressedImage,
+    CompressedImage(Option<crate::zimage::compression_config::Quantize>),
 }
 
 // Round a byte count up to the next BLOCK_SIZE boundary.  Returns 0
@@ -512,11 +521,14 @@ impl FITS {
                 offsets, Arc::clone(&self.layout),
                 Arc::clone(&self.file), Arc::clone(&self.tainted),
             ))?.into(),
-            HduKind::CompressedImage => Py::new(py, CompressedImageHDU::new(
-                trimmed, index, self.filename.clone(),
-                offsets, Arc::clone(&self.layout),
-                Arc::clone(&self.file), Arc::clone(&self.tainted),
-            ))?.into(),
+            HduKind::CompressedImage(quantize_cfg) => {
+                Py::new(py, CompressedImageHDU::new(
+                    trimmed, index, self.filename.clone(),
+                    offsets, Arc::clone(&self.layout),
+                    Arc::clone(&self.file), Arc::clone(&self.tainted),
+                    quantize_cfg,
+                ))?.into()
+            }
         };
         self.hdus.push(hdu_py);
         Ok(())
@@ -539,13 +551,15 @@ impl FITS {
     // Create a tile-compressed image HDU.  Routes from
     // `create_image_hdu(..., compress=Gzip1(...))`.  Builds a
     // BINTABLE-with-ZIMAGE header, allocates the per-tile descriptor
-    // table (n_tiles rows × 8 or 16 bytes) zero-filled, and leaves
-    // the heap empty (PCOUNT=0) until CompressedImageHDU.write is
-    // called.
+    // table (n_tiles rows × column_width bytes) zero-filled, and
+    // leaves the heap empty (PCOUNT=0) until CompressedImageHDU.write
+    // is called.
     //
-    // Phase 7 supports Gzip1, Gzip2, and Rice1 with integer ZBITPIX
-    // (u1/i2/i4/i8 for GZIP; u1/i2/i4 for RICE).  Other algorithms
-    // and float ZBITPIX raise NotImplementedError.
+    // Integer ZBITPIX: BINTABLE has one column (COMPRESSED_DATA).
+    // Float ZBITPIX with quantize=Some: BINTABLE has at least three
+    // columns (COMPRESSED_DATA + ZSCALE + ZZERO), plus an optional
+    // GZIP_COMPRESSED_DATA fallback for tiles that can't be
+    // quantized.  ZQUANTIZ + ZDITHER0 header cards are emitted.
     fn create_compressed_image_hdu_impl(
         &mut self,
         py: Python<'_>,
@@ -554,6 +568,7 @@ impl FITS {
         extname: Option<String>,
         extver: Option<i64>,
         compress: Py<PyAny>,
+        quantize: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         for (i, &d) in dims.iter().enumerate() {
             if d <= 0 {
@@ -575,17 +590,43 @@ impl FITS {
         let bound = compress.bind(py);
         let cfg = CompressionConfigKind::from_pyany(bound)?;
 
-        // Dtype validation: Phase 7 supports BITPIX-direct integer
-        // types (u1/i2/i4/i8) only.  Floats deferred to Phase 8
-        // (quantization); unsigned-int trick types (i1/u2/u4/u8)
-        // deferred until we wire the reverse-cast on the write side.
+        // Dtype validation:
+        //   - integer types (u1/i2/i4/i8) go via the BITPIX-direct
+        //     path; quantize= is ignored (and rejected if passed).
+        //   - float types (f4/f8) require a Quantize config (the
+        //     default fills in if the user didn't pass one); the
+        //     emitted BINTABLE schema includes ZSCALE/ZZERO columns
+        //     plus an optional GZIP fallback.
+        //   - unsigned-int trick types (i1/u2/u4/u8) are deferred.
         let (bitpix, bzero) = crate::hdu_image::dtype_to_bitpix(&dtype)?;
-        if bitpix < 0 {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "compressed float images are not yet supported \
-                 (planned: Phase 8 — float quantization)"
-            ));
-        }
+        let is_float = bitpix < 0;
+        let quantize_cfg: Option<crate::zimage::compression_config::Quantize> =
+            if is_float {
+                // Float: use the user's Quantize, or the default
+                // (level=4.0, method='dither1', seed=0).
+                let q = match quantize {
+                    Some(qpy) => qpy.extract::<
+                        crate::zimage::compression_config::Quantize
+                    >(py)?,
+                    None => crate::zimage::compression_config::Quantize {
+                        level: 4.0,
+                        method:
+                            crate::zimage::compression_config::QuantizeMethod
+                                ::SubtractiveDither1,
+                        seed: 0,
+                    },
+                };
+                Some(q)
+            } else {
+                if quantize.is_some() {
+                    return Err(PyValueError::new_err(
+                        "quantize= is only valid for floating-point \
+                         dtypes (f4/f8); for integer images, omit \
+                         quantize=",
+                    ));
+                }
+                None
+            };
         if bzero.is_some() {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "compressed unsigned-int trick dtypes (i1/u2/u4/u8) \
@@ -594,17 +635,28 @@ impl FITS {
                  for now, or wait for a Phase 7 follow-up"
             ));
         }
-        // PLIO_1: integer-only (mask data); floats deferred to
-        // Phase 8 anyway, but reject explicitly here so the error
-        // says PLIO instead of generic "compressed float images
-        // are not yet supported".  Also reject i8 (bitpix=64) —
-        // PLIO has no 64-bit variant.
-        if matches!(cfg, CompressionConfigKind::Plio1(_)) && bitpix == 64 {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "PLIO_1 does not support 64-bit pixels (i8 dtype): \
-                 PLIO is designed for mask images with small \
-                 non-negative integer values; use i2 or i4 instead."
-            ));
+        // PLIO_1: integer-only mask data — float quantization
+        // produces an i32 stream with negative values (bzero shifts
+        // the range), which PLIO's non-negative-only encoder
+        // refuses.  Reject upfront so the user gets a clear error
+        // instead of a downstream "pixel is negative" failure.
+        // Also reject i8 (bitpix=64) — PLIO has no 64-bit variant.
+        if matches!(cfg, CompressionConfigKind::Plio1(_)) {
+            if is_float {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "PLIO_1 does not support float dtypes: PLIO is \
+                     designed for mask images with non-negative \
+                     integer values.  For float data, use Gzip2 or \
+                     Rice1 with a quantize= argument."
+                ));
+            }
+            if bitpix == 64 {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "PLIO_1 does not support 64-bit pixels (i8 dtype): \
+                     PLIO is designed for mask images with small \
+                     non-negative integer values; use i2 or i4 instead."
+                ));
+            }
         }
         // RICE_1 rejects bitpix=64 (BYTEPIX=8).  cfitsio has no
         // 64-bit RICE encoder; producing such files would make
@@ -747,12 +799,37 @@ impl FITS {
         // (TFORM1='1PB'/'1QB'); PLIO writes i16 BE shorts
         // (TFORM1='1PI'/'1QI').  The read-side dispatch already
         // handles both via tform_vla_inner_byte_width.
-        let tform_val = match (heap_format, &cfg) {
+        let primary_tform = match (heap_format, &cfg) {
             ('P', CompressionConfigKind::Plio1(_)) => "1PI",
             ('Q', CompressionConfigKind::Plio1(_)) => "1QI",
             ('P', _) => "1PB",
             ('Q', _) => "1QB",
             _ => unreachable!("heap_format validated to P or Q"),
+        };
+
+        // Column layout depends on whether quantization is in play:
+        //
+        //   Integer ZBITPIX:
+        //     col 1: COMPRESSED_DATA  (1PB / 1QB / 1PI / 1QI)
+        //
+        //   Float ZBITPIX (always has quantize_cfg = Some):
+        //     col 1: COMPRESSED_DATA       (primary tform, quantized i32 stream)
+        //     col 2: ZSCALE                (1D, per-tile bscale)
+        //     col 3: ZZERO                 (1D, per-tile bzero)
+        //     col 4: GZIP_COMPRESSED_DATA  (1PB / 1QB, lossless float fallback)
+        //
+        // For the float layout the GZIP fallback column is always
+        // present at column 4 so any tile that can't be quantized
+        // can store raw float bytes losslessly.  Empty descriptor
+        // (nelements=0) on tiles that DID quantize cleanly.
+        let gzip_fallback_tform = if heap_format == 'P' { "1PB" } else { "1QB" };
+        let n_columns: u64 = if is_float { 4 } else { 1 };
+        // Row width in bytes: VLA columns contribute `descriptor_size`
+        // bytes each; fixed-width ZSCALE/ZZERO contribute 8 bytes each.
+        let naxis1: u64 = if is_float {
+            descriptor_size + 8 + 8 + descriptor_size
+        } else {
+            descriptor_size
         };
 
         // FITS-order copies of image + tile shapes for the Z* cards.
@@ -765,17 +842,32 @@ impl FITS {
                                "binary table extension"));
         cards.push(card_int("BITPIX", 8, "8-bit bytes"));
         cards.push(card_int("NAXIS", 2, "2-dimensional binary table"));
-        cards.push(card_int("NAXIS1", descriptor_size as i64,
+        cards.push(card_int("NAXIS1", naxis1 as i64,
                             "width of table row in bytes"));
         cards.push(card_int("NAXIS2", n_tiles as i64,
                             "number of rows in table (= n_tiles)"));
         cards.push(card_int("PCOUNT", 0, "size of heap in bytes"));
         cards.push(card_int("GCOUNT", 1, "one data group"));
-        cards.push(card_int("TFIELDS", 1, "number of fields per row"));
-        cards.push(card_string("TFORM1", tform_val,
-                               "VLA byte-array descriptor"));
+        cards.push(card_int("TFIELDS", n_columns as i64,
+                            "number of fields per row"));
+        cards.push(card_string("TFORM1", primary_tform,
+                               "compressed data descriptor"));
         cards.push(card_string("TTYPE1", "COMPRESSED_DATA",
                                "label for column 1"));
+        if is_float {
+            cards.push(card_string("TFORM2", "1D",
+                                   "per-tile linear-scale factor"));
+            cards.push(card_string("TTYPE2", "ZSCALE",
+                                   "label for column 2"));
+            cards.push(card_string("TFORM3", "1D",
+                                   "per-tile linear-scale zero point"));
+            cards.push(card_string("TTYPE3", "ZZERO",
+                                   "label for column 3"));
+            cards.push(card_string("TFORM4", gzip_fallback_tform,
+                                   "lossless GZIP fallback for unquantizable tiles"));
+            cards.push(card_string("TTYPE4", "GZIP_COMPRESSED_DATA",
+                                   "label for column 4"));
+        }
         cards.push(card_logical("ZIMAGE", true,
                                 "tile-compressed image"));
         cards.push(card_string("ZCMPTYPE", cfg.zcmptype(),
@@ -791,6 +883,22 @@ impl FITS {
         for (i, &t) in tile_shape_fits.iter().enumerate() {
             cards.push(card_int(&format!("ZTILE{}", i + 1), t as i64,
                                 &format!("tile size on axis {}", i + 1)));
+        }
+        // Float-image quantization parameters (Phase 8).  ZQUANTIZ
+        // names the dither method; ZDITHER0 is the per-file random
+        // seed.  When the user passed Quantize(seed=0) we use 1
+        // here as the on-disk default (cfitsio also defaults to 1
+        // when the user hasn't picked a seed).
+        if let Some(q) = &quantize_cfg {
+            cards.push(card_string(
+                "ZQUANTIZ", q.method.zquantiz(),
+                "dithering method",
+            ));
+            let seed_on_disk = if q.seed > 0 { q.seed } else { 1 };
+            cards.push(card_int(
+                "ZDITHER0", seed_on_disk,
+                "dithering offset/seed",
+            ));
         }
         // Algorithm-specific ZNAMEn/ZVALn pairs (RICE BLOCKSIZE +
         // BYTEPIX; GZIP has none).
@@ -816,12 +924,18 @@ impl FITS {
         // Main data section: one descriptor per tile, all zeroes
         // (nelements=0, offset=0) until CompressedImageHDU.write
         // populates them.  Heap is empty (PCOUNT=0).
-        let data_size = descriptor_size.saturating_mul(n_tiles);
+        // Main data section = row width × n_tiles, zero-filled until
+        // the .write() call populates descriptors + (for floats)
+        // ZSCALE / ZZERO columns and the heap.
+        let data_size = naxis1.saturating_mul(n_tiles);
         let data_padded = data_section_padded(data_size);
 
         let offsets =
             append_header_and_data_to_file(&self.file, &cards, data_padded)?;
-        self.finalize_hdu(py, &cards, offsets, HduKind::CompressedImage)
+        self.finalize_hdu(
+            py, &cards, offsets,
+            HduKind::CompressedImage(quantize_cfg),
+        )
     }
 }
 
@@ -965,10 +1079,22 @@ impl FITS {
     // `rustfits.Gzip1(tile_shape=..., heap_format='P')`).  In that case
     // the HDU is created as a tile-compressed image (BINTABLE+ZIMAGE on
     // disk, `CompressedImageHDU` in Python) instead of a plain IMAGE
-    // extension.  Phase 7 supports `Gzip1`, `Gzip2`, and `Rice1`;
-    // the remaining algorithms (HCOMPRESS_1, PLIO_1) will be added
-    // in follow-up sub-phases.
-    #[pyo3(signature = (dtype, dims, *, extname=None, extver=None, compress=None))]
+    // extension.  All five integer-ZBITPIX encoders are supported
+    // (GZIP_1/2, RICE_1, HCOMPRESS_1, PLIO_1).
+    //
+    // `quantize`, when non-None, is a `Quantize` config object
+    // (`rustfits.Quantize(level=..., method='dither1', seed=0)`).
+    // Required for float-image compression (Phase 8): float values
+    // are quantized to i32 per-tile before being passed to the
+    // chosen integer compression algorithm, with per-tile ZSCALE /
+    // ZZERO columns recording the scaling.  Ignored for integer
+    // images.  When omitted on float input, a default
+    // `Quantize()` is used (cfitsio-equivalent defaults: level=4.0,
+    // method='dither1', seed=0).
+    #[pyo3(signature = (
+        dtype, dims, *, extname=None, extver=None,
+        compress=None, quantize=None,
+    ))]
     fn create_image_hdu(
         &mut self,
         py: Python<'_>,
@@ -977,11 +1103,19 @@ impl FITS {
         extname: Option<String>,
         extver: Option<i64>,
         compress: Option<Py<PyAny>>,
+        quantize: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         if let Some(cfg) = compress {
             return self.create_compressed_image_hdu_impl(
-                py, dtype, dims, extname, extver, cfg,
+                py, dtype, dims, extname, extver, cfg, quantize,
             );
+        }
+        if quantize.is_some() {
+            return Err(PyValueError::new_err(
+                "quantize= is only valid with compress= (it controls \
+                 the per-tile quantization for tile-compressed float \
+                 images); for uncompressed images, omit quantize=",
+            ));
         }
         for (i, &d) in dims.iter().enumerate() {
             if d <= 0 {

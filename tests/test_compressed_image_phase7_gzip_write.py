@@ -202,18 +202,9 @@ def test_compressed_write_shifts_later_hdus():
 # ---------------------- rejections ---------------------------------
 
 
-def test_float_compress_rejected():
-    """Float ZBITPIX writes raise NotImplementedError (Phase 8)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fn = os.path.join(tmp, "t.fits.fz")
-        with rustfits.FITS(fn, "w+") as f:
-            with pytest.raises(NotImplementedError, match="float"):
-                f.create_image_hdu(
-                    "f4",
-                    (16, 16),
-                    compress=rustfits.Gzip1(tile_shape=(16, 16)),
-                )
-
+# test_float_compress_rejected: removed in Phase 8 commit 2 —
+# float-compressed writes are now supported via quantize=.  See
+# tests/test_compressed_image_phase8_quantize_write.py.
 
 def test_unsigned_trick_dtype_rejected():
     """u2/u4/u8/i1 writes raise NotImplementedError until the

@@ -164,6 +164,15 @@ impl TileCache {
 #[pyclass(extends = ImageHDU)]
 pub(crate) struct CompressedImageHDU {
     cache: Arc<TileCache>,
+    // Quantization config from `create_image_hdu(..., quantize=...)`.
+    // Populated when the HDU was just created in this session for a
+    // float ZBITPIX; `None` after reopen (the FITS Tile Compression
+    // Convention only records method+seed in ZQUANTIZ/ZDITHER0 on
+    // disk, not the qlevel).  The write path consults this for the
+    // qlevel value — for reopened HDUs it falls back to defaults
+    // (level=4.0).
+    quantize_config:
+        Arc<Mutex<Option<crate::zimage::compression_config::Quantize>>>,
 }
 
 impl CompressedImageHDU {
@@ -175,6 +184,8 @@ impl CompressedImageHDU {
         layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
+        quantize_config:
+            Option<crate::zimage::compression_config::Quantize>,
     ) -> PyClassInitializer<Self> {
         let hdu = HDU::new(
             header, index, filename, offsets, layout, file, tainted,
@@ -183,6 +194,7 @@ impl CompressedImageHDU {
             .add_subclass(ImageHDU)
             .add_subclass(CompressedImageHDU {
                 cache: Arc::new(TileCache::new(DEFAULT_TILE_CACHE_BYTES)),
+                quantize_config: Arc::new(Mutex::new(quantize_config)),
             })
     }
 }
@@ -473,6 +485,7 @@ impl CompressedImageHDU {
             ));
         }
         let cache = Arc::clone(&slf.cache);
+        let quantize_config = Arc::clone(&slf.quantize_config);
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         write_compressed_image_data(
@@ -481,6 +494,7 @@ impl CompressedImageHDU {
             &super_.file, &super_.layout, &super_.tainted,
             &cache,
             &super_.header,
+            &quantize_config,
         )
     }
 
@@ -1896,7 +1910,20 @@ fn slice_compressed_image(
     }
 }
 
-// ====== Compressed write (Phase 7) ======
+// ====== Compressed write (Phases 7 + 8) ======
+//
+// REFACTOR TODO (post-Phase-8): `write_compressed_image_data` has
+// grown unwieldy — it branches on int-vs-float in several places,
+// embeds a per-tile-row struct, and duplicates descriptor-writing
+// logic.  Once the quantize matrix tests are in place (commit 3 of
+// Phase 8), refactor into:
+//   - `TileRow` promoted to a module-level struct (out of the fn).
+//   - `encode_tile_int` / `encode_tile_float` helpers, each
+//     returning `(TileRow, primary_bytes, fallback_bytes)`.
+//   - The main dispatcher just loops, calls the right helper,
+//     accumulates the heap, and emits the descriptor table.
+// Don't do it before the dither-matrix tests anchor behavior —
+// landing the refactor on top of a known-good baseline is safer.
 
 // Bulk-write entry point for CompressedImageHDU.write.  Encodes every
 // tile in RAM, then mutates the file (grow if non-last HDU, write
@@ -1931,6 +1958,9 @@ fn write_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    quantize_config: &Arc<
+        Mutex<Option<crate::zimage::compression_config::Quantize>>
+    >,
 ) -> PyResult<()> {
     check_not_tainted(tainted)?;
 
@@ -1946,17 +1976,21 @@ fn write_compressed_image_data(
             "compressed HDU has ZNAXIS=0 (no image data)"
         ));
     }
-    if zbitpix < 0 {
-        return Err(PyNotImplementedError::new_err(
-            "compressed float-image writes are not yet supported \
-             (planned: Phase 8 — float quantization)"
-        ));
-    }
+    let is_float = zbitpix < 0;
+    // For integer ZBITPIX, bytepix matches the image pixel width.
+    // For float ZBITPIX, we use the i32 width (4) for the encoded
+    // primary stream — quantize_float/_double output i32 values.
     let bytepix: u32 = match zbitpix {
         8 => 1, 16 => 2, 32 => 4, 64 => 8,
+        -32 | -64 => 4,
         other => return Err(PyValueError::new_err(format!(
             "unsupported ZBITPIX {} for compressed write", other
         ))),
+    };
+    let float_bytepix: u32 = match zbitpix {
+        -32 => 4,
+        -64 => 8,
+        _ => 0,
     };
     let tile_shape = parse_tile_shape(cards, &image_shape);
     let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
@@ -1991,14 +2025,16 @@ fn write_compressed_image_data(
             in_shape, expected_shape
         )));
     }
-    // Convert to the expected on-disk dtype in big-endian order in
-    // one pass.  numpy's astype handles dtype matching + byteswap
-    // atomically; we don't need to babysit it.
+    // Convert each tile to the expected on-disk byte order in one
+    // pass via numpy.  Integer ZBITPIX → u1/i2/i4/i8; float ZBITPIX
+    // → f4/f8 (so we can re-extract the floats for quantization).
     let be_dtype = match zbitpix {
         8  => ">u1",
         16 => ">i2",
         32 => ">i4",
         64 => ">i8",
+        -32 => ">f4",
+        -64 => ">f8",
         other => return Err(PyValueError::new_err(format!(
             "unsupported ZBITPIX {} for compressed write", other
         ))),
@@ -2012,17 +2048,58 @@ fn write_compressed_image_data(
     let (blocksize_opt, _bytepix_header_opt) = parse_rice_params(cards);
     let hcompress_scale = parse_hcompress_scale(cards);
 
-    // ----- encode all tiles into RAM -----
-    let mut heap_bytes: Vec<u8> = Vec::new();
-    // descriptors: (nelements, heap_offset) per tile, in tile-index
-    // order (FITS row-major, numpy-last-axis fastest).
-    let mut descriptors: Vec<(u64, u64)> = Vec::with_capacity(n_tiles as usize);
+    // ----- float-only quantize setup -----
+    // For float HDUs we need:
+    //   - DitherMethod from ZQUANTIZ
+    //   - ZDITHER0 seed
+    //   - qlevel from the create-time Quantize config (the FITS
+    //     spec records method+seed only, not the level)
+    let (quant_method, zdither0, qlevel) = if is_float {
+        let zq = parse_string_keyword(cards, "ZQUANTIZ");
+        let method = crate::zimage::quantize::parse_dither_method(
+            zq.as_deref(),
+        )?.ok_or_else(|| PyNotImplementedError::new_err(
+            "compressed-float write with ZQUANTIZ='NONE' \
+             (unquantized) is not yet supported; pass quantize= \
+             with a method other than 'none'"
+        ))?;
+        let zd = parse_keyword(cards, "ZDITHER0").unwrap_or(1).max(1);
+        let level = quantize_config.lock()
+            .map_err(|_| PyIOError::new_err(
+                "quantize config lock poisoned"
+            ))?.as_ref().map(|q| q.level).unwrap_or(4.0);
+        (Some(method), zd, level)
+    } else {
+        (None, 0, 0.0)
+    };
+
+    // ----- per-tile encode loop -----
+    //
+    // For each tile we accumulate either:
+    //   - (primary stream) bytes appended to `primary_heap`, or
+    //   - (lossless fallback) raw float bytes GZIP-compressed and
+    //     appended to `fallback_heap`,
+    // plus per-row metadata (descriptors + ZSCALE/ZZERO for floats)
+    // captured in `rows`.  The two heaps are concatenated to form
+    // the on-disk heap after the loop; fallback offsets are then
+    // bumped by `primary_heap.len()` so their descriptors point at
+    // the correct combined-heap location.
+    struct TileRow {
+        primary_nelem: u64,
+        primary_off: u64,
+        zscale: f64,
+        zzero: f64,
+        fallback_nelem: u64,
+        fallback_off: u64,
+    }
+    let mut rows: Vec<TileRow> = Vec::with_capacity(n_tiles as usize);
+    let mut primary_heap: Vec<u8> = Vec::new();
+    let mut fallback_heap: Vec<u8> = Vec::new();
 
     for tile_idx in 0..n_tiles {
         let (origin, actual_shape) = tile_origin_and_shape(
             tile_idx, &image_shape, &tile_shape,
         );
-        // Build slice tuple data[origin[0]:origin[0]+shape[0], ...]
         let slice_objs: Vec<Bound<'_, PySlice>> = origin.iter()
             .zip(actual_shape.iter())
             .map(|(&o, &s)| PySlice::new(
@@ -2031,51 +2108,170 @@ fn write_compressed_image_data(
             .collect();
         let slice_tuple = PyTuple::new(py, &slice_objs)?;
         let tile_view = ascontig.get_item(slice_tuple)?;
-        // ascontiguousarray(view, be_dtype) gives us a contiguous
-        // big-endian buffer in one numpy call; cheap when input is
-        // already contiguous + native, a single copy when not.
         let tile_be = np.call_method1(
             "ascontiguousarray", (tile_view, be_dtype),
         )?;
         let tile_bytes_py = tile_be.call_method0("tobytes")?;
         let tile_bytes: Vec<u8> = tile_bytes_py.extract()?;
         let n_pixels = actual_shape.iter().product::<u64>() as usize;
-        let expected_bytes = n_pixels * bytepix as usize;
+        let pixel_width_bytes = if is_float {
+            float_bytepix as usize
+        } else {
+            bytepix as usize
+        };
+        let expected_bytes = n_pixels * pixel_width_bytes;
         if tile_bytes.len() != expected_bytes {
             return Err(PyValueError::new_err(format!(
                 "internal: tile {} bytes={} expected {}",
                 tile_idx, tile_bytes.len(), expected_bytes
             )));
         }
-        let encode_params = crate::zimage::AlgorithmEncodeParams {
-            blocksize: blocksize_opt.unwrap_or(32),
-            tile_shape_numpy: &actual_shape,
-            scale: hcompress_scale,
-        };
-        let encoded = crate::zimage::encode_tile_from_bytes(
-            algorithm, &tile_bytes, bytepix, n_pixels,
-            zbitpix, encode_params,
-        )?;
-        // Descriptor nelements counts ELEMENTS of the inner type
-        // (bytes for `1PB`, i16 shorts for `1PI`).  The encoder
-        // always returns whole elements, so this divides cleanly.
-        if encoded.len() as u64 % inner_byte_width != 0 {
-            return Err(PyValueError::new_err(format!(
-                "internal: encoded tile {} bytes={} not a multiple \
-                 of inner_byte_width={}",
-                tile_idx, encoded.len(), inner_byte_width,
-            )));
+
+        if is_float {
+            // ---- float quantization path ----
+            let method = quant_method.unwrap();
+            // Tile dims as passed to quantize_float/_double:
+            //   nxpix = numpy-last (fast) axis
+            //   nypix = remaining (product of the rest)
+            // The noise estimator walks rows of length nxpix.
+            let nxpix = actual_shape[actual_shape.len() - 1] as usize;
+            let nypix = if nxpix == 0 { 0 } else { n_pixels / nxpix };
+            // 1-based tile index drives the dither seed.
+            let row_1based = tile_idx + 1;
+            let qt_opt = if zbitpix == -32 {
+                let mut tile_f32: Vec<f32> = Vec::with_capacity(n_pixels);
+                for chunk in tile_bytes.chunks_exact(4) {
+                    tile_f32.push(f32::from_be_bytes(
+                        chunk.try_into().unwrap(),
+                    ));
+                }
+                crate::zimage::quantize::quantize_float(
+                    &tile_f32, nxpix, nypix, None,
+                    qlevel, method, row_1based, zdither0,
+                )
+            } else {
+                let mut tile_f64: Vec<f64> = Vec::with_capacity(n_pixels);
+                for chunk in tile_bytes.chunks_exact(8) {
+                    tile_f64.push(f64::from_be_bytes(
+                        chunk.try_into().unwrap(),
+                    ));
+                }
+                crate::zimage::quantize::quantize_double(
+                    &tile_f64, nxpix, nypix, None,
+                    qlevel, method, row_1based, zdither0,
+                )
+            };
+
+            if let Some(qt) = qt_opt {
+                // Quantized successfully — encode the i32 stream
+                // through the chosen algorithm (acts as if the
+                // input were a 32-bit integer image).
+                let mut i32_be: Vec<u8> = Vec::with_capacity(n_pixels * 4);
+                for &v in &qt.idata {
+                    i32_be.extend_from_slice(&v.to_be_bytes());
+                }
+                let encode_params = crate::zimage::AlgorithmEncodeParams {
+                    blocksize: blocksize_opt.unwrap_or(32),
+                    tile_shape_numpy: &actual_shape,
+                    scale: hcompress_scale,
+                };
+                let encoded = crate::zimage::encode_tile_from_bytes(
+                    algorithm, &i32_be, 4 /* bytepix=4 for i32 */,
+                    n_pixels, 32 /* zbitpix=32 for the integer encode */,
+                    encode_params,
+                )?;
+                if encoded.len() as u64 % inner_byte_width != 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "internal: encoded tile {} bytes={} not a \
+                         multiple of inner_byte_width={}",
+                        tile_idx, encoded.len(), inner_byte_width,
+                    )));
+                }
+                let off = primary_heap.len() as u64;
+                let nelem = encoded.len() as u64 / inner_byte_width;
+                primary_heap.extend(encoded);
+                rows.push(TileRow {
+                    primary_nelem: nelem,
+                    primary_off: off,
+                    zscale: qt.bscale,
+                    zzero: qt.bzero,
+                    fallback_nelem: 0,
+                    fallback_off: 0,
+                });
+            } else {
+                // Couldn't quantize (constant tile, range too
+                // wide, etc.) — GZIP-compress the raw float bytes
+                // into the lossless fallback column.
+                let encoded = crate::zimage::gzip::encode_gzip1(
+                    &tile_bytes,
+                )?;
+                let off = fallback_heap.len() as u64;
+                let nelem = encoded.len() as u64;
+                fallback_heap.extend(encoded);
+                rows.push(TileRow {
+                    primary_nelem: 0,
+                    primary_off: 0,
+                    zscale: 1.0,
+                    zzero: 0.0,
+                    fallback_nelem: nelem,
+                    fallback_off: off,
+                });
+            }
+        } else {
+            // ---- integer path ----
+            let encode_params = crate::zimage::AlgorithmEncodeParams {
+                blocksize: blocksize_opt.unwrap_or(32),
+                tile_shape_numpy: &actual_shape,
+                scale: hcompress_scale,
+            };
+            let encoded = crate::zimage::encode_tile_from_bytes(
+                algorithm, &tile_bytes, bytepix, n_pixels,
+                zbitpix, encode_params,
+            )?;
+            if encoded.len() as u64 % inner_byte_width != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "internal: encoded tile {} bytes={} not a multiple \
+                     of inner_byte_width={}",
+                    tile_idx, encoded.len(), inner_byte_width,
+                )));
+            }
+            let off = primary_heap.len() as u64;
+            let nelem = encoded.len() as u64 / inner_byte_width;
+            primary_heap.extend(encoded);
+            rows.push(TileRow {
+                primary_nelem: nelem,
+                primary_off: off,
+                zscale: 0.0,
+                zzero: 0.0,
+                fallback_nelem: 0,
+                fallback_off: 0,
+            });
         }
-        let nelements = encoded.len() as u64 / inner_byte_width;
-        let offset = heap_bytes.len() as u64;
-        descriptors.push((nelements, offset));
-        heap_bytes.extend(encoded);
     }
-    let total_heap_bytes = heap_bytes.len() as u64;
+
+    // Combine the two heaps.  Bump fallback offsets so they land
+    // in the right position of the concatenated heap.
+    let primary_size = primary_heap.len() as u64;
+    let fallback_size = fallback_heap.len() as u64;
+    let total_heap_bytes = primary_size + fallback_size;
+    for row in rows.iter_mut() {
+        if row.fallback_nelem > 0 {
+            row.fallback_off += primary_size;
+        }
+    }
 
     // ----- compute file extents -----
     let data_offset = offsets.data_offset();
-    let main_bytes = descriptor_size.saturating_mul(n_tiles);
+    // Main data section = NAXIS1 (row width) × n_tiles.  Row width
+    // depends on the column layout: 1 VLA descriptor for integer
+    // HDUs, primary + ZSCALE + ZZERO + fallback descriptor for
+    // floats.
+    let row_width: u64 = if is_float {
+        descriptor_size + 8 + 8 + descriptor_size
+    } else {
+        descriptor_size
+    };
+    let main_bytes = row_width.saturating_mul(n_tiles);
     let new_data_size = main_bytes.saturating_add(total_heap_bytes);
     let new_padded = if new_data_size == 0 {
         0
@@ -2159,25 +2355,51 @@ fn write_compressed_image_data(
                 PyIOError::new_err(format!(
                     "compressed write: seek to data_offset failed: {}", e))
             })?;
-        // Descriptors in tile-index order.  P: (u32 nelem BE, u32 off BE).
-        // Q: (u64 nelem BE, u64 off BE).
+        // Build the per-row descriptor table.  Layout:
+        //   Integer: primary descriptor only.
+        //   Float:   primary descriptor + ZSCALE (8 BE) + ZZERO (8
+        //            BE) + fallback descriptor.
+        // P-format descriptors are 8 bytes (u32 nelem BE + u32 off BE);
+        // Q-format are 16 bytes (u64 + u64 BE).  cfitsio agrees on
+        // both layouts.
         let mut desc_buf: Vec<u8> =
-            Vec::with_capacity((descriptor_size * n_tiles) as usize);
-        for &(nel, off) in &descriptors {
+            Vec::with_capacity((row_width * n_tiles) as usize);
+        let push_desc = |buf: &mut Vec<u8>, nel: u64, off: u64|
+            -> PyResult<()>
+        {
             if heap_is_q {
-                desc_buf.extend_from_slice(&nel.to_be_bytes());
-                desc_buf.extend_from_slice(&off.to_be_bytes());
+                buf.extend_from_slice(&nel.to_be_bytes());
+                buf.extend_from_slice(&off.to_be_bytes());
             } else {
                 if nel > u32::MAX as u64 || off > u32::MAX as u64 {
-                    tainted.store(true, Ordering::Release);
                     return Err(PyValueError::new_err(format!(
-                        "compressed write: P-descriptor overflow (nelem={}, \
-                         offset={}); use heap_format='Q' for heaps > 4 GB",
-                        nel, off
+                        "compressed write: P-descriptor overflow \
+                         (nelem={}, offset={}); use heap_format='Q' \
+                         for heaps > 4 GB",
+                        nel, off,
                     )));
                 }
-                desc_buf.extend_from_slice(&(nel as u32).to_be_bytes());
-                desc_buf.extend_from_slice(&(off as u32).to_be_bytes());
+                buf.extend_from_slice(&(nel as u32).to_be_bytes());
+                buf.extend_from_slice(&(off as u32).to_be_bytes());
+            }
+            Ok(())
+        };
+        for row in &rows {
+            if let Err(e) = push_desc(
+                &mut desc_buf, row.primary_nelem, row.primary_off,
+            ) {
+                tainted.store(true, Ordering::Release);
+                return Err(e);
+            }
+            if is_float {
+                desc_buf.extend_from_slice(&row.zscale.to_be_bytes());
+                desc_buf.extend_from_slice(&row.zzero.to_be_bytes());
+                if let Err(e) = push_desc(
+                    &mut desc_buf, row.fallback_nelem, row.fallback_off,
+                ) {
+                    tainted.store(true, Ordering::Release);
+                    return Err(e);
+                }
             }
         }
         f.write_all(&desc_buf).map_err(|e| {
@@ -2185,10 +2407,18 @@ fn write_compressed_image_data(
             PyIOError::new_err(format!(
                 "compressed write: descriptor write failed: {}", e))
         })?;
-        f.write_all(&heap_bytes).map_err(|e| {
+        // Heap = primary_heap followed by fallback_heap (already
+        // composed into one logical stream above).  Write both
+        // halves consecutively.
+        f.write_all(&primary_heap).map_err(|e| {
             tainted.store(true, Ordering::Release);
             PyIOError::new_err(format!(
-                "compressed write: heap write failed: {}", e))
+                "compressed write: primary heap write failed: {}", e))
+        })?;
+        f.write_all(&fallback_heap).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed write: fallback heap write failed: {}", e))
         })?;
         // Zero-pad to the block boundary so the data section is FITS-
         // conforming.  Cheap: at most BLOCK_SIZE-1 bytes.
