@@ -63,6 +63,19 @@ fn validate_heap_format(heap_format: &str) -> PyResult<char> {
     }
 }
 
+// Validate GZIP compression level: must be None or 0..=9.
+fn validate_gzip_level(level: Option<u32>) -> PyResult<Option<u32>> {
+    match level {
+        None => Ok(None),
+        Some(v) if v <= 9 => Ok(Some(v)),
+        Some(v) => Err(PyValueError::new_err(format!(
+            "level must be in 0..=9 (0=none, 1=fastest, 9=best), \
+             or None for the codec default (6).  Got {}.",
+            v
+        ))),
+    }
+}
+
 // ---------- Gzip1 ----------
 
 /// Configuration for GZIP_1 tile compression.
@@ -77,6 +90,7 @@ fn validate_heap_format(heap_format: &str) -> PyResult<char> {
 pub(crate) struct Gzip1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
+    pub(crate) level: Option<u32>,
 }
 
 #[pymethods]
@@ -95,15 +109,28 @@ impl Gzip1 {
     ///     with 32-bit nelements/offset (4 GB heap ceiling).
     ///     'Q' uses 16-byte descriptors (no practical ceiling)
     ///     for files whose compressed heap exceeds 4 GB.
+    /// level : int in 0..=9, optional
+    ///     zlib compression level for the GZIP_1 stream.  0 means
+    ///     no compression (just gzip framing), 1 is fastest with
+    ///     least compression, 9 is slowest with most.  None (the
+    ///     default) uses the codec default of 6 — the same as
+    ///     cfitsio/zlib/astropy.  The level is a write-only
+    ///     parameter; it isn't recorded in the file, so
+    ///     `.compression` on a reopened HDU returns `level=None`
+    ///     regardless of what was used to write the file.
     #[new]
-    #[pyo3(signature = (*, tile_shape=None, heap_format=String::from("P")))]
+    #[pyo3(signature = (
+        *, tile_shape=None, heap_format=String::from("P"), level=None,
+    ))]
     fn new(
         tile_shape: Option<Vec<i64>>,
         heap_format: String,
+        level: Option<u32>,
     ) -> PyResult<Self> {
         let tile_shape = validate_tile_shape(tile_shape)?;
         let heap_format = validate_heap_format(&heap_format)?;
-        Ok(Gzip1 { tile_shape, heap_format })
+        let level = validate_gzip_level(level)?;
+        Ok(Gzip1 { tile_shape, heap_format, level })
     }
 
     #[getter]
@@ -122,6 +149,14 @@ impl Gzip1 {
         self.heap_format.to_string()
     }
 
+    #[getter]
+    fn level(&self, py: Python<'_>) -> Py<PyAny> {
+        match self.level {
+            None => py.None(),
+            Some(v) => v.into_pyobject(py).unwrap().unbind().into_any(),
+        }
+    }
+
     /// FITS-spec ZCMPTYPE string for this algorithm.
     #[getter]
     fn zcmptype(&self) -> &'static str {
@@ -133,9 +168,13 @@ impl Gzip1 {
             None => "None".to_string(),
             Some(v) => format!("{:?}", v),
         };
+        let lvl = match self.level {
+            None => "None".to_string(),
+            Some(v) => v.to_string(),
+        };
         format!(
-            "Gzip1(tile_shape={}, heap_format='{}')",
-            ts, self.heap_format
+            "Gzip1(tile_shape={}, heap_format='{}', level={})",
+            ts, self.heap_format, lvl,
         )
     }
 
@@ -162,6 +201,7 @@ impl Gzip1 {
 pub(crate) struct Gzip2 {
     pub(crate) tile_shape: Option<Vec<u64>>,
     pub(crate) heap_format: char,
+    pub(crate) level: Option<u32>,
 }
 
 #[pymethods]
@@ -180,15 +220,24 @@ impl Gzip2 {
     ///     with 32-bit nelements/offset (4 GB heap ceiling).
     ///     'Q' uses 16-byte descriptors (no practical ceiling)
     ///     for files whose compressed heap exceeds 4 GB.
+    /// level : int in 0..=9, optional
+    ///     zlib compression level for the GZIP_2 stream.  Same
+    ///     semantics as `Gzip1(level=...)` — None uses the
+    ///     codec default (6).  Write-only; not recoverable from
+    ///     the file.
     #[new]
-    #[pyo3(signature = (*, tile_shape=None, heap_format=String::from("P")))]
+    #[pyo3(signature = (
+        *, tile_shape=None, heap_format=String::from("P"), level=None,
+    ))]
     fn new(
         tile_shape: Option<Vec<i64>>,
         heap_format: String,
+        level: Option<u32>,
     ) -> PyResult<Self> {
         let tile_shape = validate_tile_shape(tile_shape)?;
         let heap_format = validate_heap_format(&heap_format)?;
-        Ok(Gzip2 { tile_shape, heap_format })
+        let level = validate_gzip_level(level)?;
+        Ok(Gzip2 { tile_shape, heap_format, level })
     }
 
     #[getter]
@@ -207,6 +256,14 @@ impl Gzip2 {
         self.heap_format.to_string()
     }
 
+    #[getter]
+    fn level(&self, py: Python<'_>) -> Py<PyAny> {
+        match self.level {
+            None => py.None(),
+            Some(v) => v.into_pyobject(py).unwrap().unbind().into_any(),
+        }
+    }
+
     /// FITS-spec ZCMPTYPE string for this algorithm.
     #[getter]
     fn zcmptype(&self) -> &'static str {
@@ -218,9 +275,13 @@ impl Gzip2 {
             None => "None".to_string(),
             Some(v) => format!("{:?}", v),
         };
+        let lvl = match self.level {
+            None => "None".to_string(),
+            Some(v) => v.to_string(),
+        };
         format!(
-            "Gzip2(tile_shape={}, heap_format='{}')",
-            ts, self.heap_format
+            "Gzip2(tile_shape={}, heap_format='{}', level={})",
+            ts, self.heap_format, lvl,
         )
     }
 
@@ -724,5 +785,137 @@ impl Quantize {
 
     fn __eq__(&self, other: &Self) -> bool {
         self == other
+    }
+}
+
+// ---------- CompressionConfigKind ----------
+
+// Internal wrapper over the per-algorithm config pyclasses.  The
+// `compress=` argument to `create_image_hdu` may be any of
+// `Gzip1` / `Gzip2` / `Rice1` / `Hcompress1` / `Plio1`; extracting
+// directly to one specific type would force a separate isinstance
+// branch per algorithm at the call site, so this enum centralises
+// the "try each known class in turn" logic and exposes the small
+// set of shared accessors.
+//
+// Stored on `CompressedImageHDU::compress_config` after create so
+// that write-only parameters (`Gzip1(level=...)`,
+// `Gzip2(level=...)`, future additions) survive across
+// write/extend/__setitem__ calls AND so the `.compression`
+// accessor returns the SAME object the user passed in for
+// freshly-created HDUs.  For reopened HDUs the field is None and
+// callers fall back to reconstructing from header cards via
+// `build_compression_config`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CompressionConfigKind {
+    Gzip1(Gzip1),
+    Gzip2(Gzip2),
+    Rice1(Rice1),
+    Hcompress1(Hcompress1),
+    Plio1(Plio1),
+}
+
+impl CompressionConfigKind {
+    pub(crate) fn from_pyany(bound: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(g) = bound.extract::<Gzip1>() {
+            return Ok(Self::Gzip1(g));
+        }
+        if let Ok(g) = bound.extract::<Gzip2>() {
+            return Ok(Self::Gzip2(g));
+        }
+        if let Ok(r) = bound.extract::<Rice1>() {
+            return Ok(Self::Rice1(r));
+        }
+        if let Ok(h) = bound.extract::<Hcompress1>() {
+            return Ok(Self::Hcompress1(h));
+        }
+        if let Ok(p) = bound.extract::<Plio1>() {
+            return Ok(Self::Plio1(p));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "compress= must be a compression-config object (e.g. \
+             rustfits.Gzip1(...), rustfits.Gzip2(...), \
+             rustfits.Rice1(...), rustfits.Hcompress1(...), \
+             rustfits.Plio1(...))",
+        ))
+    }
+
+    pub(crate) fn tile_shape(&self) -> &Option<Vec<u64>> {
+        match self {
+            Self::Gzip1(g) => &g.tile_shape,
+            Self::Gzip2(g) => &g.tile_shape,
+            Self::Rice1(r) => &r.tile_shape,
+            Self::Hcompress1(h) => &h.tile_shape,
+            Self::Plio1(p) => &p.tile_shape,
+        }
+    }
+
+    pub(crate) fn heap_format(&self) -> char {
+        match self {
+            Self::Gzip1(g) => g.heap_format,
+            Self::Gzip2(g) => g.heap_format,
+            Self::Rice1(r) => r.heap_format,
+            Self::Hcompress1(h) => h.heap_format,
+            Self::Plio1(p) => p.heap_format,
+        }
+    }
+
+    pub(crate) fn zcmptype(&self) -> &'static str {
+        match self {
+            Self::Gzip1(_) => "GZIP_1",
+            Self::Gzip2(_) => "GZIP_2",
+            Self::Rice1(_) => "RICE_1",
+            Self::Hcompress1(_) => "HCOMPRESS_1",
+            Self::Plio1(_) => "PLIO_1",
+        }
+    }
+
+    // Algorithm-specific (ZNAMEn, ZVALn) pairs to emit alongside
+    // the standard ZIMAGE header cards.  RICE_1 carries BLOCKSIZE
+    // + BYTEPIX; HCOMPRESS_1 carries SCALE + SMOOTH; GZIP variants
+    // have no extras (level is write-only and not emitted).
+    pub(crate) fn extra_z_cards(
+        &self, bitpix: i32,
+    ) -> Vec<(&'static str, i64)> {
+        match self {
+            Self::Gzip1(_) | Self::Gzip2(_) | Self::Plio1(_) => Vec::new(),
+            Self::Rice1(r) => vec![
+                ("BLOCKSIZE", r.blocksize as i64),
+                ("BYTEPIX", (bitpix / 8) as i64),
+            ],
+            Self::Hcompress1(h) => vec![
+                ("SCALE", h.scale as i64),
+                ("SMOOTH", if h.smooth { 1 } else { 0 }),
+            ],
+        }
+    }
+
+    // GZIP compression level for Gzip1 / Gzip2; None for other
+    // algorithms (they don't use a zlib level).  Used by the write
+    // path to thread the user's level through to the encoder.
+    pub(crate) fn gzip_level(&self) -> Option<u32> {
+        match self {
+            Self::Gzip1(g) => g.level,
+            Self::Gzip2(g) => g.level,
+            _ => None,
+        }
+    }
+
+    // Replace the wrapped algorithm config's tile_shape with the
+    // resolved value (the actual on-disk tile shape, computed by
+    // `create_compressed_image_hdu_impl` from the user's input or
+    // the algorithm-specific default).  Stored on the HDU so that
+    // `.compression.tile_shape` returns the real tile shape even
+    // when the user passed `Gzip1()` etc. without specifying it.
+    pub(crate) fn with_resolved_tile_shape(self, ts: Vec<u64>) -> Self {
+        match self {
+            Self::Gzip1(mut g) => { g.tile_shape = Some(ts); Self::Gzip1(g) }
+            Self::Gzip2(mut g) => { g.tile_shape = Some(ts); Self::Gzip2(g) }
+            Self::Rice1(mut r) => { r.tile_shape = Some(ts); Self::Rice1(r) }
+            Self::Hcompress1(mut h) => {
+                h.tile_shape = Some(ts); Self::Hcompress1(h)
+            }
+            Self::Plio1(mut p) => { p.tile_shape = Some(ts); Self::Plio1(p) }
+        }
     }
 }

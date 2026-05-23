@@ -130,6 +130,10 @@ pub(crate) struct AlgorithmEncodeParams<'a> {
     // increasing compression at the cost of precision.  Ignored
     // by other algorithms.
     pub scale: i32,
+    // GZIP_1 / GZIP_2: zlib compression level.  None → codec
+    // default (level 6); Some(0..=9) overrides.  Ignored by
+    // other algorithms.
+    pub gzip_level: Option<u32>,
 }
 
 impl<'a> Default for AlgorithmEncodeParams<'a> {
@@ -138,6 +142,7 @@ impl<'a> Default for AlgorithmEncodeParams<'a> {
             blocksize: 32,
             tile_shape_numpy: &[],
             scale: 0,
+            gzip_level: None,
         }
     }
 }
@@ -163,9 +168,11 @@ pub(crate) fn encode_tile_from_bytes(
     params: AlgorithmEncodeParams<'_>,
 ) -> PyResult<Vec<u8>> {
     match algorithm {
-        CompressionAlgorithm::Gzip1 => gzip::encode_gzip1(pixel_bytes_be),
+        CompressionAlgorithm::Gzip1 => {
+            gzip::encode_gzip1(pixel_bytes_be, params.gzip_level)
+        }
         CompressionAlgorithm::Gzip2 => {
-            gzip::encode_gzip2(pixel_bytes_be, bytepix)
+            gzip::encode_gzip2(pixel_bytes_be, bytepix, params.gzip_level)
         }
         CompressionAlgorithm::Rice1 => {
             rice::encode_rice(pixel_bytes_be, n_pixels, bytepix, params.blocksize)

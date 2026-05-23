@@ -1785,6 +1785,51 @@ orphaned bytes.  A future "compact" / "repack" operation could
 rewrite the heap with only live tiles, but isn't worth the
 complexity until a workload demonstrably needs it.
 
+**GZIP compression level (`Gzip1(level=...)` / `Gzip2(level=...)`).**
+Shipped 2026-05-23.  Accepts 0..=9 (zlib levels: 0 = none, 1 =
+fastest, 9 = best); `None` (default) uses the codec default of 6
+— same as cfitsio/zlib/astropy.
+
+The level is a **write-only** parameter: the gzip stream format
+itself doesn't preserve the level that produced it (the decoder
+handles any level identically), and the FITS Tile Compression
+Convention defines no ZNAMEn/ZVALn slot for it.  Within the same
+Python session `hdu.compression.level` returns the user's value
+(stored on the HDU); after close + reopen the field comes back
+as `None`.
+
+**`compress_config` field on `CompressedImageHDU`.**  Added
+alongside `quantize_config` to hold the user's full
+`CompressionConfigKind` (i.e., the `Gzip1(...) / Gzip2(...) /
+Rice1(...) / Hcompress1(...) / Plio1(...)` they passed to
+`compress=`).  Same-session `hdu.compression` returns the stored
+config so write-only params (`level`, and any future additions)
+round-trip via `.compression`.  At create time the stored cfg's
+`tile_shape` is replaced with the resolved value (the actual
+on-disk tile shape, after applying the algorithm's default-tile
+heuristic) so `.compression.tile_shape` returns the real value
+even when the user passed `Gzip1()` without specifying it.  For
+reopened HDUs the field is `None`; `.compression` falls back to
+rebuilding from header cards (level → None).
+
+`CompressionConfigKind` was moved from `fits.rs` (file-private)
+to `compression_config.rs` (`pub(crate)`) so the HDU can hold
+it.  The enum gained a `gzip_level()` accessor (Some for Gzip1/
+Gzip2, None for others) and a `with_resolved_tile_shape(ts)`
+method used at create time.  The write/extend/__setitem__
+dispatchers take `compress_config: &Arc<Mutex<Option<
+CompressionConfigKind>>>` and extract `gzip_level` from it,
+threading it through `IntTileCtx` / `FloatTileCtx` /
+`encode_quant_boundary_tile` / `AlgorithmEncodeParams` and into
+`encode_gzip1` / `encode_gzip2`.
+
+Tests in `tests/test_gzip_level.py` (26 cases): config-class API
+(default, repr, equality, validation), same-session round-trip,
+reopen loses level, file-size proxy (level=9 ≥ 10% smaller than
+level=1 on compressible data), bit-exact round-trip across all
+levels × Gzip1/Gzip2, level applies to extend + __setitem__,
+non-GZIP algorithms reject level kwarg.
+
 **BLANK / ZBLANK + MaskedArray support.**  Shipped 2026-05-23
 for both compressed and uncompressed image HDUs.
 

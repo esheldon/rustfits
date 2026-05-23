@@ -219,13 +219,16 @@ fn parse_hdus_from_file(
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
             ))?.into()
         } else if is_compressed_image {
-            // Reopened from disk: quantize_config is None.  Write
-            // path falls back to default qlevel=4.0; method+seed
-            // recover from ZQUANTIZ + ZDITHER0 cards.
+            // Reopened from disk: both write-only configs
+            // (quantize_config, compress_config) are None.  Write
+            // path falls back to defaults (qlevel=4.0, gzip level=
+            // codec default 6); method+seed recover from ZQUANTIZ
+            // + ZDITHER0 cards.  The .compression accessor builds
+            // a fresh CompressionConfigKind from the cards.
             Py::new(py, CompressedImageHDU::new(
                 header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
-                None,
+                None, None,
             ))?.into()
         } else if is_binary_table {
             Py::new(py, TableHDU::new(
@@ -269,7 +272,10 @@ fn parse_hdus_from_file(
 enum HduKind {
     Image,
     Table,
-    CompressedImage(Option<crate::zimage::compression_config::Quantize>),
+    CompressedImage {
+        quantize: Option<crate::zimage::compression_config::Quantize>,
+        compress_config: Option<CompressionConfigKind>,
+    },
 }
 
 // Round a byte count up to the next BLOCK_SIZE boundary.  Returns 0
@@ -410,108 +416,7 @@ pub(crate) struct FITS {
     tainted: TaintFlag,
 }
 
-// Internal wrapper over the compression-config pyclasses.  The
-// `compress=` argument to `create_image_hdu` may be any of the
-// per-algorithm config classes (`Gzip1`, `Gzip2`, ...).  Extracting
-// directly to one specific type would force a separate isinstance
-// branch per algorithm at the call site; this enum centralises the
-// "try each known class in turn" logic and exposes the small set of
-// shared accessors (tile shape, heap format, on-disk ZCMPTYPE name).
-enum CompressionConfigKind {
-    Gzip1(crate::zimage::compression_config::Gzip1),
-    Gzip2(crate::zimage::compression_config::Gzip2),
-    Rice1(crate::zimage::compression_config::Rice1),
-    Hcompress1(crate::zimage::compression_config::Hcompress1),
-    Plio1(crate::zimage::compression_config::Plio1),
-}
-
-impl CompressionConfigKind {
-    fn from_pyany(bound: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(g) = bound.extract::<
-            crate::zimage::compression_config::Gzip1>()
-        {
-            return Ok(Self::Gzip1(g));
-        }
-        if let Ok(g) = bound.extract::<
-            crate::zimage::compression_config::Gzip2>()
-        {
-            return Ok(Self::Gzip2(g));
-        }
-        if let Ok(r) = bound.extract::<
-            crate::zimage::compression_config::Rice1>()
-        {
-            return Ok(Self::Rice1(r));
-        }
-        if let Ok(h) = bound.extract::<
-            crate::zimage::compression_config::Hcompress1>()
-        {
-            return Ok(Self::Hcompress1(h));
-        }
-        if let Ok(p) = bound.extract::<
-            crate::zimage::compression_config::Plio1>()
-        {
-            return Ok(Self::Plio1(p));
-        }
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "compress= must be a compression-config object \
-             (e.g. rustfits.Gzip1(...), rustfits.Gzip2(...), \
-             rustfits.Rice1(...), rustfits.Hcompress1(...), \
-             rustfits.Plio1(...))"
-        ))
-    }
-
-    fn tile_shape(&self) -> &Option<Vec<u64>> {
-        match self {
-            Self::Gzip1(g) => &g.tile_shape,
-            Self::Gzip2(g) => &g.tile_shape,
-            Self::Rice1(r) => &r.tile_shape,
-            Self::Hcompress1(h) => &h.tile_shape,
-            Self::Plio1(p) => &p.tile_shape,
-        }
-    }
-
-    fn heap_format(&self) -> char {
-        match self {
-            Self::Gzip1(g) => g.heap_format,
-            Self::Gzip2(g) => g.heap_format,
-            Self::Rice1(r) => r.heap_format,
-            Self::Hcompress1(h) => h.heap_format,
-            Self::Plio1(p) => p.heap_format,
-        }
-    }
-
-    fn zcmptype(&self) -> &'static str {
-        match self {
-            Self::Gzip1(_) => "GZIP_1",
-            Self::Gzip2(_) => "GZIP_2",
-            Self::Rice1(_) => "RICE_1",
-            Self::Hcompress1(_) => "HCOMPRESS_1",
-            Self::Plio1(_) => "PLIO_1",
-        }
-    }
-
-    // Algorithm-specific (ZNAMEn, ZVALn) pairs to emit alongside
-    // the standard ZIMAGE header cards.  RICE_1 carries BLOCKSIZE
-    // and BYTEPIX so the decoder can pick the right parameter
-    // table; HCOMPRESS_1 carries SCALE and SMOOTH so the decoder
-    // can find the smoothing flag (and so the SCALE is documented
-    // even though the decoder reads it from the stream); GZIP
-    // variants have no extras.  Caller supplies the image BITPIX
-    // so we can compute BYTEPIX = bitpix/8.
-    fn extra_z_cards(&self, bitpix: i32) -> Vec<(&'static str, i64)> {
-        match self {
-            Self::Gzip1(_) | Self::Gzip2(_) | Self::Plio1(_) => Vec::new(),
-            Self::Rice1(r) => vec![
-                ("BLOCKSIZE", r.blocksize as i64),
-                ("BYTEPIX", (bitpix / 8) as i64),
-            ],
-            Self::Hcompress1(h) => vec![
-                ("SCALE", h.scale as i64),
-                ("SMOOTH", if h.smooth { 1 } else { 0 }),
-            ],
-        }
-    }
-}
+use crate::zimage::compression_config::CompressionConfigKind;
 
 // HCOMPRESS_1 default stripe height along the slow axis when the
 // user doesn't pass tile_shape.  Direct port of cfitsio's heuristic
@@ -577,12 +482,13 @@ impl FITS {
                 offsets, Arc::clone(&self.layout),
                 Arc::clone(&self.file), Arc::clone(&self.tainted),
             ))?.into(),
-            HduKind::CompressedImage(quantize_cfg) => {
+            HduKind::CompressedImage { quantize, compress_config } => {
                 Py::new(py, CompressedImageHDU::new(
                     trimmed, index, self.filename.clone(),
                     offsets, Arc::clone(&self.layout),
                     Arc::clone(&self.file), Arc::clone(&self.tainted),
-                    quantize_cfg,
+                    quantize,
+                    compress_config,
                 ))?.into()
             }
         };
@@ -1077,9 +983,19 @@ impl FITS {
 
         let offsets =
             append_header_and_data_to_file(&self.file, &cards, data_padded)?;
+        // Store the cfg with the RESOLVED tile_shape (the actual
+        // on-disk value) so .compression.tile_shape returns the
+        // real shape even when the user passed `Gzip1()` etc.
+        // without specifying tile_shape.  Same for the other
+        // algorithm configs.
+        let stored_cfg =
+            cfg.with_resolved_tile_shape(tile_shape_numpy.clone());
         self.finalize_hdu(
             py, &cards, offsets,
-            HduKind::CompressedImage(quantize_cfg),
+            HduKind::CompressedImage {
+                quantize: quantize_cfg,
+                compress_config: Some(stored_cfg),
+            },
         )
     }
 }

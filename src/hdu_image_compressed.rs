@@ -173,6 +173,19 @@ pub(crate) struct CompressedImageHDU {
     // (level=4.0).
     quantize_config:
         Arc<Mutex<Option<crate::zimage::compression_config::Quantize>>>,
+    // Full compression-config object (Gzip1 / Gzip2 / Rice1 /
+    // Hcompress1 / Plio1) as the user passed it to
+    // `create_image_hdu(compress=...)`.  Stored so that
+    // (a) write-only parameters like `Gzip1(level=...)` survive
+    // through write / extend / __setitem__ calls (they're not
+    // recoverable from the file), and (b) the `.compression`
+    // accessor returns the SAME object the user passed in (same-
+    // session round-trip).  For reopened HDUs this is None and
+    // `.compression` builds a fresh config from the cards via
+    // `build_compression_config`.
+    pub(crate) compress_config: Arc<
+        Mutex<Option<crate::zimage::compression_config::CompressionConfigKind>>,
+    >,
 }
 
 impl CompressedImageHDU {
@@ -186,6 +199,9 @@ impl CompressedImageHDU {
         tainted: TaintFlag,
         quantize_config:
             Option<crate::zimage::compression_config::Quantize>,
+        compress_config: Option<
+            crate::zimage::compression_config::CompressionConfigKind,
+        >,
     ) -> PyClassInitializer<Self> {
         let hdu = HDU::new(
             header, index, filename, offsets, layout, file, tainted,
@@ -195,6 +211,7 @@ impl CompressedImageHDU {
             .add_subclass(CompressedImageHDU {
                 cache: Arc::new(TileCache::new(DEFAULT_TILE_CACHE_BYTES)),
                 quantize_config: Arc::new(Mutex::new(quantize_config)),
+                compress_config: Arc::new(Mutex::new(compress_config)),
             })
     }
 }
@@ -341,6 +358,20 @@ impl CompressedImageHDU {
     fn compression(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
+        // Prefer the stored config (set at create time from the
+        // user's `compress=` argument) so write-only kwargs like
+        // `Gzip1(level=9)` round-trip via .compression within the
+        // same session.  For reopened HDUs the stored field is None
+        // and we fall back to rebuilding from header cards (level
+        // not recoverable from disk → comes back as None).
+        let stored: Option<crate::zimage::compression_config::CompressionConfigKind> =
+            slf.compress_config.lock()
+                .map_err(|_| PyIOError::new_err(
+                    "compress config lock poisoned"))?
+                .clone();
+        if let Some(cfg) = stored {
+            return compression_config_kind_to_py(py, cfg);
+        }
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         build_compression_config(py, &cards)
@@ -486,6 +517,7 @@ impl CompressedImageHDU {
         }
         let cache = Arc::clone(&slf.cache);
         let quantize_config = Arc::clone(&slf.quantize_config);
+        let compress_config = Arc::clone(&slf.compress_config);
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         write_compressed_image_data(
@@ -495,6 +527,7 @@ impl CompressedImageHDU {
             &cache,
             &super_.header,
             &quantize_config,
+            &compress_config,
         )
     }
 
@@ -508,6 +541,7 @@ impl CompressedImageHDU {
     ) -> PyResult<()> {
         let cache = Arc::clone(&slf.cache);
         let quantize_config = Arc::clone(&slf.quantize_config);
+        let compress_config = Arc::clone(&slf.compress_config);
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         extend_compressed_image_data(
@@ -521,6 +555,7 @@ impl CompressedImageHDU {
             &cache,
             &super_.header,
             &quantize_config,
+            &compress_config,
         )
     }
 
@@ -532,6 +567,7 @@ impl CompressedImageHDU {
     ) -> PyResult<()> {
         let cache = Arc::clone(&slf.cache);
         let quantize_config = Arc::clone(&slf.quantize_config);
+        let compress_config = Arc::clone(&slf.compress_config);
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         setitem_compressed_image(
@@ -544,6 +580,7 @@ impl CompressedImageHDU {
             &cache,
             &super_.header,
             &quantize_config,
+            &compress_config,
             key,
             value,
         )
@@ -1306,6 +1343,26 @@ fn parse_hcompress_smooth(header: &[String]) -> bool {
 // Errors: missing ZCMPTYPE → ValueError; unknown algorithm name →
 // the error from parse_algorithm.  Caller (the .compression getter)
 // surfaces both directly.
+// Wrap a CompressionConfigKind variant in a Py<PyAny> by handing
+// the inner per-algorithm pyclass to PyO3.  Used by the
+// `.compression` getter when the stored config (set at create
+// time) is present so the user gets back exactly what they passed
+// in — including write-only fields like `Gzip1(level=9)` that
+// aren't recoverable from the file.
+fn compression_config_kind_to_py(
+    py: Python<'_>,
+    cfg: crate::zimage::compression_config::CompressionConfigKind,
+) -> PyResult<Py<PyAny>> {
+    use crate::zimage::compression_config::CompressionConfigKind as K;
+    match cfg {
+        K::Gzip1(g) => Ok(Py::new(py, g)?.into_any()),
+        K::Gzip2(g) => Ok(Py::new(py, g)?.into_any()),
+        K::Rice1(r) => Ok(Py::new(py, r)?.into_any()),
+        K::Hcompress1(h) => Ok(Py::new(py, h)?.into_any()),
+        K::Plio1(p) => Ok(Py::new(py, p)?.into_any()),
+    }
+}
+
 fn build_compression_config(
     py: Python<'_>, cards: &[String],
 ) -> PyResult<Py<PyAny>> {
@@ -1338,9 +1395,13 @@ fn build_compression_config(
     use crate::zimage::CompressionAlgorithm;
     match algorithm {
         CompressionAlgorithm::Gzip1 => {
+            // level is not recoverable from the on-disk file —
+            // always return None.  Users wanting round-trip equality
+            // should compare with `Gzip1(level=None, ...)`.
             let cfg = Gzip1 {
                 tile_shape: Some(tile_shape),
                 heap_format,
+                level: None,
             };
             Ok(Py::new(py, cfg)?.into_any())
         }
@@ -1348,6 +1409,7 @@ fn build_compression_config(
             let cfg = Gzip2 {
                 tile_shape: Some(tile_shape),
                 heap_format,
+                level: None,
             };
             Ok(Py::new(py, cfg)?.into_any())
         }
@@ -2078,6 +2140,9 @@ struct IntTileCtx {
     inner_byte_width: u64,
     blocksize: u32,
     hcompress_scale: i32,
+    // None → codec default (zlib level 6).  Only consulted by
+    // GZIP_1 / GZIP_2 encoders; other algorithms ignore it.
+    gzip_level: Option<u32>,
 }
 
 // HDU-invariant context for the float-tile encode helper.
@@ -2092,6 +2157,10 @@ struct FloatTileCtx {
     method: crate::zimage::quantize::DitherMethod,
     qlevel: f64,
     zdither0: i64,
+    // GZIP level for the GZIP_1 lossless fallback path (and for
+    // the primary algo when it's GZIP_1/GZIP_2).  None → codec
+    // default (level 6).
+    gzip_level: Option<u32>,
 }
 
 // Encode one integer tile: run it through the chosen algorithm,
@@ -2110,6 +2179,7 @@ fn encode_tile_int(
         blocksize: ctx.blocksize,
         tile_shape_numpy: actual_shape,
         scale: ctx.hcompress_scale,
+        gzip_level: ctx.gzip_level,
     };
     let encoded = crate::zimage::encode_tile_from_bytes(
         ctx.algorithm, tile_bytes, ctx.bytepix, n_pixels,
@@ -2190,6 +2260,7 @@ fn encode_tile_float(
             blocksize: ctx.blocksize,
             tile_shape_numpy: actual_shape,
             scale: ctx.hcompress_scale,
+            gzip_level: ctx.gzip_level,
         };
         let encoded = crate::zimage::encode_tile_from_bytes(
             ctx.algorithm, &i32_be, 4, n_pixels, 32,
@@ -2218,7 +2289,8 @@ fn encode_tile_float(
         // — GZIP-compress the raw float bytes into the lossless
         // fallback column.  Primary descriptor stays empty so the
         // reader falls through to the GZIP fallback.
-        let encoded = crate::zimage::gzip::encode_gzip1(tile_bytes)?;
+        let encoded =
+            crate::zimage::gzip::encode_gzip1(tile_bytes, ctx.gzip_level)?;
         let off = fallback_heap.len() as u64;
         let nelem = encoded.len() as u64;
         fallback_heap.extend(encoded);
@@ -2258,6 +2330,7 @@ fn encode_quant_boundary_tile(
     inner_byte_width: u64,
     blocksize: u32,
     hcompress_scale: i32,
+    gzip_level: Option<u32>,
     old_main_buf: &[u8],
     tile_idx: u64,
     row_width: u64,
@@ -2315,6 +2388,7 @@ fn encode_quant_boundary_tile(
             blocksize,
             tile_shape_numpy: actual_shape,
             scale: hcompress_scale,
+            gzip_level,
         };
         let encoded = crate::zimage::encode_tile_from_bytes(
             algorithm, &i32_be, 4, n_pixels, 32, encode_params,
@@ -2333,7 +2407,8 @@ fn encode_quant_boundary_tile(
     } else {
         // Was in fallback: stay in fallback (lossless raw float
         // bytes, GZIP_1).  ZSCALE/ZZERO are placeholder.
-        let encoded = crate::zimage::gzip::encode_gzip1(combined_be)?;
+        let encoded =
+            crate::zimage::gzip::encode_gzip1(combined_be, gzip_level)?;
         let fb_off = fallback_heap.len() as u64;
         let nelem = encoded.len() as u64;
         fallback_heap.extend(encoded);
@@ -2384,6 +2459,9 @@ fn write_compressed_image_data(
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>
     >,
+    compress_config: &Arc<
+        Mutex<Option<crate::zimage::compression_config::CompressionConfigKind>>
+    >,
 ) -> PyResult<()> {
     check_not_tainted(tainted)?;
 
@@ -2394,6 +2472,21 @@ fn write_compressed_image_data(
         ))?;
     let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
     let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
+
+    // GZIP compression level (write-only param not recoverable
+    // from the on-disk file).  When the user passed Gzip1/Gzip2
+    // with an explicit level, the full config sits in
+    // compress_config (see HduKind::CompressedImage); read out
+    // just the level here.  For reopened HDUs or non-GZIP
+    // algorithms the value is None → encoder uses codec default
+    // (zlib level 6).
+    let gzip_level: Option<u32> = compress_config
+        .lock()
+        .map_err(|_| PyIOError::new_err(
+            "compress config lock poisoned",
+        ))?
+        .as_ref()
+        .and_then(|c| c.gzip_level());
     if image_shape.is_empty() {
         return Err(PyValueError::new_err(
             "compressed HDU has ZNAXIS=0 (no image data)"
@@ -2564,6 +2657,7 @@ fn write_compressed_image_data(
             inner_byte_width,
             blocksize: blocksize_opt.unwrap_or(32),
             hcompress_scale,
+            gzip_level,
         })
     } else {
         None
@@ -2578,6 +2672,7 @@ fn write_compressed_image_data(
             method: quant_method.unwrap(),
             qlevel,
             zdither0,
+            gzip_level,
         })
     } else {
         None
@@ -2927,6 +3022,9 @@ fn extend_compressed_image_data(
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
+    compress_config: &Arc<
+        Mutex<Option<crate::zimage::compression_config::CompressionConfigKind>>,
+    >,
 ) -> PyResult<()> {
     check_not_tainted(tainted)?;
 
@@ -2943,6 +3041,15 @@ fn extend_compressed_image_data(
     }
     let is_float = zbitpix < 0;
     let tfields = parse_keyword(cards, "TFIELDS").unwrap_or(0) as u64;
+
+    // GZIP level (write-only param; None → codec default).
+    let gzip_level: Option<u32> = compress_config
+        .lock()
+        .map_err(|_| PyIOError::new_err(
+            "compress config lock poisoned",
+        ))?
+        .as_ref()
+        .and_then(|c| c.gzip_level());
     // Three schema dispatches based on (is_float, tfields):
     //   integer:          single-col (TFIELDS=1)
     //   unquantized float: single-col (TFIELDS=1, quantize=None)
@@ -3126,6 +3233,7 @@ fn extend_compressed_image_data(
         inner_byte_width,
         blocksize,
         hcompress_scale,
+        gzip_level,
     };
     let be_dtype = match zbitpix {
         8 => ">u1",
@@ -3189,6 +3297,7 @@ fn extend_compressed_image_data(
         method,
         qlevel: level,
         zdither0: zd,
+        gzip_level,
     });
 
     // ----- encode boundary tiles -----
@@ -3298,6 +3407,7 @@ fn extend_compressed_image_data(
                     inner_byte_width,
                     blocksize,
                     hcompress_scale,
+                    gzip_level,
                     &old_main_buf,
                     tile_idx,
                     row_width,
@@ -3831,6 +3941,9 @@ fn setitem_compressed_image(
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
+    compress_config: &Arc<
+        Mutex<Option<crate::zimage::compression_config::CompressionConfigKind>>,
+    >,
     key: &Bound<'_, PyAny>,
     value: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
@@ -3852,6 +3965,15 @@ fn setitem_compressed_image(
     // Schema dispatch: quantized-float HDUs use 4-col rows;
     // integer + unquantized-float use 1-col rows.
     let is_quantized_float = is_float && tfields == 4;
+
+    // GZIP level (write-only param; None → codec default).
+    let gzip_level: Option<u32> = compress_config
+        .lock()
+        .map_err(|_| PyIOError::new_err(
+            "compress config lock poisoned",
+        ))?
+        .as_ref()
+        .and_then(|c| c.gzip_level());
 
     let bytepix: u32 = match zbitpix {
         8 => 1,
@@ -3986,6 +4108,7 @@ fn setitem_compressed_image(
         inner_byte_width,
         blocksize,
         hcompress_scale,
+        gzip_level,
     };
     let be_dtype = match zbitpix {
         8 => ">u1",
@@ -4137,6 +4260,7 @@ fn setitem_compressed_image(
                 inner_byte_width,
                 blocksize,
                 hcompress_scale,
+                gzip_level,
                 &main_buf,
                 tile_idx,
                 row_width,

@@ -124,12 +124,15 @@ pub(crate) fn decode_gzip2(
 // framing rather than raw deflate or zlib (see the Phase 4 notes
 // in CLAUDE.md for the framing gotcha).
 //
-// Compression level is `Compression::default()` (zlib level 6) —
-// same as cfitsio/zlib's default.  Not exposed as a knob yet;
-// neither fitsio nor astropy expose it at the high-level API
-// either.
-pub(crate) fn encode_gzip1(pixel_bytes_be: &[u8]) -> PyResult<Vec<u8>> {
-    gzip_compress(pixel_bytes_be, "GZIP_1")
+// Compression level: `None` (the default) uses zlib level 6 — the
+// same as cfitsio/zlib/astropy default.  Caller can pass
+// `Some(0..=9)` to override (0 = no compression, 1 = fastest /
+// least, 9 = slowest / best).  Exposed to Python via
+// `Gzip1(level=...)` / `Gzip2(level=...)`.
+pub(crate) fn encode_gzip1(
+    pixel_bytes_be: &[u8], level: Option<u32>,
+) -> PyResult<Vec<u8>> {
+    gzip_compress(pixel_bytes_be, "GZIP_1", level)
 }
 
 // Apply the GZIP_2 byte-shuffle preprocessor (inverse of
@@ -154,6 +157,7 @@ fn shuffle(pixels: &[u8], n_pixels: usize, bytepix: usize) -> Vec<u8> {
 pub(crate) fn encode_gzip2(
     pixel_bytes_be: &[u8],
     bytepix: u32,
+    level: Option<u32>,
 ) -> PyResult<Vec<u8>> {
     if !matches!(bytepix, 1 | 2 | 4 | 8) {
         return Err(PyValueError::new_err(format!(
@@ -168,19 +172,24 @@ pub(crate) fn encode_gzip2(
         )));
     }
     if bytepix == 1 {
-        return gzip_compress(pixel_bytes_be, "GZIP_2");
+        return gzip_compress(pixel_bytes_be, "GZIP_2", level);
     }
     let n_pixels = pixel_bytes_be.len() / bytepix as usize;
     let shuffled = shuffle(pixel_bytes_be, n_pixels, bytepix as usize);
-    gzip_compress(&shuffled, "GZIP_2")
+    gzip_compress(&shuffled, "GZIP_2", level)
 }
 
 // Shared gzip-compress primitive used by both GZIP_1 and GZIP_2
-// encoders.  Caller passes a label so error messages name the
-// algorithm.  Compression level is zlib default (6); see
-// `encode_gzip1` for rationale.
-fn gzip_compress(bytes: &[u8], algo_label: &str) -> PyResult<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+// encoders.  Caller passes a label (for error messages) and an
+// optional compression level.  None → zlib default (level 6).
+fn gzip_compress(
+    bytes: &[u8], algo_label: &str, level: Option<u32>,
+) -> PyResult<Vec<u8>> {
+    let compression = match level {
+        None => Compression::default(),
+        Some(v) => Compression::new(v),
+    };
+    let mut encoder = GzEncoder::new(Vec::new(), compression);
     encoder.write_all(bytes).map_err(|e| {
         PyValueError::new_err(format!("{} encode: write failed: {}", algo_label, e))
     })?;
