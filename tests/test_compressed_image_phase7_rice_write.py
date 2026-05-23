@@ -457,17 +457,9 @@ def test_i8_rice_rejected():
 # float round-trip coverage.
 
 
-def test_unsigned_trick_dtype_rejected():
-    """u2/u4/u8/i1 not yet supported on the compressed-write side."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fn = os.path.join(tmp, "t.fits.fz")
-        with rustfits.FITS(fn, "w+") as f:
-            with pytest.raises(NotImplementedError, match="unsigned"):
-                f.create_image_hdu(
-                    "u4",
-                    (16, 16),
-                    compress=rustfits.Rice1(tile_shape=(16, 16)),
-                )
+# test_unsigned_trick_dtype_rejected: removed — u2/u4/u8/i1 are
+# now supported for compressed writes via Gzip1/Gzip2/Rice1/
+# Hcompress1.  See tests/test_compressed_image_unsigned_trick.py.
 
 
 def test_input_shape_mismatch_rejected():

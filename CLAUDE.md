@@ -498,11 +498,14 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   all five integer-ZBITPIX encoders (`Gzip1`, `Gzip2`, `Rice1`,
   `Hcompress1`, `Plio1`); Phase 8 added float ZBITPIX writes via
   the new `Quantize` config object (`compress=Rice1(...)` +
-  `quantize=Quantize(level=..., method=..., seed=...)`).
-  Compressed `extend`/`__setitem__` are Phase 9+ (mutation).
-  Remaining follow-ups: unsigned-int trick dtypes
-  (i1/u2/u4/u8) on the compressed-write side; PLIO_1 + float
-  (rejected — non-negative-only encoder).
+  `quantize=Quantize(level=..., method=..., seed=...)`) plus
+  unquantized float writes via `quantize=None` (single-column
+  COMPRESSED_DATA with raw GZIP'd float bytes; requires Gzip1
+  or Gzip2).  Unsigned-int trick dtypes (i1/u2/u4/u8) work on
+  compressed writes for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
+  excluded — the reverse XOR produces negatives PLIO can't
+  encode).  Compressed `extend`/`__setitem__` are Phase 9+
+  (mutation).
 
 ### Table read
 
@@ -1479,14 +1482,22 @@ we worked for RICE:
     (matches Rice1 + GZIP/PLIO/HCOMPRESS reads).  Makes testing
     trivial via fitsio cross-write + heap-byte diff.
 
-- **Unsigned-int trick on write (i1/u2/u4/u8)** — reverse the
-  XOR view-cast before encoding; emit `BSCALE=1, BZERO=2^(n-1)`
-  cards.  Symmetric with `create_image_hdu`'s existing handling
-  for uncompressed HDUs.  All shipped encoders (GZIP_1/2, RICE_1)
-  currently reject these dtypes upfront in
-  `create_compressed_image_hdu_impl` (now also PLIO_1 and
-  HCOMPRESS_1 — all five algorithms share the rejection); the
-  branch tests `bzero.is_some()`, so the fix lives there.
+- ~~**Unsigned-int trick on write (i1/u2/u4/u8)**~~ — **Shipped
+  2026-05-23.**  Works for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
+  is rejected because the reverse XOR produces signed stored
+  values that include negatives, which PLIO's non-negative
+  encoder can't represent).  Implementation: re-uses
+  `hdu_image.rs::reverse_unsigned_trick`; the compressed-write
+  path's new `normalize_compressed_input_dtype` helper dispatches
+  fast-path (BITPIX-native input pass-through) vs reverse-XOR
+  based on the input dtype and the HDU's BSCALE/BZERO.  BSCALE/
+  BZERO cards are emitted at create time in
+  `create_compressed_image_hdu_impl` using the same pattern as
+  the uncompressed path.  See
+  `tests/test_compressed_image_unsigned_trick.py` (33 cases).
+  *Known limitation (not new):* astropy returns f8 (with
+  precision loss) on u8 + BZERO=2^63 — also affects uncompressed
+  u8.  rustfits's own round-trip is bit-exact.
 
 **Phase 8 — Quantized float compressed writes.**  Shipped (read +
 write).

@@ -1316,7 +1316,13 @@ fn normalize_input_dtype(
 // Same primitives (XOR with sign bit + view-cast for bit reinterpret)
 // applied in reverse.  Caller must guarantee input dtype matches the
 // scaled dtype for this BITPIX.
-fn reverse_unsigned_trick(
+//
+// `pub(crate)` because the compressed-write path
+// (`hdu_image_compressed.rs::write_compressed_image_data`) calls it
+// directly when the HDU has BSCALE=1 + BZERO=2^(n-1) configured —
+// the uncompressed `normalize_input_dtype` doesn't help because it
+// parses from regular NAXIS/BITPIX rather than the Z-prefixed cards.
+pub(crate) fn reverse_unsigned_trick(
     py: Python<'_>,
     arr: &Bound<'_, PyAny>,
     bitpix: i32,

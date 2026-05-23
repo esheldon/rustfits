@@ -72,7 +72,7 @@ fn validate_heap_format(heap_format: &str) -> PyResult<char> {
 /// preprocessing — the simplest of the FITS Tile Compression
 /// algorithms.  Pairs well with mostly-uniform integer data;
 /// for noisy data RICE_1 typically compresses tighter.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Gzip1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
@@ -157,7 +157,7 @@ impl Gzip1 {
 /// deflate compresses tighter than the interleaved layout of
 /// GZIP_1.  For 1-byte data the shuffle is a no-op, so GZIP_2
 /// and GZIP_1 produce identical output on `u1` images.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Gzip2 {
     pub(crate) tile_shape: Option<Vec<u64>>,
@@ -241,7 +241,7 @@ impl Gzip2 {
 /// (the encoder is a Phase 7 follow-up).  Until then, passing
 /// `compress=Plio1(...)` to `create_image_hdu` raises
 /// `NotImplementedError`.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Plio1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
@@ -328,7 +328,7 @@ impl Plio1 {
 /// reduces block artifacts — has no effect at `scale <= 1` since
 /// nothing is quantized).  Tiles must be 2-D; 1-D and 3-D images
 /// are rejected at create time.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hcompress1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
@@ -467,7 +467,7 @@ impl Hcompress1 {
 /// i32), so they would be unreadable outside rustfits.  Use
 /// Gzip2 for i64 data — within ~5% of RICE compression on real
 /// imagery and universally readable.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rice1 {
     pub(crate) tile_shape: Option<Vec<u64>>,
@@ -615,7 +615,7 @@ impl Rice1 {
 ///     uses a checksum of the data).  Positive values are passed
 ///     through verbatim — useful when reproducible output across
 ///     runs matters.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Quantize {
     pub(crate) level: f64,

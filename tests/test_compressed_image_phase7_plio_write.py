@@ -471,11 +471,17 @@ def test_float_compress_rejected():
 
 
 def test_unsigned_trick_dtype_rejected():
-    """u2/u4/u8/i1 not yet supported on the compressed-write side."""
+    """
+    PLIO + unsigned-int trick (i1/u2/u4/u8) is rejected with the
+    PLIO-specific error: the reverse XOR produces signed stored
+    values that include negatives, which PLIO's non-negative-only
+    encoder can't represent.  Other algorithms now accept these
+    dtypes — see tests/test_compressed_image_unsigned_trick.py.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
         with rustfits.FITS(fn, "w+") as f:
-            with pytest.raises(NotImplementedError, match="unsigned"):
+            with pytest.raises(NotImplementedError, match="PLIO"):
                 f.create_image_hdu(
                     "u4",
                     (16, 16),

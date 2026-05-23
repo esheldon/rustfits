@@ -623,20 +623,16 @@ impl FITS {
                 None
             };
         let is_unquantized_float = is_float && quantize_cfg.is_none();
-        if bzero.is_some() {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "compressed unsigned-int trick dtypes (i1/u2/u4/u8) \
-                 are not yet supported on write; pass the matching \
-                 signed dtype (i1→u1 mismatch, u2→i2, u4→i4, u8→i8) \
-                 for now, or wait for a Phase 7 follow-up"
-            ));
-        }
         // PLIO_1: integer-only mask data — float quantization
         // produces an i32 stream with negative values (bzero shifts
         // the range), which PLIO's non-negative-only encoder
         // refuses.  Reject upfront so the user gets a clear error
         // instead of a downstream "pixel is negative" failure.
         // Also reject i8 (bitpix=64) — PLIO has no 64-bit variant.
+        // Unsigned-int trick dtypes (u2/u4/u8) reverse-transform to
+        // negative signed stored values too, so we reject those for
+        // PLIO as well; the user wanting PLIO + mask data should
+        // pass plain u1/i2/i4 with no BZERO instead.
         if matches!(cfg, CompressionConfigKind::Plio1(_)) {
             if is_float {
                 return Err(pyo3::exceptions::PyNotImplementedError::new_err(
@@ -651,6 +647,16 @@ impl FITS {
                     "PLIO_1 does not support 64-bit pixels (i8 dtype): \
                      PLIO is designed for mask images with small \
                      non-negative integer values; use i2 or i4 instead."
+                ));
+            }
+            if bzero.is_some() {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "PLIO_1 does not support unsigned-int trick dtypes \
+                     (i1/u2/u4/u8): the FITS unsigned-int convention \
+                     reverse-transforms unsigned input into signed \
+                     stored values, which include negatives that PLIO's \
+                     non-negative-only encoder rejects.  Use u1 or \
+                     plain signed integer dtypes (i2/i4) instead."
                 ));
             }
         }
@@ -957,6 +963,26 @@ impl FITS {
         }
         if let Some(ver) = extver {
             cards.push(card_int("EXTVER", ver, "extension version"));
+        }
+        // Unsigned-int trick: same pattern as the uncompressed image
+        // path above.  User-facing dtype was u2/u4/u8/i1 but the
+        // on-disk ZBITPIX is the opposite signedness.  Emit BSCALE/
+        // BZERO as regular (NOT Z-prefixed) cards so readers
+        // (rustfits + astropy + cfitsio) recover the original dtype
+        // when they decompress and apply scaling.
+        if let Some(bz) = bzero {
+            cards.push(card_int(
+                "BSCALE", 1, "default linear scaling"));
+            let bz_card = if bz > i64::MAX as f64 {
+                card_uint(
+                    "BZERO", bz as u64,
+                    "offset for unsigned-int storage")
+            } else {
+                card_int(
+                    "BZERO", bz as i64,
+                    "offset for unsigned-int storage")
+            };
+            cards.push(bz_card);
         }
         cards.push(pad_to_card("END"));
 

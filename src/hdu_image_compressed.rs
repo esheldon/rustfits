@@ -604,6 +604,83 @@ fn zbitpix_to_native_dtype(zbitpix: i32) -> PyResult<&'static str> {
     }
 }
 
+// Compressed-write counterpart of hdu_image.rs::normalize_input_dtype.
+// Inspects the HDU's BSCALE/BZERO (regular header cards, NOT
+// Z-prefixed) and the input array's dtype:
+//
+//   - Input dtype matches ZBITPIX (e.g. i2 for ZBITPIX=16):
+//     pass through unchanged.
+//   - HDU has the unsigned-int trick (BSCALE=1 + BZERO=2^(n-1) or
+//     -128 for ZBITPIX=8) AND input dtype matches the SCALED form
+//     (e.g. u2 for ZBITPIX=16 + BZERO=32768): reverse_unsigned_trick
+//     XORs the sign bit to produce the BITPIX-native bytes the
+//     encoder needs.
+//   - Otherwise (input doesn't match either): error.
+//
+// Integer ZBITPIX only — caller is responsible for skipping this
+// for float HDUs (where BSCALE/BZERO would be a malformed file
+// since the spec forbids them on floating-point arrays).
+fn normalize_compressed_input_dtype(
+    py: Python<'_>,
+    arr: &Bound<'_, PyAny>,
+    cards: &[String],
+    zbitpix: i32,
+) -> PyResult<Py<PyAny>> {
+    let dtype = arr.getattr("dtype")?;
+    let input_kind: String = dtype.getattr("kind")?.extract()?;
+    let input_size: u64 = dtype.getattr("itemsize")?.extract()?;
+    let expected = zbitpix_to_native_dtype(zbitpix)?;
+    let (expected_kind, expected_size) = match expected {
+        "u1" => ("u", 1u64),
+        "i2" => ("i", 2),
+        "i4" => ("i", 4),
+        "i8" => ("i", 8),
+        _ => unreachable!("integer ZBITPIX expected"),
+    };
+
+    // Fast path: input already in ZBITPIX-native dtype.
+    if input_kind == expected_kind && input_size == expected_size {
+        return Ok(arr.clone().unbind());
+    }
+
+    // Scaled-dtype input?  Check BSCALE/BZERO match the
+    // unsigned-int trick for this ZBITPIX.
+    let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
+    let kind = crate::hdu_image::image_scaling_kind(zbitpix, bscale, bzero);
+    if matches!(kind, crate::hdu_image::ScalingKind::UnsignedTrick) {
+        // Expected scaled dtype is the opposite signedness.
+        let (scaled_kind, scaled_size): (&str, u64) = match zbitpix {
+            8 => ("i", 1),   // u1 stored ← i1 scaled (BZERO=-128)
+            16 => ("u", 2),  // i2 stored ← u2 scaled (BZERO=32768)
+            32 => ("u", 4),
+            64 => ("u", 8),
+            _ => unreachable!("unsigned trick on non-int ZBITPIX"),
+        };
+        if input_kind == scaled_kind && input_size == scaled_size {
+            return crate::hdu_image::reverse_unsigned_trick(
+                py, arr, zbitpix,
+            );
+        }
+    }
+
+    Err(PyValueError::new_err(format!(
+        "compressed image write: input dtype '{}{}' does not match \
+         the HDU's ZBITPIX={} (expected '{}{}'{})",
+        input_kind, input_size, zbitpix, expected_kind, expected_size,
+        if matches!(kind, crate::hdu_image::ScalingKind::UnsignedTrick) {
+            match zbitpix {
+                8 => " or scaled 'i1' (BZERO=-128)",
+                16 => " or scaled 'u2' (BZERO=32768)",
+                32 => " or scaled 'u4' (BZERO=2^31)",
+                64 => " or scaled 'u8' (BZERO=2^63)",
+                _ => "",
+            }
+        } else {
+            ""
+        },
+    )))
+}
+
 // Detect ZIMAGE=T in a BINTABLE header.  Called from
 // parse_hdus_from_file's dispatch to route to CompressedImageHDU
 // instead of TableHDU.  Looks for a logical-T card; tolerant of
@@ -2191,8 +2268,8 @@ fn write_compressed_image_data(
 
     // ----- input ndarray validation -----
     let np = py.import("numpy")?;
-    let ascontig = np.call_method1("ascontiguousarray", (data,))?;
-    let in_shape: Vec<usize> = ascontig.getattr("shape")?.extract()?;
+    let ascontig0 = np.call_method1("ascontiguousarray", (data,))?;
+    let in_shape: Vec<usize> = ascontig0.getattr("shape")?.extract()?;
     let expected_shape: Vec<usize> =
         image_shape.iter().map(|&d| d as usize).collect();
     if in_shape != expected_shape {
@@ -2201,6 +2278,24 @@ fn write_compressed_image_data(
             in_shape, expected_shape
         )));
     }
+
+    // ----- unsigned-int trick reverse-transform -----
+    // If the HDU has BSCALE=1 + BZERO=2^(n-1) (or -128 for i1) AND
+    // the input dtype is the scaled form (u2/u4/u8 for BITPIX
+    // 16/32/64, i1 for BITPIX 8), reverse-transform via XOR so the
+    // encoder receives the on-disk (BITPIX-native) bytes.  Fast
+    // path: input already matches BITPIX → pass through unchanged.
+    // Float HDUs (is_float) never trigger this path — BSCALE/BZERO
+    // are only checked for integer ZBITPIX.
+    let ascontig_owned = if !is_float {
+        normalize_compressed_input_dtype(
+            py, &ascontig0, cards, zbitpix,
+        )?
+    } else {
+        ascontig0.clone().unbind()
+    };
+    let ascontig = ascontig_owned.bind(py);
+
     // Convert each tile to the expected on-disk byte order in one
     // pass via numpy.  Integer ZBITPIX → u1/i2/i4/i8; float ZBITPIX
     // → f4/f8 (so we can re-extract the floats for quantization).
