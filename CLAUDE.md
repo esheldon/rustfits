@@ -1599,6 +1599,77 @@ per-tile.  Heap-byte equality would require a more painstaking
 port of cfitsio's qsort tie-breaking; not worth doing absent a
 specific need.
 
+*Pending follow-up: implement `Quantize(method='none')` write
+path.*  The kwarg is currently accepted at create time and writes
+`ZQUANTIZ='NONE'` to the header, but `.write(data)` raises
+`NotImplementedError` (see `hdu_image_compressed.rs` near the
+`compressed-float write with ZQUANTIZ='NONE'` message).  The
+intent is: every tile stored losslessly as GZIP-1 compressed
+raw float bytes in the GZIP_COMPRESSED_DATA column, no
+quantization at all.
+
+The design has four interacting standards-compliance × UX
+choices that need a decision before coding.  Standards
+landscape:
+
+|  | FITS spec | cfitsio | astropy |
+|--|--|--|--|
+| ZQUANTIZ for unquantized | omit | omit OR `'NONE'` | `'NONE'` |
+| ZCMPTYPE | spec silent | reflects user's choice (e.g. `RICE_1` even when nothing gets RICE'd) | same |
+| Schema | varies | typically still 4 columns | typically still 4 columns |
+| Inner GZIP for fallback | GZIP_1 | GZIP_1 | GZIP_1 |
+
+Read-side already handles both signals (`ZQUANTIZ='NONE'`
+explicit AND absent + missing ZSCALE/ZZERO columns).
+
+Open decisions (waiting on user input):
+
+1.  **`ZCMPTYPE` value when `method='none'`.**
+    - (A) Honor `compress=` even though every tile actually
+      gets GZIP_1 in the fallback column.  Matches cfitsio /
+      astropy convention; misleading header.
+    - (B, my recommendation) Require `compress=Gzip1(...)` and
+      reject other algorithms with a clear error.  Header
+      matches reality; teaches the user the relationship.
+
+2.  **`ZQUANTIZ` keyword.**
+    - (A, my recommendation) Emit `'NONE'`.  Matches astropy
+      in the wild; our reader already accepts it; explicit
+      "I considered quantization and chose not to".
+    - (B) Omit `ZQUANTIZ` entirely (strict spec).
+
+3.  **Column layout.**
+    - (A, my recommendation) Keep the 4-column schema same as
+      the quantized case (COMPRESSED_DATA + ZSCALE + ZZERO +
+      GZIP_COMPRESSED_DATA).  ZSCALE/ZZERO get placeholder
+      values (1.0 / 0.0) per row.  Consistency wins over the
+      small per-tile overhead.
+    - (B) Drop ZSCALE/ZZERO when `method='none'`; emit a
+      2-column schema (COMPRESSED_DATA + GZIP_COMPRESSED_DATA).
+      Strict-spec; creates two different schemas for
+      "compressed float HDU".
+
+4.  **Headers to skip.**  Regardless of which schema we pick,
+    `ZDITHER0` and `ZBLANK` should NOT be emitted when
+    `method='none'` (no dither stream is in use, no quantized
+    NaN sentinel to mark).
+
+If all my recommendations are accepted (B / A / A / skip both),
+the implementation is small:
+  - `fits.rs::create_compressed_image_hdu_impl`: when
+    `quantize_cfg.method == None_`, validate
+    `matches!(cfg, CompressionConfigKind::Gzip1(_))` (clear
+    error otherwise); skip ZDITHER0 + ZBLANK emission.
+  - `hdu_image_compressed.rs::encode_tile_float`: when
+    `method == None_`, skip `quantize_double/float` entirely
+    and route every tile to the GZIP fallback (the existing
+    `qt_opt = None` branch already does the right thing).
+  - Replace the current `NotImplementedError` in
+    `write_compressed_image_data` with the dispatch above.
+  - Tests: round-trip across f4/f8, fitsio cross-read agreement,
+    confirm ZDITHER0 + ZBLANK absent, confirm every primary
+    descriptor empty.
+
 **Phase 9+ — Mutation.**  `CompressedImageHDU.extend` and
 `__setitem__`.  Changing a single pixel requires re-encoding the
 affected tile and possibly re-laying out the heap (same problem
