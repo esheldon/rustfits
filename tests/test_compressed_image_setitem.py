@@ -449,20 +449,11 @@ def test_empty_slice_is_noop():
 # ---------------------- rejections --------------------------------
 
 
-def test_quantized_float_setitem_rejected():
-    """__setitem__ on quantized-float HDUs is deferred."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fn = os.path.join(tmp, "t.fits.fz")
-        with rustfits.FITS(fn, "w+") as f:
-            f.create_image_hdu(
-                "f4",
-                (16,),
-                compress=rustfits.Gzip1(tile_shape=(16,)),
-                quantize=rustfits.Quantize(method="dither1"),
-            )
-            f[1].write(np.arange(16, dtype="f4"))
-            with pytest.raises(NotImplementedError, match="quantized"):
-                f[1][0] = 99.0
+# test_quantized_float_setitem_rejected: removed — quantized-float
+# __setitem__ is now supported with the careful re-encoding scheme
+# (re-uses existing per-tile bscale/bzero/seed to avoid compounding
+# loss on unchanged pixels).  See
+# tests/test_compressed_image_quant_mutation.py.
 
 
 def test_shape_mismatch_rejected():

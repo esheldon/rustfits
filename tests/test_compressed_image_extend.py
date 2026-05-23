@@ -446,25 +446,11 @@ def test_empty_data_rejected():
                 f[1].extend(np.empty(0, dtype="i4"))
 
 
-def test_quantized_float_extend_rejected():
-    """
-    Extend on quantized-float HDUs (4-column schema) is deferred.
-    Clear error pointing the user at quantize=None.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        fn = os.path.join(tmp, "t.fits.fz")
-        rng = np.random.default_rng(0)
-        initial = rng.standard_normal(32).astype("f4")
-        with rustfits.FITS(fn, "w+") as f:
-            f.create_image_hdu(
-                "f4",
-                (32,),
-                compress=rustfits.Gzip1(tile_shape=(16,)),
-                quantize=rustfits.Quantize(method="dither1"),
-            )
-            f[1].write(initial)
-            with pytest.raises(NotImplementedError, match="quantized"):
-                f[1].extend(np.zeros(8, dtype="f4"))
+# test_quantized_float_extend_rejected: removed — quantized-float
+# extend is now supported with the careful re-encoding scheme
+# (re-uses existing per-tile bscale/bzero/seed to avoid compounding
+# loss on unchanged pixels).  See
+# tests/test_compressed_image_quant_mutation.py.
 
 
 def test_axis_count_mismatch_rejected():

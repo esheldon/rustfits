@@ -1079,6 +1079,163 @@ pub(crate) fn quantize_double(
     })
 }
 
+// Quantize with the caller-supplied (bscale, bzero, dither seed) —
+// no noise estimation, no scale picking.  Used by extend/__setitem__
+// on quantized-float HDUs to re-encode tiles after partial
+// modification: re-using the existing per-tile bscale/bzero AND
+// the same row_1based seed makes `requantize(dequantize(stored))`
+// idempotent for unchanged pixels, so they round-trip with NO
+// compounding quantization loss.  Modified pixels still pay one
+// round of quantization noise (unavoidable for lossy).
+//
+// Returns `Err(msg)` when any pixel quantizes outside the legal
+// i32 range minus reserved values — caller should surface this to
+// the user as "value too large/small to fit the existing tile's
+// quantization scale".  Caller advises dropping to `quantize=None`
+// for unrestricted mutation.
+//
+// Per-pixel semantics match quantize_float exactly: NaN →
+// NULL_VALUE_I32 regardless of dither method; SUBTRACTIVE_DITHER_2
+// + exact zero → ZERO_VALUE_I32; dither stream advances per pixel
+// regardless of sentinel hits (preserves cfitsio's dither sequence).
+pub(crate) fn requantize_float_fixed_scale(
+    fdata: &[f32],
+    bscale: f64,
+    bzero: f64,
+    method: DitherMethod,
+    row_1based: u64,
+    dither_seed: i64,
+) -> Result<Vec<i32>, String> {
+    if bscale == 0.0 || !bscale.is_finite() {
+        return Err(format!(
+            "requantize: invalid bscale {} (must be finite and non-zero)",
+            bscale
+        ));
+    }
+    let mut dither = if row_1based > 0 {
+        Some(DitherStream::new(row_1based, dither_seed))
+    } else {
+        None
+    };
+    let lo_legal = (i32::MIN as i64) + N_RESERVED_VALUES as i64;
+    let hi_legal = i32::MAX as i64;
+    let mut idata: Vec<i32> = Vec::with_capacity(fdata.len());
+    for (i, &v) in fdata.iter().enumerate() {
+        if is_null_f32(v, Some(f32::NAN)) {
+            idata.push(NULL_VALUE_I32);
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
+            }
+            continue;
+        }
+        if matches!(method, DitherMethod::SubtractiveDither2) && v == 0.0 {
+            idata.push(ZERO_VALUE_I32);
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
+            }
+            continue;
+        }
+        let unscaled = (v as f64 - bzero) / bscale;
+        let q_i64 = if let Some(ds) = dither.as_mut() {
+            let offset = ds.next_offset() as f64;
+            (unscaled + offset - 0.5).round() as i64
+        } else {
+            unscaled.round() as i64
+        };
+        if q_i64 < lo_legal || q_i64 > hi_legal {
+            return Err(out_of_range_message(
+                i, v as f64, q_i64, lo_legal, hi_legal, bscale, bzero,
+            ));
+        }
+        idata.push(q_i64 as i32);
+    }
+    Ok(idata)
+}
+
+// f64 sibling of `requantize_float_fixed_scale`.
+pub(crate) fn requantize_double_fixed_scale(
+    fdata: &[f64],
+    bscale: f64,
+    bzero: f64,
+    method: DitherMethod,
+    row_1based: u64,
+    dither_seed: i64,
+) -> Result<Vec<i32>, String> {
+    if bscale == 0.0 || !bscale.is_finite() {
+        return Err(format!(
+            "requantize: invalid bscale {} (must be finite and non-zero)",
+            bscale
+        ));
+    }
+    let mut dither = if row_1based > 0 {
+        Some(DitherStream::new(row_1based, dither_seed))
+    } else {
+        None
+    };
+    let lo_legal = (i32::MIN as i64) + N_RESERVED_VALUES as i64;
+    let hi_legal = i32::MAX as i64;
+    let mut idata: Vec<i32> = Vec::with_capacity(fdata.len());
+    for (i, &v) in fdata.iter().enumerate() {
+        if is_null_f64(v, Some(f64::NAN)) {
+            idata.push(NULL_VALUE_I32);
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
+            }
+            continue;
+        }
+        if matches!(method, DitherMethod::SubtractiveDither2) && v == 0.0 {
+            idata.push(ZERO_VALUE_I32);
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
+            }
+            continue;
+        }
+        let unscaled = (v - bzero) / bscale;
+        let q_i64 = if let Some(ds) = dither.as_mut() {
+            let offset = ds.next_offset() as f64;
+            (unscaled + offset - 0.5).round() as i64
+        } else {
+            unscaled.round() as i64
+        };
+        if q_i64 < lo_legal || q_i64 > hi_legal {
+            return Err(out_of_range_message(
+                i, v, q_i64, lo_legal, hi_legal, bscale, bzero,
+            ));
+        }
+        idata.push(q_i64 as i32);
+    }
+    Ok(idata)
+}
+
+fn out_of_range_message(
+    pixel_idx: usize,
+    value: f64,
+    quantized: i64,
+    lo_legal: i64,
+    hi_legal: i64,
+    bscale: f64,
+    bzero: f64,
+) -> String {
+    format!(
+        "requantize: pixel {} value {:.6e} doesn't fit the tile's \
+         existing per-tile quantization scale (bscale={:.6e}, \
+         bzero={:.6e}; would quantize to {} which is outside the legal \
+         stored range [{}, {}]).  The per-tile bscale was chosen when \
+         this tile was first written; modifying values outside that \
+         scale would require re-quantizing the entire tile, which \
+         would compound quantization noise on the unchanged pixels — \
+         so this is rejected.  To support wider value ranges you need \
+         to RECREATE the file (the schema can't be widened in place) \
+         with one of: (1) quantize=Quantize(level=N) for a smaller N \
+         (default level=4.0 ~ noise/4; try level=2.0 or 1.0 for \
+         coarser scales that admit wider ranges), (2) \
+         quantize=Quantize(level=-bscale_value) to pin bscale \
+         explicitly, or (3) quantize=None for lossless raw-float \
+         GZIP storage (larger files, no precision loss).",
+        pixel_idx, value, bscale, bzero, quantized, lo_legal, hi_legal,
+    )
+}
+
 // Round to nearest integer, ties away from zero — mirror of
 // cfitsio's `NINT` macro `(x >= 0.) ? (int)(x + 0.5) : (int)(x - 0.5)`.
 // Saturates to i32 bounds on overflow (shouldn't happen because
@@ -1340,5 +1497,102 @@ mod tests {
         assert_eq!(nint(1.4), 1);
         assert_eq!(nint(-1.4), -1);
         assert_eq!(nint(0.0), 0);
+    }
+
+    // The load-bearing property of requantize_*_fixed_scale:
+    // re-quantizing a dequantized stream with the same parameters
+    // reproduces the original stream exactly.  This is what makes
+    // partial __setitem__ / extend on quantized HDUs safe — pixels
+    // outside the modification region pay zero compounding loss.
+    #[test]
+    fn requantize_is_idempotent_no_dither_f32() {
+        let stored_in: Vec<i32> = vec![-5, 0, 7, 13, 42, -100];
+        let bscale = 0.5;
+        let bzero = 10.0;
+        // dequantize → physical floats
+        let de = dequantize_to_f32(
+            &stored_in, bscale, bzero, DitherMethod::NoDither, 0, 0,
+        );
+        let phys: Vec<f32> = de.chunks(4)
+            .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        // requantize with the SAME bscale, bzero, dither setup
+        let stored_out = requantize_float_fixed_scale(
+            &phys, bscale, bzero, DitherMethod::NoDither, 0, 0,
+        )
+        .expect("must succeed for in-range input");
+        assert_eq!(stored_out, stored_in);
+    }
+
+    #[test]
+    fn requantize_is_idempotent_dither1_f32() {
+        let stored_in: Vec<i32> = vec![-5, 0, 7, 13, 42, -100];
+        let bscale = 0.5;
+        let bzero = 10.0;
+        let row_1based = 1;
+        let dither_seed = 1;
+        let de = dequantize_to_f32(
+            &stored_in, bscale, bzero,
+            DitherMethod::SubtractiveDither1,
+            row_1based, dither_seed,
+        );
+        let phys: Vec<f32> = de.chunks(4)
+            .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        let stored_out = requantize_float_fixed_scale(
+            &phys, bscale, bzero,
+            DitherMethod::SubtractiveDither1,
+            row_1based, dither_seed,
+        )
+        .expect("must succeed for in-range input");
+        assert_eq!(stored_out, stored_in);
+    }
+
+    #[test]
+    fn requantize_is_idempotent_no_dither_f64() {
+        let stored_in: Vec<i32> = vec![-5, 0, 7, 13, 42, -100];
+        let bscale = 0.5;
+        let bzero = 10.0;
+        let de = dequantize_to_f64(
+            &stored_in, bscale, bzero, DitherMethod::NoDither, 0, 0,
+        );
+        let phys: Vec<f64> = de.chunks(8)
+            .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        let stored_out = requantize_double_fixed_scale(
+            &phys, bscale, bzero, DitherMethod::NoDither, 0, 0,
+        )
+        .expect("must succeed for in-range input");
+        assert_eq!(stored_out, stored_in);
+    }
+
+    #[test]
+    fn requantize_rejects_out_of_range() {
+        // bscale=0.01, bzero=0 → values must fit within
+        // [(i32::MIN+10)*0.01, i32::MAX*0.01] ≈ [-2.15e7, 2.15e7].
+        // 1e10 is way outside.
+        let phys = vec![0.0_f32, 1e10_f32];
+        let err = requantize_float_fixed_scale(
+            &phys, 0.01, 0.0, DitherMethod::NoDither, 0, 0,
+        )
+        .expect_err("must reject out-of-range value");
+        assert!(err.contains("outside the legal stored range"));
+        assert!(err.contains("RECREATE the file"));
+        assert!(err.contains("quantize=None"));
+    }
+
+    #[test]
+    fn requantize_preserves_nan() {
+        let phys = vec![1.0_f32, f32::NAN, 3.0_f32];
+        let out = requantize_float_fixed_scale(
+            &phys, 0.5, 0.0,
+            DitherMethod::SubtractiveDither1, 1, 1,
+        )
+        .expect("NaN handling must not error");
+        // Middle pixel should be NULL_VALUE_I32.
+        assert_eq!(out[1], NULL_VALUE_I32);
+        // Surrounding pixels not the sentinel.
+        assert_ne!(out[0], NULL_VALUE_I32);
+        assert_ne!(out[2], NULL_VALUE_I32);
     }
 }

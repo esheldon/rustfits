@@ -505,12 +505,19 @@ through the f8 intermediate); the upper bound check uses 2^63 -
   compressed writes for Gzip1/Gzip2/Rice1/Hcompress1 (PLIO_1
   excluded — the reverse XOR produces negatives PLIO can't
   encode).  `CompressedImageHDU.extend(data)` appends rows along
-  numpy axis 0 (integer + unsigned-trick + unquantized-float
-  HDUs).  `CompressedImageHDU.__setitem__` modifies pixels
-  in place via the same slice surface as `__getitem__` (single
-  pixel, row/col, contiguous slices, stepped slices, scalar
-  broadcast, array RHS).  Quantized-float `extend` and
-  `__setitem__` deferred until a real workload pushes for them.
+  numpy axis 0; `CompressedImageHDU.__setitem__` modifies
+  pixels in place via the same slice surface as `__getitem__`
+  (single pixel, row/col, contiguous slices, stepped slices,
+  scalar broadcast, array RHS).  Both work for integer +
+  unsigned-trick + unquantized-float + **quantized-float**
+  HDUs.  Quantized mutation reuses each tile's existing
+  per-tile bscale/bzero/dither seed via
+  `requantize_*_fixed_scale` so unchanged pixels round-trip
+  with NO compounding quantization loss — verified bit-exact
+  in tests.  Values that don't fit the existing per-tile scale
+  are rejected with a clear error that names the recovery
+  options (recreate the file with a coarser `Quantize(level=)`
+  or with `quantize=None` for lossless storage).
 
 ### Table read
 
@@ -1709,9 +1716,12 @@ generic, Plio1 algorithm-specific, removed
 `Quantize(method='none')` spelling).
 
 **Phase 9 — `CompressedImageHDU.extend(data)`.**  Shipped
-2026-05-23 for integer, unsigned-int trick, and unquantized-float
-HDUs (all 5 algorithms except PLIO_1 paired with unsigned trick).
-Quantized-float extend is the remaining gap.
+2026-05-23 for integer, unsigned-int trick, unquantized-float,
+and quantized-float HDUs (all 5 algorithms except PLIO_1
+paired with unsigned trick).  The quantized-float path reuses
+each tile's existing per-tile bscale/bzero/dither seed so
+unchanged pixels round-trip with NO compounding loss — see
+"Quantized-float mutation" section below.
 
 API: `extend(data)` — no `start=` kwarg.  In-place writes to
 existing tile rows are `__setitem__`'s job (re-encode affected
@@ -1739,9 +1749,8 @@ extends, astropy cross-read, non-last HDU growth, unquantized
 float, all rejection paths.
 
 **Phase 9 — `CompressedImageHDU.__setitem__(key, value)`.**
-Shipped 2026-05-23 for integer, unsigned-int trick, and
-unquantized-float HDUs.  Quantized-float `__setitem__` deferred
-(same scope cut as quantized extend).
+Shipped 2026-05-23 for integer, unsigned-int trick,
+unquantized-float, and quantized-float HDUs.
 
 API: same slice surface as `__getitem__` (slice / int / ellipsis
 per axis, stepped slices, mixed combinations).  RHS is a scalar
@@ -1775,6 +1784,46 @@ modifying the same tiles, the heap grows monotonically with
 orphaned bytes.  A future "compact" / "repack" operation could
 rewrite the heap with only live tiles, but isn't worth the
 complexity until a workload demonstrably needs it.
+
+**Quantized-float mutation (extend + __setitem__).**  Shipped
+2026-05-23.  When extending or mutating a tile that was
+originally stored in the **primary** (quantized i32) column,
+rustfits reuses the EXISTING per-tile bscale/bzero (read from
+the tile's ZSCALE/ZZERO row entries) AND the existing dither
+seed (deterministic from `row_1based` + `ZDITHER0`).  This
+makes `requantize(dequantize(stored))` idempotent: unchanged
+pixels in the modified tile round-trip BIT-EXACT — no
+compounding quantization noise.  Verified by tests in
+`tests/test_compressed_image_quant_mutation.py` (24 cases)
+that compare a reference no-mutation file against a post-
+mutation file across f4/f8 × {no_dither, dither1, dither2}.
+
+Tiles originally in the **GZIP fallback** column (lossless raw
+float bytes, used when the original quantize couldn't fit the
+range) stay in the fallback after modification — re-encoded as
+GZIP_1 of the modified raw float bytes.  No new precision loss.
+
+**Out-of-range rejection.**  If a user writes a value that
+doesn't fit the tile's existing per-tile bscale/bzero (after
+the unscale arithmetic the i32 stored value would land outside
+the legal range), the mutation is rejected with a clear error
+message that names the three recovery options: (1) recreate
+the file with `Quantize(level=N)` for a smaller N (coarser
+scales admit wider ranges), (2) recreate with
+`Quantize(level=-bscale)` to pin bscale explicitly, or
+(3) recreate with `quantize=None` for lossless raw-float GZIP.
+The error message also reports the failing pixel index, value,
+and the tile's bscale/bzero so the user can size the new
+scale.
+
+Implementation in
+`src/zimage/quantize.rs::requantize_float_fixed_scale` /
+`requantize_double_fixed_scale` (idempotency anchored by
+Rust unit tests).  The mutation dispatchers
+(`extend_compressed_image_data` and `setitem_compressed_image`)
+read each affected tile's primary descriptor to detect
+primary-vs-fallback storage, then route through
+`encode_quant_boundary_tile` which handles both cases.
 
 ## Build / dev workflow
 

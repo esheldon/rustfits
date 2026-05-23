@@ -2204,6 +2204,121 @@ fn encode_tile_float(
     }
 }
 
+// Encode a boundary tile for the quantized-float extend / __setitem__
+// path.  The tile has already been decoded + combined-with-new-data
+// upstream; this helper does the requantize-and-encode step.
+//
+// Dispatches on whether the existing tile was stored in the primary
+// column (had a non-empty primary descriptor before the call) or in
+// the GZIP fallback (primary nelem == 0).  Tiles stored in primary
+// stay in primary — re-quantized with the EXISTING per-tile bscale/
+// bzero so unchanged pixels round-trip exactly.  Tiles stored in
+// the fallback stay in the fallback — re-encoded as GZIP_1 raw
+// float bytes (the fallback always works, so we don't try to
+// promote them back to primary).
+//
+// `combined_be` is the full re-formed tile in FITS big-endian float
+// bytes (f4 or f8 matching `zbitpix`).  Returns a TileRow ready for
+// descriptor emission; encoded bytes are appended to the right
+// heap buffer (`primary_heap` for primary path, `fallback_heap`
+// for fallback path).
+#[allow(clippy::too_many_arguments)]
+fn encode_quant_boundary_tile(
+    algorithm: crate::zimage::CompressionAlgorithm,
+    zbitpix: i32,
+    inner_byte_width: u64,
+    blocksize: u32,
+    hcompress_scale: i32,
+    old_main_buf: &[u8],
+    tile_idx: u64,
+    row_width: u64,
+    descriptor_size: u64,
+    heap_is_q: bool,
+    quant_setup: (
+        crate::zimage::quantize::DitherMethod,
+        i64,
+        f64,
+    ),
+    combined_be: &[u8],
+    actual_shape: &[u64],
+    n_pixels: usize,
+    primary_heap: &mut Vec<u8>,
+    fallback_heap: &mut Vec<u8>,
+) -> PyResult<TileRow> {
+    let row_at = (tile_idx * row_width) as usize;
+    let (old_p_nel, _old_p_off, old_zscale, old_zzero, _, _) =
+        read_quant_descriptor_row(
+            old_main_buf, row_at, heap_is_q, descriptor_size,
+        );
+    let (method, zdither0, _qlevel) = quant_setup;
+    let row_1based = tile_idx + 1;
+
+    if old_p_nel > 0 {
+        // Was in primary: requantize with the existing per-tile
+        // bscale/bzero (no compounding loss on unchanged pixels)
+        // and encode via the algorithm.  Reject if any value
+        // doesn't fit the existing scale.
+        let i32_stream = if zbitpix == -32 {
+            let floats: Vec<f32> = combined_be
+                .chunks_exact(4)
+                .map(|c| f32::from_be_bytes(c.try_into().unwrap()))
+                .collect();
+            crate::zimage::quantize::requantize_float_fixed_scale(
+                &floats, old_zscale, old_zzero, method, row_1based,
+                zdither0,
+            )
+        } else {
+            let floats: Vec<f64> = combined_be
+                .chunks_exact(8)
+                .map(|c| f64::from_be_bytes(c.try_into().unwrap()))
+                .collect();
+            crate::zimage::quantize::requantize_double_fixed_scale(
+                &floats, old_zscale, old_zzero, method, row_1based,
+                zdither0,
+            )
+        }
+        .map_err(PyValueError::new_err)?;
+        let mut i32_be: Vec<u8> = Vec::with_capacity(i32_stream.len() * 4);
+        for &v in &i32_stream {
+            i32_be.extend_from_slice(&v.to_be_bytes());
+        }
+        let encode_params = crate::zimage::AlgorithmEncodeParams {
+            blocksize,
+            tile_shape_numpy: actual_shape,
+            scale: hcompress_scale,
+        };
+        let encoded = crate::zimage::encode_tile_from_bytes(
+            algorithm, &i32_be, 4, n_pixels, 32, encode_params,
+        )?;
+        let primary_off_start = primary_heap.len() as u64;
+        let nelem = encoded.len() as u64 / inner_byte_width;
+        primary_heap.extend(encoded);
+        Ok(TileRow {
+            primary_nelem: nelem,
+            primary_off: primary_off_start,
+            zscale: old_zscale,
+            zzero: old_zzero,
+            fallback_nelem: 0,
+            fallback_off: 0,
+        })
+    } else {
+        // Was in fallback: stay in fallback (lossless raw float
+        // bytes, GZIP_1).  ZSCALE/ZZERO are placeholder.
+        let encoded = crate::zimage::gzip::encode_gzip1(combined_be)?;
+        let fb_off = fallback_heap.len() as u64;
+        let nelem = encoded.len() as u64;
+        fallback_heap.extend(encoded);
+        Ok(TileRow {
+            primary_nelem: 0,
+            primary_off: 0,
+            zscale: 1.0,
+            zzero: 0.0,
+            fallback_nelem: nelem,
+            fallback_off: fb_off,
+        })
+    }
+}
+
 // Bulk-write entry point for CompressedImageHDU.write.  Encodes every
 // tile in RAM, then mutates the file (grow if non-last HDU, write
 // descriptors + heap, update PCOUNT card).  Phase 7 supports GZIP_1
@@ -2772,7 +2887,7 @@ fn extend_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
-    _quantize_config: &Arc<
+    quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
 ) -> PyResult<()> {
@@ -2791,19 +2906,15 @@ fn extend_compressed_image_data(
     }
     let is_float = zbitpix < 0;
     let tfields = parse_keyword(cards, "TFIELDS").unwrap_or(0) as u64;
-    // Quantized-float HDUs use the 4-column schema (with ZSCALE +
-    // ZZERO + GZIP_COMPRESSED_DATA fallback).  Extend on that schema
-    // needs to grow the fixed-width columns too and keep the dither
-    // stream consistent across the boundary — deferred for now.
+    // Three schema dispatches based on (is_float, tfields):
+    //   integer:          single-col (TFIELDS=1)
+    //   unquantized float: single-col (TFIELDS=1, quantize=None)
+    //   quantized float:  4-col (TFIELDS=4) — re-uses existing
+    //                     per-tile ZSCALE/ZZERO via
+    //                     requantize_*_fixed_scale to avoid
+    //                     compounding loss on unchanged pixels
     let is_quantized_float = is_float && tfields == 4;
-    if is_quantized_float {
-        return Err(PyNotImplementedError::new_err(
-            "extend on quantized-float compressed images is not yet \
-             supported (quantize=Quantize(...) HDUs).  Integer and \
-             unquantized-float (quantize=None) HDUs work.",
-        ));
-    }
-    let is_unquantized_float = is_float;
+    let is_unquantized_float = is_float && !is_quantized_float;
 
     let bytepix: u32 = match zbitpix {
         8 => 1,
@@ -2840,11 +2951,49 @@ fn extend_compressed_image_data(
     let blocksize = blocksize_opt.unwrap_or(32);
     let hcompress_scale = parse_hcompress_scale(cards);
 
-    // Single-column schema confirmed above (we rejected the quantized
-    // 4-column path), so row_width = descriptor_size.
-    let row_width = descriptor_size;
+    // Quantized-float HDUs use a 4-column row layout:
+    //   primary descriptor + ZSCALE (8 BE) + ZZERO (8 BE) +
+    //   fallback descriptor.
+    // Integer + unquantized-float HDUs use a single descriptor.
+    let row_width: u64 = if is_quantized_float {
+        descriptor_size + 8 + 8 + descriptor_size
+    } else {
+        descriptor_size
+    };
     let old_main_bytes = row_width.saturating_mul(old_n_tiles);
     let data_offset = offsets.data_offset();
+
+    // For the quantized-float path we need dither method + seed + qlevel.
+    // These are read from the header (ZQUANTIZ / ZDITHER0) plus the
+    // create-time Quantize config (the FITS spec records method +
+    // seed only, not the qlevel; reopened HDUs fall back to 4.0).
+    // None for integer + unquantized-float HDUs.
+    let quant_setup: Option<(crate::zimage::quantize::DitherMethod, i64, f64)> =
+        if is_quantized_float {
+            let zq = parse_string_keyword(cards, "ZQUANTIZ");
+            let method = crate::zimage::quantize::parse_dither_method(
+                zq.as_deref(),
+            )?
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "quantized-float HDU has ZQUANTIZ='NONE' but the \
+                     4-column schema is present (malformed file).",
+                )
+            })?;
+            let zd =
+                parse_keyword(cards, "ZDITHER0").unwrap_or(1).max(1);
+            let level = quantize_config
+                .lock()
+                .map_err(|_| {
+                    PyIOError::new_err("quantize config lock poisoned")
+                })?
+                .as_ref()
+                .map(|q| q.level)
+                .unwrap_or(4.0);
+            Some((method, zd, level))
+        } else {
+            None
+        };
 
     // ----- input validation -----
     let np = py.import("numpy")?;
@@ -2950,21 +3099,72 @@ fn extend_compressed_image_data(
             )))
         }
     };
-    let _ = is_unquantized_float; // (signal kept for future quant-extend)
+    let _ = is_unquantized_float; // (signal kept; used in helpers below)
+
+    // ----- read existing main descriptor table early -----
+    // For quantized-float HDUs we need each boundary tile's existing
+    // ZSCALE/ZZERO (to reuse the same per-tile quantization scale
+    // and avoid compounding loss) AND whether it was stored in the
+    // primary or GZIP fallback column.  Both are in main_buf.  For
+    // integer/unquantized we don't strictly need it before encoding,
+    // but reading early keeps the I/O sequencing simple: all
+    // pre-write reads happen first, then encoding (which is pure
+    // CPU), then writes.
+    let mut old_main_buf: Vec<u8> = vec![0; old_main_bytes as usize];
+    if old_main_bytes > 0 {
+        let mut g = lock_file(file_handle)?;
+        let f = g
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut old_main_buf).map_err(|e| {
+            PyIOError::new_err(format!(
+                "compressed extend: read old main: {}",
+                e
+            ))
+        })?;
+    }
+
+    // Quantization context (only meaningful for quantized-float HDUs).
+    // Used by get_or_decode_tile to dispatch the dequantize step on
+    // boundary tile reads.
+    let cols_lookup = find_data_columns(cards)?;
+    let quant_ctx_opt = if is_quantized_float {
+        build_quant_context(cards, &cols_lookup)?
+    } else {
+        None
+    };
+
+    // FloatTileCtx for the quantized-float path's new-tile encoding
+    // (mirrors what write_compressed_image_data uses).
+    let float_ctx = quant_setup.map(|(method, zd, level)| FloatTileCtx {
+        algorithm,
+        zbitpix,
+        inner_byte_width,
+        blocksize,
+        hcompress_scale,
+        method,
+        qlevel: level,
+        zdither0: zd,
+    });
 
     // ----- encode boundary tiles -----
     // For each boundary tile, decode the existing partial tile via
     // the cache machinery, slice the new data portion that falls
-    // into the same tile, concatenate (byte-concat along axis 0 in
-    // C-order = byte concatenation), and re-encode.  The new
-    // descriptor goes into boundary_updates; the encoded bytes
-    // accumulate in appended_heap.
+    // into the same tile, concatenate, and re-encode.  Integer +
+    // unquantized-float HDUs go through encode_tile_int; quantized-
+    // float HDUs go through requantize_with_fixed_scale (preserves
+    // the existing per-tile bscale/bzero so unchanged pixels suffer
+    // no compounding loss) and may use the GZIP fallback for tiles
+    // already stored there.
     let mut appended_heap: Vec<u8> = Vec::new();
+    let mut appended_fallback_heap: Vec<u8> = Vec::new();
     let mut boundary_updates: Vec<(u64, TileRow)> = Vec::new();
     let mut new_descs: Vec<TileRow> = Vec::new();
 
     if let Some((b_start, b_end)) = boundary_range {
-        let cols = find_data_columns(cards)?;
+        let cols = &cols_lookup;
         let theap = parse_keyword(cards, "THEAP")
             .map(|x| x.max(0) as u64)
             .unwrap_or(row_width * old_n_tiles);
@@ -2973,8 +3173,15 @@ fn extend_compressed_image_data(
                 tile_origin_and_shape(tile_idx, &new_image_shape, &tile_shape);
             let (_, old_actual_shape) =
                 tile_origin_and_shape(tile_idx, &old_image_shape, &tile_shape);
-            // Decode the existing partial tile (native-endian bytes
-            // in BITPIX-native dtype, numpy C-order).
+            // For quantized-float HDUs the decoder runs the
+            // dequantize step (i32 stored → f4/f8 physical),
+            // returning float bytes.  For integer/unquantized-float
+            // it returns BITPIX-native bytes.
+            let (dec_bytepix, dec_stored_zbitpix) = if is_quantized_float {
+                (4u32, 32i32)
+            } else {
+                (bytepix, zbitpix)
+            };
             let old_bytes_arc = get_or_decode_tile(
                 py,
                 cache,
@@ -2984,14 +3191,14 @@ fn extend_compressed_image_data(
                 data_offset,
                 row_width,
                 theap,
-                &cols,
+                cols,
                 algorithm,
                 &old_actual_shape,
-                bytepix,
+                dec_bytepix,
                 blocksize,
+                dec_stored_zbitpix,
                 zbitpix,
-                zbitpix,
-                None,
+                quant_ctx_opt.as_ref(),
                 false,
             )?;
 
@@ -3042,14 +3249,35 @@ fn extend_compressed_image_data(
 
             let n_pixels: usize =
                 new_actual_shape.iter().product::<u64>() as usize;
-            let row = encode_tile_int(
-                &int_ctx,
-                &combined_be,
-                tile_idx,
-                &new_actual_shape,
-                n_pixels,
-                &mut appended_heap,
-            )?;
+            let row = if is_quantized_float {
+                encode_quant_boundary_tile(
+                    algorithm,
+                    zbitpix,
+                    inner_byte_width,
+                    blocksize,
+                    hcompress_scale,
+                    &old_main_buf,
+                    tile_idx,
+                    row_width,
+                    descriptor_size,
+                    heap_is_q,
+                    quant_setup.unwrap(),
+                    &combined_be,
+                    &new_actual_shape,
+                    n_pixels,
+                    &mut appended_heap,
+                    &mut appended_fallback_heap,
+                )?
+            } else {
+                encode_tile_int(
+                    &int_ctx,
+                    &combined_be,
+                    tile_idx,
+                    &new_actual_shape,
+                    n_pixels,
+                    &mut appended_heap,
+                )?
+            };
             boundary_updates.push((tile_idx, row));
         }
     }
@@ -3086,15 +3314,49 @@ fn extend_compressed_image_data(
         let tile_bytes: Vec<u8> = tile_bytes_py.extract()?;
         let n_pixels: usize =
             new_actual_shape.iter().product::<u64>() as usize;
-        let row = encode_tile_int(
-            &int_ctx,
-            &tile_bytes,
-            tile_idx,
-            &new_actual_shape,
-            n_pixels,
-            &mut appended_heap,
-        )?;
+        let row = if is_quantized_float {
+            // Truly-new tile rows: standard quantize_float (may
+            // fall to the GZIP fallback if range too wide).  The
+            // existing encode_tile_float helper already handles
+            // both paths and writes to the right heap.
+            encode_tile_float(
+                float_ctx.as_ref().unwrap(),
+                &tile_bytes,
+                tile_idx,
+                &new_actual_shape,
+                n_pixels,
+                &mut appended_heap,
+                &mut appended_fallback_heap,
+            )?
+        } else {
+            encode_tile_int(
+                &int_ctx,
+                &tile_bytes,
+                tile_idx,
+                &new_actual_shape,
+                n_pixels,
+                &mut appended_heap,
+            )?
+        };
         new_descs.push(row);
+    }
+
+    // ----- combine the two appended heaps -----
+    // For quantized-float HDUs the appended heap is
+    // [appended_primary; appended_fallback].  Bump fallback offsets
+    // by primary size so descriptors point at the right slot.  No-op
+    // for integer/unquantized-float (fallback heap is empty).
+    let appended_primary_size = appended_heap.len() as u64;
+    appended_heap.extend(appended_fallback_heap.drain(..));
+    for (_, row) in boundary_updates.iter_mut() {
+        if row.fallback_nelem > 0 {
+            row.fallback_off += appended_primary_size;
+        }
+    }
+    for row in new_descs.iter_mut() {
+        if row.fallback_nelem > 0 {
+            row.fallback_off += appended_primary_size;
+        }
     }
 
     // ----- shift descriptor offsets into the combined-heap frame -----
@@ -3102,10 +3364,20 @@ fn extend_compressed_image_data(
     // appended).  The combined heap is [old_heap; appended], so
     // absolute offsets are old_pcount + offset_in_appended.
     for (_, row) in boundary_updates.iter_mut() {
-        row.primary_off += old_pcount;
+        if row.primary_nelem > 0 {
+            row.primary_off += old_pcount;
+        }
+        if row.fallback_nelem > 0 {
+            row.fallback_off += old_pcount;
+        }
     }
     for row in new_descs.iter_mut() {
-        row.primary_off += old_pcount;
+        if row.primary_nelem > 0 {
+            row.primary_off += old_pcount;
+        }
+        if row.fallback_nelem > 0 {
+            row.fallback_off += old_pcount;
+        }
     }
 
     // ----- compute new file extents -----
@@ -3150,50 +3422,57 @@ fn extend_compressed_image_data(
     let current_padded_data = current_hdu_end.saturating_sub(data_offset);
     let new_hdu_end = data_offset + new_padded;
 
-    // ----- read existing main descriptor table + heap into RAM -----
-    // (Done BEFORE the grow so that an I/O failure here leaves the
-    // file untouched.  After this point all errors taint.)
-    let mut old_main_buf: Vec<u8> = vec![0; old_main_bytes as usize];
+    // ----- read existing heap into RAM -----
+    // (main_buf was already read earlier so quantized boundary
+    // tiles could inspect existing ZSCALE/ZZERO.  This step reads
+    // the heap so we can relocate it past the new descriptor
+    // table.  Done BEFORE the grow so an I/O failure leaves the
+    // file untouched.)
     let mut old_heap_buf: Vec<u8> = vec![0; old_pcount as usize];
-    {
+    if old_pcount > 0 {
         let mut g = lock_file(file_handle)?;
         let f = g
             .as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        if old_main_bytes > 0 {
-            f.seek(SeekFrom::Start(data_offset))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            f.read_exact(&mut old_main_buf).map_err(|e| {
-                PyIOError::new_err(format!(
-                    "compressed extend: read old main: {}",
-                    e
-                ))
-            })?;
-        }
-        if old_pcount > 0 {
-            f.seek(SeekFrom::Start(data_offset + old_main_bytes))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            f.read_exact(&mut old_heap_buf).map_err(|e| {
-                PyIOError::new_err(format!(
-                    "compressed extend: read old heap: {}",
-                    e
-                ))
-            })?;
-        }
+        f.seek(SeekFrom::Start(data_offset + old_main_bytes))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut old_heap_buf).map_err(|e| {
+            PyIOError::new_err(format!(
+                "compressed extend: read old heap: {}",
+                e
+            ))
+        })?;
     }
 
     // Apply boundary descriptor updates to old_main_buf in place.
     // Descriptor format: P → u32 nelem BE + u32 off BE (8 bytes);
-    // Q → u64 nelem BE + u64 off BE (16 bytes).
+    // Q → u64 nelem BE + u64 off BE (16 bytes).  For quantized-
+    // float HDUs each row is the full 4-column layout (primary +
+    // ZSCALE + ZZERO + fallback).
     for (tile_idx, row) in &boundary_updates {
         let desc_offset = (tile_idx * row_width) as usize;
-        write_descriptor(
-            &mut old_main_buf,
-            desc_offset,
-            heap_is_q,
-            row.primary_nelem,
-            row.primary_off,
-        )?;
+        if is_quantized_float {
+            write_quant_descriptor_row(
+                &mut old_main_buf,
+                desc_offset,
+                heap_is_q,
+                descriptor_size,
+                row.primary_nelem,
+                row.primary_off,
+                row.zscale,
+                row.zzero,
+                row.fallback_nelem,
+                row.fallback_off,
+            )?;
+        } else {
+            write_descriptor(
+                &mut old_main_buf,
+                desc_offset,
+                heap_is_q,
+                row.primary_nelem,
+                row.primary_off,
+            )?;
+        }
     }
 
     // Serialize new tile descriptors into a buffer.
@@ -3202,13 +3481,28 @@ fn extend_compressed_image_data(
     );
     for row in &new_descs {
         let mut tmp = vec![0u8; row_width as usize];
-        write_descriptor(
-            &mut tmp,
-            0,
-            heap_is_q,
-            row.primary_nelem,
-            row.primary_off,
-        )?;
+        if is_quantized_float {
+            write_quant_descriptor_row(
+                &mut tmp,
+                0,
+                heap_is_q,
+                descriptor_size,
+                row.primary_nelem,
+                row.primary_off,
+                row.zscale,
+                row.zzero,
+                row.fallback_nelem,
+                row.fallback_off,
+            )?;
+        } else {
+            write_descriptor(
+                &mut tmp,
+                0,
+                heap_is_q,
+                row.primary_nelem,
+                row.primary_off,
+            )?;
+        }
         new_descs_buf.extend_from_slice(&tmp);
     }
 
@@ -3385,6 +3679,74 @@ fn write_descriptor(
     Ok(())
 }
 
+// Read a single VLA descriptor (nelem + offset) from a buffer at `at`.
+// (Named with the `_buf` suffix to disambiguate from the existing
+// file-reading `read_descriptor` upstream.)  Used by extend/
+// __setitem__ on quantized-float HDUs to inspect existing per-tile
+// descriptors (specifically: is the tile in the primary column or
+// the GZIP fallback column?).
+fn read_descriptor_from_buf(
+    buf: &[u8], at: usize, heap_is_q: bool,
+) -> (u64, u64) {
+    if heap_is_q {
+        let nel = u64::from_be_bytes(buf[at..at + 8].try_into().unwrap());
+        let off = u64::from_be_bytes(buf[at + 8..at + 16].try_into().unwrap());
+        (nel, off)
+    } else {
+        let nel = u32::from_be_bytes(buf[at..at + 4].try_into().unwrap())
+            as u64;
+        let off = u32::from_be_bytes(buf[at + 4..at + 8].try_into().unwrap())
+            as u64;
+        (nel, off)
+    }
+}
+
+// Quantized-float HDUs use a 4-column row layout: primary
+// descriptor + ZSCALE (1D) + ZZERO (1D) + GZIP fallback descriptor.
+// This helper writes one such row into `buf` at `at` (the start of
+// the row).  `descriptor_size` is 8 for P-format, 16 for Q-format.
+fn write_quant_descriptor_row(
+    buf: &mut [u8],
+    at: usize,
+    heap_is_q: bool,
+    descriptor_size: u64,
+    primary_nelem: u64,
+    primary_off: u64,
+    zscale: f64,
+    zzero: f64,
+    fallback_nelem: u64,
+    fallback_off: u64,
+) -> PyResult<()> {
+    write_descriptor(buf, at, heap_is_q, primary_nelem, primary_off)?;
+    let zs_at = at + descriptor_size as usize;
+    buf[zs_at..zs_at + 8].copy_from_slice(&zscale.to_be_bytes());
+    buf[zs_at + 8..zs_at + 16].copy_from_slice(&zzero.to_be_bytes());
+    let fb_at = zs_at + 16;
+    write_descriptor(buf, fb_at, heap_is_q, fallback_nelem, fallback_off)?;
+    Ok(())
+}
+
+// Read a quantized-float row (primary descriptor + ZSCALE + ZZERO
+// + fallback descriptor) from `buf` at `at`.  Returns
+// (primary_nelem, primary_off, zscale, zzero, fallback_nelem,
+// fallback_off).  Inverse of write_quant_descriptor_row.
+fn read_quant_descriptor_row(
+    buf: &[u8],
+    at: usize,
+    heap_is_q: bool,
+    descriptor_size: u64,
+) -> (u64, u64, f64, f64, u64, u64) {
+    let (p_nel, p_off) = read_descriptor_from_buf(buf, at, heap_is_q);
+    let zs_at = at + descriptor_size as usize;
+    let zscale =
+        f64::from_be_bytes(buf[zs_at..zs_at + 8].try_into().unwrap());
+    let zzero =
+        f64::from_be_bytes(buf[zs_at + 8..zs_at + 16].try_into().unwrap());
+    let fb_at = zs_at + 16;
+    let (f_nel, f_off) = read_descriptor_from_buf(buf, fb_at, heap_is_q);
+    (p_nel, p_off, zscale, zzero, f_nel, f_off)
+}
+
 // In-place modification of compressed image pixels via numpy-style
 // slicing.  For each tile that overlaps the selection, decode the
 // existing tile, apply the user's value to the affected portion,
@@ -3424,7 +3786,7 @@ fn setitem_compressed_image(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
-    _quantize_config: &Arc<
+    quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
     key: &Bound<'_, PyAny>,
@@ -3445,14 +3807,9 @@ fn setitem_compressed_image(
     }
     let is_float = zbitpix < 0;
     let tfields = parse_keyword(cards, "TFIELDS").unwrap_or(0) as u64;
+    // Schema dispatch: quantized-float HDUs use 4-col rows;
+    // integer + unquantized-float use 1-col rows.
     let is_quantized_float = is_float && tfields == 4;
-    if is_quantized_float {
-        return Err(PyNotImplementedError::new_err(
-            "__setitem__ on quantized-float compressed images is not yet \
-             supported (quantize=Quantize(...) HDUs).  Integer and \
-             unquantized-float (quantize=None) HDUs work.",
-        ));
-    }
 
     let bytepix: u32 = match zbitpix {
         8 => 1,
@@ -3489,10 +3846,42 @@ fn setitem_compressed_image(
     let blocksize = blocksize_opt.unwrap_or(32);
     let hcompress_scale = parse_hcompress_scale(cards);
 
-    // Single-column schema confirmed above.
-    let row_width = descriptor_size;
+    // Row width: 4-col for quantized-float, single-col otherwise.
+    let row_width: u64 = if is_quantized_float {
+        descriptor_size + 8 + 8 + descriptor_size
+    } else {
+        descriptor_size
+    };
     let main_bytes = row_width.saturating_mul(n_tiles);
     let data_offset = offsets.data_offset();
+
+    // Quantization setup (only for quantized-float path).
+    let quant_setup: Option<(crate::zimage::quantize::DitherMethod, i64, f64)> =
+        if is_quantized_float {
+            let zq = parse_string_keyword(cards, "ZQUANTIZ");
+            let method = crate::zimage::quantize::parse_dither_method(
+                zq.as_deref(),
+            )?
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "quantized-float HDU has ZQUANTIZ='NONE' but the \
+                     4-column schema is present (malformed file).",
+                )
+            })?;
+            let zd =
+                parse_keyword(cards, "ZDITHER0").unwrap_or(1).max(1);
+            let level = quantize_config
+                .lock()
+                .map_err(|_| {
+                    PyIOError::new_err("quantize config lock poisoned")
+                })?
+                .as_ref()
+                .map(|q| q.level)
+                .unwrap_or(4.0);
+            Some((method, zd, level))
+        } else {
+            None
+        };
 
     // ----- parse slice key -----
     let slices = normalize_slice_key(key, &image_shape)?;
@@ -3569,8 +3958,39 @@ fn setitem_compressed_image(
         .map(|x| x.max(0) as u64)
         .unwrap_or(row_width * n_tiles);
 
+    // Quantization context (only meaningful for quantized-float
+    // HDUs; runs the dequantize step inside get_or_decode_tile).
+    let quant_ctx_opt = if is_quantized_float {
+        build_quant_context(cards, &cols)?
+    } else {
+        None
+    };
+
+    // ----- read main descriptor table early -----
+    // For quantized-float HDUs we need each affected tile's
+    // existing ZSCALE/ZZERO and primary/fallback column status to
+    // pick the right re-encode path.  For integer/unquantized
+    // we'd read main_buf later anyway; doing it here unifies the
+    // structure.
+    let mut main_buf: Vec<u8> = vec![0; main_bytes as usize];
+    if main_bytes > 0 {
+        let mut g = lock_file(file_handle)?;
+        let f = g
+            .as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut main_buf).map_err(|e| {
+            PyIOError::new_err(format!(
+                "compressed __setitem__: read main table: {}",
+                e
+            ))
+        })?;
+    }
+
     // ----- per-tile re-encode for overlapping tiles -----
     let mut appended_heap: Vec<u8> = Vec::new();
+    let mut appended_fallback_heap: Vec<u8> = Vec::new();
     let mut tile_updates: Vec<(u64, TileRow)> = Vec::new();
 
     for tile_idx in 0..n_tiles {
@@ -3605,8 +4025,16 @@ fn setitem_compressed_image(
             continue;
         }
 
-        // Decode the existing tile.  frombuffer returns a
-        // read-only view; .copy() gives us a writable ndarray.
+        // Decode the existing tile.  For quantized-float HDUs the
+        // decoder runs dequantize, returning f4/f8 native bytes;
+        // for integer/unquantized-float it returns BITPIX-native
+        // bytes directly.  frombuffer returns a read-only view;
+        // .copy() gives us a writable ndarray.
+        let (dec_bytepix, dec_stored_zbitpix) = if is_quantized_float {
+            (4u32, 32i32)
+        } else {
+            (bytepix, zbitpix)
+        };
         let old_bytes_arc = get_or_decode_tile(
             py,
             cache,
@@ -3619,11 +4047,11 @@ fn setitem_compressed_image(
             &cols,
             algorithm,
             &actual_shape,
-            bytepix,
+            dec_bytepix,
             blocksize,
+            dec_stored_zbitpix,
             zbitpix,
-            zbitpix,
-            None,
+            quant_ctx_opt.as_ref(),
             false,
         )?;
         let pyb = PyBytes::new(py, &old_bytes_arc);
@@ -3646,20 +4074,41 @@ fn setitem_compressed_image(
             tile_arr.set_item(tile_idx_tuple, rhs_for_tile)?;
         }
 
-        // Cast to BE bytes and re-encode.
+        // Cast to BE bytes and re-encode (dispatch on schema).
         let tile_be =
             np.call_method1("ascontiguousarray", (tile_arr, be_dtype))?;
         let tile_bytes: Vec<u8> =
             tile_be.call_method0("tobytes")?.extract()?;
         let n_pixels: usize = actual_shape.iter().product::<u64>() as usize;
-        let row = encode_tile_int(
-            &int_ctx,
-            &tile_bytes,
-            tile_idx,
-            &actual_shape,
-            n_pixels,
-            &mut appended_heap,
-        )?;
+        let row = if is_quantized_float {
+            encode_quant_boundary_tile(
+                algorithm,
+                zbitpix,
+                inner_byte_width,
+                blocksize,
+                hcompress_scale,
+                &main_buf,
+                tile_idx,
+                row_width,
+                descriptor_size,
+                heap_is_q,
+                quant_setup.unwrap(),
+                &tile_bytes,
+                &actual_shape,
+                n_pixels,
+                &mut appended_heap,
+                &mut appended_fallback_heap,
+            )?
+        } else {
+            encode_tile_int(
+                &int_ctx,
+                &tile_bytes,
+                tile_idx,
+                &actual_shape,
+                n_pixels,
+                &mut appended_heap,
+            )?
+        };
         tile_updates.push((tile_idx, row));
     }
 
@@ -3669,40 +4118,52 @@ fn setitem_compressed_image(
         return Ok(());
     }
 
+    // ----- combine primary + fallback appended heaps -----
+    // (No-op for integer/unquantized-float — fallback_heap is
+    // empty.  Quantized-float may have both.)
+    let appended_primary_size = appended_heap.len() as u64;
+    appended_heap.extend(appended_fallback_heap.drain(..));
+    for (_, row) in tile_updates.iter_mut() {
+        if row.fallback_nelem > 0 {
+            row.fallback_off += appended_primary_size;
+        }
+    }
     // Shift descriptor offsets into the absolute-heap frame.
     // appended_heap sits at old_pcount in the combined heap.
     for (_, row) in tile_updates.iter_mut() {
-        row.primary_off += old_pcount;
-    }
-
-    // ----- read existing main descriptor table into RAM -----
-    let mut main_buf: Vec<u8> = vec![0; main_bytes as usize];
-    {
-        let mut g = lock_file(file_handle)?;
-        let f = g
-            .as_mut()
-            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        if main_bytes > 0 {
-            f.seek(SeekFrom::Start(data_offset))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            f.read_exact(&mut main_buf).map_err(|e| {
-                PyIOError::new_err(format!(
-                    "compressed __setitem__: read main table: {}",
-                    e
-                ))
-            })?;
+        if row.primary_nelem > 0 {
+            row.primary_off += old_pcount;
+        }
+        if row.fallback_nelem > 0 {
+            row.fallback_off += old_pcount;
         }
     }
-    // Apply descriptor updates in place.
+
+    // Apply descriptor updates to the already-read main_buf in place.
     for (tile_idx, row) in &tile_updates {
         let desc_offset = (tile_idx * row_width) as usize;
-        write_descriptor(
-            &mut main_buf,
-            desc_offset,
-            heap_is_q,
-            row.primary_nelem,
-            row.primary_off,
-        )?;
+        if is_quantized_float {
+            write_quant_descriptor_row(
+                &mut main_buf,
+                desc_offset,
+                heap_is_q,
+                descriptor_size,
+                row.primary_nelem,
+                row.primary_off,
+                row.zscale,
+                row.zzero,
+                row.fallback_nelem,
+                row.fallback_off,
+            )?;
+        } else {
+            write_descriptor(
+                &mut main_buf,
+                desc_offset,
+                heap_is_q,
+                row.primary_nelem,
+                row.primary_off,
+            )?;
+        }
     }
 
     // ----- compute new file extents -----
