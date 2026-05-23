@@ -4092,6 +4092,404 @@ fn append_vla_aware(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// VLA __setitem__ helpers
+// ---------------------------------------------------------------------------
+//
+// All three forms follow the same heap model: new cells are appended
+// at the end of the existing heap (heap_start_offset = current PCOUNT)
+// and the old cells become orphans.  PCOUNT grows monotonically.
+// Mirrors the compressed-image __setitem__ pattern; a future repack()
+// can compact the heap when a workload demands it.
+//
+// Validate-then-mutate: input is fully validated before any file or
+// header bytes are touched, so a dtype/shape error leaves the file
+// unchanged.  Mid-write I/O failures taint the file (close + reopen
+// to recover) — same semantics as every other write path.
+
+// Shared core for the single-row and row-slice VLA setitem paths.
+// Writes `input_nrows` contiguous rows of main-table data starting at
+// row index `first_row`, planning the new heap to start at the
+// current PCOUNT.  Caller has already extracted the per-column input
+// ndarrays and validated their length == input_nrows.
+#[allow(clippy::too_many_arguments)]
+fn setitem_rows_vla_aware_inner(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    per_col: Vec<Bound<'_, PyAny>>,
+    first_row: usize,
+    input_nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+
+    // Build per-column fixed info up front so dtype/shape errors
+    // surface before any file mutation.
+    let mut fixed: Vec<Option<FixedColInfo>> =
+        columns.iter().map(|_| None).collect();
+    for (col_idx, col) in columns.iter().enumerate() {
+        if col.var_kind.is_none() {
+            fixed[col_idx] = Some(build_fixed_col_info(
+                &per_col[col_idx], &ndarray, col, input_nrows)?);
+        }
+    }
+
+    let nrows_total = parse_keyword(cards, "NAXIS2")
+        .unwrap_or(0).max(0) as u64;
+    let current_pcount = parse_keyword(cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let (plans, total_heap_bytes) = plan_vla_heap_layout(
+        columns, &per_col, input_nrows, &ndarray,
+        current_pcount as usize)?;
+    let new_pcount = total_heap_bytes as u64;
+
+    let vla: Vec<Option<VlaColInfo>> = columns.iter().enumerate()
+        .map(|(col_idx, col)| {
+            if col.var_kind.is_some() {
+                Some(VlaColInfo {
+                    plans: plans[col_idx].clone(),
+                    per_col_array: per_col[col_idx].clone(),
+                })
+            } else {
+                None
+            }
+        }).collect();
+
+    let main_bytes = nrows_total * row_width as u64;
+    let current_data_bytes = main_bytes + current_pcount;
+    let new_data_bytes = main_bytes + new_pcount;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta, &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Main rows start at the first-modified-row's offset; new heap
+    // bytes start right after the existing heap end.
+    let main_start_offset =
+        data_offset + (first_row as u64) * row_width as u64;
+    let heap_start_offset_in_file =
+        data_offset + main_bytes + current_pcount;
+    write_vla_data_range(
+        columns, &fixed, &vla, total_heap_bytes,
+        current_pcount as usize,
+        &super_.file, main_start_offset, heap_start_offset_in_file,
+        input_nrows, row_width, &super_.tainted)?;
+
+    // PCOUNT update — disk-write-before-commit.  No NAXIS2 change
+    // (row count unchanged).
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header flush failed: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
+// hdu[i] = record on a VLA-bearing table.  Coerces value to a length-1
+// structured ndarray, extracts per-column inputs, and dispatches to
+// the shared inner helper.
+#[allow(clippy::too_many_arguments)]
+fn setitem_single_row_vla_aware(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    i: i64,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let r = normalize_row_index(i, nrows)?;
+    let arr = coerce_to_len1_record(py, value)?;
+    let per_col = extract_per_column_inputs(
+        py, &arr, None, columns)?;
+    setitem_rows_vla_aware_inner(
+        py, super_, cards, columns, per_col, r, 1, row_width, data_offset)
+}
+
+// hdu[a:b] = arr on a VLA-bearing table.  Only step=1 is supported;
+// strided writes are rejected because the contiguous main-row writer
+// (write_vla_data_range) can't emit non-contiguous rows in one pass.
+#[allow(clippy::too_many_arguments)]
+fn setitem_row_slice_vla_aware(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    slice_py: &Bound<'_, PySlice>,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let indices = slice_py.indices(nrows as isize)?;
+    if indices.step != 1 {
+        return Err(PyValueError::new_err(
+            "TableHDU[slice] = value: only step=1 slices are supported \
+             for tables with VLA columns (strided writes would require \
+             per-row heap layouts; not implemented)"));
+    }
+    let count = indices.slicelength as usize;
+    let start = indices.start as usize;
+    if count == 0 {
+        let v_len: usize = value.len().unwrap_or(0);
+        if v_len != 0 {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[slice] = value: slice selects 0 rows but value \
+                 has length {}", v_len)));
+        }
+        return Ok(());
+    }
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[slice] = value: value must be a structured numpy \
+             ndarray with one element per selected row"));
+    }
+    let v_len: usize = value.len()?;
+    if v_len != count {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU[slice] = value: slice selects {} rows but value \
+             has length {}", count, v_len)));
+    }
+    let per_col = extract_per_column_inputs(
+        py, value, None, columns)?;
+    setitem_rows_vla_aware_inner(
+        py, super_, cards, columns, per_col, start, count, row_width,
+        data_offset)
+}
+
+// hdu["vla_col"] = arr where the named column is variable-length.
+// Writes only the column's descriptor bytes at each row (the other
+// columns' bytes are untouched), appending the new cell bytes at the
+// end of the heap.  Old cells become orphans.
+#[allow(clippy::too_many_arguments)]
+fn setitem_single_column_vla(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    col_idx: usize,
+    nrows: usize,
+    row_width: usize,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let col = &columns[col_idx];
+    let descriptor_kind = col.var_kind.unwrap();
+    let elem_size = bytes_per_element(col.tform_letter).unwrap_or(0);
+
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': value must be a numpy ndarray", col.name)));
+    }
+    let shape: Vec<usize> = value.getattr("shape")?.extract()?;
+    if shape.len() != 1 || shape[0] != nrows {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': value must have shape ({},); got {:?}",
+            col.name, nrows, shape)));
+    }
+    let dtype_kind: String = value.getattr("dtype")?
+        .getattr("kind")?.extract()?;
+    if dtype_kind != "O" {
+        return Err(PyValueError::new_err(format!(
+            "column '{}': VLA column write requires an Object-dtype \
+             ndarray (one inner ndarray per row); got dtype kind '{}'",
+            col.name, dtype_kind)));
+    }
+
+    // Plan + validate every cell up front.
+    let current_pcount = parse_keyword(cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let mut plans: Vec<VlaCellPlan> = Vec::with_capacity(nrows);
+    let mut cursor = current_pcount as usize;
+    for r in 0..nrows {
+        let cell = value.get_item(r)?;
+        let nelements = validate_vla_cell(
+            &cell, &ndarray, col.tform_letter, &col.name, r)?;
+        plans.push(VlaCellPlan {
+            nelements, bytes_offset_in_heap: cursor,
+        });
+        cursor = cursor.checked_add(nelements * elem_size)
+            .ok_or_else(|| PyValueError::new_err("heap size overflow"))?;
+    }
+    let new_pcount = cursor as u64;
+    let added_heap_bytes = (new_pcount - current_pcount) as usize;
+
+    let nrows_u64 = nrows as u64;
+    let main_bytes = nrows_u64 * row_width as u64;
+    let current_data_bytes = main_bytes + current_pcount;
+    let new_data_bytes = main_bytes + new_pcount;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    // Grow file if heap end pushes past the padded extent.
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta, &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Build the heap-bytes buffer + per-row descriptor bytes.
+    let mut heap_buf = vec![0u8; added_heap_bytes];
+    let desc_width = col.byte_width;
+    let mut desc_bytes = vec![0u8; nrows * desc_width];
+    for r in 0..nrows {
+        let plan = plans[r];
+        let cell = value.get_item(r)?;
+        if plan.nelements > 0 {
+            let local_off = plan.bytes_offset_in_heap
+                - current_pcount as usize;
+            let n_bytes = plan.nelements * elem_size;
+            serialize_vla_cell(
+                &cell, col.tform_letter, plan.nelements,
+                &mut heap_buf[local_off..local_off + n_bytes])?;
+        }
+        let dst = &mut desc_bytes[r * desc_width..(r + 1) * desc_width];
+        write_descriptor(
+            descriptor_kind, plan.nelements,
+            plan.bytes_offset_in_heap, dst);
+    }
+
+    // Write new heap bytes first (no descriptors yet refer to them),
+    // then walk rows and overwrite each descriptor in place.
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        if added_heap_bytes > 0 {
+            let heap_off = data_offset + main_bytes + current_pcount;
+            f.seek(SeekFrom::Start(heap_off))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.write_all(&heap_buf).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "heap write failed during VLA column setitem: {}", e))
+            })?;
+        }
+        for r in 0..nrows {
+            let off = data_offset
+                + (r as u64) * row_width as u64
+                + col.byte_offset as u64;
+            f.seek(SeekFrom::Start(off))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.write_all(
+                &desc_bytes[r * desc_width..(r + 1) * desc_width]
+            ).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "descriptor write failed during VLA column setitem: {}",
+                    e))
+            })?;
+        }
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "flush failed during VLA column setitem: {}", e))
+        })?;
+    }
+
+    // PCOUNT update (disk-write-before-commit).
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header flush failed: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
 // Append rows to a table with no VLA columns.  Validates input, grows
 // the data section if needed (last-HDU branch uses set_len; non-last
 // branch shifts the file tail and zero-fills the gap), rewrites
@@ -4742,19 +5140,46 @@ impl TableHDU {
         let columns = parse_columns(&cards)?;
         let data_offset = super_.offsets.data_offset();
         let kind = classify_setitem_key(key)?;
+        let has_vla = any_var_column(&columns);
         match kind {
-            SetItemKey::SingleRow(i) => setitem_single_row(
-                py, &columns, &super_.file, data_offset, nrows, row_width,
-                i, value, &super_.tainted),
+            SetItemKey::SingleRow(i) => {
+                if has_vla {
+                    setitem_single_row_vla_aware(
+                        py, &super_, &cards, &columns, nrows, row_width,
+                        i, value, data_offset)
+                } else {
+                    setitem_single_row(
+                        py, &columns, &super_.file, data_offset, nrows,
+                        row_width, i, value, &super_.tainted)
+                }
+            }
             SetItemKey::RowSlice => {
                 let slice_py = key.cast::<PySlice>()?;
-                setitem_row_slice(
-                    py, &columns, &super_.file, data_offset, nrows,
-                    row_width, slice_py, value, &super_.tainted)
+                if has_vla {
+                    setitem_row_slice_vla_aware(
+                        py, &super_, &cards, &columns, nrows, row_width,
+                        slice_py, value, data_offset)
+                } else {
+                    setitem_row_slice(
+                        py, &columns, &super_.file, data_offset, nrows,
+                        row_width, slice_py, value, &super_.tainted)
+                }
             }
-            SetItemKey::SingleColumn(name) => setitem_single_column(
-                py, &columns, &super_.file, data_offset, nrows, row_width,
-                &name, value, &super_.tainted),
+            SetItemKey::SingleColumn(name) => {
+                let name_u = name.to_uppercase();
+                let col_idx = columns.iter()
+                    .position(|c| c.name.to_uppercase() == name_u);
+                if let Some(idx) = col_idx {
+                    if columns[idx].var_kind.is_some() {
+                        return setitem_single_column_vla(
+                            py, &super_, &cards, &columns, idx, nrows,
+                            row_width, value, data_offset);
+                    }
+                }
+                setitem_single_column(
+                    py, &columns, &super_.file, data_offset, nrows,
+                    row_width, &name, value, &super_.tainted)
+            }
         }
     }
 

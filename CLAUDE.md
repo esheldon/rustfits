@@ -598,11 +598,39 @@ forward to sit after the new main rows.  Validate-then-mutate so
 dtype errors leave the file untouched.  Mid-write I/O failures
 taint the file the same way as image writes.
 
+**VLA `__setitem__`.**  Shipped.  Three forms supported on tables
+with at least one variable-length column:
+- `hdu[i] = record` — single row write.
+- `hdu[a:b] = arr` — slice write (step=1 only; strided rejected
+  with a clear error — would need per-row main-data seeks; defer).
+- `hdu["vla_col"] = arr` — whole-column write (Object dtype, one
+  inner ndarray per row).
+
+Heap model: new cells are appended at the end of the existing heap
+(heap_start_offset = current PCOUNT) and the old cells become
+orphans.  PCOUNT grows monotonically with every mutation.  Matches
+the compressed-image `__setitem__` pattern; a future `repack()` can
+compact the heap if a workload accumulates enough orphans to make
+it worthwhile.
+
+Implementation lives in `hdu_table.rs` next to `write_vla_aware` /
+`append_vla_aware`.  Three helpers:
+- `setitem_single_row_vla_aware` and `setitem_row_slice_vla_aware`
+  share a `setitem_rows_vla_aware_inner` core that reuses
+  `plan_vla_heap_layout` (with `heap_start_offset = current_pcount`)
+  and `write_vla_data_range` to write `input_nrows` contiguous main
+  rows + appended heap.
+- `setitem_single_column_vla` writes ONLY the column's descriptor
+  bytes at each row (other columns' bytes untouched) plus the new
+  heap.
+
+Validate-then-mutate (input fully validated before any file/header
+bytes are touched).  Same taint discipline as every other write —
+mid-write failures taint the file (close + reopen to recover).
+Fixed-column writes on a VLA-bearing table still take the existing
+fixed-only path (PCOUNT and heap untouched).
+
 **Missing.**
-- **VLA `__setitem__`** — fixed `__setitem__` is implemented; VLA
-  is deferred because cell-resize forces heap re-layout (either
-  rewrite the heap, or always-append-and-orphan which bloats).
-  Revisit when an actual workload demands it.
 - **String VLAs (`PA`) on write** — read side has niche support;
   not on the write side.  Defer until requested.
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
@@ -633,9 +661,9 @@ taint the file the same way as image writes.
 
 Plan for getting table creation + writing on par with the image side.
 Reading is mature; Phases 1 (create + bulk write), 2 (__setitem__),
-3 (append/extend), and 4 (VLA columns on write/append, except
-`__setitem__`) have all shipped.  Only Phase 5 (ASCII tables,
-add/remove columns, VLA `__setitem__`) is deferred.  The image
+3 (append/extend), 4 (VLA columns on write/append), and 5 (VLA
+`__setitem__`) have all shipped.  Only Phase 6 (ASCII tables,
+add/remove columns) is deferred.  The image
 side has all four and the patterns translated directly.
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
@@ -791,11 +819,14 @@ heap-in-RAM into pain.
 that branch on `any_var_column(&columns)`.  Same pattern as the
 post-Phase-1 `dbc7bfc` refactor.
 
-**Phase 5 — out of scope.**  ASCII tables (rare in modern files);
+**Phase 5 — VLA `__setitem__`.**  Shipped.  See "VLA `__setitem__`"
+under the Table write Supported section above for the API + heap
+model (always-append-and-orphan).  19 tests in
+`tests/test_vla_setitem.py`.
+
+**Phase 6 — out of scope.**  ASCII tables (rare in modern files);
 adding / removing columns from existing tables (header rewriting
-+ byte shuffling); VLA `__setitem__` (resizing a cell forces heap
-re-layout — either rewrite the heap, or always-append-and-orphan
-which bloats; revisit when an actual workload demands it).
++ byte shuffling).
 
 ## Tile-compressed images (ZIMAGE) roadmap
 
