@@ -889,6 +889,13 @@ impl FITS {
         // seed.  When the user passed Quantize(seed=0) we use 1
         // here as the on-disk default (cfitsio also defaults to 1
         // when the user hasn't picked a seed).
+        //
+        // ZBLANK records the integer sentinel cfitsio's quantized-
+        // float decoder treats as "this pixel was NaN".  Always
+        // -2147483647 (NULL_VALUE_I32 in our quantize module).
+        // Emitting it lets fitsio / astropy readers recognize our
+        // NaN-encoded pixels on the way back through their own
+        // dequantize path.
         if let Some(q) = &quantize_cfg {
             cards.push(card_string(
                 "ZQUANTIZ", q.method.zquantiz(),
@@ -898,6 +905,10 @@ impl FITS {
             cards.push(card_int(
                 "ZDITHER0", seed_on_disk,
                 "dithering offset/seed",
+            ));
+            cards.push(card_int(
+                "ZBLANK", -2147483647,
+                "quantized null-pixel sentinel",
             ));
         }
         // Algorithm-specific ZNAMEn/ZVALn pairs (RICE BLOCKSIZE +

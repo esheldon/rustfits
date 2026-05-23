@@ -166,19 +166,33 @@ pub(crate) fn dequantize_to_f32(
 ) -> Vec<u8> {
     let n = stored.len();
     let mut out = Vec::with_capacity(n * 4);
+    // All three dither methods recognize NULL_VALUE_I32 → NaN: the
+    // encoder writes that sentinel for any input NaN pixel,
+    // regardless of method.  DITHER_2 additionally reserves
+    // ZERO_VALUE_I32 for exact-zero round-trip.
     match method {
         DitherMethod::NoDither => {
             for &q in stored {
-                let v = (q as f64) * scale + zero;
-                out.extend_from_slice(&(v as f32).to_ne_bytes());
+                let v: f32 = if q == NULL_VALUE_I32 {
+                    f32::NAN
+                } else {
+                    ((q as f64) * scale + zero) as f32
+                };
+                out.extend_from_slice(&v.to_ne_bytes());
             }
         }
         DitherMethod::SubtractiveDither1 => {
             let mut dither = DitherStream::new(tile_row_1based, zdither0);
             for &q in stored {
                 let offset = dither.next_offset();
-                let v = ((q as f64) - (offset as f64) + 0.5) * scale + zero;
-                out.extend_from_slice(&(v as f32).to_ne_bytes());
+                let v: f32 = if q == NULL_VALUE_I32 {
+                    f32::NAN
+                } else {
+                    let phys = ((q as f64) - (offset as f64) + 0.5)
+                        * scale + zero;
+                    phys as f32
+                };
+                out.extend_from_slice(&v.to_ne_bytes());
             }
         }
         DitherMethod::SubtractiveDither2 => {
@@ -196,7 +210,8 @@ pub(crate) fn dequantize_to_f32(
                     // (not via the noisy dequant formula).
                     0.0
                 } else {
-                    let phys = ((q as f64) - (offset as f64) + 0.5) * scale + zero;
+                    let phys = ((q as f64) - (offset as f64) + 0.5)
+                        * scale + zero;
                     phys as f32
                 };
                 out.extend_from_slice(&v.to_ne_bytes());
@@ -219,10 +234,15 @@ pub(crate) fn dequantize_to_f64(
 ) -> Vec<u8> {
     let n = stored.len();
     let mut out = Vec::with_capacity(n * 8);
+    // Same NULL_VALUE_I32 handling as the f32 sibling above.
     match method {
         DitherMethod::NoDither => {
             for &q in stored {
-                let v = (q as f64) * scale + zero;
+                let v: f64 = if q == NULL_VALUE_I32 {
+                    f64::NAN
+                } else {
+                    (q as f64) * scale + zero
+                };
                 out.extend_from_slice(&v.to_ne_bytes());
             }
         }
@@ -230,7 +250,11 @@ pub(crate) fn dequantize_to_f64(
             let mut dither = DitherStream::new(tile_row_1based, zdither0);
             for &q in stored {
                 let offset = dither.next_offset();
-                let v = ((q as f64) - (offset as f64) + 0.5) * scale + zero;
+                let v: f64 = if q == NULL_VALUE_I32 {
+                    f64::NAN
+                } else {
+                    ((q as f64) - (offset as f64) + 0.5) * scale + zero
+                };
                 out.extend_from_slice(&v.to_ne_bytes());
             }
         }
@@ -294,6 +318,26 @@ pub(crate) fn i32_bytes_to_values(bytes: &[u8]) -> PyResult<Vec<i32>> {
 // NULL_VALUE_I32 and ZERO_VALUE_I32 are defined at the top of the
 // file (shared with the decoder).
 const N_RESERVED_VALUES: i32 = 10;
+
+// NaN-aware "is this pixel the null sentinel?" check.  Plain `==`
+// fails for NaN (IEEE 754: NaN != NaN), so when the user passes
+// `Some(NaN)` as the null sentinel we have to special-case it via
+// `is_nan()`.  Returns false when no null sentinel is configured.
+fn is_null_f32(v: f32, null_value: Option<f32>) -> bool {
+    match null_value {
+        Some(nv) if nv.is_nan() => v.is_nan(),
+        Some(nv) => v == nv,
+        None => false,
+    }
+}
+
+fn is_null_f64(v: f64, null_value: Option<f64>) -> bool {
+    match null_value {
+        Some(nv) if nv.is_nan() => v.is_nan(),
+        Some(nv) => v == nv,
+        None => false,
+    }
+}
 
 // Output of `quantize_float` / `quantize_double` on the success
 // path.  `idata` is the per-pixel quantized stream; `bscale` and
@@ -380,10 +424,8 @@ fn noise5_f32(
 
     if nx < 9 {
         for &v in &array[..nx] {
-            if let Some(nv) = null_value {
-                if v == nv {
-                    continue;
-                }
+            if is_null_f32(v, null_value) {
+                continue;
             }
             if v < xminval {
                 xminval = v;
@@ -413,13 +455,9 @@ fn noise5_f32(
     let mut diffs5: Vec<f64> = Vec::with_capacity(ny);
 
     // is_valid: returns true when `v` is not the null sentinel
-    // (or always true if no nullcheck).
-    let is_valid = |v: f32| -> bool {
-        match null_value {
-            Some(nv) => v != nv,
-            None => true,
-        }
-    };
+    // (or always true if no nullcheck).  NaN-aware via the
+    // is_null_f32 helper.
+    let is_valid = |v: f32| -> bool { !is_null_f32(v, null_value) };
 
     for jj in 0..ny {
         let rowstart = jj * nx;
@@ -577,10 +615,8 @@ fn noise5_f64(
 
     if nx < 9 {
         for &v in &array[..nx] {
-            if let Some(nv) = null_value {
-                if v == nv {
-                    continue;
-                }
+            if is_null_f64(v, null_value) {
+                continue;
             }
             if v < xminval {
                 xminval = v;
@@ -607,12 +643,7 @@ fn noise5_f64(
     let mut diffs3: Vec<f64> = Vec::with_capacity(ny);
     let mut diffs5: Vec<f64> = Vec::with_capacity(ny);
 
-    let is_valid = |v: f64| -> bool {
-        match null_value {
-            Some(nv) => v != nv,
-            None => true,
-        }
-    };
+    let is_valid = |v: f64| -> bool { !is_null_f64(v, null_value) };
 
     for jj in 0..ny {
         let rowstart = jj * nx;
@@ -749,10 +780,8 @@ fn min_max_f32(
     let mut xmax = f32::NEG_INFINITY;
     let mut ng = 0usize;
     for &v in array {
-        if let Some(nv) = null_value {
-            if v == nv {
-                continue;
-            }
+        if is_null_f32(v, null_value) {
+            continue;
         }
         if v < xmin {
             xmin = v;
@@ -772,10 +801,8 @@ fn min_max_f64(
     let mut xmax = f64::NEG_INFINITY;
     let mut ng = 0usize;
     for &v in array {
-        if let Some(nv) = null_value {
-            if v == nv {
-                continue;
-            }
+        if is_null_f64(v, null_value) {
+            continue;
         }
         if v < xmin {
             xmin = v;
@@ -904,18 +931,14 @@ pub(crate) fn quantize_float(
     let needs_null_check = ngood != nx;
     for i in 0..nx {
         let v = fdata[i];
-        if needs_null_check {
-            if let Some(nv) = null_value {
-                if v == nv {
-                    idata.push(NULL_VALUE_I32);
-                    // The dither stream advances on every pixel
-                    // regardless, per cfitsio.
-                    if let Some(ds) = dither.as_mut() {
-                        ds.next_offset();
-                    }
-                    continue;
-                }
+        if needs_null_check && is_null_f32(v, null_value) {
+            idata.push(NULL_VALUE_I32);
+            // The dither stream advances on every pixel
+            // regardless, per cfitsio.
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
             }
+            continue;
         }
         // SUBTRACTIVE_DITHER_2 special case: exact-zero pixels
         // map to ZERO_VALUE so they round-trip exactly.
@@ -1025,16 +1048,12 @@ pub(crate) fn quantize_double(
     let needs_null_check = ngood != nx;
     for i in 0..nx {
         let v = fdata[i];
-        if needs_null_check {
-            if let Some(nv) = null_value {
-                if v == nv {
-                    idata.push(NULL_VALUE_I32);
-                    if let Some(ds) = dither.as_mut() {
-                        ds.next_offset();
-                    }
-                    continue;
-                }
+        if needs_null_check && is_null_f64(v, null_value) {
+            idata.push(NULL_VALUE_I32);
+            if let Some(ds) = dither.as_mut() {
+                ds.next_offset();
             }
+            continue;
         }
         if matches!(method, DitherMethod::SubtractiveDither2) && v == 0.0 {
             idata.push(ZERO_VALUE_I32);

@@ -2138,6 +2138,11 @@ fn write_compressed_image_data(
             let nypix = if nxpix == 0 { 0 } else { n_pixels / nxpix };
             // 1-based tile index drives the dither seed.
             let row_1based = tile_idx + 1;
+            // NaN is the natural null sentinel for float data —
+            // pass it as the null_value so the noise estimator
+            // skips NaN pixels and the per-pixel quantize loop
+            // maps them to NULL_VALUE_I32.  The decoder restores
+            // NaN on read for all dither methods.
             let qt_opt = if zbitpix == -32 {
                 let mut tile_f32: Vec<f32> = Vec::with_capacity(n_pixels);
                 for chunk in tile_bytes.chunks_exact(4) {
@@ -2146,7 +2151,7 @@ fn write_compressed_image_data(
                     ));
                 }
                 crate::zimage::quantize::quantize_float(
-                    &tile_f32, nxpix, nypix, None,
+                    &tile_f32, nxpix, nypix, Some(f32::NAN),
                     qlevel, method, row_1based, zdither0,
                 )
             } else {
@@ -2157,7 +2162,7 @@ fn write_compressed_image_data(
                     ));
                 }
                 crate::zimage::quantize::quantize_double(
-                    &tile_f64, nxpix, nypix, None,
+                    &tile_f64, nxpix, nypix, Some(f64::NAN),
                     qlevel, method, row_1based, zdither0,
                 )
             };
