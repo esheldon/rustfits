@@ -1,0 +1,28 @@
+# Codecov configuration for rustfits.
+#
+# We deliberately don't chase patch coverage during feature work
+# (see "Coverage TODO — sweep once feature-complete" in CLAUDE.md
+# for the rationale).  These thresholds turn codecov status into
+# *informational* signals rather than blocking checks:
+#
+#   - patch: pass when new-code coverage is at least 70%.  Most
+#     of our feature PRs land an algorithmic port plus tests for
+#     the supported paths; the uncovered slice is usually error
+#     branches (mid-write I/O failures, malformed-file paths) that
+#     are hard to exercise without fault injection — appropriate
+#     targets for the planned post-feature-complete coverage sweep.
+#   - project: allow project coverage to dip up to 1% per PR
+#     (otherwise any patch that's slightly below the global average
+#     fails the project check too, which is double-counting).
+#
+# Tighten these once the planned coverage sweep is done.
+
+coverage:
+  status:
+    patch:
+      default:
+        target: 70%
+        threshold: 0%
+    project:
+      default:
+        threshold: 1%
