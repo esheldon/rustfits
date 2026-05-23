@@ -1912,18 +1912,194 @@ fn slice_compressed_image(
 
 // ====== Compressed write (Phases 7 + 8) ======
 //
-// REFACTOR TODO (post-Phase-8): `write_compressed_image_data` has
-// grown unwieldy — it branches on int-vs-float in several places,
-// embeds a per-tile-row struct, and duplicates descriptor-writing
-// logic.  Once the quantize matrix tests are in place (commit 3 of
-// Phase 8), refactor into:
-//   - `TileRow` promoted to a module-level struct (out of the fn).
-//   - `encode_tile_int` / `encode_tile_float` helpers, each
-//     returning `(TileRow, primary_bytes, fallback_bytes)`.
-//   - The main dispatcher just loops, calls the right helper,
-//     accumulates the heap, and emits the descriptor table.
-// Don't do it before the dither-matrix tests anchor behavior —
-// landing the refactor on top of a known-good baseline is safer.
+// Layout: `write_compressed_image_data` is the top-level
+// dispatcher.  It parses the header, loops over tiles calling
+// either `encode_tile_int` or `encode_tile_float`, then grows the
+// file and writes the descriptor table + heap.  The per-tile
+// helpers return a `TileRow` (descriptor + per-tile ZSCALE/ZZERO
+// + optional GZIP fallback descriptor) and mutate the heap
+// buffers in place.
+
+// Per-tile row data captured during the encode loop.  For integer
+// HDUs only `primary_nelem` / `primary_off` are meaningful (the
+// other fields stay at their default values).  For float HDUs
+// either the primary fields are non-zero (tile quantized cleanly)
+// OR the fallback fields are non-zero (tile went to the GZIP
+// fallback column).  `zscale` / `zzero` are the per-tile
+// quantization parameters; they're meaningless when the fallback
+// path fires but get written anyway since the row width is fixed.
+struct TileRow {
+    primary_nelem: u64,
+    primary_off: u64,
+    zscale: f64,
+    zzero: f64,
+    fallback_nelem: u64,
+    fallback_off: u64,
+}
+
+// HDU-invariant context for the integer-tile encode helper.
+// Everything that doesn't vary tile-to-tile.
+struct IntTileCtx {
+    algorithm: crate::zimage::CompressionAlgorithm,
+    bytepix: u32,
+    zbitpix: i32,
+    inner_byte_width: u64,
+    blocksize: u32,
+    hcompress_scale: i32,
+}
+
+// HDU-invariant context for the float-tile encode helper.
+// Carries the noise-estimation knobs (qlevel) and dither state
+// (method + zdither0) alongside the algorithm parameters.
+struct FloatTileCtx {
+    algorithm: crate::zimage::CompressionAlgorithm,
+    zbitpix: i32, // -32 or -64
+    inner_byte_width: u64,
+    blocksize: u32,
+    hcompress_scale: i32,
+    method: crate::zimage::quantize::DitherMethod,
+    qlevel: f64,
+    zdither0: i64,
+}
+
+// Encode one integer tile: run it through the chosen algorithm,
+// append the encoded bytes to `primary_heap`, return the row's
+// descriptor.  The float fields of TileRow stay at their defaults
+// (caller knows to ignore them for integer HDUs).
+fn encode_tile_int(
+    ctx: &IntTileCtx,
+    tile_bytes: &[u8],
+    tile_idx: u64,
+    actual_shape: &[u64],
+    n_pixels: usize,
+    primary_heap: &mut Vec<u8>,
+) -> PyResult<TileRow> {
+    let encode_params = crate::zimage::AlgorithmEncodeParams {
+        blocksize: ctx.blocksize,
+        tile_shape_numpy: actual_shape,
+        scale: ctx.hcompress_scale,
+    };
+    let encoded = crate::zimage::encode_tile_from_bytes(
+        ctx.algorithm, tile_bytes, ctx.bytepix, n_pixels,
+        ctx.zbitpix, encode_params,
+    )?;
+    if encoded.len() as u64 % ctx.inner_byte_width != 0 {
+        return Err(PyValueError::new_err(format!(
+            "internal: encoded tile {} bytes={} not a multiple \
+             of inner_byte_width={}",
+            tile_idx, encoded.len(), ctx.inner_byte_width,
+        )));
+    }
+    let off = primary_heap.len() as u64;
+    let nelem = encoded.len() as u64 / ctx.inner_byte_width;
+    primary_heap.extend(encoded);
+    Ok(TileRow {
+        primary_nelem: nelem,
+        primary_off: off,
+        zscale: 0.0,
+        zzero: 0.0,
+        fallback_nelem: 0,
+        fallback_off: 0,
+    })
+}
+
+// Encode one float tile.  Convert big-endian float bytes to
+// native floats, run quantize_float / quantize_double, then either:
+//   - encode the quantized i32 stream through the chosen algorithm
+//     and append to `primary_heap`, OR
+//   - GZIP-compress the raw float bytes (lossless) and append to
+//     `fallback_heap` (the "couldn't quantize" path).
+// Per-pixel NaN handling: NaN inputs become NULL_VALUE_I32 in the
+// quantized stream regardless of dither method (cfitsio's
+// convention).  Exact zeros become ZERO_VALUE_I32 under DITHER_2.
+fn encode_tile_float(
+    ctx: &FloatTileCtx,
+    tile_bytes: &[u8],
+    tile_idx: u64,
+    actual_shape: &[u64],
+    n_pixels: usize,
+    primary_heap: &mut Vec<u8>,
+    fallback_heap: &mut Vec<u8>,
+) -> PyResult<TileRow> {
+    // Quantize.  nxpix = numpy-last (fast) axis; nypix = the rest.
+    // 1-based tile index drives the dither seed.
+    let nxpix = actual_shape[actual_shape.len() - 1] as usize;
+    let nypix = if nxpix == 0 { 0 } else { n_pixels / nxpix };
+    let row_1based = tile_idx + 1;
+    let qt_opt = if ctx.zbitpix == -32 {
+        let mut tile_f32: Vec<f32> = Vec::with_capacity(n_pixels);
+        for chunk in tile_bytes.chunks_exact(4) {
+            tile_f32.push(f32::from_be_bytes(chunk.try_into().unwrap()));
+        }
+        crate::zimage::quantize::quantize_float(
+            &tile_f32, nxpix, nypix, Some(f32::NAN),
+            ctx.qlevel, ctx.method, row_1based, ctx.zdither0,
+        )
+    } else {
+        let mut tile_f64: Vec<f64> = Vec::with_capacity(n_pixels);
+        for chunk in tile_bytes.chunks_exact(8) {
+            tile_f64.push(f64::from_be_bytes(chunk.try_into().unwrap()));
+        }
+        crate::zimage::quantize::quantize_double(
+            &tile_f64, nxpix, nypix, Some(f64::NAN),
+            ctx.qlevel, ctx.method, row_1based, ctx.zdither0,
+        )
+    };
+
+    if let Some(qt) = qt_opt {
+        // Quantized successfully — encode the i32 stream through
+        // the chosen algorithm (acts as if the input were a 32-bit
+        // integer image).
+        let mut i32_be: Vec<u8> = Vec::with_capacity(n_pixels * 4);
+        for &v in &qt.idata {
+            i32_be.extend_from_slice(&v.to_be_bytes());
+        }
+        let encode_params = crate::zimage::AlgorithmEncodeParams {
+            blocksize: ctx.blocksize,
+            tile_shape_numpy: actual_shape,
+            scale: ctx.hcompress_scale,
+        };
+        let encoded = crate::zimage::encode_tile_from_bytes(
+            ctx.algorithm, &i32_be, 4, n_pixels, 32,
+            encode_params,
+        )?;
+        if encoded.len() as u64 % ctx.inner_byte_width != 0 {
+            return Err(PyValueError::new_err(format!(
+                "internal: encoded tile {} bytes={} not a multiple \
+                 of inner_byte_width={}",
+                tile_idx, encoded.len(), ctx.inner_byte_width,
+            )));
+        }
+        let off = primary_heap.len() as u64;
+        let nelem = encoded.len() as u64 / ctx.inner_byte_width;
+        primary_heap.extend(encoded);
+        Ok(TileRow {
+            primary_nelem: nelem,
+            primary_off: off,
+            zscale: qt.bscale,
+            zzero: qt.bzero,
+            fallback_nelem: 0,
+            fallback_off: 0,
+        })
+    } else {
+        // Couldn't quantize (constant tile, range too wide, etc.)
+        // — GZIP-compress the raw float bytes into the lossless
+        // fallback column.  Primary descriptor stays empty so the
+        // reader falls through to the GZIP fallback.
+        let encoded = crate::zimage::gzip::encode_gzip1(tile_bytes)?;
+        let off = fallback_heap.len() as u64;
+        let nelem = encoded.len() as u64;
+        fallback_heap.extend(encoded);
+        Ok(TileRow {
+            primary_nelem: 0,
+            primary_off: 0,
+            zscale: 1.0,
+            zzero: 0.0,
+            fallback_nelem: nelem,
+            fallback_off: off,
+        })
+    }
+}
 
 // Bulk-write entry point for CompressedImageHDU.write.  Encodes every
 // tile in RAM, then mutates the file (grow if non-last HDU, write
@@ -2075,23 +2251,45 @@ fn write_compressed_image_data(
 
     // ----- per-tile encode loop -----
     //
-    // For each tile we accumulate either:
-    //   - (primary stream) bytes appended to `primary_heap`, or
-    //   - (lossless fallback) raw float bytes GZIP-compressed and
-    //     appended to `fallback_heap`,
-    // plus per-row metadata (descriptors + ZSCALE/ZZERO for floats)
-    // captured in `rows`.  The two heaps are concatenated to form
-    // the on-disk heap after the loop; fallback offsets are then
-    // bumped by `primary_heap.len()` so their descriptors point at
-    // the correct combined-heap location.
-    struct TileRow {
-        primary_nelem: u64,
-        primary_off: u64,
-        zscale: f64,
-        zzero: f64,
-        fallback_nelem: u64,
-        fallback_off: u64,
-    }
+    // For each tile we either:
+    //   - encode through the chosen algorithm → primary_heap, or
+    //   - (float-only) fall back to GZIP-compressed raw float
+    //     bytes → fallback_heap when quantize returns None.
+    // The two heaps are concatenated below; fallback offsets are
+    // bumped by primary_heap.len() so descriptors point at the
+    // right place in the combined heap.
+    //
+    // Integer / float dispatch lives in `encode_tile_int` /
+    // `encode_tile_float`; HDU-invariant params travel in
+    // IntTileCtx / FloatTileCtx, leaving this loop to just
+    // extract tile bytes and call the right helper.
+    let int_ctx = if !is_float {
+        Some(IntTileCtx {
+            algorithm,
+            bytepix,
+            zbitpix,
+            inner_byte_width,
+            blocksize: blocksize_opt.unwrap_or(32),
+            hcompress_scale,
+        })
+    } else {
+        None
+    };
+    let float_ctx = if is_float {
+        Some(FloatTileCtx {
+            algorithm,
+            zbitpix,
+            inner_byte_width,
+            blocksize: blocksize_opt.unwrap_or(32),
+            hcompress_scale,
+            method: quant_method.unwrap(),
+            qlevel,
+            zdither0,
+        })
+    } else {
+        None
+    };
+
     let mut rows: Vec<TileRow> = Vec::with_capacity(n_tiles as usize);
     let mut primary_heap: Vec<u8> = Vec::new();
     let mut fallback_heap: Vec<u8> = Vec::new();
@@ -2127,131 +2325,20 @@ fn write_compressed_image_data(
             )));
         }
 
-        if is_float {
-            // ---- float quantization path ----
-            let method = quant_method.unwrap();
-            // Tile dims as passed to quantize_float/_double:
-            //   nxpix = numpy-last (fast) axis
-            //   nypix = remaining (product of the rest)
-            // The noise estimator walks rows of length nxpix.
-            let nxpix = actual_shape[actual_shape.len() - 1] as usize;
-            let nypix = if nxpix == 0 { 0 } else { n_pixels / nxpix };
-            // 1-based tile index drives the dither seed.
-            let row_1based = tile_idx + 1;
-            // NaN is the natural null sentinel for float data —
-            // pass it as the null_value so the noise estimator
-            // skips NaN pixels and the per-pixel quantize loop
-            // maps them to NULL_VALUE_I32.  The decoder restores
-            // NaN on read for all dither methods.
-            let qt_opt = if zbitpix == -32 {
-                let mut tile_f32: Vec<f32> = Vec::with_capacity(n_pixels);
-                for chunk in tile_bytes.chunks_exact(4) {
-                    tile_f32.push(f32::from_be_bytes(
-                        chunk.try_into().unwrap(),
-                    ));
-                }
-                crate::zimage::quantize::quantize_float(
-                    &tile_f32, nxpix, nypix, Some(f32::NAN),
-                    qlevel, method, row_1based, zdither0,
-                )
-            } else {
-                let mut tile_f64: Vec<f64> = Vec::with_capacity(n_pixels);
-                for chunk in tile_bytes.chunks_exact(8) {
-                    tile_f64.push(f64::from_be_bytes(
-                        chunk.try_into().unwrap(),
-                    ));
-                }
-                crate::zimage::quantize::quantize_double(
-                    &tile_f64, nxpix, nypix, Some(f64::NAN),
-                    qlevel, method, row_1based, zdither0,
-                )
-            };
-
-            if let Some(qt) = qt_opt {
-                // Quantized successfully — encode the i32 stream
-                // through the chosen algorithm (acts as if the
-                // input were a 32-bit integer image).
-                let mut i32_be: Vec<u8> = Vec::with_capacity(n_pixels * 4);
-                for &v in &qt.idata {
-                    i32_be.extend_from_slice(&v.to_be_bytes());
-                }
-                let encode_params = crate::zimage::AlgorithmEncodeParams {
-                    blocksize: blocksize_opt.unwrap_or(32),
-                    tile_shape_numpy: &actual_shape,
-                    scale: hcompress_scale,
-                };
-                let encoded = crate::zimage::encode_tile_from_bytes(
-                    algorithm, &i32_be, 4 /* bytepix=4 for i32 */,
-                    n_pixels, 32 /* zbitpix=32 for the integer encode */,
-                    encode_params,
-                )?;
-                if encoded.len() as u64 % inner_byte_width != 0 {
-                    return Err(PyValueError::new_err(format!(
-                        "internal: encoded tile {} bytes={} not a \
-                         multiple of inner_byte_width={}",
-                        tile_idx, encoded.len(), inner_byte_width,
-                    )));
-                }
-                let off = primary_heap.len() as u64;
-                let nelem = encoded.len() as u64 / inner_byte_width;
-                primary_heap.extend(encoded);
-                rows.push(TileRow {
-                    primary_nelem: nelem,
-                    primary_off: off,
-                    zscale: qt.bscale,
-                    zzero: qt.bzero,
-                    fallback_nelem: 0,
-                    fallback_off: 0,
-                });
-            } else {
-                // Couldn't quantize (constant tile, range too
-                // wide, etc.) — GZIP-compress the raw float bytes
-                // into the lossless fallback column.
-                let encoded = crate::zimage::gzip::encode_gzip1(
-                    &tile_bytes,
-                )?;
-                let off = fallback_heap.len() as u64;
-                let nelem = encoded.len() as u64;
-                fallback_heap.extend(encoded);
-                rows.push(TileRow {
-                    primary_nelem: 0,
-                    primary_off: 0,
-                    zscale: 1.0,
-                    zzero: 0.0,
-                    fallback_nelem: nelem,
-                    fallback_off: off,
-                });
-            }
+        let row = if is_float {
+            encode_tile_float(
+                float_ctx.as_ref().unwrap(),
+                &tile_bytes, tile_idx, &actual_shape, n_pixels,
+                &mut primary_heap, &mut fallback_heap,
+            )?
         } else {
-            // ---- integer path ----
-            let encode_params = crate::zimage::AlgorithmEncodeParams {
-                blocksize: blocksize_opt.unwrap_or(32),
-                tile_shape_numpy: &actual_shape,
-                scale: hcompress_scale,
-            };
-            let encoded = crate::zimage::encode_tile_from_bytes(
-                algorithm, &tile_bytes, bytepix, n_pixels,
-                zbitpix, encode_params,
-            )?;
-            if encoded.len() as u64 % inner_byte_width != 0 {
-                return Err(PyValueError::new_err(format!(
-                    "internal: encoded tile {} bytes={} not a multiple \
-                     of inner_byte_width={}",
-                    tile_idx, encoded.len(), inner_byte_width,
-                )));
-            }
-            let off = primary_heap.len() as u64;
-            let nelem = encoded.len() as u64 / inner_byte_width;
-            primary_heap.extend(encoded);
-            rows.push(TileRow {
-                primary_nelem: nelem,
-                primary_off: off,
-                zscale: 0.0,
-                zzero: 0.0,
-                fallback_nelem: 0,
-                fallback_off: 0,
-            });
-        }
+            encode_tile_int(
+                int_ctx.as_ref().unwrap(),
+                &tile_bytes, tile_idx, &actual_shape, n_pixels,
+                &mut primary_heap,
+            )?
+        };
+        rows.push(row);
     }
 
     // Combine the two heaps.  Bump fallback offsets so they land
