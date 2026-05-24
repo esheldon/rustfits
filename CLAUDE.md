@@ -115,9 +115,11 @@ else stays private to its file.
   `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`),
   4 (VLA-column read via dual-descriptor heap), 5 (bulk write
   via `create_table_hdu(..., compress=...)` for fixed columns),
-  and 6a (VLA write via dual-descriptor heap + ZPCOUNT for
-  funpack interop) shipped; remaining: `__setitem__` / `append`
-  on compressed tables (Phase 6b).  Detection lives in `header_has_ztable`; routing
+  6a (VLA write via dual-descriptor heap + ZPCOUNT for
+  funpack interop), and 6b (`append()` for fixed-column tables
+  with merge-into-partial-last-tile) shipped; remaining (Phase
+  6c, deferred until a user asks): `__setitem__` + `repack()` +
+  VLA `append`.  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2377,7 +2379,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 4 | VLA-column read (dual-descriptor heap) | ✅ Shipped |
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ✅ Shipped |
 | 6a | VLA write (dual-descriptor heap, ZPCOUNT, funpack interop) | ✅ Shipped |
-| 6b | `__setitem__` / `append` on compressed tables | ⏳ Planned |
+| 6b | `append()` for fixed-column tables (merge into partial last tile) | ✅ Shipped |
+| 6c | `__setitem__` + `repack()` + VLA `append` | ⏳ Planned (only if a user asks) |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -2809,6 +2812,85 @@ mixed VLA + fixed columns; multi-tile VLA writes; PA (string
 VLA) columns; per-column compression overrides on VLA cols;
 **byte-exact funpack interop** (cfitsio decompresses our
 VLA-bearing files and round-trips the data through fitsio).
+
+**Phase 6b — append for fixed-column tables.**  Shipped.
+
+`CompressedTableHDU.append(data, *, names=None)` extends the
+table with new rows.  Accepts the same three input forms as
+`TableHDU.append` (structured ndarray / dict / list+names).
+`extend()` is the symmetric alias.
+
+**Merge-into-last-partial semantics.**  If the existing last
+tile has fewer than ZTILELEN rows:
+
+  1. Decode the existing last tile per column (BE bytes, via a
+     stripped-down read path that stops before the byteswap-to-
+     native that `convert_column_cell` does).
+  2. Concatenate the first M new rows (M = min(append_nrows,
+     ZTILELEN - last_tile_rows)) via the shared
+     `apply_transform_cell`.
+  3. Re-encode the merged tile per ZCTYPn, append the new blobs
+     to the heap end.  Old last-tile blobs become orphans —
+     PCOUNT grows monotonically until a `repack()` reclaims them
+     (Phase 6c).
+
+Remaining rows after the merge become fresh tiles encoded
+exactly like the bulk write path.  This maintains the FITS Tile
+Compression Convention's "all tiles same size except the last"
+invariant so funpack reads back correctly.
+
+**Block-alignment gotcha (debugged + fixed).**  The data section
+must end at a `BLOCK_SIZE` boundary so subsequent HDU headers
+stay aligned.  Initial naive implementation shifted the file
+tail by `delta_desc_bytes` (typically a few tens of bytes, not
+block-aligned), which:
+
+  - Left HDU N+1's header at a non-aligned offset.
+  - The append's tail-pad write then overwrote the start of
+    HDU N+1 with zeros.
+
+Fixed by using `grow_file_to_at_least` (rounds to block,
+handles last vs non-last HDU via set_len vs shift_file_tail)
+plus a within-file `relocate_region_forward_local` to slide the
+existing heap forward to its new position after the larger
+descriptor table.  No tail-pad write — the bytes between
+`heap_cursor` and the next block boundary are either zeros
+(last HDU, OS set_len) or HDU N+1's shifted content (non-last);
+either way don't overwrite them.
+
+**VLA append rejected.**  Per-cell decode + re-encode of the
+existing last tile's dual-descriptor blob is significantly more
+work than the fixed path; deferred to Phase 6c.  Workaround:
+rebuild the table via `create_table_hdu` + `write` to add rows
+to a VLA-bearing compressed table.
+
+**Cache invalidation.**  Cleared after each append (cheaper
+than per-tile invalidation; append is rare-vs-read in any
+realistic workflow).
+
+Tests: `tests/test_compressed_table_phase6b.py` (14 cases) —
+merge-only, exact-fill, merge + new tile, no-merge (full last
+tile), multiple appends accumulating, three input forms,
+`extend()` alias, zero-row no-op, **non-last-HDU preserves
+trailing HDU**, **funpack byte-exact interop**, VLA rejection,
+PCOUNT grows after merge, ZNAXIS2 + NAXIS2 update correctly.
+
+**Refactor opportunity (post-6b).**  `write_compressed_table_data`
+and `append_compressed_table_data` overlap heavily on the
+per-(tile, col) encode → heap-write → descriptor-fill loop and
+on the per-column prep struct (`FixedColPrep` ↔ `AppendColPrep`
+have basically the same fields).  Candidates for extraction:
+
+  - A shared per-column-prep struct (combine `FixedColPrep` +
+    `AppendColPrep`).
+  - A shared `encode_tile_column_and_record` helper that takes a
+    `(tile_idx, col_idx, rows_in_tile, source_row_offset)` plus
+    per-column prep + algorithm + heap_cursor + descriptor table,
+    and writes the blob + fills the descriptor entry.
+
+Deferred until after Phase 6c (if it ships) so the write-set's
+shape is fully settled.  ~200 lines could come out of the table-
+compressed file with this refactor.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

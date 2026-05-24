@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
-use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
