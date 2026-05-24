@@ -386,6 +386,67 @@ failure inside the shift loop, the post-shift `flush`, or the subsequent
 header `write_all`/`flush` DOES taint, because the file may now be
 inconsistent.  See the `check_not_tainted` block above.
 
+## Heap repack: drop orphans + shrink the file
+
+Both `TableHDU.repack()` (VLA tables) and
+`CompressedImageHDU.repack()` rebuild the heap with only the bytes
+that live descriptors point at, dropping orphans accumulated by
+`__setitem__` (and `extend` on the compressed side).  When the new
+padded extent is smaller than the old, the on-disk file shrinks too:
+the last HDU uses `set_len`; non-last HDUs go through a backward
+file-tail shift via the shared primitive
+`shift_file_tail_backward_and_update_offsets` (common.rs), the
+mirror image of the forward grow primitive — destination offsets
+land BEFORE source so the copy walks front-to-back without overlap
+worries.  Later HDUs' offsets bump DOWN by `delta` via the shared
+`Arc<HduOffsets>` model, so previously-issued handles transparently
+see the post-shrink layout.
+
+Algorithm (same shape on both sides):
+1. Read the whole main table + the whole old heap into RAM under a
+   single file lock.
+2. Walk every row × every descriptor column.  For each live cell
+   (`nelements > 0`) copy its bytes from the old-heap snapshot into
+   a fresh `Vec<u8>` (in row-major × descriptor-order, which matches
+   what the bulk write path emits), record the new offset, and
+   rewrite the in-memory descriptor to point at the new location.
+3. Drop the old heap; if `new_pcount == current_pcount` already
+   (compact), bail out.
+4. Compute new padded extent.  Write the rebuilt main table + new
+   heap back at the same `data_offset`.
+5. If the new padded extent is smaller: shift the file tail
+   backward (non-last) or `set_len` (last).
+6. PCOUNT update via the standard disk-write-before-commit header
+   rewrite + taint discipline.
+7. Compressed side also `cache.clear()`s the tile cache (entries
+   pointed at the old heap layout).
+
+**Scope limitations.**  Both sides reject the call up front when
+the file has a non-default `THEAP` (where `THEAP != NAXIS1*NAXIS2`)
+because repack writes the new heap at the default position and
+would corrupt a file with a custom layout.  rustfits never emits
+THEAP itself, so this only blocks repack on files written by other
+tools with a non-standard heap offset — workaround is to clone the
+file through a fresh `create_*` + write.
+
+**Implementation.**  `repack_table_heap` in `hdu_table.rs` and
+`repack_compressed_heap` in `hdu_image_compressed.rs`.  Same shape,
+different descriptor-column enumeration: tables iterate every VLA
+column per row; compressed images iterate the primary
+`COMPRESSED_DATA` column plus the optional `GZIP_COMPRESSED_DATA`
+and `UNCOMPRESSED_DATA` fallbacks (each with its own
+`inner_byte_width`).  Validate-then-mutate (descriptor sanity
+checked before any write); mid-write failures taint the file.
+Pre-write failures (THEAP rejection, locks) don't taint.
+
+**Tests.**  `tests/test_vla_repack.py` (9 cases: drop orphans,
+shrink last HDU, no-op compact, no-op non-VLA, multiple VLA
+columns, mixed fixed+VLA, non-last shift, all-empty cells,
+repack→setitem→repack).  `tests/test_compressed_image_repack.py`
+(11 cases: drop orphans, shrink last HDU, no-op compact, non-last
+shift, algorithm matrix Gzip1/Gzip2/Rice1/Hcompress1, quantized
+float, unquantized float, cache invalidation).
+
 ## Feature status: supported and missing
 
 Snapshot of what's implemented across (image | table) × (read | write).
@@ -609,9 +670,8 @@ with at least one variable-length column:
 Heap model: new cells are appended at the end of the existing heap
 (heap_start_offset = current PCOUNT) and the old cells become
 orphans.  PCOUNT grows monotonically with every mutation.  Matches
-the compressed-image `__setitem__` pattern; a future `repack()` can
-compact the heap if a workload accumulates enough orphans to make
-it worthwhile.
+the compressed-image `__setitem__` pattern; call `hdu.repack()` to
+rebuild the heap with only live cells (see "Heap repack" below).
 
 Implementation lives in `hdu_table.rs` next to `write_vla_aware` /
 `append_vla_aware`.  Three helpers:
@@ -855,9 +915,6 @@ the reader walks tiles and decodes them.
 
 **Open follow-ups (low priority):**
 
-- **Heap repack/compact** — after many `__setitem__` calls, the
-  heap accumulates orphaned bytes.  A `repack()` method could
-  rewrite the heap with only live tiles.  Workload-driven.
 - **Per-tile ZBLANK column** — today only header-level ZBLANK
   works.  The convention also allows a per-tile column.  Rare
   in practice; defer until a real file needs it.
@@ -1814,9 +1871,9 @@ rejection paths.
 
 **Heap orphaning trade-off.**  After many `__setitem__` calls
 modifying the same tiles, the heap grows monotonically with
-orphaned bytes.  A future "compact" / "repack" operation could
-rewrite the heap with only live tiles, but isn't worth the
-complexity until a workload demonstrably needs it.
+orphaned bytes.  Call `hdu.repack()` to rebuild the heap with
+only live tiles (see "Heap repack" below for the shared
+mechanism with `TableHDU.repack()`).
 
 **GZIP compression level (`Gzip1(level=...)` / `Gzip2(level=...)`).**
 Shipped 2026-05-23.  Accepts 0..=9 (zlib levels: 0 = none, 1 =

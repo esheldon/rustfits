@@ -327,6 +327,109 @@ pub(crate) fn zero_fill_range(
     Ok(())
 }
 
+// Shift every byte in [old_after_offset..EOF] BACKWARD by `delta` bytes,
+// truncate the file to its new (smaller) size, and decrement every HDU
+// offset in `layout` whose `header_offset >= old_after_offset` by `delta`.
+// Mirror of `shift_file_tail_and_update_offsets` for the shrink direction;
+// used by the repack/compact path when an HDU's data section gets smaller
+// and the file tail must move forward to reclaim the freed space.
+//
+// Source range:      [old_after_offset .. original_len)
+// Destination range: [old_after_offset - delta .. original_len - delta)
+//
+// Because the destination starts BEFORE the source, a forward-walking
+// copy is safe: chunk k's write at [dst_k .. dst_k + n) cannot overlap
+// any chunk we haven't yet read (which all sit at offsets > dst_k + n).
+// The opposite-direction primitive needs back-to-front; this one needs
+// front-to-back.
+//
+// Taint semantics: pre-loop failures (lock acquisition, metadata) do
+// NOT taint — the file is untouched.  Failures inside the loop, the
+// post-loop flush, or the final set_len DO taint — the file may be
+// inconsistent and the user must close + reopen.
+pub(crate) fn shift_file_tail_backward_and_update_offsets(
+    file_handle: &FileHandle,
+    layout: &FileLayout,
+    old_after_offset: u64,
+    delta: u64,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    if delta > old_after_offset {
+        return Err(PyIOError::new_err(
+            "shift_file_tail_backward: delta exceeds the source offset"));
+    }
+
+    let mut guard = lock_file(file_handle)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    let original_len = f.metadata()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?
+        .len();
+    let tail_len = original_len.saturating_sub(old_after_offset);
+
+    if tail_len > 0 {
+        const CHUNK: u64 = 1 << 20;
+        let mut buf = vec![0u8; CHUNK as usize];
+        let mut moved: u64 = 0;
+        while moved < tail_len {
+            let n = std::cmp::min(tail_len - moved, CHUNK);
+            let src = old_after_offset + moved;
+            let dst = src - delta;
+            f.seek(SeekFrom::Start(src)).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "seek failed during backward shift: {}; \
+                     close + reopen", e))
+            })?;
+            let chunk = &mut buf[..n as usize];
+            f.read_exact(chunk).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "read failed during backward shift: {}; \
+                     close + reopen", e))
+            })?;
+            f.seek(SeekFrom::Start(dst)).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "seek failed during backward shift: {}; \
+                     close + reopen", e))
+            })?;
+            f.write_all(chunk).map_err(|e| {
+                tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "write failed during backward shift: {}; \
+                     close + reopen", e))
+            })?;
+            moved += n;
+        }
+        f.flush().map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "flush failed after backward shift: {}; close + reopen", e))
+        })?;
+    }
+
+    let new_len = original_len - delta;
+    f.set_len(new_len).map_err(|e| {
+        tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "set_len failed after backward shift: {}; close + reopen", e))
+    })?;
+
+    let layout_guard = layout.hdus.lock()
+        .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+    for hdu in layout_guard.iter() {
+        if hdu.header_offset() >= old_after_offset {
+            hdu.header_offset.fetch_sub(delta, Ordering::Release);
+            hdu.data_offset.fetch_sub(delta, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
 // Strict match: the keyword field in cols 1-8 (trimmed) must equal `key`, and
 // col 9 must be `=`.  This avoids the trap that `starts_with("NAXIS")` would
 // also match `NAXIS1`, `NAXIS2`, etc.

@@ -28,7 +28,8 @@ use std::sync::atomic::Ordering;
 
 use crate::common::{
     check_not_tainted, lock_file, parse_keyword, parse_keyword_float,
-    parse_string_keyword, shift_file_tail_and_update_offsets, zero_fill_range,
+    parse_string_keyword, shift_file_tail_and_update_offsets,
+    shift_file_tail_backward_and_update_offsets, zero_fill_range,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
@@ -4490,6 +4491,222 @@ fn setitem_single_column_vla(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Heap repack (drop orphaned cells)
+// ---------------------------------------------------------------------------
+
+// Rebuild the heap with only the bytes that live descriptors point at,
+// dropping orphan bytes left behind by VLA __setitem__.  Reads main
+// rows + old heap into RAM, builds the compact new heap, writes them
+// back, and shrinks the file if the new padded extent is smaller than
+// the old.
+//
+// Validate-then-mutate: pre-write failures (THEAP nonstandard, lock,
+// metadata) don't taint.  Once any byte movement starts, failures
+// taint.  No-op for non-VLA tables and for already-compact heaps.
+fn repack_table_heap(super_: &HDU) -> PyResult<()> {
+    check_not_tainted(&super_.tainted)?;
+    let cards = super_.header_snapshot()?;
+    let columns = parse_columns(&cards)?;
+    if !any_var_column(&columns) {
+        return Ok(());
+    }
+    let nrows = parse_keyword(&cards, "NAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let row_width = parse_keyword(&cards, "NAXIS1")
+        .unwrap_or(0).max(0) as usize;
+    let current_pcount = parse_keyword(&cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let data_offset = super_.offsets.data_offset();
+    if current_pcount == 0 || nrows == 0 {
+        return Ok(());
+    }
+
+    // Reject non-default THEAP — the read side would point at a heap
+    // start that differs from where repack writes the new heap.  Files
+    // rustfits creates never set THEAP, so this only blocks repack on
+    // files written by other tools with a non-default layout.
+    let theap_raw = parse_keyword(&cards, "THEAP").unwrap_or(0);
+    let main_bytes = (nrows as u64).saturating_mul(row_width as u64);
+    if theap_raw > 0 && (theap_raw as u64) != main_bytes {
+        return Err(PyValueError::new_err(format!(
+            "repack: file has non-default THEAP={} (main rows end at \
+             {}); repack would write the new heap at the default \
+             position and corrupt the file.  Workaround: rewrite the \
+             file through a fresh create_table_hdu + write",
+            theap_raw, main_bytes)));
+    }
+
+    // Read the main table + old heap into RAM under a single file lock.
+    let mut main_buf = vec![0u8; nrows * row_width];
+    let mut old_heap = vec![0u8; current_pcount as usize];
+    let heap_base = heap_base_in_data(&cards);
+    let old_heap_off = data_offset + heap_base;
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut main_buf)
+            .map_err(|e| PyIOError::new_err(format!(
+                "repack: read main table failed: {}", e)))?;
+        f.seek(SeekFrom::Start(old_heap_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut old_heap)
+            .map_err(|e| PyIOError::new_err(format!(
+                "repack: read heap failed: {}", e)))?;
+    }
+
+    // Walk rows × VLA columns, copy live cells from old_heap into a
+    // new compact buffer, and rewrite each descriptor in main_buf to
+    // point at its new location.
+    let mut new_heap: Vec<u8> = Vec::new();
+    for r in 0..nrows {
+        let row_off = r * row_width;
+        for col in &columns {
+            let Some(descriptor_kind) = col.var_kind else { continue; };
+            let desc_off = row_off + col.byte_offset;
+            let desc = &main_buf[desc_off..desc_off + col.byte_width];
+            let (nelements_s, old_off_s) =
+                read_descriptor(descriptor_kind, desc);
+            // Negative descriptor values indicate a bad file; reject
+            // up front rather than passing them through.
+            if nelements_s < 0 || old_off_s < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "repack: column '{}' row {}: descriptor has \
+                     negative field (nelements={}, offset={})",
+                    col.name, r, nelements_s, old_off_s)));
+            }
+            let nelements = nelements_s as u64;
+            let old_off = old_off_s as u64;
+            let elem_size = bytes_per_element(col.tform_letter)
+                .unwrap_or(0) as u64;
+            let n_bytes = nelements * elem_size;
+            if old_off + n_bytes > current_pcount {
+                return Err(PyValueError::new_err(format!(
+                    "repack: column '{}' row {}: descriptor points \
+                     past heap end (offset+bytes={} > PCOUNT={})",
+                    col.name, r, old_off + n_bytes, current_pcount)));
+            }
+            let new_off = new_heap.len() as u64;
+            if n_bytes > 0 {
+                new_heap.extend_from_slice(
+                    &old_heap[old_off as usize
+                        ..(old_off + n_bytes) as usize]);
+            }
+            let dst = &mut main_buf[desc_off..desc_off + col.byte_width];
+            write_descriptor(
+                descriptor_kind, nelements as usize, new_off as usize, dst);
+        }
+    }
+    drop(old_heap);
+    let new_pcount = new_heap.len() as u64;
+    if new_pcount == current_pcount {
+        // Already compact; nothing to do.
+        return Ok(());
+    }
+
+    let current_data_bytes = main_bytes + current_pcount;
+    let new_data_bytes = main_bytes + new_pcount;
+    let current_padded = round_up_to_block(current_data_bytes);
+    let new_padded = round_up_to_block(new_data_bytes);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    // Write the rebuilt main table + new heap (the new heap sits
+    // immediately after main; if the old heap was at default position
+    // we may be partially overwriting old-heap bytes, which is fine
+    // since they're in RAM as old_heap was already dropped above —
+    // sorry, the read snapshot in main_buf+new_heap is what we write
+    // out).  Pad the heap region within the current padded extent so
+    // any trailing bytes between new heap end and current end are
+    // zeroed (they won't be reachable from any descriptor regardless).
+    let heap_off_in_file = data_offset + main_bytes;
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&main_buf) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "repack: write main failed: {}; close + reopen", e)));
+        }
+        f.seek(SeekFrom::Start(heap_off_in_file))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&new_heap) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "repack: write heap failed: {}; close + reopen", e)));
+        }
+        if let Err(e) = f.flush() {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "repack: flush failed: {}; close + reopen", e)));
+        }
+    }
+
+    // Shrink the file extent.  For non-last HDUs, shift the tail
+    // backward to fill the gap and bump every later HDU's offset down;
+    // for the last HDU, a plain set_len reclaims the trailing block(s).
+    if new_hdu_end < current_hdu_end {
+        let delta = current_hdu_end - new_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_backward_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "repack: set_len failed: {}; close + reopen", e))
+            })?;
+        }
+    }
+
+    // PCOUNT update — disk-write-before-commit ordering.
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "repack: PCOUNT header write failed: {}; close + reopen",
+                e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "repack: PCOUNT header flush failed: {}; close + reopen",
+                e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
 // Append rows to a table with no VLA columns.  Validates input, grows
 // the data section if needed (last-HDU branch uses set_len; non-last
 // branch shifts the file tail and zero-fills the gap), rewrites
@@ -5249,6 +5466,18 @@ impl TableHDU {
         names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         Self::append(slf, py, data, names)
+    }
+
+    // Rewrite the heap to drop orphaned cells left behind by VLA
+    // __setitem__ (and any future mutation that always-appends).  No-op
+    // for tables without VLA columns or with an already-compact heap.
+    // If the heap shrinks, the on-disk file shrinks too (last HDU →
+    // set_len; non-last HDU → tail shifted backward and later HDU
+    // offsets bumped down via the shared
+    // shift_file_tail_backward_and_update_offsets primitive).
+    fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        repack_table_heap(&super_)
     }
 }
 
