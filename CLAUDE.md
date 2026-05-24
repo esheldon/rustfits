@@ -690,9 +690,23 @@ mid-write failures taint the file (close + reopen to recover).
 Fixed-column writes on a VLA-bearing table still take the existing
 fixed-only path (PCOUNT and heap untouched).
 
+**String VLAs (`PA`) on write.**  Shipped.  Declare with
+`var_dtypes={col: 'S'}` (or `'U'` / `'A'` / `'S1'` / `'U1'` — bare
+lowercase `'s'`/`'u'` rejected to avoid collision with `'u1'` =
+uint8).  Per-cell input is a Python `str` (ASCII; non-ASCII raises
+with the same shape as the read-side check) or `bytes`/`numpy.bytes_`
+(verbatim, including embedded NULs / non-ASCII).  Empty cells
+accepted (descriptor is `(0, current_heap_offset)`).  Works through
+the full table-write surface: `write`, `append`, `__setitem__`
+(single-row / slice / whole-column), `repack`.  All paths share the
+existing `validate_vla_cell` / `serialize_vla_cell` machinery via a
+small `extract_string_vla_cell_bytes` helper that handles the str/
+bytes type-check and ASCII validation in one place.  Cross-tool:
+astropy reads our PA columns as per-cell chararrays of single chars;
+we read astropy's PA columns as Python str (the natural mapping).
+Tests in `tests/test_vla_string_write.py` (24 cases).
+
 **Missing.**
-- **String VLAs (`PA`) on write** — read side has niche support;
-  not on the write side.  Defer until requested.
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
 - **`X` (bit) columns on write** — numpy `bool` currently maps to
   `L` (one byte per bool).  True `X` would need an explicit opt-in.
@@ -815,9 +829,10 @@ maxlen hint is emitted in TFORM for now (read side already accepts
 both `1PE` and `1PE(100)` shapes).
 
 **Inner types supported.**  Numeric: `B / I / J / K / E / D / C /
-M`; plus `L` (bool).  String VLAs (`PA`) and bit VLAs (`PX`) are
-NOT implemented on write — these are the two cases the read side
-also rejects/has-niche-support-for; defer until a user asks.
+M`; plus `L` (bool) and `A` (ASCII string — see "String VLAs (`PA`)
+on write" under Supported above for the API).  Bit VLAs (`PX`) are
+NOT implemented on write — paired with the read-side gap; defer
+until a user asks.
 
 **Write path.**  Dispatches on `any_var_column(&columns)`.  No-VLA
 tables take the existing fast/slow strip writer untouched.  With

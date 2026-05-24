@@ -1911,6 +1911,18 @@ fn classify_var_numpy_field(
         "var_dtypes['{}'] = '{}': {}", col_name, inner_dtype, reason));
     let s = inner_dtype
         .trim_start_matches(|c| c == '<' || c == '>' || c == '|' || c == '=');
+    // String VLA aliases (FITS letter 'A').  Check BEFORE the numeric
+    // lowercase match below — numpy's uppercase 'S' / 'U' string-kind
+    // characters lowercase to 'u' / 's', which would collide with the
+    // numeric uint8 ('u1') entry.  Bare lowercase 'u' / 's' are NOT
+    // string aliases (no numpy precedent).  Both 'A' and 'a' accepted
+    // because 'A' is a FITS letter rather than a numpy dtype.
+    match s {
+        "S" | "U" | "S1" | "U1" | "A" | "a" => {
+            return Ok(VarClass { inner_letter: 'A', elem_size: 1 });
+        }
+        _ => {}
+    }
     let normalized = s.to_lowercase();
     let (letter, size) = match normalized.as_str() {
         "u1" | "uint8"  => ('B', 1),
@@ -1924,7 +1936,8 @@ fn classify_var_numpy_field(
         "?" | "b1" | "bool" | "bool_" => ('L', 1),
         _ => return Err(err(
             "unsupported inner dtype (supported: \
-             u1/i2/i4/i8/f4/f8/c8/c16/? / bool)")),
+             u1/i2/i4/i8/f4/f8/c8/c16/? / bool, plus S/U/A for \
+             ASCII string VLA)")),
     };
     Ok(VarClass { inner_letter: letter, elem_size: size })
 }
@@ -3388,10 +3401,51 @@ struct VlaCellPlan {
     bytes_offset_in_heap: usize,
 }
 
-// Validate one VLA cell's ndarray + return its element count.  The
-// cell must be a 1-D numpy ndarray with C-contiguous layout and the
-// dtype matching the column's inner letter.  Empty cells (nelements
-// == 0) are accepted (descriptor is just (0, current_heap_offset)).
+// Encode a single ASCII string VLA cell (Python str / bytes / numpy
+// str-scalar) to its on-disk bytes.  Mirrors the read side: 'A' cells
+// hold ASCII text; non-ASCII bytes in a str input are rejected with
+// the same message shape the read side raises.  Used by both the
+// validate pass (length only) and the serialize pass (full bytes).
+//
+// Explicit isinstance checks rather than extract() because numpy
+// scalars subclass str/bytes (good — they fall through to the right
+// branch) but a numpy ndarray of integers would otherwise extract
+// successfully as Vec<u8> (each int coerced), silently mis-typing
+// the cell.
+fn extract_string_vla_cell_bytes(
+    cell: &Bound<'_, PyAny>,
+    col_name: &str,
+    row_idx: usize,
+) -> PyResult<Vec<u8>> {
+    // Python `bytes` / numpy.bytes_ scalar — take verbatim.
+    if cell.is_instance_of::<PyBytes>() {
+        return Ok(cell.extract::<Vec<u8>>()?);
+    }
+    // Python `str` / numpy.str_ scalar — ASCII-encode.
+    if cell.is_instance_of::<PyString>() {
+        let s: String = cell.extract()?;
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            if !b.is_ascii() {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' row {}: VLA string cell contains \
+                     non-ASCII byte 0x{:02X} at position {}; pass \
+                     bytes instead of str to store arbitrary bytes",
+                    col_name, row_idx, b, i)));
+            }
+        }
+        return Ok(s.into_bytes());
+    }
+    Err(PyValueError::new_err(format!(
+        "column '{}' row {}: VLA string cell must be a Python str \
+         (ASCII) or bytes; got {}",
+        col_name, row_idx, cell.get_type().name()?)))
+}
+
+// Validate one VLA cell + return its element count.  Numeric cells
+// must be a 1-D C-contiguous numpy ndarray with dtype matching the
+// inner letter; 'A' string cells must be a Python str (ASCII) or
+// bytes.  Empty cells (nelements == 0) are accepted (descriptor is
+// just (0, current_heap_offset)).
 fn validate_vla_cell(
     cell: &Bound<'_, PyAny>,
     ndarray: &Bound<'_, PyAny>,
@@ -3399,6 +3453,9 @@ fn validate_vla_cell(
     col_name: &str,
     row_idx: usize,
 ) -> PyResult<usize> {
+    if inner_letter == 'A' {
+        return Ok(extract_string_vla_cell_bytes(cell, col_name, row_idx)?.len());
+    }
     if !cell.is_instance(ndarray)? {
         return Err(PyValueError::new_err(format!(
             "column '{}' row {}: VLA cell must be a numpy ndarray",
@@ -3490,6 +3547,18 @@ fn serialize_vla_cell(
     dst: &mut [u8],
 ) -> PyResult<()> {
     if nelements == 0 {
+        return Ok(());
+    }
+    if inner_letter == 'A' {
+        let bytes = extract_string_vla_cell_bytes(cell, "<vla>", 0)?;
+        if bytes.len() != nelements {
+            return Err(PyValueError::new_err(format!(
+                "VLA string cell length {} differs from planned \
+                 nelements {} (input changed between validate and \
+                 serialize passes)",
+                bytes.len(), nelements)));
+        }
+        dst[..nelements].copy_from_slice(&bytes);
         return Ok(());
     }
     let buf = RawBuffer::acquire(cell)?;
