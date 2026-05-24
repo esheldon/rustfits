@@ -213,12 +213,59 @@ def test_compressed_write_shifts_later_hdus():
 
 
 def test_compress_not_a_config_rejected():
-    """Passing a non-config object to compress= raises TypeError."""
+    """
+    Passing a non-config, non-string object to compress= raises
+    TypeError.  (Strings — "GZIP_1" etc. — are accepted as aliases
+    for the default-constructed class; this test covers the truly
+    invalid-type case.)
+    """
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
         with rustfits.FITS(fn, "w+") as f:
             with pytest.raises(TypeError, match="compress="):
-                f.create_image_hdu("i4", (16, 16), compress="GZIP_1")
+                f.create_image_hdu("i4", (16, 16), compress=42)
+
+
+def test_compress_unknown_string_rejected():
+    """An algorithm-name string that isn't recognized raises ValueError."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits.fz")
+        with rustfits.FITS(fn, "w+") as f:
+            with pytest.raises(ValueError, match="unknown compression"):
+                f.create_image_hdu("i4", (16, 16), compress="SQUEEZE_1")
+
+
+@pytest.mark.parametrize(
+    "alias,zcmptype",
+    [
+        ("GZIP_1", "GZIP_1"),
+        ("gzip_1", "GZIP_1"),
+        ("GZIP", "GZIP_1"),
+        ("GZIP_2", "GZIP_2"),
+        ("RICE_1", "RICE_1"),
+        ("rice", "RICE_1"),
+        ("RICE_ONE", "RICE_1"),
+        ("HCOMPRESS_1", "HCOMPRESS_1"),
+        ("HCOMPRESS", "HCOMPRESS_1"),
+        ("PLIO_1", "PLIO_1"),
+    ],
+)
+def test_compress_string_alias_resolves_to_class(alias, zcmptype):
+    """
+    compress='<alias>' is equivalent to compress=<Class>() with all
+    other parameters default.  Verifies via the ZCMPTYPE the on-disk
+    header lands with.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits.fz")
+        # PLIO_1 only accepts integer images; use small mask-style
+        # input for the PLIO case to avoid the algorithm-specific
+        # validation kicking in.
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu("i2", (16, 16), compress=alias)
+            f[1].write(np.zeros((16, 16), dtype="i2"))
+        with rustfits.FITS(fn, "r") as f:
+            assert f[1].header["ZCMPTYPE"] == zcmptype
 
 
 def test_input_shape_mismatch_rejected():

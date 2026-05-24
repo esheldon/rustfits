@@ -113,8 +113,10 @@ else stays private to its file.
   read across GZIP_1 / GZIP_2 / RICE_1), 3 (`read(rows=)` /
   `__getitem__` / `CompressedSingleColumnSubset` +
   `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`),
-  and 4 (VLA-column read via dual-descriptor heap) shipped;
-  later phases add the write side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
+  4 (VLA-column read via dual-descriptor heap), and 5 (bulk
+  write via `create_table_hdu(..., compress=...)` for fixed
+  columns) shipped; later phases add VLA write + `__setitem__`
+  / `append` (Phase 6).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2372,7 +2374,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ✅ Shipped |
 | 3 | `read(rows=)` / `__getitem__` / column-subset objects / tile cache | ✅ Shipped |
 | 4 | VLA-column read (dual-descriptor heap) | ✅ Shipped |
-| 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ⏳ Planned |
+| 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ✅ Shipped |
 | 6 | VLA write + `__setitem__` / `append` | ⏳ Planned |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
@@ -2640,6 +2642,115 @@ per-dtype); empty cells; multiple VLA columns in one table;
 VLA mixed with fixed columns; multi-tile read; slice across
 tiles; fancy-row read preserving user order; single row via
 `__getitem__`; `columns=` subset; single-column subset chained.
+
+**Phase 5 — bulk write (fixed columns).**  Shipped.
+
+`create_table_hdu(dtype, nrows, *, compress=..., ztilelen=None)`
+routes to the ZTABLE path when `compress` is non-None.  Accepted
+`compress` shapes:
+
+  - `False` / `None` (default) — uncompressed (existing path,
+    unchanged).
+  - `True` — compressed with cfitsio defaults per dtype.
+  - `"GZIP_2"` / `Gzip2()` (string alias or class instance) —
+    same algorithm everywhere, validated per column.
+  - `{"col": "RICE_1", "other": Gzip2(level=9)}` — per-column
+    overrides; unspecified columns get cfitsio defaults.  Dict
+    values can be string aliases or config-class instances.
+
+Strict validation: an algorithm that isn't legal for a column's
+dtype raises with the allowed-list ("`b` is f8 so RICE_1 isn't
+allowed; permitted: GZIP_1, GZIP_2").  No silent fallback —
+cfitsio's tolerant behavior silently gives you a different
+algorithm than asked, which is worse than asking the user to fix
+the call.  `compress=True` is the escape hatch when you don't
+want to think about it.
+
+Per-column defaults match cfitsio (imcompress.c around line 8261):
+
+  | TFORM | numpy | Default | Allowed |
+  |---|---|---|---|
+  | B | u1 | GZIP_1 | GZIP_1, RICE_1 |
+  | I | i2 | GZIP_2 | GZIP_1, GZIP_2, RICE_1 |
+  | J | i4 | RICE_1 | GZIP_1, GZIP_2, RICE_1 |
+  | K | i8 | GZIP_2 | GZIP_1, GZIP_2 |
+  | E | f4 | GZIP_2 | GZIP_1, GZIP_2 |
+  | D | f8 | GZIP_2 | GZIP_1, GZIP_2 |
+  | C | c8 | GZIP_2 | GZIP_1, GZIP_2 |
+  | M | c16 | GZIP_2 | GZIP_1, GZIP_2 |
+  | L | b1 | GZIP_1 | GZIP_1 only |
+  | A | str | GZIP_1 | GZIP_1 only |
+  | X | bit | GZIP_1 | GZIP_1 only |
+
+`ztilelen=None` defaults to cfitsio's `max(1, min(nrows,
+10_000_000 / row_width))` — ~10 MB worth of rows per tile.
+
+**String aliases on the image side too.**  This phase also rolled
+out string-alias support on `create_image_hdu(compress="GZIP_1")`
+(case-insensitive, accepts cfitsio synonyms like `GZIP`,
+`RICE_ONE`, `HCOMPRESS`).  Shared normalizer is
+`CompressionConfigKind::from_str` (next to `from_pyany` in
+`zimage/compression_config.rs`).  Strings are useful both as
+standalone shortcuts on images and as values in the table per-
+column dict.
+
+**`write()` accepts the same three input forms as the uncompressed
+`TableHDU.write`**: structured ndarray, dict `{name: ndarray}`, or
+list/tuple of ndarrays + `names=[...]`.  All three normalize via
+`extract_per_column_inputs` (the same helper the uncompressed VLA
+write uses for per-column dispatch — already `pub(crate)`).
+
+**Per-cell transform reuse.**  Per-tile per-column slab encoding
+uses the shared `apply_transform_cell` from `hdu_table/write_fixed`
+(the slow path of the uncompressed write).  That single dispatch
+covers byteswap (Identity), unsigned-int trick XOR (UnsignedXor),
+bool 0/1 → 'F'/'T' ASCII (BoolToLogical), S<n> verbatim copy
+(BytesCopy), and U<n> UTF-32 → 7-bit ASCII (UnicodeToAscii).
+Replicating the conversion logic in the compressed path would
+have invited drift; reusing the existing one means TSCAL/TZERO
+behavior evolves in one place for both write paths.
+
+**Encode loop.**  `write_compressed_table_data` is per-tile,
+per-column.  For each `(tile, col)`:
+
+  1. Apply the per-cell transform from the column's native-order
+     source bytes into a BE slab of size `rows_in_tile *
+     byte_width`.
+  2. Encode the slab per the column's ZCTYPn (using the existing
+     `encode_gzip1` / `encode_gzip2` / `encode_rice` primitives
+     from `zimage/`).
+  3. Append the compressed blob to the heap at the running
+     `heap_cursor`; record `(blob_len, heap_cursor)` in the
+     descriptor table.
+  4. `grow_file_to_at_least` extends the data section in
+     block-aligned chunks as the heap grows; for non-last HDUs
+     this shifts later HDUs forward via the shared primitive.
+
+After all tiles are encoded, the in-RAM descriptor table is
+written at `data_offset`, the trailing block is zero-padded, and
+the header's `PCOUNT` card is rewritten to the final heap size
+via the standard disk-write-before-commit + taint pattern.
+
+**Stored compress configs.**  `CompressedTableHDU::new` gained a
+new `compress_configs: Option<Vec<CompressionConfigKind>>` field
+holding the user's per-column configs from create time.  Lets
+write-only params like `Gzip1(level=9)` survive within a session
+through `.compression`.  Reopened HDUs have `None` here and
+`.compression` falls back to the dict-of-strings from ZCTYPn.
+
+Tests: `tests/test_compressed_table_phase5.py` (27 cases) —
+every `compress=` shape (True / False / string / class / dict),
+default per-dtype matrix, invalid-algorithm rejection,
+image-only-algorithm rejection, three input forms (structured
+ndarray / dict / list+names), dtype round trip for every fixed
+scalar type, unsigned-int trick (u2 / u4), subarray TDIM,
+string columns, default vs explicit ztilelen, **byte-exact
+funpack interop** (cfitsio decompresses our files and we get
+the original BINTABLE bit-exactly).
+
+Plus `tests/test_compressed_image_phase7_gzip_write.py`
+(11 new cases) covering image-side string aliases including
+cfitsio synonyms and the case-insensitive match.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

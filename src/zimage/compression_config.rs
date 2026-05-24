@@ -817,6 +817,15 @@ pub(crate) enum CompressionConfigKind {
 
 impl CompressionConfigKind {
     pub(crate) fn from_pyany(bound: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // String-alias path — case-insensitive FITS-spec algorithm
+        // name (plus the cfitsio synonyms `GZIP`, `RICE_ONE`,
+        // `HCOMPRESS`).  Resolves to the algorithm class
+        // constructed with default parameters.  Useful both as a
+        // standalone shortcut (`compress="GZIP_1"`) and inside the
+        // per-column dict on tables (`compress={"flux": "GZIP_2"}`).
+        if let Ok(s) = bound.extract::<String>() {
+            return Self::from_str(&s);
+        }
         if let Ok(g) = bound.extract::<Gzip1>() {
             return Ok(Self::Gzip1(g));
         }
@@ -836,8 +845,43 @@ impl CompressionConfigKind {
             "compress= must be a compression-config object (e.g. \
              rustfits.Gzip1(...), rustfits.Gzip2(...), \
              rustfits.Rice1(...), rustfits.Hcompress1(...), \
-             rustfits.Plio1(...))",
+             rustfits.Plio1(...)) or an algorithm name string \
+             (e.g. \"GZIP_1\", \"GZIP_2\", \"RICE_1\")",
         ))
+    }
+
+    // Map an algorithm name to the corresponding config class
+    // default-constructed (no tile_shape / level / blocksize override).
+    // Names are case-insensitive; cfitsio synonyms `GZIP`, `RICE_ONE`,
+    // `HCOMPRESS` are accepted alongside the FITS-spec canonical
+    // forms `GZIP_1`, `RICE_1`, `HCOMPRESS_1`.
+    pub(crate) fn from_str(name: &str) -> PyResult<Self> {
+        let upper = name.trim().to_uppercase();
+        match upper.as_str() {
+            "GZIP" | "GZIP_1" => Ok(Self::Gzip1(Gzip1 {
+                tile_shape: None, heap_format: 'P', level: None,
+            })),
+            "GZIP_2" => Ok(Self::Gzip2(Gzip2 {
+                tile_shape: None, heap_format: 'P', level: None,
+            })),
+            "RICE" | "RICE_1" | "RICE_ONE" => Ok(Self::Rice1(Rice1 {
+                tile_shape: None, heap_format: 'P', blocksize: 32,
+            })),
+            "HCOMPRESS" | "HCOMPRESS_1" => Ok(Self::Hcompress1(
+                Hcompress1 {
+                    tile_shape: None, heap_format: 'P',
+                    scale: 0, smooth: false,
+                },
+            )),
+            "PLIO" | "PLIO_1" => Ok(Self::Plio1(Plio1 {
+                tile_shape: None, heap_format: 'P',
+            })),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown compression algorithm name '{}'; recognized: \
+                 GZIP_1 (or GZIP), GZIP_2, RICE_1 (or RICE / RICE_ONE), \
+                 HCOMPRESS_1 (or HCOMPRESS), PLIO_1 (or PLIO)",
+                name))),
+        }
     }
 
     pub(crate) fn tile_shape(&self) -> &Option<Vec<u64>> {

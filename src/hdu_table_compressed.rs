@@ -21,20 +21,22 @@ use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::cache::BytesBoundLruCache;
 use crate::common::{
     byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
+use crate::zimage::compression_config::CompressionConfigKind;
 use crate::hdu::HDU;
 use crate::hdu_table::{
-    build_numpy_dtype, build_var_cell_value, bytes_per_element,
-    byteswap_unit, classify_table_key, convert_column_cell,
+    apply_transform_cell, build_numpy_dtype, build_var_cell_value,
+    bytes_per_element, byteswap_unit, classify_table_key,
+    column_expected_shape, column_transform, convert_column_cell,
     field_dtype_and_shape, numpy_field_layout, parse_columns,
     read_descriptor, resolve_columns, resolve_rows, scaling_kind, Column,
-    ScalingKind, TableHDU, TableKey,
+    ScalingKind, TableHDU, TableKey, WriteTransform,
 };
 use crate::zimage::gzip::{decode_gzip1, decode_gzip2};
 use crate::zimage::rice::decode_rice;
@@ -102,6 +104,16 @@ pub(crate) fn header_has_ztable(header: &[String]) -> bool {
 #[pyclass(extends = TableHDU)]
 pub(crate) struct CompressedTableHDU {
     cache: Arc<ColumnTileCache>,
+    // Per-column compression configs as the user passed them to
+    // create_table_hdu(..., compress=...).  Stored so that
+    // write-only kwargs like Gzip1(level=9) round-trip via
+    // `.compression` within the same session.  For reopened HDUs
+    // this is None and `.compression` falls back to rebuilding
+    // dict-of-strings from the ZCTYPn cards.  One entry per column,
+    // in file order; None when the HDU wasn't created with compress.
+    pub(crate) compress_configs: Arc<
+        Mutex<Option<Vec<CompressionConfigKind>>>,
+    >,
 }
 
 impl CompressedTableHDU {
@@ -113,6 +125,7 @@ impl CompressedTableHDU {
         layout: Arc<FileLayout>,
         file: FileHandle,
         tainted: TaintFlag,
+        compress_configs: Option<Vec<CompressionConfigKind>>,
     ) -> PyClassInitializer<Self> {
         let hdu = HDU::new(
             header, index, filename, offsets, layout, file, tainted,
@@ -123,6 +136,7 @@ impl CompressedTableHDU {
                 cache: Arc::new(ColumnTileCache::new(
                     DEFAULT_TILE_CACHE_BYTES,
                 )),
+                compress_configs: Arc::new(Mutex::new(compress_configs)),
             })
     }
 }
@@ -432,13 +446,73 @@ impl CompressedTableHDU {
              re-encoding affected tiles"))
     }
 
+    // Compress and write `data` to the table.  Accepts the same
+    // three input forms as TableHDU.write:
+    //   - structured numpy ndarray with the table's field names
+    //   - dict {col_name: ndarray}
+    //   - list/tuple of ndarrays + names=[...]
+    //
+    // Encodes each (tile, column) per the per-column ZCTYPn
+    // algorithm, streams compressed blobs to the heap, fills the
+    // descriptor table, and updates PCOUNT.  Mid-write I/O failures
+    // taint the file (close + reopen to recover).
+    #[pyo3(signature = (data, *, names=None))]
     fn write(
-        _slf: PyRef<'_, Self>,
-        _data: &Bound<'_, PyAny>,
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.write() — ZTABLE Phase 5 will add this \
-             (bulk write with create_table_hdu(..., compress=...))"))
+        let cfgs = slf.compress_configs.lock()
+            .map_err(|_| PyIOError::new_err(
+                "compress_configs lock poisoned"))?
+            .clone();
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let virtual_cards = synthesize_uncompressed_cards(&cards);
+        let columns = parse_columns(&virtual_cards)?;
+        for col in &columns {
+            if col.var_kind.is_some() {
+                return Err(PyNotImplementedError::new_err(
+                    "CompressedTableHDU.write: VLA columns are ZTABLE \
+                     Phase 6 — not yet implemented"));
+            }
+        }
+        let nrows = parse_keyword(&cards, "ZNAXIS2")
+            .unwrap_or(0).max(0) as usize;
+        let ztilelen = parse_keyword(&cards, "ZTILELEN")
+            .unwrap_or(0).max(0) as usize;
+        let n_tiles = parse_keyword(&cards, "NAXIS2")
+            .unwrap_or(0).max(0) as usize;
+        let descriptor_row_width = parse_keyword(&cards, "NAXIS1")
+            .unwrap_or(0).max(0) as usize;
+        let data_offset = super_.offsets.data_offset();
+
+        // Algorithms come from ZCTYPn cards (single source of truth
+        // — for reopened HDUs the stored configs may be None).
+        let mut algorithms: Vec<CompressionAlgorithm> =
+            Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            let key = format!("ZCTYP{}", i + 1);
+            let zctyp = parse_string_keyword(&cards, &key)
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "compressed table missing {} card", key)))?;
+            algorithms.push(parse_algorithm(&zctyp)?);
+        }
+
+        // Normalize the input to a Vec of per-column ndarrays.  The
+        // helper handles structured-ndarray / dict / list+names
+        // dispatch + per-form validation (extras / missing / wrong
+        // names) — same logic the uncompressed TableHDU.write uses.
+        let per_column = crate::hdu_table::extract_per_column_inputs(
+            py, data, names, &columns,
+        )?;
+
+        write_compressed_table_data(
+            py, &super_, &cards, &per_column, &columns, &algorithms,
+            cfgs.as_deref(), nrows, ztilelen, n_tiles,
+            descriptor_row_width, data_offset,
+        )
     }
 
     fn append(
@@ -1366,4 +1440,730 @@ fn gzip_decompress_bytes(compressed: &[u8], expected_len: usize) -> PyResult<Vec
     }
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 — write side
+// ---------------------------------------------------------------------------
+//
+// cfitsio's `fits_compress_table` picks per-dtype defaults that
+// differ from the image side.  See CLAUDE.md for the full table;
+// rules below mirror imcompress.c around line 8261:
+//
+//   B (u1)  -> GZIP_1   {GZIP_1, RICE_1}
+//   I (i2)  -> GZIP_2   {GZIP_1, GZIP_2, RICE_1}
+//   J (i4)  -> RICE_1   {GZIP_1, GZIP_2, RICE_1}
+//   K (i8)  -> GZIP_2   {GZIP_1, GZIP_2}
+//   E (f4)  -> GZIP_2   {GZIP_1, GZIP_2}
+//   D (f8)  -> GZIP_2   {GZIP_1, GZIP_2}
+//   C (c8)  -> GZIP_2   {GZIP_1, GZIP_2}
+//   M (c16) -> GZIP_2   {GZIP_1, GZIP_2}
+//   L (b1)  -> GZIP_1   {GZIP_1}
+//   A (str) -> GZIP_1   {GZIP_1}
+//   X (bit) -> GZIP_1   {GZIP_1}
+//
+// We're strict about the allowed-algorithm list: an explicit
+// algorithm choice that's incompatible with a column dtype
+// produces a ValueError naming the allowed algorithms.  Cfitsio
+// silently falls back to a default; that "tolerance" silently
+// gives the user something they didn't ask for, which is worse
+// than asking them to fix the call.
+
+pub(crate) fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
+    match letter {
+        'B' | 'L' | 'A' | 'X' => CompressionAlgorithm::Gzip1,
+        'J' => CompressionAlgorithm::Rice1,
+        'I' | 'K' | 'E' | 'D' | 'C' | 'M' => CompressionAlgorithm::Gzip2,
+        // Unknown letters land at Gzip1 (universally allowed).
+        // parse_columns would have rejected anything truly bad
+        // upstream; this is a safety net.
+        _ => CompressionAlgorithm::Gzip1,
+    }
+}
+
+fn algorithm_allowed_for_letter(
+    letter: char, algo: CompressionAlgorithm,
+) -> bool {
+    use CompressionAlgorithm::*;
+    match algo {
+        Gzip1 => true,  // universally allowed
+        Gzip2 => !matches!(letter, 'L' | 'A' | 'X'),
+        Rice1 => matches!(letter, 'B' | 'I' | 'J'),
+        // Hcompress1 and Plio1 are image-only — caller filters
+        // them out before reaching this function.
+        _ => false,
+    }
+}
+
+fn allowed_algorithm_names_for_letter(letter: char) -> &'static str {
+    match letter {
+        'B' => "GZIP_1, RICE_1",
+        'I' | 'J' => "GZIP_1, GZIP_2, RICE_1",
+        'K' | 'E' | 'D' | 'C' | 'M' => "GZIP_1, GZIP_2",
+        'L' | 'A' | 'X' => "GZIP_1",
+        _ => "GZIP_1",
+    }
+}
+
+// Resolve the user's compress= argument into a per-column config
+// list.  Returns None when no compression was requested
+// (compress=None / False), Some(Vec) otherwise.  Cell types are
+// validated against the chosen algorithm before any file mutation.
+//
+// Accepted shapes:
+//   - None / False       -> None (caller falls back to uncompressed)
+//   - True               -> defaults per column
+//   - str / class        -> same algorithm across all columns
+//                          (must be allowed for every column)
+//   - dict<str, ...>     -> per-column overrides; unspecified
+//                          columns use defaults; values are
+//                          strings or config-class instances
+pub(crate) fn resolve_compress_arg(
+    py: Python<'_>,
+    compress: Option<&Bound<'_, PyAny>>,
+    columns: &[Column],
+) -> PyResult<Option<Vec<CompressionConfigKind>>> {
+    let Some(arg) = compress else {
+        return Ok(None);
+    };
+    if arg.is_none() {
+        return Ok(None);
+    }
+    // bool: False -> uncompressed; True -> defaults
+    if let Ok(b) = arg.extract::<bool>() {
+        if !b {
+            return Ok(None);
+        }
+        return Ok(Some(default_per_column_configs(columns)));
+    }
+
+    // dict<col_name, algo>
+    if let Ok(dict) = arg.cast::<PyDict>() {
+        let mut out: Vec<CompressionConfigKind> = columns.iter()
+            .map(|c| build_default_config_for_letter(c.tform_letter))
+            .collect();
+        // Walk dict items and apply per-column overrides.
+        for (key, val) in dict.iter() {
+            let name: String = key.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "compress= dict keys must be strings (column names)")
+            })?;
+            let pos = columns.iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "compress= dict key '{}' does not match any column \
+                     in the table",
+                    name)))?;
+            let cfg = CompressionConfigKind::from_pyany(&val)?;
+            check_table_algorithm_allowed(
+                &columns[pos], algorithm_of(&cfg),
+            )?;
+            out[pos] = cfg;
+        }
+        return Ok(Some(out));
+    }
+
+    // Otherwise treat as a single algorithm (string or class) and
+    // apply it everywhere, with per-column validation.
+    let cfg = CompressionConfigKind::from_pyany(arg)?;
+    let _ = py;  // silence unused in the all-config path
+    let algo = algorithm_of(&cfg);
+    let mut out = Vec::with_capacity(columns.len());
+    for col in columns {
+        check_table_algorithm_allowed(col, algo)?;
+        out.push(cfg.clone());
+    }
+    Ok(Some(out))
+}
+
+fn default_per_column_configs(columns: &[Column]) -> Vec<CompressionConfigKind> {
+    columns.iter()
+        .map(|c| build_default_config_for_letter(c.tform_letter))
+        .collect()
+}
+
+fn build_default_config_for_letter(letter: char) -> CompressionConfigKind {
+    let name = match default_table_algorithm(letter) {
+        CompressionAlgorithm::Gzip1 => "GZIP_1",
+        CompressionAlgorithm::Gzip2 => "GZIP_2",
+        CompressionAlgorithm::Rice1 => "RICE_1",
+        // Defaults for tables only use the three algorithms above.
+        _ => "GZIP_1",
+    };
+    CompressionConfigKind::from_str(name)
+        .expect("default algorithm name is always recognized")
+}
+
+fn algorithm_of(cfg: &CompressionConfigKind) -> CompressionAlgorithm {
+    match cfg {
+        CompressionConfigKind::Gzip1(_) => CompressionAlgorithm::Gzip1,
+        CompressionConfigKind::Gzip2(_) => CompressionAlgorithm::Gzip2,
+        CompressionConfigKind::Rice1(_) => CompressionAlgorithm::Rice1,
+        CompressionConfigKind::Hcompress1(_) => CompressionAlgorithm::Hcompress1,
+        CompressionConfigKind::Plio1(_) => CompressionAlgorithm::Plio1,
+    }
+}
+
+fn check_table_algorithm_allowed(
+    col: &Column, algo: CompressionAlgorithm,
+) -> PyResult<()> {
+    use CompressionAlgorithm::*;
+    if matches!(algo, Hcompress1 | Plio1) {
+        return Err(PyValueError::new_err(format!(
+            "compress= column '{}': {} is an image-only algorithm and \
+             cannot be used for tables (the FITS Tile Compression \
+             Convention only allows GZIP_1, GZIP_2, and RICE_1 for ZTABLE)",
+            col.name,
+            match algo {
+                Hcompress1 => "HCOMPRESS_1",
+                Plio1 => "PLIO_1",
+                _ => "?",
+            },
+        )));
+    }
+    if !algorithm_allowed_for_letter(col.tform_letter, algo) {
+        let algo_name = match algo {
+            Gzip1 => "GZIP_1",
+            Gzip2 => "GZIP_2",
+            Rice1 => "RICE_1",
+            _ => "?",
+        };
+        return Err(PyValueError::new_err(format!(
+            "compress= column '{}' (TFORM letter '{}'): {} is not \
+             a valid algorithm for this column type.  Allowed for \
+             this dtype: {}.  Pass `compress=True` for cfitsio \
+             defaults or change this column's algorithm.",
+            col.name, col.tform_letter, algo_name,
+            allowed_algorithm_names_for_letter(col.tform_letter),
+        )));
+    }
+    Ok(())
+}
+
+// Default ZTILELEN, picked the way cfitsio's fits_compress_table
+// does (imcompress.c line 8135ish): rowspertile = max(1,
+// min(nrows, 10_000_000 / row_width)).
+pub(crate) fn default_ztilelen(nrows: usize, row_width: usize) -> usize {
+    if nrows == 0 {
+        return 1;
+    }
+    let cap = 10_000_000usize / row_width.max(1);
+    cap.max(1).min(nrows)
+}
+
+// ---------------------------------------------------------------------------
+// Encode one column's per-tile slab
+// ---------------------------------------------------------------------------
+//
+// Input is the column's bytes for this tile, in native order
+// (numpy's default).  Output is the compressed blob ready to land
+// in the heap.  We don't byteswap to BE first — instead the
+// per-algorithm encoder does it (RICE encodes from BE; GZIP_1 and
+// GZIP_2 expect BE bytes too because that's what the read side
+// reverses).  So caller passes `bytes_be: &[u8]` of length
+// `n_pixels * elem_size`.
+pub(crate) fn encode_table_column_slab(
+    algo: CompressionAlgorithm,
+    bytes_be: &[u8],
+    n_pixels: usize,
+    elem_size: usize,
+    rice_blocksize: u32,
+    gzip_level: Option<u32>,
+) -> PyResult<Vec<u8>> {
+    use crate::zimage::gzip::{encode_gzip1, encode_gzip2};
+    use crate::zimage::rice::encode_rice;
+    match algo {
+        CompressionAlgorithm::Gzip1 => encode_gzip1(bytes_be, gzip_level),
+        CompressionAlgorithm::Gzip2 => encode_gzip2(
+            bytes_be, elem_size as u32, gzip_level,
+        ),
+        CompressionAlgorithm::Rice1 => encode_rice(
+            bytes_be, n_pixels, elem_size as u32, rice_blocksize,
+        ),
+        _ => Err(PyValueError::new_err(format!(
+            "internal: non-table algorithm reached encode_table_column_slab",
+        ))),
+    }
+}
+
+// Pull the gzip level (if set) and rice blocksize from a per-
+// column config so the encoder gets the user's chosen params.
+pub(crate) fn gzip_level_of(cfg: &CompressionConfigKind) -> Option<u32> {
+    match cfg {
+        CompressionConfigKind::Gzip1(g) => g.level,
+        CompressionConfigKind::Gzip2(g) => g.level,
+        _ => None,
+    }
+}
+
+pub(crate) fn rice_blocksize_of(cfg: &CompressionConfigKind) -> u32 {
+    match cfg {
+        CompressionConfigKind::Rice1(r) => r.blocksize,
+        _ => 32,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZTABLE header construction
+// ---------------------------------------------------------------------------
+//
+// Build the cards for a freshly-created compressed table.  Mirrors
+// the cfitsio `fits_compress_table` header layout but produced
+// directly from the user's structured dtype (the original
+// uncompressed schema) — no copy from an existing BINTABLE.
+//
+// Result: a Vec<String> of cards ready to serialize, plus the
+// computed (n_tiles, descriptor_row_width) the caller needs to
+// reserve the data section.
+pub(crate) fn build_compressed_table_header(
+    cards_in: &[String],            // Pre-built uncompressed header
+    row_width: u64,                 // From normalize_and_build_table_header
+    nrows: i64,
+    ztilelen: usize,
+    algorithms: &[CompressionAlgorithm],
+    columns: &[Column],
+) -> PyResult<(Vec<String>, usize, u64)> {
+    use crate::header::{card_int, card_logical, card_string, pad_to_card};
+
+    let ncols = columns.len();
+    let n_tiles_u = if nrows <= 0 {
+        0usize
+    } else {
+        let n = nrows as usize;
+        n.div_ceil(ztilelen.max(1))
+    };
+    // Each compressed-table row holds N descriptors; each is 1QB
+    // (Q kind, 16 bytes).  Phase 5 only emits 1QB regardless of
+    // input — Q-format heap supports arbitrarily large compressed
+    // heaps and is what fpack always writes.
+    let descriptor_row_width = ncols * 16;
+
+    let mut out: Vec<String> = Vec::with_capacity(cards_in.len() + 16);
+
+    // Structural keys: rewrite NAXIS1/NAXIS2/PCOUNT/TFIELDS into
+    // the compressed shape, replace TFORMn with '1QB', drop the
+    // input PCOUNT (we set it to 0 for now), and rewrite the
+    // commentary lines so the user sees compressed-table semantics.
+    for card in cards_in {
+        if card.len() < 8 {
+            out.push(card.clone());
+            continue;
+        }
+        let kw = card[..8].trim_end();
+        if kw == "NAXIS1" {
+            out.push(card_int(
+                "NAXIS1", descriptor_row_width as i64,
+                "width of one compressed-table row in bytes"));
+        } else if kw == "NAXIS2" {
+            out.push(card_int(
+                "NAXIS2", n_tiles_u as i64,
+                "number of tiles"));
+        } else if kw == "PCOUNT" {
+            out.push(card_int(
+                "PCOUNT", 0,
+                "size of heap in bytes (filled on write)"));
+        } else if let Some(suffix) = kw.strip_prefix("TFORM") {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(n) = suffix.parse::<usize>() {
+                    if n >= 1 && n <= ncols {
+                        out.push(card_string(
+                            &format!("TFORM{}", n), "1QB",
+                            "compressed data descriptor"));
+                        continue;
+                    }
+                }
+            }
+            out.push(card.clone());
+        } else if kw == "END" {
+            // Skip — we'll add the END after our Z-prefix cards.
+        } else {
+            out.push(card.clone());
+        }
+    }
+
+    // ZTABLE / ZTILELEN / Z*-shape cards, ZFORM, ZCTYP.
+    out.push(card_logical("ZTABLE", true, "this is a compressed table"));
+    out.push(card_int(
+        "ZTILELEN", ztilelen as i64, "number of rows in each tile"));
+    out.push(card_int(
+        "ZNAXIS1", row_width as i64,
+        "original (uncompressed) row width in bytes"));
+    out.push(card_int(
+        "ZNAXIS2", nrows, "original (uncompressed) row count"));
+    out.push(card_int(
+        "ZPCOUNT", 0,
+        "original heap size (0 for fixed-only tables)"));
+
+    // ZFORMn (the original TFORMn).  Build from the Column list —
+    // cfitsio copies via fits_read_card from the pre-compress
+    // header, but constructing from the columns is equivalent and
+    // doesn't require parsing the input cards twice.  Repeat counts
+    // get encoded as 'NL' (e.g. '6E', '10A').
+    for (i, col) in columns.iter().enumerate() {
+        let n = i + 1;
+        let tform = format!("{}{}", col.repeat, col.tform_letter);
+        out.push(card_string(
+            &format!("ZFORM{}", n), &tform,
+            "original column TFORM"));
+    }
+    for (i, &algo) in algorithms.iter().enumerate() {
+        let n = i + 1;
+        let name = match algo {
+            CompressionAlgorithm::Gzip1 => "GZIP_1",
+            CompressionAlgorithm::Gzip2 => "GZIP_2",
+            CompressionAlgorithm::Rice1 => "RICE_1",
+            _ => return Err(PyValueError::new_err(format!(
+                "internal: non-table algorithm in build_compressed_table_header"))),
+        };
+        out.push(card_string(
+            &format!("ZCTYP{}", n), name,
+            "compression algorithm for this column"));
+    }
+    out.push(pad_to_card("END"));
+
+    let data_size = (n_tiles_u as u64).saturating_mul(descriptor_row_width as u64);
+    Ok((out, n_tiles_u, data_size))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — write loop
+// ---------------------------------------------------------------------------
+//
+// Encode each column's per-tile slab, stream blob bytes to the
+// heap, fill the descriptor table in RAM, then seek back and
+// write the descriptor table + update PCOUNT + grow the file
+// extent as needed.  Validate-then-mutate: any dtype/shape error
+// surfaces before the file is touched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_compressed_table_data<'py>(
+    py: Python<'py>,
+    super_: &HDU,
+    cards: &[String],
+    per_column_inputs: &[Bound<'py, PyAny>],
+    columns: &[Column],
+    algorithms: &[CompressionAlgorithm],
+    per_col_configs: Option<&[CompressionConfigKind]>,
+    nrows: usize,
+    ztilelen: usize,
+    n_tiles: usize,
+    descriptor_row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    use crate::hdu_image::round_up_to_block;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    crate::common::check_not_tainted(&super_.tainted)?;
+
+    if per_column_inputs.len() != columns.len() {
+        return Err(PyValueError::new_err(format!(
+            "internal: per-column inputs len {} != columns len {}",
+            per_column_inputs.len(), columns.len())));
+    }
+
+    // For each input column, validate its shape against the on-disk
+    // column's expected per-cell shape, pick the per-cell
+    // WriteTransform (Identity / UnsignedXor / BoolToLogical /
+    // BytesCopy / UnicodeToAscii), and capture native-order source
+    // bytes via RawBuffer.  This matches the slow-path validation
+    // the uncompressed write does in `acquire_per_column_array` —
+    // we don't have a fast bulk-memcpy path because the per-tile
+    // slabs are column-major (one column at a time), so the
+    // per-cell loop here is the path that lights up.
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    struct ColPrep<'py> {
+        buf: RawBuffer,
+        src_total_size: usize,
+        transform: WriteTransform,
+        // Pin the contiguous ndarray for the buf's lifetime — numpy
+        // could otherwise free the buffer mid-loop.  Field is held,
+        // not read.
+        #[allow(dead_code)]
+        contig_arr: Bound<'py, PyAny>,
+    }
+    let mut col_preps: Vec<ColPrep<'_>> = Vec::with_capacity(columns.len());
+    for (col, arr) in columns.iter().zip(per_column_inputs.iter()) {
+        if !arr.is_instance(&ndarray)? {
+            return Err(PyValueError::new_err(format!(
+                "CompressedTableHDU.write: column '{}' value must be a \
+                 numpy ndarray", col.name)));
+        }
+        let arr_shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+        if arr_shape.is_empty() || arr_shape[0] != nrows {
+            return Err(PyValueError::new_err(format!(
+                "CompressedTableHDU.write: column '{}' shape {:?} does \
+                 not have first axis == ZNAXIS2 ({})",
+                col.name, arr_shape, nrows)));
+        }
+        let per_cell_shape: Vec<usize> = arr_shape[1..].to_vec();
+        let expected_shape = column_expected_shape(col);
+        if per_cell_shape != expected_shape {
+            return Err(PyValueError::new_err(format!(
+                "CompressedTableHDU.write: column '{}' per-cell shape \
+                 {:?} does not match expected {:?}",
+                col.name, per_cell_shape, expected_shape)));
+        }
+        let dtype = arr.getattr("dtype")?;
+        let kind: String = dtype.getattr("kind")?.extract()?;
+        let elem_size: usize = dtype.getattr("itemsize")?.extract()?;
+        let transform = column_transform(col, &kind, elem_size)?;
+        let cell_elements: usize = per_cell_shape.iter()
+            .product::<usize>().max(1);
+        let src_total_size = elem_size * cell_elements;
+        let contig = np.call_method1("ascontiguousarray", (arr,))?;
+        let buf = RawBuffer::acquire(&contig)?;
+        col_preps.push(ColPrep {
+            buf, src_total_size, transform, contig_arr: contig,
+        });
+    }
+    let _ = ndarray;  // type-marker only past this point
+
+    // Stream-encode tile by tile, writing each blob to the heap as
+    // it's produced.  Descriptor table is held in RAM (small:
+    // n_tiles * ncols * 16 bytes; typically a few KB) and written
+    // at the end with one seek-back.
+    let mut desc_table: Vec<u8> = vec![0u8; n_tiles * descriptor_row_width];
+    let heap_start_offset = data_offset
+        + (n_tiles as u64 * descriptor_row_width as u64);
+    let mut heap_cursor: u64 = 0;
+
+    // Grow the file extent so we have room for the descriptor table
+    // upfront.  The heap grows it further below.
+    let current_padded = round_up_to_block(
+        (n_tiles as u64) * (descriptor_row_width as u64));
+    {
+        // Allocate the initial descriptor space within this HDU.
+        let mut guard = lock_file(&super_.file)?;
+        let f = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let current_end = data_offset + current_padded;
+        let file_len = f.metadata()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?.len();
+        if file_len < current_end {
+            f.set_len(current_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Per-column metadata for the encode loop.
+    struct ColMeta {
+        elem_size: usize,        // bytes per inner element
+        algo: CompressionAlgorithm,
+        gzip_level: Option<u32>,
+        rice_blocksize: u32,
+        per_row_bytes: usize,    // = col.byte_width = repeat * elem_size for non-A
+        per_row_pixels: usize,   // n_pixels per row for the encoder (= repeat for most)
+    }
+    let mut metas: Vec<ColMeta> = Vec::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        let elem_size = bytes_per_element(col.tform_letter)
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "column '{}': unsupported TFORM letter '{}' on compressed \
+                 write", col.name, col.tform_letter)))?;
+        let cfg = per_col_configs.and_then(|cs| cs.get(i));
+        let gzip_level = cfg.and_then(gzip_level_of);
+        let rice_blocksize = cfg.map(rice_blocksize_of).unwrap_or(32);
+        metas.push(ColMeta {
+            elem_size,
+            algo: algorithms[i],
+            gzip_level,
+            rice_blocksize,
+            per_row_bytes: col.byte_width,
+            per_row_pixels: col.repeat,
+        });
+    }
+
+    for tile_idx in 0..n_tiles {
+        let tile_row_start = tile_idx * ztilelen;
+        let rows_in_tile = if tile_idx + 1 == n_tiles {
+            nrows - tile_row_start
+        } else {
+            ztilelen
+        };
+
+        for (col_idx, (col, meta)) in columns.iter().zip(metas.iter())
+            .enumerate()
+        {
+            // Build the per-tile BE slab by applying the per-cell
+            // transform from this column's native-order source bytes.
+            // The shared `apply_transform_cell` handles all the
+            // conversion cases: byteswap (Identity), unsigned-int
+            // trick XOR (UnsignedXor), bool 0/1 → 'F'/'T' ASCII
+            // (BoolToLogical), S<n> verbatim copy (BytesCopy), and
+            // U<n> UTF-32 → 7-bit ASCII (UnicodeToAscii).
+            let prep = &col_preps[col_idx];
+            let src_bytes = prep.buf.as_slice();
+            let mut slab = vec![0u8; rows_in_tile * meta.per_row_bytes];
+            for r in 0..rows_in_tile {
+                let disk_row = tile_row_start + r;
+                let src_off = disk_row * prep.src_total_size;
+                let src = &src_bytes
+                    [src_off..src_off + prep.src_total_size];
+                let dst_off = r * meta.per_row_bytes;
+                let dst = &mut slab[dst_off..dst_off + meta.per_row_bytes];
+                apply_transform_cell(
+                    &prep.transform, src, dst, &col.name, disk_row,
+                )?;
+            }
+
+            let n_pixels = rows_in_tile * meta.per_row_pixels;
+            let blob = encode_table_column_slab(
+                meta.algo, &slab, n_pixels, meta.elem_size,
+                meta.rice_blocksize, meta.gzip_level,
+            )?;
+
+            // Write blob to heap.  Grow file as needed.
+            let want_heap_end = heap_cursor + blob.len() as u64;
+            let want_total = heap_start_offset + want_heap_end - data_offset;
+            grow_file_to_at_least(
+                &super_.file, &super_.layout, data_offset,
+                want_total, &super_.tainted,
+            )?;
+            {
+                let mut guard = lock_file(&super_.file)?;
+                let f = guard.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                f.write_all(&blob).map_err(|e| {
+                    super_.tainted.store(true, Ordering::Release);
+                    PyIOError::new_err(format!(
+                        "compressed table write: heap write failed at \
+                         tile {} col '{}': {}", tile_idx, col.name, e))
+                })?;
+            }
+
+            // Fill the descriptor for this (tile, col).  1QB =
+            // two big-endian i64.  nelements = compressed bytes;
+            // offset = current heap cursor (relative to heap start).
+            let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
+            let nelems_be = (blob.len() as i64).to_be_bytes();
+            let off_be = (heap_cursor as i64).to_be_bytes();
+            desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
+            desc_table[desc_off + 8..desc_off + 16].copy_from_slice(&off_be);
+
+            heap_cursor += blob.len() as u64;
+        }
+    }
+
+    // One round-up to the FITS block boundary so the data section
+    // ends cleanly.  The grow helper already extends to multiples
+    // of BLOCK_SIZE, but if heap_cursor isn't a multiple of
+    // BLOCK_SIZE we need to make sure the tail is zero-filled.
+    let total_data_bytes = (n_tiles as u64 * descriptor_row_width as u64)
+        + heap_cursor;
+    let padded = round_up_to_block(total_data_bytes);
+    if padded > total_data_bytes {
+        let pad = padded - total_data_bytes;
+        let mut guard = lock_file(&super_.file)?;
+        let f = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset + total_data_bytes))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&vec![0u8; pad as usize]).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed table write: tail-pad write failed: {}", e))
+        })?;
+    }
+
+    // Write the descriptor table at the start of the data section.
+    {
+        let mut guard = lock_file(&super_.file)?;
+        let f = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&desc_table).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed table write: descriptor-table write \
+                 failed: {}", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed table write: flush failed: {}", e))
+        })?;
+    }
+
+    // Update PCOUNT in the header.  Disk-write-before-commit
+    // pattern: build new cards, rewrite header, then commit the
+    // in-memory cards.
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards.to_vec();
+    crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
+    crate::header::rewrite_header_to_disk(
+        &super_.file, &super_.offsets, &super_.layout,
+        &new_cards, &super_.tainted,
+    )?;
+    *cards_guard = new_cards;
+    Ok(())
+}
+
+// Grow this HDU's data extent so it covers at least `min_bytes`
+// (relative to data_offset).  Block-rounds; pushes later HDUs
+// forward via the shared shift primitive when needed.  No-op when
+// the file is already large enough.
+fn grow_file_to_at_least(
+    file: &FileHandle,
+    layout: &Arc<FileLayout>,
+    data_offset: u64,
+    min_bytes: u64,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    use crate::common::shift_file_tail_and_update_offsets;
+    use crate::hdu_image::round_up_to_block;
+    use std::sync::atomic::Ordering;
+
+    let want_end = data_offset + round_up_to_block(min_bytes);
+    let (file_len, current_end) = {
+        let g = lock_file(file)?;
+        let f = g.as_ref()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let len = f.metadata()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?.len();
+        // Take the larger of file_len and want_end as a baseline —
+        // if the HDU is the last one on disk, "current end" is just
+        // the file length.
+        (len, len)
+    };
+    if want_end <= file_len {
+        return Ok(());
+    }
+    // Two cases: this HDU is last on disk (just set_len) OR there's
+    // tail data after it (shift forward).  layout tells us where
+    // the next HDU lives if any.
+    let next_hdu_start = {
+        let guard = layout.hdus.lock()
+            .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+        guard.iter()
+            .map(|o| o.header_offset())
+            .filter(|&off| off > data_offset)
+            .min()
+    };
+    let is_last = next_hdu_start.is_none()
+        || next_hdu_start.unwrap() <= data_offset;
+    let delta = want_end.saturating_sub(file_len);
+    if is_last || file_len <= current_end {
+        // No later HDUs to shift OR layout puts the next HDU before
+        // the new end — either way, extend the file.
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.set_len(want_end).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed table write: set_len({}) failed: {}",
+                want_end, e))
+        })?;
+    } else {
+        shift_file_tail_and_update_offsets(
+            file, layout, current_end, delta, tainted,
+        )?;
+    }
+    Ok(())
+}
+
 

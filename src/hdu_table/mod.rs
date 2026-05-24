@@ -28,5 +28,9 @@ pub(crate) use read::{
     field_dtype_and_shape, numpy_field_layout, read_descriptor,
     resolve_columns, resolve_rows,
 };
-pub(crate) use write_fixed::set_pcount_in_cards;
-pub(crate) use write_setup::normalize_and_build_table_header;
+pub(crate) use write_fixed::{apply_transform_cell, set_pcount_in_cards};
+pub(crate) use write_setup::{
+    column_expected_shape, column_transform, normalize_and_build_table_header,
+    WriteTransform,
+};
+pub(crate) use write_vla::extract_per_column_inputs;

@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::Bound;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -20,8 +20,13 @@ use crate::common::{
 use crate::hdu::HDU;
 use crate::hdu_image::{dtype_to_bitpix, ImageHDU};
 use crate::hdu_image_compressed::{header_has_zimage, CompressedImageHDU};
-use crate::hdu_table_compressed::{header_has_ztable, CompressedTableHDU};
-use crate::hdu_table::{normalize_and_build_table_header, TableHDU};
+use crate::hdu_table_compressed::{
+    build_compressed_table_header, default_ztilelen, header_has_ztable,
+    resolve_compress_arg, CompressedTableHDU,
+};
+use crate::hdu_table::{
+    normalize_and_build_table_header, parse_columns, TableHDU,
+};
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
 
@@ -239,9 +244,13 @@ fn parse_hdus_from_file(
                 None, None,
             ))?.into()
         } else if is_compressed_table {
+            // Reopened from disk: per-column configs unknown
+            // (level= etc. aren't stored on disk).  .compression
+            // falls back to dict-of-strings from ZCTYPn cards.
             Py::new(py, CompressedTableHDU::new(
                 header_cards.clone(), hdus.len(), hdu_filename,
                 hdu_offsets, hdu_layout, hdu_file, hdu_taint,
+                None,
             ))?.into()
         } else if is_binary_table {
             Py::new(py, TableHDU::new(
@@ -288,6 +297,9 @@ enum HduKind {
     CompressedImage {
         quantize: Option<crate::zimage::compression_config::Quantize>,
         compress_config: Option<CompressionConfigKind>,
+    },
+    CompressedTable {
+        compress_configs: Option<Vec<CompressionConfigKind>>,
     },
 }
 
@@ -502,6 +514,14 @@ impl FITS {
                     Arc::clone(&self.file), Arc::clone(&self.tainted),
                     quantize,
                     compress_config,
+                ))?.into()
+            }
+            HduKind::CompressedTable { compress_configs } => {
+                Py::new(py, CompressedTableHDU::new(
+                    trimmed, index, self.filename.clone(),
+                    offsets, Arc::clone(&self.layout),
+                    Arc::clone(&self.file), Arc::clone(&self.tainted),
+                    compress_configs,
                 ))?.into()
             }
         };
@@ -1011,6 +1031,75 @@ impl FITS {
             },
         )
     }
+
+    // Compressed-table create path.  Called by create_table_hdu when
+    // `compress=` is non-None.  Builds the ZTABLE-shaped header
+    // (ZTABLE=T, ZTILELEN, ZNAXIS1/2/PCOUNT, ZFORMn, ZCTYPn) from the
+    // already-built uncompressed cards, replaces the on-disk
+    // structural keys (NAXIS1/2, TFORMn = '1QB') with their
+    // compressed-shell values, and reserves space for the descriptor
+    // table.  The heap is grown on demand by hdu.write() — at create
+    // time PCOUNT=0 and the data section is just the descriptor table.
+    //
+    // Phase 5 scope: fixed columns only.  VLA + compress is Phase 6
+    // and rejected upstream in create_table_hdu.
+    #[allow(clippy::too_many_arguments)]
+    fn create_compressed_table_hdu_impl(
+        &mut self,
+        py: Python<'_>,
+        table_cards: Vec<String>,
+        row_width: u64,
+        nrows: i64,
+        columns: &[crate::hdu_table::Column],
+        per_col_cfgs: Vec<CompressionConfigKind>,
+        ztilelen: Option<i64>,
+    ) -> PyResult<()> {
+        // Validate ztilelen if user-provided; otherwise pick the
+        // cfitsio default (~10 MB worth of rows).
+        let ztilelen_u: usize = match ztilelen {
+            Some(v) if v <= 0 => return Err(PyValueError::new_err(format!(
+                "ztilelen must be > 0, got {}", v))),
+            Some(v) => (v as usize).min(nrows.max(1) as usize),
+            None => default_ztilelen(nrows as usize, row_width as usize),
+        };
+
+        // Translate per-column configs to algorithm enums (header
+        // builder + write path both want this lighter form).  The
+        // full configs are stored on the HDU for in-session round trip
+        // of write-only params like Gzip1(level=).
+        let algorithms: Vec<crate::zimage::CompressionAlgorithm> =
+            per_col_cfgs.iter().map(|cfg| match cfg {
+                CompressionConfigKind::Gzip1(_) =>
+                    crate::zimage::CompressionAlgorithm::Gzip1,
+                CompressionConfigKind::Gzip2(_) =>
+                    crate::zimage::CompressionAlgorithm::Gzip2,
+                CompressionConfigKind::Rice1(_) =>
+                    crate::zimage::CompressionAlgorithm::Rice1,
+                CompressionConfigKind::Hcompress1(_) =>
+                    crate::zimage::CompressionAlgorithm::Hcompress1,
+                CompressionConfigKind::Plio1(_) =>
+                    crate::zimage::CompressionAlgorithm::Plio1,
+            }).collect();
+
+        let (cards, _n_tiles, data_size) = build_compressed_table_header(
+            &table_cards, row_width, nrows, ztilelen_u, &algorithms,
+            columns,
+        )?;
+        let data_padded = data_section_padded(data_size);
+
+        // BINTABLE cannot be primary — write an empty primary image
+        // first if the file has no HDUs yet (same as create_table_hdu).
+        self.ensure_primary(py)?;
+
+        let offsets = append_header_and_data_to_file(
+            &self.file, &cards, data_padded)?;
+        self.finalize_hdu(
+            py, &cards, offsets,
+            HduKind::CompressedTable {
+                compress_configs: Some(per_col_cfgs),
+            },
+        )
+    }
 }
 
 #[pymethods]
@@ -1300,7 +1389,8 @@ impl FITS {
     #[pyo3(signature = (
         dtype, nrows=0, *,
         extname=None, extver=None, units=None,
-        var_dtypes=None, heap_format=None
+        var_dtypes=None, heap_format=None,
+        compress=None, ztilelen=None,
     ))]
     fn create_table_hdu(
         &mut self,
@@ -1312,10 +1402,25 @@ impl FITS {
         units: Option<&Bound<'_, PyDict>>,
         var_dtypes: Option<&Bound<'_, PyDict>>,
         heap_format: Option<String>,
+        compress: Option<&Bound<'_, PyAny>>,
+        ztilelen: Option<i64>,
     ) -> PyResult<()> {
         if nrows < 0 {
             return Err(PyValueError::new_err(format!(
                 "create_table_hdu: nrows must be >= 0, got {}", nrows)));
+        }
+        // ztilelen is meaningful only with compress=; reject early
+        // if the user set it without compress=.
+        if compress.is_none() && ztilelen.is_some() {
+            return Err(PyValueError::new_err(
+                "create_table_hdu: ztilelen= requires compress="));
+        }
+        // VLA + compress is Phase 6 territory.
+        if compress.is_some() && var_dtypes.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "create_table_hdu: compress= with var_dtypes= (VLA columns) \
+                 is ZTABLE Phase 6 — not yet implemented; create the table \
+                 without compress= for now"));
         }
         // heap_format is 'P' (default — 8-byte descriptors, 4 GB heap
         // ceiling) or 'Q' (16-byte, no practical ceiling).  Only
@@ -1334,6 +1439,22 @@ impl FITS {
             py, dtype, nrows, extname.as_deref(), extver, units,
             var_dtypes, desc_char,
         )?;
+
+        // Dispatch on compress=.  None/False -> uncompressed (the
+        // existing path).  Anything else routes to the ZTABLE create
+        // impl, which builds a fresh ZTABLE-shaped header from the
+        // uncompressed cards and reserves descriptor space for write().
+        let columns = parse_columns(&table_cards)?;
+        let resolved_compress = resolve_compress_arg(
+            py, compress, &columns,
+        )?;
+        if let Some(per_col_cfgs) = resolved_compress {
+            return self.create_compressed_table_hdu_impl(
+                py, table_cards, row_width, nrows, &columns,
+                per_col_cfgs, ztilelen,
+            );
+        }
+
         let data_size = (nrows as u64).saturating_mul(row_width);
         let data_padded = data_section_padded(data_size);
 
