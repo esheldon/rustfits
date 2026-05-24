@@ -98,7 +98,8 @@ def test_repack_shrinks_last_hdu_file():
         with rustfits.FITS(fname, "r") as fits:
             got = fits[1].read()
             np.testing.assert_array_equal(
-                got["v"][0], np.arange(800, dtype="f4"),
+                got["v"][0],
+                np.arange(800, dtype="f4"),
             )
             for r in range(1, 4):
                 np.testing.assert_array_equal(got["v"][r], arr["v"][r])
@@ -268,7 +269,8 @@ def test_repack_non_last_hdu_shifts_tail_backward():
             )
             got = fits[1].read()
             np.testing.assert_array_equal(
-                got["v"][0], np.arange(800, dtype="f4"),
+                got["v"][0],
+                np.arange(800, dtype="f4"),
             )
             for r in range(1, nrows):
                 np.testing.assert_array_equal(got["v"][r], arr["v"][r])
