@@ -377,19 +377,9 @@ def test_compressed_table_after_other_hdus():
 
 
 # ---------------------------------------------------------------------
-# Phase boundaries — rows= + mask_null= + VLA all still rejected
+# Phase boundaries — mask_null= and VLA still rejected
+# (rows= subset moved into Phase 3 — see test_compressed_table_phase3.py)
 # ---------------------------------------------------------------------
-
-
-def test_rows_kwarg_still_rejected_phase3():
-    with tempfile.TemporaryDirectory() as td:
-        dt = np.dtype([("a", "i4")])
-        src = np.zeros(2000, dtype=dt)
-        src["a"] = np.arange(2000, dtype="i4")
-        _, fz = _make_ztable_fixture(td, src)
-        with rustfits.FITS(fz, "r") as f:
-            with pytest.raises(NotImplementedError, match="Phase 3"):
-                f[1].read(rows=slice(0, 10))
 
 
 def test_mask_null_still_rejected():

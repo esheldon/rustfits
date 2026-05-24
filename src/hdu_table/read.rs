@@ -830,7 +830,7 @@ struct RunPlan {
 // normalized and duplicates removed (first occurrence kept).  Validates
 // range up front so a bad index in the middle of a large request fails
 // before any I/O.
-fn resolve_rows(
+pub(crate) fn resolve_rows(
     rows_arg: &Bound<'_, PyAny>,
     n_rows: usize,
 ) -> PyResult<Vec<usize>> {

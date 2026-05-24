@@ -17,11 +17,13 @@
 // algorithms (GZIP_1 / GZIP_2 / RICE_1); later phases add slicing, VLA,
 // and the write side.
 
+use lru::LruCache;
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::common::{
     byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
@@ -29,13 +31,123 @@ use crate::common::{
 };
 use crate::hdu::HDU;
 use crate::hdu_table::{
-    build_numpy_dtype, bytes_per_element, byteswap_unit, convert_column_cell,
-    field_dtype_and_shape, numpy_field_layout, parse_columns, read_descriptor,
-    resolve_columns, scaling_kind, Column, ScalingKind, TableHDU,
+    build_numpy_dtype, bytes_per_element, byteswap_unit, classify_table_key,
+    convert_column_cell, field_dtype_and_shape, numpy_field_layout,
+    parse_columns, read_descriptor, resolve_columns, resolve_rows,
+    scaling_kind, Column, ScalingKind, TableHDU, TableKey,
 };
 use crate::zimage::gzip::{decode_gzip1, decode_gzip2};
 use crate::zimage::rice::decode_rice;
 use crate::zimage::{parse_algorithm, CompressionAlgorithm};
+
+// 32 MiB default — matches CompressedImageHDU's default; large enough
+// to cache the per-column slabs for a handful of typical tiles, small
+// enough not to surprise desktop users.
+const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Per-(tile, column) decompressed-bytes cache
+// ---------------------------------------------------------------------------
+//
+// Same shape as the ZIMAGE TileCache (bytes-bound LRU, brief mutex
+// around get/put, value is `Arc<Vec<u8>>` so callers work without
+// holding the lock).  Key is the packed (tile_idx, col_idx) pair so
+// the LRU policy is per-(tile, col) — useful when a user reads
+// `hdu[i:j]` to pull a single column from many tiles: subsequent
+// reads of nearby rows or sibling columns can reuse adjacent cache
+// entries instead of re-decompressing.
+
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+struct CacheKey(u32, u32);
+
+struct ColumnTileCache {
+    inner: Mutex<ColumnTileCacheInner>,
+    max_bytes: AtomicU64,
+}
+
+struct ColumnTileCacheInner {
+    lru: LruCache<CacheKey, Arc<Vec<u8>>>,
+    cur_bytes: u64,
+}
+
+impl ColumnTileCache {
+    fn new(max_bytes: u64) -> Self {
+        ColumnTileCache {
+            inner: Mutex::new(ColumnTileCacheInner {
+                lru: LruCache::unbounded(),
+                cur_bytes: 0,
+            }),
+            max_bytes: AtomicU64::new(max_bytes),
+        }
+    }
+
+    fn capacity(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.inner.lock().map(|g| g.cur_bytes).unwrap_or(0)
+    }
+
+    fn get(&self, key: CacheKey) -> Option<Arc<Vec<u8>>> {
+        let mut guard = self.inner.lock().ok()?;
+        guard.lru.get(&key).cloned()
+    }
+
+    fn put(&self, key: CacheKey, bytes: Arc<Vec<u8>>) {
+        let cap = self.capacity();
+        if cap == 0 {
+            return;
+        }
+        let size = bytes.len() as u64;
+        if size > cap {
+            return;
+        }
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(old) = guard.lru.pop(&key) {
+            guard.cur_bytes =
+                guard.cur_bytes.saturating_sub(old.len() as u64);
+        }
+        while guard.cur_bytes + size > cap {
+            match guard.lru.pop_lru() {
+                Some((_, val)) => {
+                    guard.cur_bytes = guard.cur_bytes
+                        .saturating_sub(val.len() as u64);
+                }
+                None => break,
+            }
+        }
+        guard.lru.put(key, bytes);
+        guard.cur_bytes += size;
+    }
+
+    fn set_capacity(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        while guard.cur_bytes > max_bytes {
+            match guard.lru.pop_lru() {
+                Some((_, val)) => {
+                    guard.cur_bytes = guard.cur_bytes
+                        .saturating_sub(val.len() as u64);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.lru.clear();
+            guard.cur_bytes = 0;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -67,7 +179,9 @@ pub(crate) fn header_has_ztable(header: &[String]) -> bool {
 // ---------------------------------------------------------------------------
 
 #[pyclass(extends = TableHDU)]
-pub(crate) struct CompressedTableHDU;
+pub(crate) struct CompressedTableHDU {
+    cache: Arc<ColumnTileCache>,
+}
 
 impl CompressedTableHDU {
     pub(crate) fn new(
@@ -84,7 +198,11 @@ impl CompressedTableHDU {
         );
         PyClassInitializer::from(hdu)
             .add_subclass(TableHDU)
-            .add_subclass(CompressedTableHDU)
+            .add_subclass(CompressedTableHDU {
+                cache: Arc::new(ColumnTileCache::new(
+                    DEFAULT_TILE_CACHE_BYTES,
+                )),
+            })
     }
 }
 
@@ -256,11 +374,21 @@ impl CompressedTableHDU {
     // I/O surface — all stubbed; later phases will fill these in.
     // -------------------------------------------------------------------
 
-    // Whole-table read into a numpy structured ndarray.  Phase 2:
-    // fixed columns only across GZIP_1 / GZIP_2 / RICE_1.  rows=
-    // (subset / slicing) is rejected until Phase 3 lands; VLA columns
-    // are rejected until Phase 4.  scale=True (default) applies
-    // TSCAL/TZERO; columns=<list> selects + reorders columns.
+    // Read the (decompressed) table into a numpy structured ndarray.
+    //
+    //   rows=None    every row in file order, shape (ZNAXIS2,).
+    //   rows=slice   range of rows; step!=1 supported via per-tile
+    //                row dispatch.
+    //   rows=list    arbitrary indices in user-requested order
+    //                (deduped — first occurrence wins).
+    //   columns=None all columns in file order.
+    //   columns=list subset + reorder, case-insensitive name lookup.
+    //   scale=True   apply TSCAL/TZERO (unsigned trick + general).
+    //
+    // Only fixed columns are supported in Phase 2/3; VLA columns
+    // raise NotImplementedError (Phase 4).  mask_null=True is not
+    // yet implemented (TNULL masking on compressed-table reads is a
+    // separate follow-up).
     #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -270,32 +398,106 @@ impl CompressedTableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
-        if rows.is_some() {
-            return Err(PyNotImplementedError::new_err(
-                "CompressedTableHDU.read(rows=...): row subset / slicing \
-                 on compressed tables is ZTABLE Phase 3 — coming next.  \
-                 Read the whole table for now"));
-        }
         if mask_null {
             return Err(PyNotImplementedError::new_err(
                 "CompressedTableHDU.read(mask_null=True): TNULL masking \
                  on compressed-table reads is not yet implemented"));
         }
+        let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
         read_compressed_table(
-            py, &cards, data_offset, &super_.file, columns, scale,
+            py, &cards, data_offset, &super_.file, rows, columns, scale,
+            &cache,
         )
     }
 
+    // Standard table-shaped __getitem__:
+    //   hdu[i]            → 0-d structured record (numpy.void) at row i
+    //   hdu[i:j[:s]]      → structured ndarray covering the slice
+    //   hdu[[i, j, k]]    → fancy-row structured ndarray in input order
+    //   hdu["col"]        → CompressedSingleColumnSubset (chained reads)
+    //   hdu[["a", "b"]]   → CompressedColumnSubset
+    //
+    // Dispatch mirrors TableHDU.__getitem__ exactly via the shared
+    // classify_table_key/TableKey machinery.
     fn __getitem__(
-        _slf: PyRef<'_, Self>,
-        _key: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.__getitem__ — ZTABLE Phase 2/3 will add \
-             this (whole-table read in Phase 2, slicing in Phase 3)"))
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let kind = classify_table_key(key)?;
+        match kind {
+            TableKey::Rows => {
+                let pyref = slf.borrow();
+                let cache = Arc::clone(&pyref.cache);
+                let super_ = pyref.into_super().into_super();
+                let cards = super_.header_snapshot()?;
+                let data_offset = super_.offsets.data_offset();
+                read_compressed_table(
+                    py, &cards, data_offset, &super_.file,
+                    Some(key), None, /* scale = */ true, &cache,
+                )
+            }
+            TableKey::SingleRow(idx) => {
+                let pyref = slf.borrow();
+                let cache = Arc::clone(&pyref.cache);
+                let super_ = pyref.into_super().into_super();
+                let cards = super_.header_snapshot()?;
+                let data_offset = super_.offsets.data_offset();
+                // Same trick as TableHDU.__getitem__: wrap the
+                // bare-int request as a single-element list so
+                // resolve_rows handles the negative-index +
+                // bounds-check semantics, then unwrap [0] for the
+                // 0-d record return value.
+                let one = PyList::new(py, [idx])?;
+                let arr = read_compressed_table(
+                    py, &cards, data_offset, &super_.file,
+                    Some(one.as_any()), None,
+                    /* scale = */ true, &cache,
+                )?;
+                Ok(arr.bind(py).get_item(0)?.unbind())
+            }
+            TableKey::SingleColumn(name) => {
+                let hdu_py: Py<CompressedTableHDU> = slf.clone().unbind();
+                Ok(Py::new(py, CompressedSingleColumnSubset {
+                    hdu: hdu_py, name,
+                })?.into())
+            }
+            TableKey::MultiColumns(names) => {
+                let hdu_py: Py<CompressedTableHDU> = slf.clone().unbind();
+                Ok(Py::new(py, CompressedColumnSubset {
+                    hdu: hdu_py, columns: names,
+                })?.into())
+            }
+        }
+    }
+
+    // ----- Tile cache controls (mirror CompressedImageHDU) -----
+
+    // Current cache capacity in bytes (default 32 MiB).
+    #[getter]
+    fn tile_cache_size(slf: PyRef<'_, Self>) -> u64 {
+        slf.cache.capacity()
+    }
+
+    // Set capacity in bytes; 0 disables caching.  Shrinking below
+    // current usage evicts LRU entries to fit.
+    fn set_tile_cache_size(&self, bytes: u64) {
+        self.cache.set_capacity(bytes);
+    }
+
+    // Bytes currently held in the cache.
+    #[getter]
+    fn tile_cache_used(slf: PyRef<'_, Self>) -> u64 {
+        slf.cache.used_bytes()
+    }
+
+    // Drop every cached (tile, column) decompressed slab.  Keeps the
+    // capacity setting in place.
+    fn clear_tile_cache(&self) {
+        self.cache.clear();
     }
 
     fn __setitem__(
@@ -553,13 +755,16 @@ fn compression_algorithms(cards: &[String]) -> Vec<(String, String)> {
 // Peak memory bound per call: output ndarray + one tile's worth of
 // decompressed bytes per column being processed (a few MB for
 // typical fpack tile sizes).  No whole-table intermediate buffer.
-pub(crate) fn read_compressed_table(
+#[allow(clippy::too_many_arguments)]
+fn read_compressed_table(
     py: Python<'_>,
     cards: &[String],
     data_offset: u64,
     file_handle: &FileHandle,
+    rows_requested: Option<&Bound<'_, PyAny>>,
     columns_requested: Option<Vec<String>>,
     scale: bool,
+    cache: &ColumnTileCache,
 ) -> PyResult<Py<PyAny>> {
     let virtual_cards = synthesize_uncompressed_cards(cards);
     let all_columns = parse_columns(&virtual_cards)?;
@@ -626,11 +831,23 @@ pub(crate) fn read_compressed_table(
     };
     let heap_start = data_offset + heap_base_in_data;
 
+    // Resolve row selection.  When rows_requested is None we walk
+    // the whole table; otherwise we get a list of disk-row indices
+    // in the user's requested order (deduped, range-validated).
+    let row_plan = match rows_requested {
+        None => RowPlan::all(n_rows),
+        Some(arg) => {
+            let indices = resolve_rows(arg, n_rows)?;
+            RowPlan::from_indices(indices, ztilelen)
+        }
+    };
+    let n_out = row_plan.n_output_rows;
+
     // Allocate output ndarray.
     let dtype = build_numpy_dtype(py, &selected, scale)?;
     let np = py.import("numpy")?;
-    let arr = np.call_method1("empty", (n_rows, dtype.bind(py)))?;
-    if n_rows == 0 || selected.is_empty() {
+    let arr = np.call_method1("empty", (n_out, dtype.bind(py)))?;
+    if n_out == 0 || selected.is_empty() {
         return Ok(arr.unbind());
     }
 
@@ -663,7 +880,12 @@ pub(crate) fn read_compressed_table(
     // Per-tile buffer (descriptors) — reused across tiles.
     let mut desc_buf = vec![0u8; descriptor_row_width];
 
-    for tile_idx in 0..n_tiles {
+    // Walk tiles in increasing tile_idx (best disk locality for the
+    // descriptor reads + the heap-blob reads).  Output_row indices
+    // come from the per-tile requests so the user's row order is
+    // preserved in the final array.
+    let tile_plan = row_plan.tiles_with_requests(n_tiles, ztilelen);
+    for (tile_idx, requests) in tile_plan {
         let tile_row_start = tile_idx * ztilelen;
         let rows_in_tile = if tile_idx + 1 == n_tiles {
             n_rows - tile_row_start
@@ -688,54 +910,235 @@ pub(crate) fn read_compressed_table(
 
         for (out_col_idx, sel_col) in selected.iter().enumerate() {
             let orig_idx = selected_orig_idx[out_col_idx];
-            let desc_slice = &desc_buf
-                [orig_idx * 16..(orig_idx + 1) * 16];
-            let (nelems_s, heap_offset_s) = read_descriptor('Q', desc_slice);
-            if nelems_s < 0 || heap_offset_s < 0 {
-                return Err(PyValueError::new_err(format!(
-                    "tile {} column '{}': descriptor has negative field \
-                     (nelements={}, offset={})",
-                    tile_idx, sel_col.name, nelems_s, heap_offset_s)));
-            }
-            let n_bytes_compressed = nelems_s as usize;
+            let cache_key = CacheKey(tile_idx as u32, orig_idx as u32);
+            let slab_arc = match cache.get(cache_key) {
+                Some(arc) => arc,
+                None => {
+                    let desc_slice = &desc_buf
+                        [orig_idx * 16..(orig_idx + 1) * 16];
+                    let (nelems_s, heap_offset_s) =
+                        read_descriptor('Q', desc_slice);
+                    if nelems_s < 0 || heap_offset_s < 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "tile {} column '{}': descriptor has \
+                             negative field (nelements={}, offset={})",
+                            tile_idx, sel_col.name,
+                            nelems_s, heap_offset_s)));
+                    }
+                    let n_bytes_compressed = nelems_s as usize;
+                    let mut compressed = vec![0u8; n_bytes_compressed];
+                    if n_bytes_compressed > 0 {
+                        let mut g = lock_file(file_handle)?;
+                        let f = g.as_mut().ok_or_else(|| {
+                            PyIOError::new_err("file is closed")
+                        })?;
+                        f.seek(SeekFrom::Start(
+                            heap_start + heap_offset_s as u64
+                        )).map_err(|e| {
+                            PyIOError::new_err(e.to_string())
+                        })?;
+                        f.read_exact(&mut compressed).map_err(|e| {
+                            PyIOError::new_err(format!(
+                                "read heap for tile {} col '{}': {}",
+                                tile_idx, sel_col.name, e))
+                        })?;
+                    }
+                    let slab = decompress_column_slab(
+                        algorithms[orig_idx], &compressed, sel_col,
+                        rows_in_tile,
+                    )?;
+                    let arc = Arc::new(slab);
+                    cache.put(cache_key, Arc::clone(&arc));
+                    arc
+                }
+            };
 
-            // Read the compressed bytes for this (tile, column).
-            let mut compressed = vec![0u8; n_bytes_compressed];
-            if n_bytes_compressed > 0 {
-                let mut g = lock_file(file_handle)?;
-                let f = g.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.seek(SeekFrom::Start(heap_start + heap_offset_s as u64))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                f.read_exact(&mut compressed).map_err(|e| {
-                    PyIOError::new_err(format!(
-                        "read heap for tile {} col '{}': {}",
-                        tile_idx, sel_col.name, e))
-                })?;
-            }
-
-            // Decompress + byteswap-to-BE.
-            let slab = decompress_column_slab(
-                algorithms[orig_idx], &compressed, sel_col, rows_in_tile,
-            )?;
-
-            // Place each row's cell into the output ndarray.
             let kind = scaling_kinds[out_col_idx];
             let (field_offset, field_itemsize) = field_layout[out_col_idx];
             let src_cell_w = sel_col.byte_width;
-            for r in 0..rows_in_tile {
-                let disk_row = tile_row_start + r;
-                let src = &slab[r * src_cell_w..(r + 1) * src_cell_w];
-                let dst_start = disk_row * itemsize + field_offset;
+            for req in &requests {
+                let in_tile = req.in_tile_offset;
+                let out_row = req.output_row;
+                let src = &slab_arc
+                    [in_tile * src_cell_w..(in_tile + 1) * src_cell_w];
+                let dst_start = out_row * itemsize + field_offset;
                 let dst = &mut out
                     [dst_start..dst_start + field_itemsize];
-                convert_column_cell(sel_col, src, dst, disk_row, kind)?;
+                convert_column_cell(sel_col, src, dst, out_row, kind)?;
             }
         }
     }
 
     drop(out_buf);
     Ok(arr.unbind())
+}
+
+// ---------------------------------------------------------------------------
+// Row planning — group requested rows by tile
+// ---------------------------------------------------------------------------
+
+// One row to be filled in the output array: which row inside the tile
+// to pull from, and which slot of the output to write into.
+struct TileRowRequest {
+    in_tile_offset: usize,
+    output_row: usize,
+}
+
+// Plan describing which tiles are needed and, for each, which rows to
+// read from and where to put them in the output.  `all_rows` flag
+// distinguishes the full-table case (synthesize sequential requests
+// per tile lazily) from the subset case (per-tile bucket built from
+// resolve_rows output).
+struct RowPlan {
+    by_tile: std::collections::HashMap<usize, Vec<TileRowRequest>>,
+    n_output_rows: usize,
+    all_rows: bool,
+}
+
+impl RowPlan {
+    fn all(n_rows: usize) -> Self {
+        RowPlan {
+            by_tile: std::collections::HashMap::new(),
+            n_output_rows: n_rows,
+            all_rows: true,
+        }
+    }
+
+    // rows= path: bucket each requested disk row into its tile.
+    fn from_indices(indices: Vec<usize>, ztilelen: usize) -> Self {
+        let mut by_tile: std::collections::HashMap<usize, Vec<TileRowRequest>>
+            = std::collections::HashMap::new();
+        let n_out = indices.len();
+        for (output_row, disk_row) in indices.into_iter().enumerate() {
+            let tile_idx = if ztilelen > 0 { disk_row / ztilelen } else { 0 };
+            let in_tile = if ztilelen > 0 { disk_row % ztilelen } else { 0 };
+            by_tile.entry(tile_idx).or_default().push(TileRowRequest {
+                in_tile_offset: in_tile,
+                output_row,
+            });
+        }
+        RowPlan { by_tile, n_output_rows: n_out, all_rows: false }
+    }
+
+    // Build the list of (tile_idx, requests) to walk, in increasing
+    // tile_idx order (best disk locality for the descriptor + heap
+    // reads).  For the all-rows path, synthesizes sequential requests
+    // per tile; per-tile Vec is bounded by ztilelen so total
+    // allocation is O(n_rows) — same as a row-subset call.
+    fn tiles_with_requests(
+        self, n_tiles: usize, ztilelen: usize,
+    ) -> Vec<(usize, Vec<TileRowRequest>)> {
+        if self.all_rows {
+            (0..n_tiles).map(|tile_idx| {
+                let tile_row_start = tile_idx * ztilelen;
+                let rows_in_tile = if tile_idx + 1 == n_tiles {
+                    self.n_output_rows - tile_row_start
+                } else {
+                    ztilelen
+                };
+                let reqs: Vec<TileRowRequest> = (0..rows_in_tile)
+                    .map(|r| TileRowRequest {
+                        in_tile_offset: r,
+                        output_row: tile_row_start + r,
+                    })
+                    .collect();
+                (tile_idx, reqs)
+            }).collect()
+        } else {
+            let mut out: Vec<(usize, Vec<TileRowRequest>)> =
+                self.by_tile.into_iter().collect();
+            out.sort_by_key(|(idx, _)| *idx);
+            out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Column-subset pyclasses returned by hdu[col] / hdu[[cols]]
+// ---------------------------------------------------------------------------
+
+// Returned by CompressedTableHDU[col] for a single str/bytes column.
+// Read-only — write-side mutations on compressed tables aren't in
+// the current roadmap.
+#[pyclass]
+pub(crate) struct CompressedSingleColumnSubset {
+    hdu: Py<CompressedTableHDU>,
+    name: String,
+}
+
+#[pymethods]
+impl CompressedSingleColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super().into_super();
+        Ok(format!(
+            "<CompressedTableColumn '{}' of HDU #{}>",
+            self.name, super_.index(),
+        ))
+    }
+
+    // [rows] returns the column's values for those rows as a plain
+    // (non-structured) ndarray — same convention as
+    // SingleColumnSubset on the uncompressed side.
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let cache = Arc::clone(&pyref.cache);
+        let super_ = pyref.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        let arr = read_compressed_table(
+            py, &cards, data_offset, &super_.file,
+            Some(rows), Some(vec![self.name.clone()]),
+            /* scale = */ true, &cache,
+        )?;
+        // Unwrap to a plain (non-structured) ndarray view of the
+        // single column — mirrors the uncompressed SingleColumnSubset.
+        Ok(arr.bind(py).get_item(self.name.as_str())?.unbind())
+    }
+}
+
+// Returned by CompressedTableHDU[[col1, col2, ...]].  Read-only.
+#[pyclass]
+pub(crate) struct CompressedColumnSubset {
+    hdu: Py<CompressedTableHDU>,
+    columns: Vec<String>,
+}
+
+#[pymethods]
+impl CompressedColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super().into_super();
+        Ok(format!(
+            "<CompressedTableColumns {:?} of HDU #{}>",
+            self.columns, super_.index(),
+        ))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let cache = Arc::clone(&pyref.cache);
+        let super_ = pyref.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_compressed_table(
+            py, &cards, data_offset, &super_.file,
+            Some(rows), Some(self.columns.clone()),
+            /* scale = */ true, &cache,
+        )
+    }
 }
 
 // Dispatch on the per-column algorithm, decompress the heap blob, and

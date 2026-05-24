@@ -102,9 +102,12 @@ else stays private to its file.
 - `src/hdu_table_compressed.rs` — `CompressedTableHDU` (`ZTABLE`
   convention) pyclass.  Subclasses `TableHDU` (so
   `isinstance(hdu, TableHDU)` holds on a compressed-table HDU).
-  Phases 1 (detection + accessors + I/O stubs) and 2 (whole-table
-  read across GZIP_1 / GZIP_2 / RICE_1) shipped; later phases add
-  slicing (Phase 3), VLA (Phase 4), and the write side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
+  Phases 1 (detection + accessors + I/O stubs), 2 (whole-table
+  read across GZIP_1 / GZIP_2 / RICE_1), and 3 (`read(rows=)` /
+  `__getitem__` / `CompressedSingleColumnSubset` +
+  `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`)
+  shipped; later phases add VLA (Phase 4) and the write side
+  (Phases 5-6).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2360,7 +2363,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 |-------|-------|--------|
 | 1 | Detection + `CompressedTableHDU` subclass + accessors + I/O stubs | ✅ Shipped |
 | 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ✅ Shipped |
-| 3 | Slicing — `hdu[i:j]` decompresses only overlapping tiles | ⏳ Planned |
+| 3 | `read(rows=)` / `__getitem__` / column-subset objects / tile cache | ✅ Shipped |
 | 4 | VLA-column read (dual-descriptor heap) | ⏳ Planned |
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ⏳ Planned |
 | 6 | VLA write + `__setitem__` / `append` | ⏳ Planned |
@@ -2478,14 +2481,98 @@ before fpack runs.  To set `ZTILELEN`, write `FZTILELN` on the
 source HDU (fpack has no CLI flag for it — surprising and
 worth noting in the test helper).
 
-Tests: `tests/test_compressed_table_phase2.py` (18 cases) —
+Tests: `tests/test_compressed_table_phase2.py` (17 cases) —
 mixed-dtype round trip; per-algorithm coverage (RICE_1 on i4 +
 the GZIP defaults for u1/i2/f4/f8/A); multi-tile + partial last
 tile; unsigned-int trick round trip; `scale=False` returns raw
 stored dtype; `columns=` subset (decompresses only selected,
 reorders, case-insensitive); multi-D subarray TDIM round trip;
-compressed table not at index 1 (programmatic lookup); `rows=`
-+ `mask_null=` Phase 3/follow-up boundary tests.
+compressed table not at index 1 (programmatic lookup).
+
+**Phase 3 — slicing, `__getitem__`, column-subset, tile cache.**
+Shipped.
+
+`read(rows=...)`: accepts a Python slice (with arbitrary step,
+including negative — handled by `resolve_rows`) or an iterable
+of ints (negative wrap-around, deduped — first occurrence wins,
+output order preserved).  Combined with `columns=` for
+two-dimensional subsets.
+
+`__getitem__` dispatch mirrors `TableHDU.__getitem__` exactly
+(reuses `classify_table_key` + `TableKey` from `hdu_table::hdu`,
+promoted to `pub(crate)` for this purpose):
+
+  - `hdu[i]` → 0-d structured record (numpy.void).
+  - `hdu[i:j[:s]]` → structured ndarray.
+  - `hdu[[i, j, k]]` → fancy-row ndarray (user order preserved).
+  - `hdu["col"]` → `CompressedSingleColumnSubset`.
+  - `hdu[["a", "b"]]` → `CompressedColumnSubset`.
+
+Subset objects are READ-ONLY (no `__setitem__`).
+`hdu["col"][rows]` returns a plain (non-structured) ndarray of
+just that column's values — matches `SingleColumnSubset` on the
+uncompressed side.
+
+**Row planner (`RowPlan`).**  Buckets the requested disk-row
+indices into per-tile lists of `TileRowRequest { in_tile_offset,
+output_row }`.  The walk iterates tiles in increasing order
+(best disk locality for the descriptor + heap reads), and
+within each tile walks each selected column.  For each
+`(tile, col)` the cache is consulted; on miss, decompress +
+byteswap-to-BE + insert into cache.  Then for each request in
+that tile, copy + scale the cell into `out[output_row].field(C)`.
+
+The "all rows" path uses a flag rather than materializing N
+requests up front; `tiles_with_requests` synthesizes sequential
+requests per tile lazily, so the planning cost is O(n_rows)
+either way.
+
+**Tile cache (`ColumnTileCache`).**  Bytes-bound LRU keyed by
+`(tile_idx, col_idx)` packed into a `CacheKey` struct.  Value is
+`Arc<Vec<u8>>` of decompressed BE bytes for that (tile, column)
+slab — so callers work without holding the inner mutex and
+concurrent readers don't serialize through long decode runs.
+
+Per-(tile, column) granularity is the right knob for tables:
+reading just `hdu["col"][i:j]` only decompresses that column's
+tiles; subsequent reads of sibling columns or nearby rows reuse
+adjacent cache entries.  This contrasts with image tiles (one
+cache entry per tile) — same primitive shape, finer key.
+
+Default capacity 32 MiB; accessors match
+`CompressedImageHDU`:
+
+  - `hdu.tile_cache_size` / `set_tile_cache_size(bytes)` —
+    capacity in bytes; 0 disables caching entirely.
+  - `hdu.tile_cache_used` — current bytes held.
+  - `hdu.clear_tile_cache()` — drop all entries, keep capacity.
+
+`set_tile_cache_size` to a value below current usage triggers
+LRU eviction until it fits.
+
+**Reused helpers (additionally promoted `pub(crate)`).**  Phase 3
+also promotes `hdu_table::read::resolve_rows`,
+`hdu_table::hdu::classify_table_key`, and the `TableKey` enum to
+`pub(crate)` so the compressed-table dispatch reuses the same
+key-classification logic as the uncompressed path.
+
+Tests: `tests/test_compressed_table_phase3.py` (27 cases) —
+`read(rows=...)` for slice / stepped slice / iterable / negative
+indices / duplicates / dedup / combined with `columns=`;
+`__getitem__` for int / negative int / slice / stepped /
+fancy / col-name / col-list (with subset-class type checks);
+chained subset reads (single + multi) including reorder;
+cache default / warming / repeat-from-cache / clear /
+set-to-zero / set-smaller-evicts; cross-call correctness when a
+partial read is followed by a full read; out-of-range int +
+empty-iterable rejection.
+
+**Fixture guard worth noting.**  cfitsio's `fits_compress_table`
+silently *copies the HDU verbatim* (no compression) when the
+table's data extent is under 5760 bytes (2 BLOCK_SIZE blocks).
+The Phase 3 test helper asserts the produced HDU IS
+`CompressedTableHDU` so future tests don't silently exercise
+the uncompressed path while pretending to test ZTABLE.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

@@ -6,6 +6,8 @@ from ._rust import (
     CompressedImageHDU,
     TableHDU,
     CompressedTableHDU,
+    CompressedSingleColumnSubset,
+    CompressedColumnSubset,
     AsciiTableHDU,
     FITSHeader,
     FITSHeaderEdit,

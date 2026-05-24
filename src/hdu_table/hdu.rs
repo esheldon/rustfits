@@ -633,7 +633,7 @@ impl TableHDU {
 // bare-integer case (`hdu[5]`); read_table still does the I/O but
 // the result is unwrapped to a numpy 0-d record (np.void) before
 // returning, matching `structured_arr[i]` semantics.
-enum TableKey {
+pub(crate) enum TableKey {
     Rows,
     SingleRow(i64),
     SingleColumn(String),
@@ -650,7 +650,7 @@ enum TableKey {
 //       mixed or unknown                 → ValueError
 //   - empty iterable                     → ValueError (ambiguous)
 //   - anything else                      → ValueError
-fn classify_table_key(key: &Bound<'_, PyAny>) -> PyResult<TableKey> {
+pub(crate) fn classify_table_key(key: &Bound<'_, PyAny>) -> PyResult<TableKey> {
     if key.is_instance_of::<PySlice>() {
         return Ok(TableKey::Rows);
     }
