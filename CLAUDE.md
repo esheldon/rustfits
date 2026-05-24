@@ -884,6 +884,33 @@ repack reclaims orphans, non-last HDU shifts, insert-then-delete
 restores layout, astropy cross-read, all rejection paths, and a
 50k-row strip-loop test to anchor the bounded-memory invariant.
 
+**Planned, not yet designed — inserting a VLA column.**
+`insert_column` currently rejects Object dtype.  The mechanical
+work would be modest (the heap-layout primitives in `write_vla.rs`
+— `plan_vla_heap_layout`, `validate_vla_cell`,
+`extract_string_vla_cell_bytes`, `serialize_vla_cell`,
+`write_descriptor` — already exist; `edit.rs` would branch on
+`data.dtype.kind == 'O'` and call a sibling
+`insert_vla_column_impl`).  What's blocking is the API surface:
+
+- **Inner element type.**  `Object` dtype doesn't carry the FITS
+  inner letter.  Options: a new `inner_dtype='f4'` kwarg (mirrors
+  `create_table_hdu`'s `var_dtypes={name: 'f4'}` shape, flat for
+  one column), or detect from the first non-empty cell (fragile
+  with heterogeneous / all-empty inputs).
+- **Descriptor format ('P' vs 'Q').**  Existing VLA columns in
+  the table may use either; the new column needs its own.
+  Options: a `heap_format=` kwarg, inherit from existing VLA
+  columns when present, or always 'P' (4 GB heap ceiling risks
+  overflow on large inserts).
+
+Both add conditional kwargs that only apply when `data.dtype` is
+Object — extra surface area that's worth deferring until a real
+user request shapes the API decision.  Not prioritized; the
+existing workaround (rebuild via `create_table_hdu` + `write`) is
+fine for tables small enough to fit in RAM, which is the typical
+"I want to add a column" workload.
+
 **Missing (low priority / niche):**
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
 - **`X` (bit) columns on write** — numpy `bool` currently maps to
