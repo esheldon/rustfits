@@ -3225,6 +3225,377 @@ fn setitem_single_column(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-column / fancy-row / cell setitem helpers
+// ---------------------------------------------------------------------------
+
+// hdu[[i, j, k]] = arr: write a structured ndarray to a non-contiguous
+// set of row indices.  Each input row maps to one disk row; the per-
+// row strided writer (write_table_strided) handles the actual I/O.
+// VLA tables are rejected — strided VLA writes would need per-row
+// heap layouts; defer until requested.
+#[allow(clippy::too_many_arguments)]
+fn setitem_fancy_rows(
+    py: Python<'_>,
+    columns: &[Column],
+    file: &FileHandle,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    row_indices_signed: &[i64],
+    value: &Bound<'_, PyAny>,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    if any_var_column(columns) {
+        return Err(PyValueError::new_err(
+            "TableHDU[[rows]] = value: fancy-row writes are not yet \
+             supported for tables with VLA columns; use hdu[i] = \
+             record per row, or hdu['vla_col'] = arr for a whole-\
+             column write"));
+    }
+    let count = row_indices_signed.len();
+    let row_indices: Vec<i64> = row_indices_signed.iter()
+        .map(|&i| normalize_row_index(i, nrows).map(|r| r as i64))
+        .collect::<PyResult<_>>()?;
+
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[[rows]] = value: value must be a structured \
+             numpy ndarray of length equal to the row list"));
+    }
+    if count == 0 {
+        let v_len: usize = value.len().unwrap_or(0);
+        if v_len != 0 {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[[rows]] = value: row list is empty but value \
+                 has length {}", v_len)));
+        }
+        return Ok(());
+    }
+    let v_len: usize = value.len()?;
+    if v_len != count {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU[[rows]] = value: row list has {} entries but \
+             value has length {}", count, v_len)));
+    }
+
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let prep = prepare_structured_input(
+        value, columns, count, row_width, &mut buffers)?;
+    let sources = build_sources(&prep.metas, &buffers);
+    write_table_strided(
+        columns, &prep.transforms, &sources, prep.layout_matches,
+        file, data_offset, &row_indices, row_width, tainted)
+}
+
+// hdu[[name1, name2]] = arr: rewrite a subset of columns across all
+// rows.  Routes each named column individually to the existing
+// per-column writers (fixed → setitem_single_column,
+// VLA → setitem_single_column_vla); the other columns' bytes stay
+// untouched.  Value must be a structured ndarray with at least the
+// named fields (extras tolerated for forward compatibility), length
+// equal to NAXIS2.
+#[allow(clippy::too_many_arguments)]
+fn setitem_multi_columns(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    names: &[String],
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    if names.is_empty() {
+        return Err(PyValueError::new_err(
+            "TableHDU[[names]] = value: empty column list"));
+    }
+    // Validate value shape: structured ndarray of length nrows.
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[[names]] = value: value must be a structured \
+             numpy ndarray with one element per row"));
+    }
+    let v_len: usize = value.len()?;
+    if v_len != nrows {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU[[names]] = value: value has {} rows but table \
+             NAXIS2={}", v_len, nrows)));
+    }
+    let dtype = value.getattr("dtype")?;
+    let value_names_attr = dtype.getattr("names")?;
+    if value_names_attr.is_none() {
+        return Err(PyValueError::new_err(
+            "TableHDU[[names]] = value: value must be a structured \
+             ndarray with named fields"));
+    }
+    let value_names: Vec<String> = value_names_attr.extract()?;
+    let value_names_upper: std::collections::HashSet<String> =
+        value_names.iter().map(|n| n.to_uppercase()).collect();
+
+    // Resolve names case-insensitively + duplicate-check.
+    let mut col_indices: Vec<usize> = Vec::with_capacity(names.len());
+    let mut seen_upper: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for name in names {
+        let name_u = name.to_uppercase();
+        if !seen_upper.insert(name_u.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[[names]] = value: duplicate column name '{}'",
+                name)));
+        }
+        let idx = columns.iter()
+            .position(|c| c.name.to_uppercase() == name_u)
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "TableHDU[[names]] = value: no column named '{}'", name)))?;
+        if !value_names_upper.contains(&name_u) {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[[names]] = value: value structured dtype is \
+                 missing field '{}'", name)));
+        }
+        col_indices.push(idx);
+    }
+
+    for (name, &col_idx) in names.iter().zip(col_indices.iter()) {
+        // Extract the per-column ndarray as a contiguous array (the
+        // structured-field view has record-itemsize strides which fail
+        // RawBuffer's c-contig check).
+        let field_view = value.get_item(name.as_str())?;
+        let per_col = np.call_method1("ascontiguousarray", (field_view,))?;
+        if columns[col_idx].var_kind.is_some() {
+            setitem_single_column_vla(
+                py, super_, cards, columns, col_idx, nrows, row_width,
+                &per_col, data_offset)?;
+        } else {
+            setitem_single_column(
+                py, columns, &super_.file, data_offset, nrows, row_width,
+                name, &per_col, &super_.tainted)?;
+        }
+    }
+    Ok(())
+}
+
+// hdu[row, "col"] = value: single-cell write.  For a fixed-width
+// column: convert the value to the column's expected per-cell shape,
+// encode to bytes, write byte_width bytes at row_offset +
+// col.byte_offset.  For a VLA column: append cell bytes to the heap
+// end, rewrite the row's descriptor, update PCOUNT.
+#[allow(clippy::too_many_arguments)]
+fn setitem_cell(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    row_idx_signed: i64,
+    col_name: &str,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let r = normalize_row_index(row_idx_signed, nrows)?;
+    let name_u = col_name.to_uppercase();
+    let col_idx = columns.iter()
+        .position(|c| c.name.to_uppercase() == name_u)
+        .ok_or_else(|| PyValueError::new_err(format!(
+            "TableHDU[(row, col)] = value: no column named '{}'",
+            col_name)))?;
+    let col = &columns[col_idx];
+
+    if col.var_kind.is_some() {
+        return setitem_cell_vla(
+            py, super_, cards, columns, col_idx, nrows, row_width,
+            r, value, data_offset);
+    }
+
+    // Fixed cell: promote `value` to a length-1 per-column ndarray
+    // matching the column's expected dtype and shape.  np.asarray
+    // with the column dtype coerces Python ints / floats to the right
+    // width (NEP 50 raises OverflowError on out-of-range int → int
+    // narrowing).  np.broadcast_to handles 0-d scalars + pre-shaped
+    // ndarrays uniformly; shape mismatches surface as numpy ValueError.
+    let np = py.import("numpy")?;
+    let expected_shape: Vec<usize> = column_expected_shape(col);
+    let full_shape: Vec<usize> = std::iter::once(1)
+        .chain(expected_shape.iter().copied()).collect();
+    let (dtype_str, _) = field_dtype_and_shape(col, false)?;
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("dtype", &dtype_str)?;
+    let arr = np.call_method("asarray", (value,), Some(&kwargs))?;
+    let broadcast = np.getattr("broadcast_to")?
+        .call1((arr, full_shape))?;
+    let promoted = np.call_method1("ascontiguousarray", (broadcast,))?;
+
+    let mut buffers: Vec<RawBuffer> = Vec::new();
+    let ndarray = np.getattr("ndarray")?;
+    let (transform, src_total_size, buffer_idx) =
+        acquire_per_column_array(&promoted, &ndarray, col, 1, &mut buffers)?;
+    let source = ColumnSource {
+        src_bytes: buffers[buffer_idx].as_slice(),
+        src_offset: 0,
+        src_row_stride: src_total_size,
+        src_total_size,
+    };
+    let mut cell_buf = vec![0u8; col.byte_width];
+    apply_transform_cell(
+        &transform, source.src_bytes, &mut cell_buf, &col.name, 0)?;
+
+    let file_off = data_offset
+        + (r * row_width + col.byte_offset) as u64;
+    let mut guard = lock_file(&super_.file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    f.seek(SeekFrom::Start(file_off))
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    f.write_all(&cell_buf).map_err(|e| {
+        super_.tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "cell write failed: {}; close + reopen", e))
+    })?;
+    f.flush().map_err(|e| {
+        super_.tainted.store(true, Ordering::Release);
+        PyIOError::new_err(format!(
+            "cell flush failed: {}; close + reopen", e))
+    })?;
+    Ok(())
+}
+
+// hdu[row, "vla_col"] = value: append the new cell bytes at the heap
+// end, rewrite the row's descriptor in place, update PCOUNT.  Same
+// orphan-and-append model as setitem_single_column_vla but for one
+// row.
+#[allow(clippy::too_many_arguments)]
+fn setitem_cell_vla(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    col_idx: usize,
+    nrows: usize,
+    row_width: usize,
+    row_idx: usize,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let col = &columns[col_idx];
+    let descriptor_kind = col.var_kind.unwrap();
+    let elem_size = bytes_per_element(col.tform_letter).unwrap_or(0);
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    let nelements = validate_vla_cell(
+        value, &ndarray, col.tform_letter, &col.name, row_idx)?;
+    let n_bytes = nelements * elem_size;
+
+    let current_pcount = parse_keyword(cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    let new_pcount = current_pcount + n_bytes as u64;
+    let nrows_u64 = nrows as u64;
+    let main_bytes = nrows_u64 * row_width as u64;
+    let current_padded = round_up_to_block(main_bytes + current_pcount);
+    let new_padded = round_up_to_block(main_bytes + new_pcount);
+    let current_hdu_end = data_offset + current_padded;
+    let new_hdu_end = data_offset + new_padded;
+
+    if new_hdu_end > current_hdu_end {
+        let delta = new_hdu_end - current_hdu_end;
+        let file_len = {
+            let g = lock_file(&super_.file)?;
+            let f = g.as_ref()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.metadata()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                .len()
+        };
+        if file_len > current_hdu_end {
+            shift_file_tail_and_update_offsets(
+                &super_.file, &super_.layout,
+                current_hdu_end, delta, &super_.tainted)?;
+            zero_fill_range(
+                &super_.file, current_hdu_end, delta, &super_.tainted)?;
+        } else {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.set_len(new_hdu_end)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+    }
+
+    // Build heap bytes + descriptor bytes.
+    let mut heap_bytes = vec![0u8; n_bytes];
+    if n_bytes > 0 {
+        serialize_vla_cell(
+            value, col.tform_letter, nelements, &mut heap_bytes)?;
+    }
+    let mut desc_bytes = vec![0u8; col.byte_width];
+    write_descriptor(
+        descriptor_kind, nelements,
+        current_pcount as usize, &mut desc_bytes);
+
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        if n_bytes > 0 {
+            let heap_off = data_offset + main_bytes + current_pcount;
+            f.seek(SeekFrom::Start(heap_off))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.write_all(&heap_bytes).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "VLA cell heap write failed: {}; close + reopen", e))
+            })?;
+        }
+        let desc_off = data_offset
+            + (row_idx as u64) * row_width as u64
+            + col.byte_offset as u64;
+        f.seek(SeekFrom::Start(desc_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&desc_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "VLA cell descriptor write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "VLA cell flush failed: {}; close + reopen", e))
+        })?;
+    }
+
+    // PCOUNT update via disk-write-before-commit.
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards_guard.clone();
+    set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header write failed: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "PCOUNT header flush failed: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // VLA write support (Phase 4)
 // ---------------------------------------------------------------------------
 
@@ -5003,14 +5374,16 @@ fn dispatch_write_input(
 }
 
 // What kind of selection the user passed to TableHDU.__setitem__.
-// Scope is intentionally narrower than __getitem__'s TableKey:
-// multi-column subset writes, fancy row-list writes, and (row, col)
-// tuple writes are all rejected with a clear message until a use case
-// for them shows up.
+// Mirrors the read-side TableKey plus an extra `Cell` variant for the
+// (row, column) tuple form.  Mixed-tuple keys like (slice, [names])
+// are rejected — those are deferable surface extensions.
 enum SetItemKey {
     SingleRow(i64),
     RowSlice,
     SingleColumn(String),
+    FancyRows(Vec<i64>),
+    MultiColumns(Vec<String>),
+    Cell(i64, String),
 }
 
 fn classify_setitem_key(key: &Bound<'_, PyAny>) -> PyResult<SetItemKey> {
@@ -5025,10 +5398,68 @@ fn classify_setitem_key(key: &Bound<'_, PyAny>) -> PyResult<SetItemKey> {
             return Ok(SetItemKey::SingleRow(idx));
         }
     }
-    Err(PyValueError::new_err(
-        "TableHDU[key] = value: key must be an int (single row), a slice \
-         (range of rows), or a str/bytes column name; other forms are \
-         not yet supported"))
+    // Two-element tuple `(row, col)` — single cell write.  Other tuple
+    // shapes (slice/list rows × list of cols, etc.) are rejected for
+    // now; users can chain the existing forms instead.
+    if let Ok(tup) = key.cast::<PyTuple>() {
+        if tup.len() == 2 {
+            let row_obj = tup.get_item(0)?;
+            let col_obj = tup.get_item(1)?;
+            let row_is_int = !row_obj.is_instance_of::<PyBool>()
+                && row_obj.extract::<i64>().is_ok();
+            let col_name = try_extract_column_name(&col_obj)?;
+            if row_is_int && col_name.is_some() {
+                let idx: i64 = row_obj.extract()?;
+                return Ok(SetItemKey::Cell(idx, col_name.unwrap()));
+            }
+            return Err(PyValueError::new_err(
+                "TableHDU[(row, col)] = value requires (int row, \
+                 str column name); other tuple shapes are not \
+                 supported"));
+        }
+    }
+    // Iterable: classify by first element (matches __getitem__'s
+    // classify_table_key shape).
+    let iter = key.try_iter().map_err(|_| PyValueError::new_err(
+        "TableHDU[key] = value: key must be an int, slice, column \
+         name, two-tuple (row, col), iterable of ints (fancy rows), \
+         or iterable of str (column subset)"
+    ))?;
+    let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
+    if items.is_empty() {
+        return Err(PyValueError::new_err(
+            "TableHDU[key] = value: empty sequence is ambiguous \
+             (rows or columns?)"));
+    }
+    let first = &items[0];
+    if let Some(_) = try_extract_column_name(first)? {
+        let names: Vec<String> = items.iter()
+            .map(|i| try_extract_column_name(i)?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "TableHDU[key] = value: column-name sequence \
+                     contains non-string elements")
+            }))
+            .collect::<PyResult<_>>()?;
+        Ok(SetItemKey::MultiColumns(names))
+    } else if !first.is_instance_of::<PyBool>() && first.extract::<i64>().is_ok() {
+        let rows: Vec<i64> = items.iter()
+            .map(|i| {
+                if i.is_instance_of::<PyBool>() {
+                    return Err(PyValueError::new_err(
+                        "TableHDU[key] = value: row-index sequence \
+                         contains a bool"));
+                }
+                i.extract::<i64>().map_err(|_| PyValueError::new_err(
+                    "TableHDU[key] = value: row-index sequence mixes \
+                     ints and non-ints"))
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(SetItemKey::FancyRows(rows))
+    } else {
+        Err(PyValueError::new_err(
+            "TableHDU[key] = value: sequence must be all int (rows) \
+             or all str (columns)"))
+    }
 }
 
 #[pyclass(extends = HDU)]
@@ -5466,6 +5897,15 @@ impl TableHDU {
                     py, &columns, &super_.file, data_offset, nrows,
                     row_width, &name, value, &super_.tainted)
             }
+            SetItemKey::FancyRows(rows) => setitem_fancy_rows(
+                py, &columns, &super_.file, data_offset, nrows,
+                row_width, &rows, value, &super_.tainted),
+            SetItemKey::MultiColumns(names) => setitem_multi_columns(
+                py, &super_, &cards, &columns, nrows, row_width,
+                &names, value, data_offset),
+            SetItemKey::Cell(i, name) => setitem_cell(
+                py, &super_, &cards, &columns, nrows, row_width,
+                i, &name, value, data_offset),
         }
     }
 

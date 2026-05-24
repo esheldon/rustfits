@@ -706,14 +706,40 @@ astropy reads our PA columns as per-cell chararrays of single chars;
 we read astropy's PA columns as Python str (the natural mapping).
 Tests in `tests/test_vla_string_write.py` (24 cases).
 
+**Multi-column / fancy / `(row, col)` `__setitem__`.**  Shipped.
+Three new forms complete the table `__setitem__` surface:
+
+- `hdu[[c1, c2]] = arr` — multi-column subset write.  Value is a
+  structured ndarray with the named fields (extras tolerated for
+  forward compatibility), length = NAXIS2.  Each column routes
+  through the existing single-column writer; if any subset column
+  is VLA, that column goes through `setitem_single_column_vla`
+  (other subset columns can be fixed).  Case-insensitive name
+  lookup; duplicate name in the list raises.
+- `hdu[[1, 3, 5]] = arr` — fancy-row write.  Value is a structured
+  ndarray of length = len(row list).  Reuses `write_table_strided`
+  (the existing stepped-slice writer).  VLA tables are rejected
+  with a clear error pointing at the per-row / whole-column
+  workarounds (strided VLA writes would need per-row heap layouts).
+- `hdu[row, "col"] = value` — single-cell write.  Fixed cells:
+  promote value to a length-1 ndarray of the column's expected
+  dtype via `np.asarray(..., dtype=...) + np.broadcast_to`,
+  encode, write `byte_width` bytes at the row+column offset.
+  Subarray columns accept an ndarray matching the per-cell shape.
+  VLA cells: append cell bytes to heap end, rewrite descriptor,
+  update PCOUNT (same orphan-and-append model as
+  `setitem_single_column_vla` but for one row).  Other tuple
+  shapes — `(slice, str)`, `(int, [str, str])` — rejected with a
+  clear "tuple shapes" message.
+
+`SetItemKey` now has six variants (was three); `classify_setitem_key`
+mirrors `classify_table_key`'s iterable/tuple inspection.  Tests in
+`tests/test_setitem_multi.py` (25 cases).
+
 **Missing.**
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
 - **`X` (bit) columns on write** — numpy `bool` currently maps to
   `L` (one byte per bool).  True `X` would need an explicit opt-in.
-- **Multi-column / fancy / `(row, col)` `__setitem__`** —
-  `hdu[[c1, c2]] = ...`, `hdu[[1, 3, 5]] = ...`, and tuple writes
-  are rejected with a clear `ValueError`.  Add when a use case
-  shows up.
 - **ASCII tables (creating, writing)** — rare in modern files.
 - **Add / remove columns from existing tables** — header rewriting
   + byte shuffling; non-trivial.
@@ -930,19 +956,21 @@ the reader walks tiles and decodes them.
 
 **Open follow-ups (low priority):**
 
-- **Per-tile ZBLANK column** — today only header-level ZBLANK
-  works.  The convention also allows a per-tile column.  Rare
-  in practice; defer until a real file needs it.
-- **`mask_blank=True` for quantized-float compressed reads** —
-  currently rejected with a "float forbidden" error consistent
-  with the uncompressed path.  Float HDUs use NaN; this would
-  only matter if a user wanted ZBLANK semantics on the i32
-  stored stream.  Defer.
 - **Performance** — chunked-read of large GZIP_2 float files is
   ~3× slower than cfitsio.  See "Performance TODO" below.
 - **Byte-exact heap agreement with cfitsio on quantized floats**
   — decoded values are bit-exact; raw heap bytes differ by qsort
   tie-breaking quirks.  Not worth fixing absent a specific need.
+
+**Deferred (not in the punch list):**
+
+- **Per-tile ZBLANK column** — header-level ZBLANK is supported;
+  the convention also allows a per-tile column form.  Rare in
+  practice and nobody's asked.  Defer.
+- **`mask_blank=True` on quantized-float compressed reads** —
+  rejected by design (matches the uncompressed-float rule; FITS
+  spec forbids BLANK on floats — NaN serves that role).  Not a
+  gap.
 
 Test fixtures use fitsio for normal-path round-trips and hand-
 crafted bytes for synthetic fallback-column cases (astropy is

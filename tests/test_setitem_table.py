@@ -402,16 +402,15 @@ def test_whole_column_wrong_dtype_rejected():
 
 
 def test_unsupported_key_rejected():
+    """Tuple shapes other than (int row, str col) still raise."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         _create_table(fname, 3)
         with rustfits.FITS(fname, "r+") as fits:
-            # Multi-column subset write not yet supported.
-            with pytest.raises(ValueError, match="not yet supported"):
-                fits[1][["id", "flag"]] = np.zeros(3)
-            # Tuple key (row, col) not yet supported.
-            with pytest.raises(ValueError, match="not yet supported"):
-                fits[1][(0, "id")] = 1
+            with pytest.raises(ValueError, match="tuple shapes"):
+                fits[1][(slice(0, 2), "id")] = np.zeros(2)
+            with pytest.raises(ValueError, match="tuple shapes"):
+                fits[1][(0, ["id", "flag"])] = (1, True)
 
 
 # --------------- per-column input via shape mismatch ---------------
