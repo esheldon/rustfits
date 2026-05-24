@@ -99,10 +99,23 @@ else stays private to its file.
     `classify_table_key` + `try_extract_column_name` for `__getitem__`
     dispatch, and the `SingleColumnSubset` / `ColumnSubset` pyclasses
     returned by the one-column / multi-column read shortcuts.
-- `src/hdu_table_compressed.rs` (planned) — `CompressedTableHDU`
-  (`ZTABLE`); will sit at the same level as `hdu_image_compressed.rs`
-  and import shared parsing helpers from `crate::hdu_table::columns`.
-  Not yet implemented.
+- `src/hdu_table_compressed.rs` — `CompressedTableHDU` (`ZTABLE`
+  convention) pyclass.  Subclasses `TableHDU` (so
+  `isinstance(hdu, TableHDU)` holds on a compressed-table HDU).
+  Phase 1 (Detection + accessors + I/O stubs) is in; later phases will
+  add read (Phase 2), slicing (Phase 3), VLA (Phase 4), and the write
+  side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
+  in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
+  cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
+  `colnames`, `units`, `__len__` override TableHDU's so they parse the
+  ORIGINAL-schema view via `synthesize_uncompressed_cards` (which
+  substitutes NAXIS1←ZNAXIS1, NAXIS2←ZNAXIS2, PCOUNT←ZPCOUNT,
+  TFORMn←ZFORMn and drops the Z-prefixed cards from the working
+  list).  Compression-specific accessors: `compression` returns
+  `{col_name: ZCTYPn_value}`, `n_tiles` is the on-disk NAXIS2,
+  `ztile_rows` is ZTILELEN.  Imports shared helpers from
+  `crate::hdu_table` (`parse_columns`, `build_numpy_dtype`,
+  `field_dtype_and_shape`).
 - `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub
   (read returns header only; no column read/write yet).
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
@@ -921,9 +934,10 @@ fine for tables small enough to fit in RAM, which is the typical
 ### Cross-cutting (read + write)
 
 - **Compressed BINTABLE (tile-compressed tables, `ZTABLE`)** —
-  separate FITS spec.  Planned next (see "Coming next" in the
-  "Table write roadmap" below); will land as
-  `src/hdu_table_compressed.rs` alongside `hdu_image_compressed.rs`.
+  separate FITS spec.  Phase 1 (detection + accessors + I/O stubs)
+  shipped in `src/hdu_table_compressed.rs`.  Later phases will add
+  read / slicing / VLA / write — see the "Tile-compressed tables
+  (ZTABLE)" roadmap below.
 - **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format,
   vanishingly rare in new files.
 - **Memory-mapped reads** — chunked sequential I/O already keeps peak
@@ -945,14 +959,9 @@ Add / remove columns (`insert_column` / `delete_column`) shipped
 post-roadmap — see the "Add / remove columns" section under "Table
 write Supported" above for the API + implementation.
 
-**Coming next (planned but unstarted):**
-- **Compressed tables (`ZTABLE`)** — tile-compressed BINTABLEs.
-  Whole new feature, comparable in scope to ZIMAGE.  Will live in
-  a new `src/hdu_table_compressed.rs` sitting next to
-  `hdu_image_compressed.rs`; shared parsing helpers will come from
-  `crate::hdu_table::columns`.  Detection (a BINTABLE with
-  `ZTABLE=T`) routes to `CompressedTableHDU` instead of `TableHDU`,
-  same dispatch shape as ZIMAGE.
+**Coming next.**  Compressed-table (ZTABLE) — currently at Phase 1
+(detection + accessors).  See the dedicated "Tile-compressed tables
+(ZTABLE)" roadmap below.
 
 **Phase 6 — out of scope for now.**  ASCII tables (rare in modern
 files; create / write missing, read returns header only) and the
@@ -2319,6 +2328,95 @@ all three HDU types, add_datasum independence, None when
 absent, corruption detection on ZDATASUM card + heap byte,
 astropy/fitsio cross-verify (uncompressed), algorithm matrix
 (compressed), ZDATASUM = uncompressed-equivalent DATASUM.
+
+## Tile-compressed tables (ZTABLE) roadmap
+
+ZTABLE is the BINTABLE counterpart of ZIMAGE: a normal BINTABLE
+shell carrying tile-compressed column data, with the original
+table's schema preserved via Z-prefixed cards.  Detection is
+`ZTABLE=T`; on-disk layout (per `<cfitsio>/imcompress.c::fits_compress_table`):
+
+- The compressed table has `NAXIS2 = num_tiles` and each
+  user-visible column becomes a `1QB(maxlen)` heap-descriptor
+  column.
+- Per tile per column: the original bytes for that column over
+  `ZTILELEN` rows are transposed to column-major, optionally
+  byte-shuffled (GZIP_2), and compressed (RICE_1 / GZIP_1 /
+  GZIP_2).  Each (tile, column) pair lands as its own
+  variable-length heap blob.
+- Header preserves the original schema via `ZNAXIS1`, `ZNAXIS2`,
+  `ZPCOUNT`, `ZFORMn` (original TFORMn including repeat),
+  `ZCTYPn` (per-column algorithm), `ZTILELEN`.  `TTYPEn`,
+  `TDIMn`, `TUNITn`, `TZEROn`, `TSCALn`, `TNULLn` are preserved
+  on disk unchanged.
+- VLA columns get a dual-descriptor scheme: each cell is
+  individually compressed AND the original/compressed
+  descriptor pairs are themselves gzipped — relevant for
+  Phase 4.
+
+**Status:**
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1 | Detection + `CompressedTableHDU` subclass + accessors + I/O stubs | ✅ Shipped |
+| 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ⏳ Planned |
+| 3 | Slicing — `hdu[i:j]` decompresses only overlapping tiles | ⏳ Planned |
+| 4 | VLA-column read (dual-descriptor heap) | ⏳ Planned |
+| 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ⏳ Planned |
+| 6 | VLA write + `__setitem__` / `append` | ⏳ Planned |
+
+**Phase 1 — detection + accessors + stubs.**  Shipped.
+
+- `header_has_ztable` in `src/hdu_table_compressed.rs` finds
+  `ZTABLE=T`; `parse_hdus_from_file` in `fits.rs` checks ZTABLE
+  AFTER ZIMAGE (defensive — they shouldn't both be set, but
+  ZIMAGE wins if they are).
+- `CompressedTableHDU` subclasses `TableHDU`, so
+  `isinstance(hdu, TableHDU)` is True on a compressed-table
+  HDU.  Construction chain: `HDU` → `TableHDU` → `CompressedTableHDU`.
+  `TableHDU` was promoted to `#[pyclass(extends = HDU, subclass)]`
+  to enable the chain (parallel to `ImageHDU` for ZIMAGE).
+- **Accessors return the original-schema view.**  `nrows`,
+  `__len__`, `dtype`, `colnames`, `units` all override the
+  TableHDU getters and route through `synthesize_uncompressed_cards`,
+  which builds a virtual cards list with `NAXIS1`←`ZNAXIS1`,
+  `NAXIS2`←`ZNAXIS2`, `PCOUNT`←`ZPCOUNT`, `TFORMn`←`ZFORMn`
+  and drops all Z-prefixed cards.  Without this substitution,
+  `parse_columns` would trip on the on-disk `1QB` descriptors
+  + preserved `TDIMn` cards (which it correctly rejects as
+  TDIM-on-VLA).  Compression-specific accessors: `compression`
+  returns `{col_name: ZCTYPn_value}`, `n_tiles` is the on-disk
+  `NAXIS2`, `ztile_rows` is `ZTILELEN`.
+- **I/O surface stubbed.**  `read`, `__getitem__`, `__setitem__`,
+  `write`, `append`, `extend`, `repack`, `insert_column`,
+  `delete_column`, `add_datasum`, `add_checksum`,
+  `verify_datasum`, `verify_checksum` all raise
+  `NotImplementedError` naming the phase that will land them.
+  Schema-edit methods are documented as "not planned for the
+  current roadmap" — rebuilding through fresh `create_table_hdu`
+  is the workaround.
+- **Test fixtures via `fpack -table`.**  Astropy doesn't expose
+  a `CompTableHDU` writer; fitsio doesn't have a high-level
+  wrapper for `fits_compress_table`.  `fpack -table` (CLI tool
+  shipped with cfitsio) is the only widely-available writer,
+  so the Phase 1 test module skips itself if `fpack` is not
+  on PATH.  Fixtures cover scalar + multi-D subarray + S10
+  string + per-column units.
+- **Stub-only surface area is the source of truth for what each
+  phase needs to fill in.**  Phase 2 implements `read` (and
+  removes the stub raise); Phase 3 implements `__getitem__`;
+  etc.  The NotImplementedError messages name the phase by
+  number so contributors can grep `Phase N` to find what's
+  pending.
+
+Tests: `tests/test_compressed_table_phase1.py` (22 cases) —
+detection, isinstance chain, all accessors, all stubs, plain
+table unaffected, raw header cards still visible.
+
+**Reference source.**  cfitsio's `fits_compress_table` and
+`fits_uncompress_table` in `<cfitsio>/imcompress.c` (around
+line 8003 and 8695 respectively).  Read/write loops there are
+the byte-exact spec.
 
 ## Build / dev workflow
 

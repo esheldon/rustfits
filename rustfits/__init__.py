@@ -5,6 +5,7 @@ from ._rust import (
     ImageHDU,
     CompressedImageHDU,
     TableHDU,
+    CompressedTableHDU,
     AsciiTableHDU,
     FITSHeader,
     FITSHeaderEdit,

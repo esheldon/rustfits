@@ -6,6 +6,7 @@
 //   hdu_image      — ImageHDU + image read/write/slicing
 //   hdu_image_compressed — CompressedImageHDU (ZIMAGE convention)
 //   hdu_table      — TableHDU (BINTABLE) stub
+//   hdu_table_compressed — CompressedTableHDU (ZTABLE convention)
 //   hdu_ascii_table — AsciiTableHDU (TABLE) stub
 //   zimage         — per-algorithm tile encoders/decoders + config classes
 //   fits           — FITS pyclass + HDU-list parser
@@ -18,6 +19,7 @@ mod hdu;
 mod hdu_image;
 mod hdu_image_compressed;
 mod hdu_table;
+mod hdu_table_compressed;
 mod hdu_ascii_table;
 mod zimage;
 mod fits;
@@ -28,6 +30,7 @@ use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
 use crate::hdu_image_compressed::CompressedImageHDU;
 use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU};
+use crate::hdu_table_compressed::CompressedTableHDU;
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::fits::FITS;
 use crate::zimage::compression_config::{
@@ -41,6 +44,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImageHDU>()?;
     m.add_class::<CompressedImageHDU>()?;
     m.add_class::<TableHDU>()?;
+    m.add_class::<CompressedTableHDU>()?;
     m.add_class::<ColumnSubset>()?;
     m.add_class::<SingleColumnSubset>()?;
     m.add_class::<AsciiTableHDU>()?;

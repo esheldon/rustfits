@@ -32,7 +32,7 @@ use super::write_vla::{
     any_var_column, append_vla_aware, repack_table_heap, write_vla_aware,
 };
 
-#[pyclass(extends = HDU)]
+#[pyclass(extends = HDU, subclass)]
 pub(crate) struct TableHDU;
 
 impl TableHDU {
