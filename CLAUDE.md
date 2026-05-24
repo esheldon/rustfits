@@ -34,13 +34,66 @@ else stays private to its file.
 - `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
   bitpix conversions, shape parsing.  Only exports `ImageHDU` (+ `new`)
   and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
-- `src/hdu_table.rs` — `TableHDU` (BINTABLE) pyclass: parses TFORM /
-  TDIM / TSCAL / TZERO / TNULL / TUNIT / THEAP / PCOUNT, reads fixed
-  and variable-length columns, writes via `create_table_hdu` +
-  `TableHDU.write` / `__setitem__` / `append`.  Free helpers
-  `write_fixed_only` / `write_vla_aware` / `append_fixed_only` /
-  `append_vla_aware` carry the per-path I/O so the pymethods stay
-  thin dispatchers.
+- `src/hdu_table/` — `TableHDU` (BINTABLE) pyclass split across eight
+  single-responsibility files (was a 6400-line `hdu_table.rs` until
+  the 2026-05 refactor).  `mod.rs` just wires the submodules and
+  re-exports the external surface (`TableHDU`, `SingleColumnSubset`,
+  `ColumnSubset`, plus the two helpers `normalize_and_build_table_header`
+  and `set_pcount_in_cards` that other modules import directly).
+  Submodules:
+  - `columns.rs` — `Column` struct, TFORM/TDIM/THEAP/PCOUNT parsing,
+    scaling-kind classifier, element-width helpers (`bytes_per_element`,
+    `byteswap_unit`).  The on-disk-schema reader; everything downstream
+    operates on a typed `Vec<Column>`.
+  - `read.rs` — `read_table` + `read_one_column` + the run planner
+    (`resolve_columns`, `resolve_rows`, `plan_runs`, `process_runs`) +
+    heap-pass for VLA reads + all read-side conversion helpers
+    (unsigned-trick, general scaling, X bit unpack, A string decode,
+    TNULL mask construction).
+  - `write_setup.rs` — `WriteColumn`, dtype-to-FITS classifiers
+    (`classify_scalar_numpy_field`, `classify_var_numpy_field`),
+    `dtype_to_write_columns`, header-card emission
+    (`build_bintable_header_cards`, `normalize_and_build_table_header`),
+    `WriteTransform` + `column_transform`, `column_expected_shape`,
+    `determine_input_nrows`, `dispatch_write_input`.  Everything
+    write-side that's shared between fixed and VLA paths.
+  - `write_fixed.rs` — `ColumnSource`, `prepare_structured_input` /
+    `prepare_dict_input` / `prepare_list_names_input`,
+    `acquire_per_column_array`, transform appliers
+    (`apply_transform_cell`, `apply_in_place_transform`), the three
+    bulk writers (`write_table_data` / `_strided` / `_one_column`),
+    the three fixed setitem helpers (`setitem_single_row` / `_slice`
+    / `_column`), `write_fixed_only` + `append_fixed_only`
+    dispatchers, plus utilities (`normalize_row_index`,
+    `find_column_by_name`, `coerce_to_len1_record`, `build_sources`,
+    `set_pcount_in_cards`).
+  - `write_vla.rs` — `any_var_column`, `extract_per_column_inputs`,
+    cell validators (`validate_vla_cell`, `extract_string_vla_cell_bytes`,
+    `vla_cell_expected_dtype`), heap planning (`plan_vla_heap_layout`,
+    `VlaCellPlan`), descriptor I/O (`write_descriptor`,
+    `serialize_vla_cell`), `FixedColInfo` / `VlaColInfo` strip
+    builders (`build_fixed_col_info`, `fill_main_row`,
+    `write_vla_data_range`), `write_vla_aware` + `append_vla_aware`
+    dispatchers, and `repack_table_heap`.
+  - `setitem.rs` — top-level `__setitem__` machinery: `SetItemKey`
+    enum + `classify_setitem_key`, the cross-cutting cases
+    (`setitem_fancy_rows`, `setitem_multi_columns`, `setitem_cell` +
+    `setitem_cell_vla`), the subset-object helpers
+    (`resolve_rows_key`, `write_one_column_at_rows`,
+    `write_column_subset_at_rows`), and the VLA-aware row/slice/
+    column dispatchers (`setitem_rows_vla_aware_inner`,
+    `setitem_single_row_vla_aware`, `setitem_row_slice_vla_aware`,
+    `setitem_single_column_vla`).
+  - `hdu.rs` — `TableHDU` pyclass + `#[pymethods]` impl blocks (read,
+    write, append, repack, checksum, `__getitem__`, `__setitem__`,
+    accessors, repr), `TableKey` + `classify_table_key` +
+    `try_extract_column_name` for `__getitem__` dispatch, and the
+    `SingleColumnSubset` / `ColumnSubset` pyclasses returned by the
+    one-column / multi-column read shortcuts.
+- `src/hdu_table_compressed.rs` (planned) — `CompressedTableHDU`
+  (`ZTABLE`); will sit at the same level as `hdu_image_compressed.rs`
+  and import shared parsing helpers from `crate::hdu_table::columns`.
+  Not yet implemented.
 - `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub
   (read returns header only; no column read/write yet).
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
@@ -56,7 +109,11 @@ else stays private to its file.
 
 Visibility discipline: keep every helper `fn foo()` (private to its file).
 Promote to `pub(crate)` only when the compiler complains — the smaller
-module surface area is the whole point of the split.
+module surface area is the whole point of the split.  Inside the
+`hdu_table/` directory module, sibling files reach each other via
+`use super::write_fixed::*` (etc.) — those cross-file calls do need
+`pub(crate)`, but external modules (`fits.rs`, `lib.rs`, `hdu_image_compressed.rs`)
+only see what `hdu_table/mod.rs` explicitly re-exports.
 
 ## Axis order: numpy throughout, FITS only at the boundary
 
@@ -429,8 +486,9 @@ THEAP itself, so this only blocks repack on files written by other
 tools with a non-standard heap offset — workaround is to clone the
 file through a fresh `create_*` + write.
 
-**Implementation.**  `repack_table_heap` in `hdu_table.rs` and
-`repack_compressed_heap` in `hdu_image_compressed.rs`.  Same shape,
+**Implementation.**  `repack_table_heap` in
+`src/hdu_table/write_vla.rs` and `repack_compressed_heap` in
+`hdu_image_compressed.rs`.  Same shape,
 different descriptor-column enumeration: tables iterate every VLA
 column per row; compressed images iterate the primary
 `COMPRESSED_DATA` column plus the optional `GZIP_COMPRESSED_DATA`
@@ -673,8 +731,9 @@ orphans.  PCOUNT grows monotonically with every mutation.  Matches
 the compressed-image `__setitem__` pattern; call `hdu.repack()` to
 rebuild the heap with only live cells (see "Heap repack" below).
 
-Implementation lives in `hdu_table.rs` next to `write_vla_aware` /
-`append_vla_aware`.  Three helpers:
+Implementation lives in `src/hdu_table/setitem.rs` (with the VLA
+primitives it calls — `validate_vla_cell`, `plan_vla_heap_layout`,
+`write_vla_data_range` — in `write_vla.rs`).  Three helpers:
 - `setitem_single_row_vla_aware` and `setitem_row_slice_vla_aware`
   share a `setitem_rows_vla_aware_inner` core that reuses
   `plan_vla_heap_layout` (with `heap_start_offset = current_pcount`)
@@ -759,20 +818,24 @@ Tests in `tests/test_setitem_subset.py` (20 cases) — single-column
 + multi-column subset across cell / slice / fancy / full-slice /
 negative-index / VLA-numeric / VLA-string / round-trip read+write.
 
-**Missing.**
+**Missing (planned next):**
+- **Add / remove columns from existing tables** — header rewriting
+  + per-row byte insertion / removal in the data section.  See the
+  "Coming next" block in "Table write roadmap" below.
+
+**Missing (low priority / niche):**
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
 - **`X` (bit) columns on write** — numpy `bool` currently maps to
   `L` (one byte per bool).  True `X` would need an explicit opt-in.
 - **ASCII tables (creating, writing)** — rare in modern files.
-- **Add / remove columns from existing tables** — header rewriting
-  + byte shuffling; non-trivial.
 - **`TDISPn` on write** — informational, low priority.
 
 ### Cross-cutting (read + write)
 
-- **Compressed BINTABLE (tile-compressed tables, `ZTABLE`)** — large,
-  separate spec.  `ZIMAGE` is the more commonly-needed sibling and
-  isn't done either; do that first.
+- **Compressed BINTABLE (tile-compressed tables, `ZTABLE`)** —
+  separate FITS spec.  Planned next (see "Coming next" in the
+  "Table write roadmap" below); will land as
+  `src/hdu_table_compressed.rs` alongside `hdu_image_compressed.rs`.
 - **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format,
   vanishingly rare in new files.
 - **Memory-mapped reads** — chunked sequential I/O already keeps peak
@@ -783,11 +846,34 @@ negative-index / VLA-numeric / VLA-string / round-trip read+write.
 ## Table write roadmap
 
 Plan for getting table creation + writing on par with the image side.
-Reading is mature; Phases 1 (create + bulk write), 2 (__setitem__),
+Reading is mature; Phases 1 (create + bulk write), 2 (`__setitem__`),
 3 (append/extend), 4 (VLA columns on write/append), and 5 (VLA
-`__setitem__`) have all shipped.  Only Phase 6 (ASCII tables,
-add/remove columns) is deferred.  The image
-side has all four and the patterns translated directly.
+`__setitem__`) have all shipped.  Plus the post-roadmap additions
+(string VLA `PA` on write, multi-column / fancy / cell forms of
+`__setitem__`, subset-object `__setitem__`, `repack()`).  The image
+side has the parallel surface and the patterns translated directly.
+
+**Coming next (planned but unstarted):**
+- **Add / remove columns from existing tables** — header rewriting
+  (insert/delete TFORMn / TTYPEn / TDIMn / TUNITn / TBCOLn / TNULLn
+  / TSCALn / TZEROn for fixed; PCOUNT for VLA) plus per-row byte
+  insertion / removal in the data section.  Will land in
+  `write_setup.rs` (header changes) + `write_fixed.rs` (data
+  shuffle).
+- **Compressed tables (`ZTABLE`)** — tile-compressed BINTABLEs.
+  Whole new feature, comparable in scope to ZIMAGE.  Will live in
+  a new `src/hdu_table_compressed.rs` sitting next to
+  `hdu_image_compressed.rs`; shared parsing helpers will come from
+  `crate::hdu_table::columns`.  Detection (a BINTABLE with
+  `ZTABLE=T`) routes to `CompressedTableHDU` instead of `TableHDU`,
+  same dispatch shape as ZIMAGE.
+
+**Phase 6 — out of scope for now.**  ASCII tables (rare in modern
+files; create / write missing, read returns header only) and the
+two niche column-format gaps: bit VLAs (`PX`) on write (paired
+with the same read-side gap), and `X` (fixed bit) columns on
+write (numpy `bool` currently maps to `L` = one byte per bool;
+true `X` packing would need an explicit opt-in).
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -822,10 +908,13 @@ dispatch.  Forms supported:
   full-table` to modify a thin column slice (pathological when
   `byte_width << row_width`, which is the common case).
 
-Deferred (not implemented; clear `ValueError` on attempt): multi-
-column subset writes `hdu[[c1,c2]] = ...`, fancy row-list writes
-`hdu[[1,3,5]] = ...`, tuple `(row, col)` writes.  Add when a use
-case shows up.
+All of multi-column subset writes (`hdu[[c1,c2]] = ...`), fancy
+row-list writes (`hdu[[1,3,5]] = ...`), single-cell tuple writes
+(`hdu[r, c] = ...`), and the subset-then-rows forms
+(`hdu["name"][rows] = ...`, `hdu[[c1,c2]][rows] = ...`) have since
+shipped — see the "Multi-column / fancy / `(row, col)`
+`__setitem__`" and "Subset `__setitem__`" sections under "Table
+write Supported" above.
 
 **Phase 3 — `TableHDU.append()` (with `extend` alias).**  Done.
 Primary method name is `append` because that's the natural verb
@@ -863,7 +952,8 @@ The dispatch helpers (`dispatch_write_input`, `build_sources`,
 so the input-form handling stays in one place.
 
 **Phase 4 — VLA columns on write.**  Done for the bulk-write +
-append surfaces.  `__setitem__` for VLA columns is deferred.
+append surfaces.  `__setitem__` for VLA columns is the subject of
+Phase 5 below.
 
 **API.**  `create_table_hdu(dtype, ..., var_dtypes=None,
 heap_format=None)`.  The user puts `'O'` for VLA fields in the
