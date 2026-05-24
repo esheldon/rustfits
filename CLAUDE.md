@@ -12,6 +12,13 @@ exposes (`pub(crate)`) what neighboring modules actually import; everything
 else stays private to its file.
 
 - `src/lib.rs` — `#[pymodule]` init + `mod` declarations.  Nothing else.
+- `src/cache.rs` — `BytesBoundLruCache<K>`, a generic bytes-budgeted
+  LRU used by `CompressedImageHDU` (key = `u64` flat tile index) and
+  `CompressedTableHDU` (key = `(u32, u32)` tile + column).  Same
+  Mutex<Inner> + AtomicU64 capacity, same `get` / `put` /
+  `set_capacity` / `clear` / `used_bytes` / `capacity` surface; values
+  are `Arc<Vec<u8>>` so callers clone the Arc out under the lock and
+  decode work runs lock-free.
 - `src/common.rs` — `FileHandle`, `TaintFlag`, `HduOffsets`, `FileLayout`,
   `lock_file`, `check_not_tainted`, `shift_file_tail_and_update_offsets`,
   `zero_fill_range`, `BLOCK_SIZE`/`CARD_SIZE`/`CARDS_PER_BLOCK`,

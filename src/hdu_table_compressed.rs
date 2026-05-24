@@ -17,14 +17,13 @@
 // algorithms (GZIP_1 / GZIP_2 / RICE_1); later phases add slicing, VLA,
 // and the write side.
 
-use lru::LruCache;
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use crate::cache::BytesBoundLruCache;
 use crate::common::{
     byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
     FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
@@ -58,97 +57,18 @@ const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 // reads of nearby rows or sibling columns can reuse adjacent cache
 // entries instead of re-decompressing.
 
+// Per-(tile_idx, col_idx) decompressed-bytes cache key.  Packed
+// into a tuple so the shared `BytesBoundLruCache` can hash it
+// directly.  Finer granularity than ZIMAGE's per-tile key is what
+// makes reading `hdu["col"][i:j]` reusable across nearby rows /
+// sibling columns.
 #[derive(Hash, Eq, PartialEq, Copy, Clone)]
 struct CacheKey(u32, u32);
 
-struct ColumnTileCache {
-    inner: Mutex<ColumnTileCacheInner>,
-    max_bytes: AtomicU64,
-}
-
-struct ColumnTileCacheInner {
-    lru: LruCache<CacheKey, Arc<Vec<u8>>>,
-    cur_bytes: u64,
-}
-
-impl ColumnTileCache {
-    fn new(max_bytes: u64) -> Self {
-        ColumnTileCache {
-            inner: Mutex::new(ColumnTileCacheInner {
-                lru: LruCache::unbounded(),
-                cur_bytes: 0,
-            }),
-            max_bytes: AtomicU64::new(max_bytes),
-        }
-    }
-
-    fn capacity(&self) -> u64 {
-        self.max_bytes.load(Ordering::Relaxed)
-    }
-
-    fn used_bytes(&self) -> u64 {
-        self.inner.lock().map(|g| g.cur_bytes).unwrap_or(0)
-    }
-
-    fn get(&self, key: CacheKey) -> Option<Arc<Vec<u8>>> {
-        let mut guard = self.inner.lock().ok()?;
-        guard.lru.get(&key).cloned()
-    }
-
-    fn put(&self, key: CacheKey, bytes: Arc<Vec<u8>>) {
-        let cap = self.capacity();
-        if cap == 0 {
-            return;
-        }
-        let size = bytes.len() as u64;
-        if size > cap {
-            return;
-        }
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if let Some(old) = guard.lru.pop(&key) {
-            guard.cur_bytes =
-                guard.cur_bytes.saturating_sub(old.len() as u64);
-        }
-        while guard.cur_bytes + size > cap {
-            match guard.lru.pop_lru() {
-                Some((_, val)) => {
-                    guard.cur_bytes = guard.cur_bytes
-                        .saturating_sub(val.len() as u64);
-                }
-                None => break,
-            }
-        }
-        guard.lru.put(key, bytes);
-        guard.cur_bytes += size;
-    }
-
-    fn set_capacity(&self, max_bytes: u64) {
-        self.max_bytes.store(max_bytes, Ordering::Relaxed);
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        while guard.cur_bytes > max_bytes {
-            match guard.lru.pop_lru() {
-                Some((_, val)) => {
-                    guard.cur_bytes = guard.cur_bytes
-                        .saturating_sub(val.len() as u64);
-                }
-                None => break,
-            }
-        }
-    }
-
-    fn clear(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.lru.clear();
-            guard.cur_bytes = 0;
-        }
-    }
-}
+// Per-(tile, col) decompressed-bytes cache.  See
+// `crate::cache::BytesBoundLruCache` for the eviction policy and
+// concurrency model.
+type ColumnTileCache = BytesBoundLruCache<CacheKey>;
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -923,7 +843,7 @@ fn read_compressed_table(
             }
 
             let cache_key = CacheKey(tile_idx as u32, orig_idx as u32);
-            let slab_arc = match cache.get(cache_key) {
+            let slab_arc = match cache.get(&cache_key) {
                 Some(arc) => arc,
                 None => {
                     let n_bytes_compressed = nelems_s as usize;
@@ -1270,7 +1190,7 @@ fn read_vla_column_tile(
     let expected_blob_size = rowspertile * width_orig + rowspertile * 16;
 
     let cache_key = CacheKey(tile_idx as u32, orig_idx as u32);
-    let blob_arc = match cache.get(cache_key) {
+    let blob_arc = match cache.get(&cache_key) {
         Some(arc) => arc,
         None => {
             let mut compressed = vec![0u8; blob_nelems];

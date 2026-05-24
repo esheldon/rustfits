@@ -13,6 +13,7 @@
 
 use pyo3::prelude::*;
 
+mod cache;
 mod common;
 mod header;
 mod hdu;
