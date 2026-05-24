@@ -102,9 +102,9 @@ else stays private to its file.
 - `src/hdu_table_compressed.rs` — `CompressedTableHDU` (`ZTABLE`
   convention) pyclass.  Subclasses `TableHDU` (so
   `isinstance(hdu, TableHDU)` holds on a compressed-table HDU).
-  Phase 1 (Detection + accessors + I/O stubs) is in; later phases will
-  add read (Phase 2), slicing (Phase 3), VLA (Phase 4), and the write
-  side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
+  Phases 1 (detection + accessors + I/O stubs) and 2 (whole-table
+  read across GZIP_1 / GZIP_2 / RICE_1) shipped; later phases add
+  slicing (Phase 3), VLA (Phase 4), and the write side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2359,7 +2359,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | Detection + `CompressedTableHDU` subclass + accessors + I/O stubs | ✅ Shipped |
-| 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ⏳ Planned |
+| 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ✅ Shipped |
 | 3 | Slicing — `hdu[i:j]` decompresses only overlapping tiles | ⏳ Planned |
 | 4 | VLA-column read (dual-descriptor heap) | ⏳ Planned |
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ⏳ Planned |
@@ -2409,9 +2409,83 @@ table's schema preserved via Z-prefixed cards.  Detection is
   number so contributors can grep `Phase N` to find what's
   pending.
 
-Tests: `tests/test_compressed_table_phase1.py` (22 cases) —
-detection, isinstance chain, all accessors, all stubs, plain
-table unaffected, raw header cards still visible.
+Tests: `tests/test_compressed_table_phase1.py` (21 cases) —
+detection, isinstance chain, all accessors, remaining stubs,
+plain table unaffected, raw header cards still visible.
+
+**Phase 2 — whole-table read.**  Shipped.
+
+`CompressedTableHDU.read(*, columns=None, scale=True)` returns
+the original (uncompressed) table as a numpy structured ndarray.
+`rows=` and `mask_null=True` are rejected with NotImplementedError
+pointing at Phases 3 and a follow-up respectively.  VLA columns
+are rejected at read time (Phase 4).
+
+Per-tile / per-column read loop in `read_compressed_table`
+(`hdu_table_compressed.rs`):
+
+1. Read this tile's descriptor row (`NAXIS1 = ncols * 16` bytes,
+   each descriptor a 1QB pair = two big-endian i64).
+2. For each selected column, read `nelements` compressed bytes
+   from the heap, dispatch on `ZCTYPn` to `decode_gzip1` /
+   `decode_gzip2` / `decode_rice`.
+3. The decoders return NATIVE-order bytes (their image-side
+   contract).  Byteswap back to FITS big-endian so the shared
+   `convert_column_cell` from `hdu_table::read` can consume them.
+   The double-swap (decoder swaps to native, we swap back to BE,
+   convert_column_cell swaps to native) costs one trivial extra
+   pass per (tile, column) — far cheaper than decompression
+   itself, and avoids touching the ZIMAGE decoders.  Refactoring
+   to a "leave BE" decoder mode would shave it but isn't worth
+   the surface-area churn.
+4. For each row in the tile, call `convert_column_cell` with the
+   cell's BE bytes → native bytes in the output ndarray's field
+   slice.  This is the same per-cell converter the uncompressed
+   path uses, so all scaling (unsigned-trick, general TSCAL/
+   TZERO, A/L/X) "just works" without duplication.
+
+**RICE_1 scope.**  cfitsio's `fits_compress_table` only emits
+RICE_1 for columns with TFORM letter B/I/J (calling
+`fits_rcomp_byte` / `_short` / nothing for K).  The Phase 2
+reader rejects RICE_1 on any other letter up front with a
+"malformed file" message.  Float / K / complex columns appearing
+with ZCTYP=RICE_1 indicate a non-conforming writer.
+
+**Reused helpers (promoted to `pub(crate)` for this phase).**
+`hdu_table::columns::{bytes_per_element, byteswap_unit, scaling_kind,
+ScalingKind}`; `hdu_table::read::{convert_column_cell, numpy_field_layout,
+read_descriptor, resolve_columns}`.  These are the per-cell
+conversion + column-selection primitives the uncompressed read
+path uses; the compressed path reuses them verbatim so the two
+paths stay in sync (e.g. when TSCAL semantics evolve, both pick
+up the change).
+
+**Algorithm-default reminder for fixtures.**  fpack (cfitsio's
+`fits_compress_table`) picks per-dtype defaults that are
+non-obvious:
+
+| Letter | Default ZCTYPn |
+|--------|----------------|
+| B (u1) | GZIP_1 |
+| I (i2) | GZIP_2 |
+| J (i4) | RICE_1 |
+| K (i8) | RICE_1 |
+| E, D, C, M | GZIP_2 |
+| A (string), L (bool) | GZIP_1 |
+
+To override, write a `FZALG<n>` keyword to the source file
+before fpack runs.  To set `ZTILELEN`, write `FZTILELN` on the
+source HDU (fpack has no CLI flag for it — surprising and
+worth noting in the test helper).
+
+Tests: `tests/test_compressed_table_phase2.py` (18 cases) —
+mixed-dtype round trip; per-algorithm coverage (RICE_1 on i4 +
+the GZIP defaults for u1/i2/f4/f8/A); multi-tile + partial last
+tile; unsigned-int trick round trip; `scale=False` returns raw
+stored dtype; `columns=` subset (decompresses only selected,
+reorders, case-insensitive); multi-D subarray TDIM round trip;
+compressed table not at index 1 (programmatic lookup); `rows=`
++ `mask_null=` Phase 3/follow-up boundary tests.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

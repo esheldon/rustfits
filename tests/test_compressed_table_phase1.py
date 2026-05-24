@@ -305,19 +305,6 @@ def test_extname_and_repr():
 # ---------------------------------------------------------------------
 
 
-def test_read_stub_raises():
-    with tempfile.TemporaryDirectory() as td:
-        fz = _make_ztable_fixture(
-            td,
-            _basic_dtype(),
-            _basic_data(),
-            units=["count", "Jy", "m", "char"],
-        )
-        with rustfits.FITS(fz, "r") as f:
-            with pytest.raises(NotImplementedError, match="Phase 2"):
-                f[1].read()
-
-
 def test_getitem_stub_raises():
     with tempfile.TemporaryDirectory() as td:
         fz = _make_ztable_fixture(

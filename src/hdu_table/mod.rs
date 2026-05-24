@@ -16,8 +16,14 @@ mod write_fixed;
 mod write_setup;
 mod write_vla;
 
-pub(crate) use columns::{parse_columns, Column};
+pub(crate) use columns::{
+    bytes_per_element, byteswap_unit, parse_columns, scaling_kind, Column,
+    ScalingKind,
+};
 pub(crate) use hdu::{ColumnSubset, SingleColumnSubset, TableHDU};
-pub(crate) use read::{build_numpy_dtype, field_dtype_and_shape};
+pub(crate) use read::{
+    build_numpy_dtype, convert_column_cell, field_dtype_and_shape,
+    numpy_field_layout, read_descriptor, resolve_columns,
+};
 pub(crate) use write_fixed::set_pcount_in_cards;
 pub(crate) use write_setup::normalize_and_build_table_header;

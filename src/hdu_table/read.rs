@@ -405,7 +405,7 @@ fn copy_with_byteswap(src: &[u8], dst: &mut [u8], elem_size: usize) {
 // the numpy U field is 4x larger than the on-disk A bytes.  When `kind`
 // is non-None, the scaling converter handles the cell instead and may
 // produce a wider dst (general scaling → f8).
-fn convert_column_cell(
+pub(crate) fn convert_column_cell(
     col: &Column,
     src: &[u8],
     dst: &mut [u8],
@@ -745,7 +745,7 @@ fn heap_pass(
 // Per-column numpy field layout: (offset within record, bytes within
 // record).  numpy may pad fields; we trust numpy to tell us where each
 // field lives rather than recomputing it.
-fn numpy_field_layout(
+pub(crate) fn numpy_field_layout(
     py: Python<'_>,
     dtype: &Bound<'_, PyAny>,
     columns: &[Column],
@@ -771,7 +771,7 @@ fn numpy_field_layout(
 // Columns in the user's requested order — `byte_offset`/`byte_width` on
 // each Column still point at this column's slot in the on-disk row, so
 // the per-row converter can subset directly.
-fn resolve_columns(
+pub(crate) fn resolve_columns(
     all: &[Column],
     requested: &[String],
 ) -> PyResult<Vec<Column>> {

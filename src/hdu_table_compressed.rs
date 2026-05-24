@@ -17,19 +17,25 @@
 // algorithms (GZIP_1 / GZIP_2 / RICE_1); later phases add slicing, VLA,
 // and the write side.
 
-use pyo3::exceptions::PyNotImplementedError;
+use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use crate::common::{
-    parse_keyword, parse_string_keyword, FileHandle, FileLayout, HduOffsets,
-    TaintFlag,
+    byteswap_in_place, lock_file, parse_keyword, parse_string_keyword,
+    FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag,
 };
 use crate::hdu::HDU;
 use crate::hdu_table::{
-    build_numpy_dtype, field_dtype_and_shape, parse_columns, Column, TableHDU,
+    build_numpy_dtype, bytes_per_element, byteswap_unit, convert_column_cell,
+    field_dtype_and_shape, numpy_field_layout, parse_columns, read_descriptor,
+    resolve_columns, scaling_kind, Column, ScalingKind, TableHDU,
 };
+use crate::zimage::gzip::{decode_gzip1, decode_gzip2};
+use crate::zimage::rice::decode_rice;
+use crate::zimage::{parse_algorithm, CompressionAlgorithm};
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -250,19 +256,37 @@ impl CompressedTableHDU {
     // I/O surface — all stubbed; later phases will fill these in.
     // -------------------------------------------------------------------
 
+    // Whole-table read into a numpy structured ndarray.  Phase 2:
+    // fixed columns only across GZIP_1 / GZIP_2 / RICE_1.  rows=
+    // (subset / slicing) is rejected until Phase 3 lands; VLA columns
+    // are rejected until Phase 4.  scale=True (default) applies
+    // TSCAL/TZERO; columns=<list> selects + reorders columns.
     #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
-        _slf: PyRef<'_, Self>,
-        _py: Python<'_>,
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
         rows: Option<&Bound<'_, PyAny>>,
-        columns: Option<&Bound<'_, PyAny>>,
+        columns: Option<Vec<String>>,
         scale: bool,
         mask_null: bool,
-    ) -> PyResult<()> {
-        let _ = (rows, columns, scale, mask_null);
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.read() — ZTABLE Phase 2 will add this \
-             (whole-table read across GZIP_1, GZIP_2, RICE_1)"))
+    ) -> PyResult<Py<PyAny>> {
+        if rows.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU.read(rows=...): row subset / slicing \
+                 on compressed tables is ZTABLE Phase 3 — coming next.  \
+                 Read the whole table for now"));
+        }
+        if mask_null {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU.read(mask_null=True): TNULL masking \
+                 on compressed-table reads is not yet implemented"));
+        }
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_compressed_table(
+            py, &cards, data_offset, &super_.file, columns, scale,
+        )
     }
 
     fn __getitem__(
@@ -500,4 +524,278 @@ fn compression_algorithms(cards: &[String]) -> Vec<(String, String)> {
         out.push((name, algo));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — whole-table read
+// ---------------------------------------------------------------------------
+//
+// For each tile T = 0..n_tiles:
+//   1. Read the row of N descriptors (one per ORIGINAL column) at
+//      data_offset + T * descriptor_row_width.  Each descriptor is
+//      16 bytes (Q kind: two big-endian i64 = nelements + heap_offset).
+//   2. For each selected column C:
+//      - Read `nelements` compressed bytes from the heap.
+//      - Decompress per ZCTYPn:
+//          - GZIP_1 → gzip decode (native-order bytes).
+//          - GZIP_2 → gzip decode + reverse byte-shuffle.
+//          - RICE_1 → rice decode (B/I/J only — cfitsio's table
+//            compressor doesn't emit RICE for other letters).
+//      - The decoder returns NATIVE-order bytes.  Byteswap back to
+//        big-endian so the shared per-row cell converter
+//        (`convert_column_cell`) can consume them — that function
+//        is the one used by the uncompressed read path and expects
+//        BE input.
+//      - For each row R in the tile, copy + scale + byteswap the
+//        cell into the output ndarray at row (tile_row_start + R),
+//        field C.
+//
+// Peak memory bound per call: output ndarray + one tile's worth of
+// decompressed bytes per column being processed (a few MB for
+// typical fpack tile sizes).  No whole-table intermediate buffer.
+pub(crate) fn read_compressed_table(
+    py: Python<'_>,
+    cards: &[String],
+    data_offset: u64,
+    file_handle: &FileHandle,
+    columns_requested: Option<Vec<String>>,
+    scale: bool,
+) -> PyResult<Py<PyAny>> {
+    let virtual_cards = synthesize_uncompressed_cards(cards);
+    let all_columns = parse_columns(&virtual_cards)?;
+
+    // Phase 2 scope: fixed columns only.  VLA = Phase 4.
+    for col in &all_columns {
+        if col.var_kind.is_some() {
+            return Err(PyNotImplementedError::new_err(format!(
+                "CompressedTableHDU.read: column '{}' is variable-length \
+                 (TFORM with P or Q kind); VLA reads on compressed tables \
+                 are ZTABLE Phase 4 — not yet implemented",
+                col.name)));
+        }
+    }
+
+    let selected: Vec<Column> = match columns_requested {
+        None => all_columns.clone(),
+        Some(names) => resolve_columns(&all_columns, &names)?,
+    };
+    let scaling_kinds: Vec<ScalingKind> = selected.iter()
+        .map(|c| if scale { scaling_kind(c) } else { Ok(ScalingKind::None) })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let n_rows = parse_keyword(cards, "ZNAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let n_tiles = parse_keyword(cards, "NAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let ztilelen = parse_keyword(cards, "ZTILELEN")
+        .unwrap_or(0).max(0) as usize;
+    let descriptor_row_width = parse_keyword(cards, "NAXIS1")
+        .unwrap_or(0).max(0) as usize;
+
+    // Per-column algorithm — parsed once up front.  Reject unsupported
+    // algorithms (HCOMPRESS_1 and PLIO_1 are image-only) so we don't
+    // start reading just to bomb on a tile-by-tile basis.
+    let algorithms: Vec<CompressionAlgorithm> = (0..all_columns.len())
+        .map(|i| {
+            let key = format!("ZCTYP{}", i + 1);
+            let zctyp = parse_string_keyword(cards, &key)
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "compressed table missing {} card", key)))?;
+            let algo = parse_algorithm(&zctyp)?;
+            match algo {
+                CompressionAlgorithm::Gzip1
+                | CompressionAlgorithm::Gzip2
+                | CompressionAlgorithm::Rice1 => Ok(algo),
+                CompressionAlgorithm::Hcompress1
+                | CompressionAlgorithm::Plio1 => Err(
+                    PyValueError::new_err(format!(
+                        "{} = '{}' — only GZIP_1, GZIP_2, and RICE_1 \
+                         are valid for compressed tables",
+                        key, zctyp))),
+            }
+        })
+        .collect::<PyResult<_>>()?;
+
+    // Heap base: respect THEAP if present, otherwise default to the
+    // end of the descriptor rows.
+    let theap_raw = parse_keyword(cards, "THEAP").unwrap_or(0);
+    let heap_base_in_data = if theap_raw > 0 {
+        theap_raw as u64
+    } else {
+        (n_tiles as u64) * (descriptor_row_width as u64)
+    };
+    let heap_start = data_offset + heap_base_in_data;
+
+    // Allocate output ndarray.
+    let dtype = build_numpy_dtype(py, &selected, scale)?;
+    let np = py.import("numpy")?;
+    let arr = np.call_method1("empty", (n_rows, dtype.bind(py)))?;
+    if n_rows == 0 || selected.is_empty() {
+        return Ok(arr.unbind());
+    }
+
+    let arr_dtype = arr.getattr("dtype")?;
+    let itemsize: usize = arr_dtype.getattr("itemsize")?.extract()?;
+    let field_layout = numpy_field_layout(py, &arr_dtype, &selected)?;
+
+    // Map each selected column back to its index in the original
+    // column list (case-insensitive name lookup), so we know which
+    // descriptor slot to read in each tile's descriptor row.
+    let selected_orig_idx: Vec<usize> = selected.iter()
+        .map(|sc| all_columns.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&sc.name))
+            .expect("resolve_columns guaranteed presence"))
+        .collect();
+
+    // Validate descriptor row width: must be ncols * 16 (each
+    // descriptor is a 1QB pair = two i64).
+    let expected_desc_width = all_columns.len() * 16;
+    if descriptor_row_width != expected_desc_width {
+        return Err(PyValueError::new_err(format!(
+            "compressed table NAXIS1 = {} but expected ncols ({}) * 16 \
+             = {} bytes per descriptor row",
+            descriptor_row_width, all_columns.len(), expected_desc_width)));
+    }
+
+    let mut out_buf = RawBuffer::acquire_writable(&arr)?;
+    let out = out_buf.as_mut_slice();
+
+    // Per-tile buffer (descriptors) — reused across tiles.
+    let mut desc_buf = vec![0u8; descriptor_row_width];
+
+    for tile_idx in 0..n_tiles {
+        let tile_row_start = tile_idx * ztilelen;
+        let rows_in_tile = if tile_idx + 1 == n_tiles {
+            n_rows - tile_row_start
+        } else {
+            ztilelen
+        };
+
+        // Read this tile's descriptor row.
+        {
+            let mut g = lock_file(file_handle)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            let off = data_offset
+                + (tile_idx as u64) * (descriptor_row_width as u64);
+            f.seek(SeekFrom::Start(off))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut desc_buf).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "read descriptor row for tile {}: {}", tile_idx, e))
+            })?;
+        }
+
+        for (out_col_idx, sel_col) in selected.iter().enumerate() {
+            let orig_idx = selected_orig_idx[out_col_idx];
+            let desc_slice = &desc_buf
+                [orig_idx * 16..(orig_idx + 1) * 16];
+            let (nelems_s, heap_offset_s) = read_descriptor('Q', desc_slice);
+            if nelems_s < 0 || heap_offset_s < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "tile {} column '{}': descriptor has negative field \
+                     (nelements={}, offset={})",
+                    tile_idx, sel_col.name, nelems_s, heap_offset_s)));
+            }
+            let n_bytes_compressed = nelems_s as usize;
+
+            // Read the compressed bytes for this (tile, column).
+            let mut compressed = vec![0u8; n_bytes_compressed];
+            if n_bytes_compressed > 0 {
+                let mut g = lock_file(file_handle)?;
+                let f = g.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.seek(SeekFrom::Start(heap_start + heap_offset_s as u64))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                f.read_exact(&mut compressed).map_err(|e| {
+                    PyIOError::new_err(format!(
+                        "read heap for tile {} col '{}': {}",
+                        tile_idx, sel_col.name, e))
+                })?;
+            }
+
+            // Decompress + byteswap-to-BE.
+            let slab = decompress_column_slab(
+                algorithms[orig_idx], &compressed, sel_col, rows_in_tile,
+            )?;
+
+            // Place each row's cell into the output ndarray.
+            let kind = scaling_kinds[out_col_idx];
+            let (field_offset, field_itemsize) = field_layout[out_col_idx];
+            let src_cell_w = sel_col.byte_width;
+            for r in 0..rows_in_tile {
+                let disk_row = tile_row_start + r;
+                let src = &slab[r * src_cell_w..(r + 1) * src_cell_w];
+                let dst_start = disk_row * itemsize + field_offset;
+                let dst = &mut out
+                    [dst_start..dst_start + field_itemsize];
+                convert_column_cell(sel_col, src, dst, disk_row, kind)?;
+            }
+        }
+    }
+
+    drop(out_buf);
+    Ok(arr.unbind())
+}
+
+// Dispatch on the per-column algorithm, decompress the heap blob, and
+// byteswap the result back to FITS big-endian (the shared
+// `convert_column_cell` expects BE input).  The existing decoders in
+// `crate::zimage` byteswap to native as their last step; we undo that
+// here.  The double-swap is one redundant pass per (tile, column) —
+// trivially cheap relative to decompression itself; refactoring the
+// decoders to expose a "leave BE" mode would shave it but isn't
+// worth touching the ZIMAGE write paths for.
+fn decompress_column_slab(
+    algo: CompressionAlgorithm,
+    compressed: &[u8],
+    col: &Column,
+    rowspertile: usize,
+) -> PyResult<Vec<u8>> {
+    let elem_bytes = bytes_per_element(col.tform_letter)
+        .ok_or_else(|| PyValueError::new_err(format!(
+            "column '{}': TFORM letter '{}' has no fixed element width",
+            col.name, col.tform_letter)))?;
+    // `col.repeat` is the number of elements per row for non-A;
+    // for A it's the total byte width per row (which == repeat
+    // since A's elem_bytes is 1).
+    let n_elements = rowspertile * col.repeat;
+    let mut slab = match algo {
+        CompressionAlgorithm::Gzip1 => {
+            decode_gzip1(compressed, n_elements, elem_bytes as u32)?
+        }
+        CompressionAlgorithm::Gzip2 => {
+            decode_gzip2(compressed, n_elements, elem_bytes as u32)?
+        }
+        CompressionAlgorithm::Rice1 => {
+            // cfitsio's table compressor only emits RICE_1 for
+            // bytepix in {1, 2, 4} (B / I / J), corresponding to
+            // `fits_rcomp_byte` / `fits_rcomp_short` / `fits_rcomp`.
+            // Reject anything else up front rather than letting the
+            // generic image-side decoder mishandle it.
+            if !matches!(col.tform_letter, 'B' | 'I' | 'J') {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' has TFORM letter '{}' with ZCTYP=RICE_1; \
+                     cfitsio's table compressor only emits RICE_1 for \
+                     B/I/J columns, so this file is malformed (or written \
+                     by a non-conforming tool)",
+                    col.name, col.tform_letter)));
+            }
+            let blocksize = 32u32;  // cfitsio table-comp constant
+            let zbitpix = (elem_bytes * 8) as i32;
+            decode_rice(
+                compressed, n_elements, elem_bytes as u32,
+                blocksize, zbitpix,
+            )?
+        }
+        _ => unreachable!("non-table algorithm filtered upstream"),
+    };
+    // Decoder returns native-order bytes; convert_column_cell expects
+    // FITS big-endian.  Swap back so the per-cell converter (which
+    // handles unsigned-trick, general scaling, A/L, etc.) just works.
+    let swap_w = byteswap_unit(col.tform_letter);
+    if swap_w > 1 && !cfg!(target_endian = "big") {
+        byteswap_in_place(&mut slab, swap_w);
+    }
+    Ok(slab)
 }
