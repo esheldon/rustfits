@@ -8,6 +8,7 @@
 // See the per-file headers for what each chunk owns.
 
 mod columns;
+mod edit;
 mod hdu;
 mod read;
 mod setitem;

@@ -14,6 +14,7 @@ use crate::common::{
 use crate::hdu::HDU;
 
 use super::columns::{parse_columns, Column};
+use super::edit::{delete_column_impl, insert_column_impl};
 use super::read::{
     build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
 };
@@ -556,6 +557,73 @@ impl TableHDU {
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super();
         repack_table_heap(&super_)
+    }
+
+    // Insert a new fixed-width column into the table.
+    //
+    //   hdu.insert_column(name, data, *, position=None, after=None,
+    //                     before=None, unit=None)
+    //
+    // Location: at most one of position / after / before may be
+    // specified.  position is a 0-based column index (0..=ncols; ncols
+    // appends at the end, which is also the default when all three are
+    // None).  after and before accept either a column name (str,
+    // case-insensitive) or a 0-based integer index (negative wraps).
+    //
+    // Data: a regular numpy ndarray of shape (NAXIS2,) + per-cell
+    // shape.  The dtype maps to a FITS letter via the same rules as
+    // create_table_hdu (i2/i4/i8/u1/u2/u4/u8/f4/f8/c8/c16/b1 + S/U
+    // strings; unsigned-int trick on u2/u4/u8 emits TZERO).  VLA
+    // (Object dtype) is not supported on insert — rebuild the table
+    // via create_table_hdu + write if you need to add a VLA column.
+    //
+    // The existing data section is reshuffled row-by-row in 1 MiB
+    // strips (peak memory bounded, regardless of table size).  Any
+    // existing VLA columns are preserved — the heap is relocated
+    // forward to sit after the new (larger) main rows; descriptor
+    // offsets are relative to heap start and remain valid.  Mid-write
+    // I/O failures taint the file (close + reopen to recover).
+    #[pyo3(signature = (
+        name, data, *, position=None, after=None, before=None, unit=None,
+    ))]
+    fn insert_column(
+        slf: PyRefMut<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+        position: Option<i64>,
+        after: Option<&Bound<'_, PyAny>>,
+        before: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+    ) -> PyResult<()> {
+        let super_: PyRefMut<HDU> = slf.into_super();
+        insert_column_impl(
+            py, &super_, name, data, position, after, before, unit,
+        )
+    }
+
+    // Remove a column from the table.
+    //
+    //   hdu.delete_column(name_or_index)
+    //
+    // `key` is a column name (str, case-insensitive) or a 0-based
+    // integer index (negative wraps from the end).  Works on both
+    // fixed and VLA columns: for a VLA column, the descriptor bytes
+    // are removed from each row but the heap is left as-is — the
+    // deleted column's heap cells become orphans that hdu.repack()
+    // reclaims.  Existing OTHER VLA columns are preserved — the heap
+    // is relocated backward to sit after the new (shorter) main rows;
+    // their descriptor offsets are relative to heap start and remain
+    // valid.
+    //
+    // Row shuffle runs in 1 MiB front-to-back strips so peak memory
+    // stays bounded.  Mid-write I/O failures taint the file.
+    fn delete_column(
+        slf: PyRefMut<'_, Self>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_: PyRefMut<HDU> = slf.into_super();
+        delete_column_impl(&super_, key)
     }
 }
 

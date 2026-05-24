@@ -165,7 +165,7 @@ fn extract_field_base_and_shape<'py>(
 // emitted in FITS (FORTRAN, fastest-first) order = reversed numpy
 // shape.  1-D shapes are fully captured by the repeat count and TDIM
 // is omitted (matches astropy convention).
-fn dtype_to_write_columns(
+pub(crate) fn dtype_to_write_columns(
     dtype: &Bound<'_, PyAny>,
     units: Option<&Bound<'_, PyDict>>,
     var_dtypes: Option<&Bound<'_, PyDict>>,

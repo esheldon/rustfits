@@ -84,12 +84,21 @@ else stays private to its file.
     column dispatchers (`setitem_rows_vla_aware_inner`,
     `setitem_single_row_vla_aware`, `setitem_row_slice_vla_aware`,
     `setitem_single_column_vla`).
+  - `edit.rs` — `insert_column` + `delete_column` schema-edit machinery:
+    header card mutation (renumbering per-column TTYPEn/TFORMn/TDIMn/
+    TUNITn/TZEROn/TSCALn/TNULLn/TDISPn/TBCOLn for shifted columns,
+    inserting/dropping the target column's cards, updating TFIELDS +
+    NAXIS1), strip-based row shuffler (`shuffle_main_for_insert`
+    back-to-front for growing rows, `shuffle_main_for_delete`
+    front-to-back for shrinking rows; both bounded at ~1 MiB per
+    buffer), in-file heap relocation (`relocate_region_forward` /
+    `_backward` for grow / shrink), data-extent grow/shrink dispatcher.
   - `hdu.rs` — `TableHDU` pyclass + `#[pymethods]` impl blocks (read,
-    write, append, repack, checksum, `__getitem__`, `__setitem__`,
-    accessors, repr), `TableKey` + `classify_table_key` +
-    `try_extract_column_name` for `__getitem__` dispatch, and the
-    `SingleColumnSubset` / `ColumnSubset` pyclasses returned by the
-    one-column / multi-column read shortcuts.
+    write, append, repack, insert_column, delete_column, checksum,
+    `__getitem__`, `__setitem__`, accessors, repr), `TableKey` +
+    `classify_table_key` + `try_extract_column_name` for `__getitem__`
+    dispatch, and the `SingleColumnSubset` / `ColumnSubset` pyclasses
+    returned by the one-column / multi-column read shortcuts.
 - `src/hdu_table_compressed.rs` (planned) — `CompressedTableHDU`
   (`ZTABLE`); will sit at the same level as `hdu_image_compressed.rs`
   and import shared parsing helpers from `crate::hdu_table::columns`.
@@ -818,10 +827,62 @@ Tests in `tests/test_setitem_subset.py` (20 cases) — single-column
 + multi-column subset across cell / slice / fancy / full-slice /
 negative-index / VLA-numeric / VLA-string / round-trip read+write.
 
-**Missing (planned next):**
-- **Add / remove columns from existing tables** — header rewriting
-  + per-row byte insertion / removal in the data section.  See the
-  "Coming next" block in "Table write roadmap" below.
+**Add / remove columns (`insert_column` + `delete_column`).**
+Shipped.  Schema-edit methods on `TableHDU`:
+
+- `hdu.insert_column(name, data, *, position=None, after=None,
+  before=None, unit=None)` — at most one of position / after /
+  before may be set; default (all None) appends at the end.
+  `after` and `before` accept either a column name (str,
+  case-insensitive) or a 0-based integer index (negative wraps).
+  `data` is a regular numpy ndarray of shape `(NAXIS2,) + per-cell
+  shape`; dtype maps to FITS letter via the same `dtype_to_write_columns`
+  rules as `create_table_hdu` (i2/i4/i8/u1/u2/u4/u8/f4/f8/c8/c16/b1
+  + S/U strings; unsigned-int trick emits TZERO; subarray shape
+  emits TDIM).  VLA (Object dtype) is rejected on insert — rebuild
+  the table via `create_table_hdu` + `write` to add a VLA column.
+- `hdu.delete_column(name_or_index)` — name (str, case-insensitive)
+  or 0-based integer index (negative wraps).  Works on BOTH fixed
+  and VLA columns: deleting a VLA column drops the descriptor bytes
+  but leaves the heap as-is (those cells become orphans that
+  `hdu.repack()` reclaims).  Other VLA columns are preserved (heap
+  relocates after the new shorter main rows; descriptor offsets are
+  relative to heap start and remain valid).
+
+**Implementation.**  `src/hdu_table/edit.rs`.  Strip-based I/O —
+peak memory bounded at ~1 MiB regardless of table size, NOT the
+whole-table-into-RAM approach repack() uses.  Insert grows the
+row width, so the row shuffler walks back-to-front (writing later
+strips first so reads don't clobber unwritten rows); delete
+shrinks, so the shuffler walks front-to-back.  The heap (if any)
+is relocated forward (insert) or backward (delete) via chunked
+in-file copies of the same ~1 MiB size.  Standard ordering:
+header rewrite first (may grow header blocks via the shared
+`rewrite_header_to_disk` primitive), then data-extent grow/shrink
+(may shift later HDUs), then heap relocate, then row shuffle.
+
+**Header card mutation.**  Renumbers every per-column keyword
+(TTYPEn / TFORMn / TDIMn / TUNITn / TZEROn / TSCALn / TNULLn /
+TDISPn / TBCOLn) for columns at indices shifted by the
+insert/delete; inserts the new column's TTYPE / TFORM / +
+TDIM/TUNIT/TZERO cards just before END; updates TFIELDS + NAXIS1.
+Same disk-write-before-commit + taint discipline as every other
+mutation path.
+
+**Scope limitation.**  Rejects non-default THEAP (THEAP !=
+NAXIS1*NAXIS2) up front — same constraint as `repack()`.  Files
+rustfits creates never set THEAP; this only blocks the operation
+on files written by other tools with a custom heap offset.
+Workaround: rewrite through a fresh `create_table_hdu` + `write`.
+
+Tests in `tests/test_table_edit_columns.py` (37 cases): default
+append + position / after / before with name and index forms,
+case-insensitive lookup, unsigned-int trick, multi-D / TDIM,
+S-string columns, units, into VLA-bearing tables (heap relocate),
+delete by name / positive+negative index, delete VLA column +
+repack reclaims orphans, non-last HDU shifts, insert-then-delete
+restores layout, astropy cross-read, all rejection paths, and a
+50k-row strip-loop test to anchor the bounded-memory invariant.
 
 **Missing (low priority / niche):**
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
@@ -853,13 +914,11 @@ Reading is mature; Phases 1 (create + bulk write), 2 (`__setitem__`),
 `__setitem__`, subset-object `__setitem__`, `repack()`).  The image
 side has the parallel surface and the patterns translated directly.
 
+Add / remove columns (`insert_column` / `delete_column`) shipped
+post-roadmap — see the "Add / remove columns" section under "Table
+write Supported" above for the API + implementation.
+
 **Coming next (planned but unstarted):**
-- **Add / remove columns from existing tables** — header rewriting
-  (insert/delete TFORMn / TTYPEn / TDIMn / TUNITn / TBCOLn / TNULLn
-  / TSCALn / TZEROn for fixed; PCOUNT for VLA) plus per-row byte
-  insertion / removal in the data section.  Will land in
-  `write_setup.rs` (header changes) + `write_fixed.rs` (data
-  shuffle).
 - **Compressed tables (`ZTABLE`)** — tile-compressed BINTABLEs.
   Whole new feature, comparable in scope to ZIMAGE.  Will live in
   a new `src/hdu_table_compressed.rs` sitting next to
