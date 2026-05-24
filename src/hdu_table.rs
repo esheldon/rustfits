@@ -3595,6 +3595,189 @@ fn setitem_cell_vla(
     Ok(())
 }
 
+// Resolve a __setitem__ rows key (int / slice / iterable of ints) to
+// a normalized Vec<usize>.  Used by SingleColumnSubset.__setitem__
+// and ColumnSubset.__setitem__ to flatten any of the three row
+// shapes into a single per-row loop.  Returns (rows_vec, was_single):
+// `was_single` is True when the user passed a bare int (so callers
+// can validate the value as a scalar / record rather than an ndarray
+// of length 1).
+fn resolve_rows_key(
+    rows: &Bound<'_, PyAny>,
+    nrows: usize,
+) -> PyResult<(Vec<usize>, bool)> {
+    if rows.is_instance_of::<PySlice>() {
+        let slice_py = rows.cast::<PySlice>()?;
+        let indices = slice_py.indices(nrows as isize)?;
+        let count = indices.slicelength as i64;
+        if count <= 0 {
+            return Ok((Vec::new(), false));
+        }
+        let start = indices.start as i64;
+        let step = indices.step as i64;
+        let mut out = Vec::with_capacity(count as usize);
+        for k in 0..count {
+            let r = start + k * step;
+            if r < 0 || r as i64 >= nrows as i64 {
+                return Err(PyIndexError::new_err(format!(
+                    "row index {} out of bounds for {} rows", r, nrows)));
+            }
+            out.push(r as usize);
+        }
+        return Ok((out, false));
+    }
+    if !rows.is_instance_of::<PyBool>() {
+        if let Ok(i) = rows.extract::<i64>() {
+            let r = normalize_row_index(i, nrows)?;
+            return Ok((vec![r], true));
+        }
+    }
+    // Iterable of ints.
+    let iter = rows.try_iter().map_err(|_| PyValueError::new_err(
+        "row key must be an int, slice, or iterable of ints"))?;
+    let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
+    let mut out: Vec<usize> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        if item.is_instance_of::<PyBool>() {
+            return Err(PyValueError::new_err(
+                "row iterable contains a bool"));
+        }
+        let i: i64 = item.extract().map_err(|_| PyValueError::new_err(
+            "row iterable contains a non-int element"))?;
+        out.push(normalize_row_index(i, nrows)?);
+    }
+    Ok((out, false))
+}
+
+// hdu["name"][rows] = value: write to one column at the specified
+// rows.  Handles all three row-key shapes by flattening through
+// resolve_rows_key and looping per-cell.  Cards are re-snapshotted
+// between cells so VLA writes see fresh PCOUNT.
+#[allow(clippy::too_many_arguments)]
+fn write_one_column_at_rows(
+    py: Python<'_>,
+    super_: &HDU,
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    col_name: &str,
+    rows: &Bound<'_, PyAny>,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let (row_indices, was_single) = resolve_rows_key(rows, nrows)?;
+    if row_indices.is_empty() {
+        return Ok(());
+    }
+    if was_single {
+        // [int] = v shortcut.
+        let cards = super_.header_snapshot()?;
+        return setitem_cell(
+            py, super_, &cards, columns, nrows, row_width,
+            row_indices[0] as i64, col_name, value, data_offset);
+    }
+    // Slice / fancy: value must be a length-matching ndarray (or an
+    // Object ndarray for VLA columns).  Validate length up front, then
+    // walk rows.
+    let count = row_indices.len();
+    let v_len: usize = value.len().map_err(|_| PyValueError::new_err(
+        "value must be indexable (ndarray, list, ...) for slice/fancy \
+         row writes"))?;
+    if v_len != count {
+        return Err(PyValueError::new_err(format!(
+            "value has length {} but row selector picks {} rows",
+            v_len, count)));
+    }
+    for (i, &r) in row_indices.iter().enumerate() {
+        let cell_value = value.get_item(i)?;
+        let cards = super_.header_snapshot()?;
+        setitem_cell(
+            py, super_, &cards, columns, nrows, row_width,
+            r as i64, col_name, &cell_value, data_offset)?;
+    }
+    Ok(())
+}
+
+// hdu[["a","b"]][rows] = value: write a column subset at the
+// specified rows.  For int row: value is a structured scalar
+// (numpy.void) or shape-(1,) ndarray; we walk each column and
+// extract its field as the cell.  For slice/fancy: value is a
+// structured ndarray of length len(row indices); per row, per
+// column, extract the cell and forward to setitem_cell.
+#[allow(clippy::too_many_arguments)]
+fn write_column_subset_at_rows(
+    py: Python<'_>,
+    super_: &HDU,
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    col_names: &[String],
+    rows: &Bound<'_, PyAny>,
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    if col_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "column subset is empty"));
+    }
+    let (row_indices, was_single) = resolve_rows_key(rows, nrows)?;
+    if row_indices.is_empty() {
+        return Ok(());
+    }
+
+    // For single-row writes, coerce value to a length-1 structured
+    // record so we can index value[name][0] uniformly.  For
+    // slice/fancy, value must already be a structured ndarray of the
+    // matching length.
+    let one_row_view = if was_single {
+        coerce_to_len1_record(py, value)?
+    } else {
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        if !value.is_instance(&ndarray)? {
+            return Err(PyValueError::new_err(
+                "value must be a structured numpy ndarray for slice/\
+                 fancy-row column-subset writes"));
+        }
+        let v_len: usize = value.len()?;
+        if v_len != row_indices.len() {
+            return Err(PyValueError::new_err(format!(
+                "value has length {} but row selector picks {} rows",
+                v_len, row_indices.len())));
+        }
+        value.clone()
+    };
+
+    // Validate field presence up front (before any I/O).
+    let dtype = one_row_view.getattr("dtype")?;
+    let field_names_attr = dtype.getattr("names")?;
+    if field_names_attr.is_none() {
+        return Err(PyValueError::new_err(
+            "value dtype must be a structured dtype with named fields"));
+    }
+    let field_names: Vec<String> = field_names_attr.extract()?;
+    let field_set: std::collections::HashSet<String> =
+        field_names.iter().map(|n| n.to_uppercase()).collect();
+    for name in col_names {
+        if !field_set.contains(&name.to_uppercase()) {
+            return Err(PyValueError::new_err(format!(
+                "value is missing field '{}'", name)));
+        }
+    }
+
+    for (i, &r) in row_indices.iter().enumerate() {
+        for name in col_names {
+            let field_view = one_row_view.get_item(name.as_str())?;
+            let cell = field_view.get_item(i)?;
+            let cards = super_.header_snapshot()?;
+            setitem_cell(
+                py, super_, &cards, columns, nrows, row_width,
+                r as i64, name, &cell, data_offset)?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // VLA write support (Phase 4)
 // ---------------------------------------------------------------------------
@@ -6135,6 +6318,34 @@ impl SingleColumnSubset {
             /* scale = */ true, /* mask_null = */ false,
         )
     }
+
+    // hdu["name"][rows] = value: row-restricted write to one column.
+    //   - [i] = v             single-cell shortcut for hdu[i, "name"] = v
+    //   - [i:j[:s]] = arr     write `count` cells in that column
+    //   - [[i,j,k]] = arr     fancy-row write, one column
+    // Per-cell loop through setitem_cell — simple and correct.  Cards
+    // are re-snapshotted between cells so VLA writes (which mutate
+    // PCOUNT) see fresh state.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        let cards = super_.header_snapshot()?;
+        let columns = parse_columns(&cards)?;
+        let nrows = parse_keyword(&cards, "NAXIS2")
+            .unwrap_or(0).max(0) as usize;
+        let row_width = parse_keyword(&cards, "NAXIS1")
+            .unwrap_or(0).max(0) as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_one_column_at_rows(
+            py, &super_, &columns, nrows, row_width, &self.name,
+            rows, value, data_offset)
+    }
 }
 
 // Returned by hdu[[col1, col2, ...]] for an iterable of column names.
@@ -6175,5 +6386,32 @@ impl ColumnSubset {
             Some(rows), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
         )
+    }
+
+    // hdu[["a","b"]][rows] = value: row-restricted write to a column
+    // subset.  Same row-key surface as SingleColumnSubset (int / slice
+    // / fancy list); value is a structured ndarray (or numpy.void for
+    // int row) carrying those columns.  Implementation walks each
+    // column and forwards to write_one_column_at_rows with the
+    // corresponding field view as the per-column data.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        let cards = super_.header_snapshot()?;
+        let columns = parse_columns(&cards)?;
+        let nrows = parse_keyword(&cards, "NAXIS2")
+            .unwrap_or(0).max(0) as usize;
+        let row_width = parse_keyword(&cards, "NAXIS1")
+            .unwrap_or(0).max(0) as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_column_subset_at_rows(
+            py, &super_, &columns, nrows, row_width, &self.columns,
+            rows, value, data_offset)
     }
 }

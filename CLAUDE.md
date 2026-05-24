@@ -736,6 +736,29 @@ Three new forms complete the table `__setitem__` surface:
 mirrors `classify_table_key`'s iterable/tuple inspection.  Tests in
 `tests/test_setitem_multi.py` (25 cases).
 
+**Subset `__setitem__`.**  Shipped.  Both subset objects returned by
+`hdu["name"]` and `hdu[["a","b"]]` are now writable, so anything the
+subset can READ via `[rows]` can also be WRITTEN via `[rows] = v`:
+
+- `hdu["name"][i] = v` / `[i:j] = arr` / `[[i,j,k]] = arr` —
+  one-column rows-restricted writes (cell / slice / fancy).
+- `hdu[["a","b"]][i] = record` / `[i:j] = arr` / `[[i,j,k]] = arr` —
+  column-subset rows-restricted writes (record / slice / fancy).
+
+Both forms route through a shared `resolve_rows_key` (int / slice /
+iterable) and loop per-cell through `setitem_cell` — simple and
+correct.  Cards are re-snapshotted between cells so VLA cell writes
+(which mutate PCOUNT in the header) see fresh state from the
+previous iteration.  Performance: O(rows × cols) seek+write
+syscalls; fine for typical "patch a few cells" workloads.  If a
+hot-path workload ever needs bulk per-column slice writes, the
+existing `write_table_one_column` / `write_table_strided` can be
+specialized for the rows-restricted case.
+
+Tests in `tests/test_setitem_subset.py` (20 cases) — single-column
++ multi-column subset across cell / slice / fancy / full-slice /
+negative-index / VLA-numeric / VLA-string / round-trip read+write.
+
 **Missing.**
 - **Bit VLAs (`PX`) on write** — paired with the read-side gap.
 - **`X` (bit) columns on write** — numpy `bool` currently maps to
