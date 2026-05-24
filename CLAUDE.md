@@ -113,10 +113,11 @@ else stays private to its file.
   read across GZIP_1 / GZIP_2 / RICE_1), 3 (`read(rows=)` /
   `__getitem__` / `CompressedSingleColumnSubset` +
   `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`),
-  4 (VLA-column read via dual-descriptor heap), and 5 (bulk
-  write via `create_table_hdu(..., compress=...)` for fixed
-  columns) shipped; later phases add VLA write + `__setitem__`
-  / `append` (Phase 6).  Detection lives in `header_has_ztable`; routing
+  4 (VLA-column read via dual-descriptor heap), 5 (bulk write
+  via `create_table_hdu(..., compress=...)` for fixed columns),
+  and 6a (VLA write via dual-descriptor heap + ZPCOUNT for
+  funpack interop) shipped; remaining: `__setitem__` / `append`
+  on compressed tables (Phase 6b).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2375,7 +2376,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 3 | `read(rows=)` / `__getitem__` / column-subset objects / tile cache | ✅ Shipped |
 | 4 | VLA-column read (dual-descriptor heap) | ✅ Shipped |
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ✅ Shipped |
-| 6 | VLA write + `__setitem__` / `append` | ⏳ Planned |
+| 6a | VLA write (dual-descriptor heap, ZPCOUNT, funpack interop) | ✅ Shipped |
+| 6b | `__setitem__` / `append` on compressed tables | ⏳ Planned |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -2751,6 +2753,62 @@ the original BINTABLE bit-exactly).
 Plus `tests/test_compressed_image_phase7_gzip_write.py`
 (11 new cases) covering image-side string aliases including
 cfitsio synonyms and the case-insensitive match.
+
+**Phase 6a — VLA-column write (dual-descriptor heap).**  Shipped.
+
+Lifts the Phase 5 "fixed-only" restriction on the table-side
+write path.  `create_table_hdu(dtype, nrows, *, compress=...,
+var_dtypes={...})` now accepts both forms, producing a
+ZTABLE-shaped HDU with the VLA columns ready to encode.
+`hdu.write(data)` per-tile per-VLA-column:
+
+  1. For each row in the tile, serialize the cell's BE bytes via
+     the shared `serialize_vla_cell` (same helper the uncompressed
+     VLA write uses).
+  2. Encode per ZCTYPn (RICE_1 / GZIP_1 / GZIP_2 — the same
+     algorithms allowed for VLA inner types as for fixed cols).
+  3. **Uncompressed fallback** (cfitsio's
+     `dlen < vlamemlen` branch in imcompress.c line 8508):
+     when the compressed output is NOT smaller than the raw cell,
+     store the raw BE bytes instead.  Phase 4 read already
+     handles this by detecting `cvlalen == vlalen * elem_size`.
+  4. Build the dual-descriptor blob (rowspertile original P/Q
+     descriptors + rowspertile compressed Q descriptors), GZIP_1
+     it, and write to the heap.  The main-table 1QB descriptor
+     for this (tile, col) points at the gzipped blob.
+
+**Original-descriptor offsets matter.**  cfitsio's
+`fits_uncompress_table` uses the *original* P/Q descriptors'
+offsets to position cells in the reconstructed uncompressed
+heap (`ffpbyt(outfptr, vlamemlen, uncompressed_vla, status)` at
+`heapstart + vlastart`).  Setting them all to 0 collides every
+cell at offset 0.  We pre-compute the original-heap layout via
+`plan_vla_heap_layout` (the same helper the uncompressed VLA
+write uses) and emit the matching offsets — so a
+funpack-decompressed file is byte-equivalent to a fresh
+`create_table_hdu` + `write` without compress.
+
+**ZPCOUNT must be the original heap size.**  funpack's
+decompressor copies the source's ZPCOUNT verbatim onto the
+output's PCOUNT.  We previously emitted ZPCOUNT=0 at create
+time (no data yet); fixed by patching ZPCOUNT alongside PCOUNT
+in the post-write header rewrite to the total original-heap
+bytes (returned by `plan_vla_heap_layout`'s cursor).  Fixed-only
+tables keep ZPCOUNT=0.
+
+**Promoted to `pub(crate)`.**  `validate_vla_cell`,
+`serialize_vla_cell`, `plan_vla_heap_layout`, `write_descriptor`,
+and `VlaCellPlan` from `hdu_table::write_vla` — shared with the
+uncompressed VLA write path so per-cell semantics evolve in one
+place.
+
+Tests: `tests/test_compressed_table_phase6a.py` (14 cases) —
+inner dtype matrix (u1/i2/i4/i8/f4/f8) covering all three
+per-dtype default algorithms; empty cells; multiple VLA columns;
+mixed VLA + fixed columns; multi-tile VLA writes; PA (string
+VLA) columns; per-column compression overrides on VLA cols;
+**byte-exact funpack interop** (cfitsio decompresses our
+VLA-bearing files and round-trips the data through fitsio).
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

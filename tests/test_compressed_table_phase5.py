@@ -208,19 +208,8 @@ def test_ztilelen_requires_compress():
                 )
 
 
-def test_compress_with_var_dtypes_rejected_phase6():
-    """compress=True + var_dtypes={...} is Phase 6 territory."""
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("a", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            with pytest.raises(NotImplementedError, match="Phase 6"):
-                f.create_table_hdu(
-                    dt,
-                    nrows=10,
-                    compress=True,
-                    var_dtypes={"v": "f4"},
-                )
+# VLA + compress shipped in Phase 6a; round-trip coverage lives in
+# tests/test_compressed_table_phase6a.py.
 
 
 # ---------------------------------------------------------------------

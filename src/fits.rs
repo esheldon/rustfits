@@ -1415,13 +1415,6 @@ impl FITS {
             return Err(PyValueError::new_err(
                 "create_table_hdu: ztilelen= requires compress="));
         }
-        // VLA + compress is Phase 6 territory.
-        if compress.is_some() && var_dtypes.is_some() {
-            return Err(PyNotImplementedError::new_err(
-                "create_table_hdu: compress= with var_dtypes= (VLA columns) \
-                 is ZTABLE Phase 6 — not yet implemented; create the table \
-                 without compress= for now"));
-        }
         // heap_format is 'P' (default — 8-byte descriptors, 4 GB heap
         // ceiling) or 'Q' (16-byte, no practical ceiling).  Only
         // relevant when any VLA columns are declared; ignored

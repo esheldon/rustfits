@@ -33,4 +33,7 @@ pub(crate) use write_setup::{
     column_expected_shape, column_transform, normalize_and_build_table_header,
     WriteTransform,
 };
-pub(crate) use write_vla::extract_per_column_inputs;
+pub(crate) use write_vla::{
+    extract_per_column_inputs, plan_vla_heap_layout, serialize_vla_cell,
+    validate_vla_cell, write_descriptor, VlaCellPlan,
+};
