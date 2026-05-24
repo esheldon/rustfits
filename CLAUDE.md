@@ -103,11 +103,11 @@ else stays private to its file.
   convention) pyclass.  Subclasses `TableHDU` (so
   `isinstance(hdu, TableHDU)` holds on a compressed-table HDU).
   Phases 1 (detection + accessors + I/O stubs), 2 (whole-table
-  read across GZIP_1 / GZIP_2 / RICE_1), and 3 (`read(rows=)` /
+  read across GZIP_1 / GZIP_2 / RICE_1), 3 (`read(rows=)` /
   `__getitem__` / `CompressedSingleColumnSubset` +
-  `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`)
-  shipped; later phases add VLA (Phase 4) and the write side
-  (Phases 5-6).  Detection lives in `header_has_ztable`; routing
+  `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`),
+  and 4 (VLA-column read via dual-descriptor heap) shipped;
+  later phases add the write side (Phases 5-6).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2364,7 +2364,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 1 | Detection + `CompressedTableHDU` subclass + accessors + I/O stubs | ✅ Shipped |
 | 2 | Whole-table read (fixed columns) across GZIP_1 + GZIP_2 + RICE_1 | ✅ Shipped |
 | 3 | `read(rows=)` / `__getitem__` / column-subset objects / tile cache | ✅ Shipped |
-| 4 | VLA-column read (dual-descriptor heap) | ⏳ Planned |
+| 4 | VLA-column read (dual-descriptor heap) | ✅ Shipped |
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ⏳ Planned |
 | 6 | VLA write + `__setitem__` / `append` | ⏳ Planned |
 
@@ -2573,6 +2573,66 @@ table's data extent is under 5760 bytes (2 BLOCK_SIZE blocks).
 The Phase 3 test helper asserts the produced HDU IS
 `CompressedTableHDU` so future tests don't silently exercise
 the uncompressed path while pretending to test ZTABLE.
+
+**Phase 4 — VLA-column read (dual-descriptor heap).**  Shipped.
+
+For each VLA column per tile, the column's heap blob (referenced
+by the 1QB main-row descriptor) is GZIP_1-compressed regardless
+of ZCTYPn — ZCTYPn governs only the *inner per-cell* compression.
+After GZIP decompression the blob is exactly
+`rowspertile * width_orig + rowspertile * 16` bytes, laid out as
+two concatenated descriptor arrays:
+
+  - First `rowspertile * width_orig` bytes: ORIGINAL P/Q
+    descriptors from the user-visible BINTABLE.  `vlalen` here is
+    the number of inner-type elements (the user-visible count).
+    Original heap-offset field is irrelevant on read (the original
+    heap doesn't exist in the compressed file).
+  - Next `rowspertile * 16` bytes: COMPRESSED-side Q descriptors.
+    `cvlalen` is the number of compressed bytes for that cell;
+    `cvlastart` is the offset of those bytes inside the
+    compressed table's heap.
+
+Per-row decompression:
+
+  1. Read `cvlalen` bytes from heap at `heap_start + cvlastart`.
+  2. **Uncompressed fallback**: if `cvlalen == vlalen * elem_size`,
+     the cell was stored raw (cfitsio's "compression didn't help"
+     branch) — those bytes are the original BE inner-element bytes
+     verbatim, no decoder invocation.
+  3. Otherwise decompress per ZCTYPn (RICE_1 for B/I/J inner;
+     GZIP_1 / GZIP_2 for everything).
+  4. Hand the resulting BE bytes to the shared
+     `build_var_cell_value` (promoted to `pub(crate)` for this
+     phase) which builds the per-cell numpy ndarray (or str / bytes
+     for A) with byteswap + scaling + ASCII validation handled the
+     same way the uncompressed read path handles them.
+
+**Caching.**  Per-(tile, col) descriptor blob goes into the same
+`ColumnTileCache` that fixed columns use — cache key is identical
+(`CacheKey(tile_idx, orig_idx)`).  Per-cell decompressed bytes
+are NOT cached: cells can be tiny but there are many, and
+VLA-of-images patterns would blow the budget.  Each cell read
+decompresses fresh; the heap-blob cache is what amortizes the
+GZIP-decompress + descriptor parse across multiple row requests
+in the same tile.
+
+**`gzip_decompress_bytes`.**  Phase 4 needed a "raw gzip decompress
+to a known length, no byteswap" primitive distinct from
+`decode_gzip1`/`decode_gzip2` (which both byteswap to native at
+the end).  The descriptor blob is a packed array of BE
+descriptors that the per-cell loop feeds straight to
+`read_descriptor` — byteswapping would corrupt it.  Implemented
+inline in `hdu_table_compressed.rs` using `flate2::read::GzDecoder`
+directly.
+
+Tests: `tests/test_compressed_table_phase4.py` (16 cases) —
+whole-table VLA round trip across u1 / i2 / i4 / i8 / f4 / f8
+inner dtypes (covers all three algorithms fpack picks
+per-dtype); empty cells; multiple VLA columns in one table;
+VLA mixed with fixed columns; multi-tile read; slice across
+tiles; fancy-row read preserving user order; single row via
+`__getitem__`; `columns=` subset; single-column subset chained.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

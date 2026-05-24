@@ -585,7 +585,7 @@ pub(crate) fn read_descriptor(kind: char, src: &[u8]) -> (i64, i64) {
 // Python `str` (strict ASCII, with the same kind of helpful error as
 // the fixed-A path) — unless `as_bytes` is set, in which case raw
 // bytes are returned verbatim (matches read_column(as_bytes=True)).
-fn build_var_cell_value(
+pub(crate) fn build_var_cell_value(
     py: Python<'_>,
     col: &Column,
     src_bytes: &[u8],

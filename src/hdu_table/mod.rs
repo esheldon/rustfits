@@ -24,8 +24,9 @@ pub(crate) use hdu::{
     classify_table_key, ColumnSubset, SingleColumnSubset, TableHDU, TableKey,
 };
 pub(crate) use read::{
-    build_numpy_dtype, convert_column_cell, field_dtype_and_shape,
-    numpy_field_layout, read_descriptor, resolve_columns, resolve_rows,
+    build_numpy_dtype, build_var_cell_value, convert_column_cell,
+    field_dtype_and_shape, numpy_field_layout, read_descriptor,
+    resolve_columns, resolve_rows,
 };
 pub(crate) use write_fixed::set_pcount_in_cards;
 pub(crate) use write_setup::normalize_and_build_table_header;
