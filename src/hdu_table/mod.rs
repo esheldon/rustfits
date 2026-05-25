@@ -34,7 +34,7 @@ pub(crate) use read::{
 pub(crate) use write_fixed::{apply_transform_cell, set_pcount_in_cards};
 pub(crate) use write_setup::{
     column_expected_shape, column_transform, normalize_and_build_table_header,
-    WriteTransform,
+    BitColumnsSpec, WriteTransform,
 };
 pub(crate) use write_vla::{
     extract_per_column_inputs, plan_vla_heap_layout, serialize_vla_cell,

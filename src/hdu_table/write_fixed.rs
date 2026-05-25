@@ -178,6 +178,14 @@ pub(crate) fn prepare_structured_input(
         {
             layout_matches = false;
         }
+        // X (bit-packed) columns always route through the slow path:
+        // src width = num_bits bytes (one per bool), dst width =
+        // ceil(num_bits/8) bytes.  Even when those happen to match
+        // (1-bit scalar), the bulk-memcpy fast path doesn't know how
+        // to bit-pack — only the per-cell apply_transform_cell does.
+        if col.tform_letter == 'X' {
+            layout_matches = false;
+        }
     }
     Ok(PreparedInput { transforms, metas, layout_matches })
 }
@@ -400,6 +408,23 @@ pub(crate) fn apply_transform_cell(
                 dst[i] = cp as u8;
             }
         }
+        WriteTransform::BitsPackMsb { num_bits } => {
+            // Pack `num_bits` source bytes (one per numpy bool) into
+            // ceil(num_bits/8) destination bytes, MSB-first within
+            // each byte.  Bit i of the cell goes to byte (i/8), bit
+            // position (7 - i%8).  Trailing bits in the last byte
+            // (when num_bits % 8 != 0) are left zero per the FITS
+            // spec.  Inverse of read.rs::convert_x_cell.
+            let n_bytes = num_bits.div_ceil(8);
+            for b in dst[..n_bytes].iter_mut() {
+                *b = 0;
+            }
+            for i in 0..num_bits {
+                if src[i] != 0 {
+                    dst[i / 8] |= 1u8 << (7 - (i % 8));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -455,6 +480,11 @@ fn apply_in_place_transform(
             unreachable!(
                 "UnicodeToAscii in fast-path; validate should have routed \
                  through the slow path");
+        }
+        WriteTransform::BitsPackMsb { .. } => {
+            unreachable!(
+                "BitsPackMsb in fast-path; X columns always force \
+                 layout_matches=false so the slow path runs");
         }
     }
 }

@@ -89,7 +89,8 @@ pub(crate) fn bytes_per_element(letter: char) -> Option<usize> {
 // float halves.  Reversing the whole element would swap real↔imaginary.
 pub(crate) fn byteswap_unit(letter: char) -> usize {
     match letter {
-        'L' | 'B' | 'A' => 1,
+        // X (bit-packed) is byte-flat on disk; no swap needed.
+        'L' | 'B' | 'A' | 'X' => 1,
         'I' => 2,
         'J' | 'E' | 'C' => 4,
         'K' | 'D' | 'M' => 8,

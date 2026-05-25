@@ -25,7 +25,8 @@ use crate::hdu_table_compressed::{
     resolve_compress_arg, CompressedTableHDU,
 };
 use crate::hdu_table::{
-    normalize_and_build_table_header, parse_columns, TableHDU,
+    normalize_and_build_table_header, parse_columns, BitColumnsSpec,
+    TableHDU,
 };
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
@@ -305,6 +306,46 @@ enum HduKind {
 
 // Round a byte count up to the next BLOCK_SIZE boundary.  Returns 0
 // when input is 0 (no data section).
+// Parse the `bit_columns=` kwarg.  Accepted forms:
+//   - None / Python None: no opt-in (default; b1 → L).
+//   - bool: True promotes ALL b1 columns to X; False is the same as
+//     None (explicit "no").  Matches fitsio's write_bitcols=True
+//     global toggle.
+//   - list/tuple of str: per-column opt-in.  Names are folded to
+//     uppercase for case-insensitive matching against the table
+//     columns; duplicates are tolerated (HashSet dedup).
+// Everything else is rejected with a clear type-error message.
+fn parse_bit_columns_arg(
+    arg: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<BitColumnsSpec>> {
+    use pyo3::types::{PyBool, PyList, PyTuple};
+    let Some(v) = arg else { return Ok(None); };
+    if v.is_none() {
+        return Ok(None);
+    }
+    // bool BEFORE int extract — Python bool is an int subclass and
+    // would otherwise route through the iterable arm.
+    if v.is_instance_of::<PyBool>() {
+        let b: bool = v.extract()?;
+        return Ok(if b { Some(BitColumnsSpec::All) } else { None });
+    }
+    if v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>() {
+        let mut set = std::collections::HashSet::new();
+        for item in v.try_iter()? {
+            let name: String = item?.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "bit_columns: list entries must be strings")
+            })?;
+            set.insert(name.to_uppercase());
+        }
+        return Ok(Some(BitColumnsSpec::Names(set)));
+    }
+    Err(PyValueError::new_err(
+        "bit_columns: must be None, a bool, or a list/tuple of str \
+         column names",
+    ))
+}
+
 fn data_section_padded(data_size: u64) -> u64 {
     if data_size == 0 {
         0
@@ -1389,7 +1430,7 @@ impl FITS {
     #[pyo3(signature = (
         dtype, nrows=0, *,
         extname=None, extver=None, units=None,
-        var_dtypes=None, heap_format=None,
+        var_dtypes=None, bit_columns=None, heap_format=None,
         compress=None, ztilelen=None,
     ))]
     fn create_table_hdu(
@@ -1401,6 +1442,7 @@ impl FITS {
         extver: Option<i64>,
         units: Option<&Bound<'_, PyDict>>,
         var_dtypes: Option<&Bound<'_, PyDict>>,
+        bit_columns: Option<&Bound<'_, PyAny>>,
         heap_format: Option<String>,
         compress: Option<&Bound<'_, PyAny>>,
         ztilelen: Option<i64>,
@@ -1428,9 +1470,10 @@ impl FITS {
                 "create_table_hdu: heap_format must be 'P' or 'Q', got '{}'",
                 other))),
         };
+        let bit_columns_spec = parse_bit_columns_arg(bit_columns)?;
         let (table_cards, row_width) = normalize_and_build_table_header(
             py, dtype, nrows, extname.as_deref(), extver, units,
-            var_dtypes, desc_char,
+            var_dtypes, bit_columns_spec.as_ref(), desc_char,
         )?;
 
         // Dispatch on compress=.  None/False -> uncompressed (the

@@ -35,6 +35,29 @@ pub(crate) struct WriteColumn {
     pub(crate) var_kind: Option<char>,
 }
 
+// Caller's `bit_columns=` kwarg, parsed from the Python form.  `All`
+// means "promote every b1 column to X" (matches fitsio's
+// `write_bitcols=True`).  `Names(set)` means "promote only the
+// listed names" (case-insensitive against the table columns; names
+// the user passed are looked up verbatim, the comparison happens
+// inside the classifier).  `None` at the call site means "default":
+// b1 columns map to L as before.
+pub(crate) enum BitColumnsSpec {
+    All,
+    Names(std::collections::HashSet<String>),
+}
+
+impl BitColumnsSpec {
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            BitColumnsSpec::All => true,
+            BitColumnsSpec::Names(set) => {
+                set.contains(&name.to_uppercase())
+            }
+        }
+    }
+}
+
 // Classification of a single numpy field base dtype.  For numeric
 // kinds, `chars_per_string` is None and `elem_bytes` is the per-
 // element byte width on disk (and in memory).  For string kinds (S
@@ -42,17 +65,26 @@ pub(crate) struct WriteColumn {
 // `chars_per_string` carries the per-string character count, which
 // the caller uses to compute total bytes per cell and emit TDIM
 // (strings need TDIM even for 1-D shapes — see dtype_to_write_columns).
+// `bit_packed=true` means a numpy bool field opted in to FITS X
+// (one bit per element on disk, MSB-packed); the caller computes
+// byte_width = ceil(repeat/8) instead of repeat * elem_bytes and
+// emits TFORM=NX.
 struct ScalarClass {
     tform_letter: char,
     elem_bytes: usize,
     tzero: Option<u64>,
     chars_per_string: Option<usize>,
+    bit_packed: bool,
 }
 
 // Returns the classification for one numpy field's base dtype.
+// `bit_packed=true` is set only when the caller has opted this
+// column into FITS X via the bit_columns= kwarg AND the field is
+// b1; for any other dtype + bit_packed=true we reject.
 fn classify_scalar_numpy_field(
     field_dtype: &Bound<'_, PyAny>,
     col_name: &str,
+    bit_packed_opt_in: bool,
 ) -> PyResult<ScalarClass> {
     let kind: String = field_dtype.getattr("kind")?.extract()?;
     let itemsize: usize = field_dtype.getattr("itemsize")?.extract()?;
@@ -61,8 +93,20 @@ fn classify_scalar_numpy_field(
         col_name, kind, itemsize, reason));
     let plain = |letter: char, bytes: usize, tz: Option<u64>| ScalarClass {
         tform_letter: letter, elem_bytes: bytes, tzero: tz,
-        chars_per_string: None,
+        chars_per_string: None, bit_packed: false,
     };
+    if bit_packed_opt_in {
+        if kind != "b" || itemsize != 1 {
+            return Err(PyValueError::new_err(format!(
+                "column '{}': bit_columns= entry requires numpy bool \
+                 (kind 'b1') input, got kind '{}' itemsize {}",
+                col_name, kind, itemsize)));
+        }
+        return Ok(ScalarClass {
+            tform_letter: 'X', elem_bytes: 1, tzero: None,
+            chars_per_string: None, bit_packed: true,
+        });
+    }
     match (kind.as_str(), itemsize) {
         ("i", 2) => Ok(plain('I', 2, None)),
         ("i", 4) => Ok(plain('J', 4, None)),
@@ -78,11 +122,11 @@ fn classify_scalar_numpy_field(
         ("b", 1) => Ok(plain('L', 1, None)),
         ("S", n) if n > 0 => Ok(ScalarClass {
             tform_letter: 'A', elem_bytes: 1, tzero: None,
-            chars_per_string: Some(n),
+            chars_per_string: Some(n), bit_packed: false,
         }),
         ("U", n) if n > 0 && n % 4 == 0 => Ok(ScalarClass {
             tform_letter: 'A', elem_bytes: 1, tzero: None,
-            chars_per_string: Some(n / 4),
+            chars_per_string: Some(n / 4), bit_packed: false,
         }),
         ("S", 0) | ("U", 0) => Err(err("zero-length string column")),
         ("i", 1) => Err(err(
@@ -169,6 +213,7 @@ pub(crate) fn dtype_to_write_columns(
     dtype: &Bound<'_, PyAny>,
     units: Option<&Bound<'_, PyDict>>,
     var_dtypes: Option<&Bound<'_, PyDict>>,
+    bit_columns: Option<&BitColumnsSpec>,
     descriptor: char,
 ) -> PyResult<Vec<WriteColumn>> {
     let names_attr = dtype.getattr("names")?;
@@ -258,18 +303,48 @@ pub(crate) fn dtype_to_write_columns(
             continue;
         }
 
-        let cls = classify_scalar_numpy_field(&base_dtype, name)?;
+        // `bit_columns=True` (All) is a soft global toggle: promote
+        // only the b1 columns to X and silently leave other types
+        // alone (matches fitsio's `write_bitcols=True` semantics).
+        // `bit_columns=["name", ...]` is a hard per-name opt-in:
+        // every listed column gets `bit_packed=true`, and the
+        // classifier rejects below if any of those columns isn't b1.
+        let bit_packed_opt_in = match bit_columns {
+            None => false,
+            Some(BitColumnsSpec::All) => {
+                let kind: String =
+                    base_dtype.getattr("kind")?.extract()?;
+                let itemsize: usize =
+                    base_dtype.getattr("itemsize")?.extract()?;
+                kind == "b" && itemsize == 1
+            }
+            Some(BitColumnsSpec::Names(set)) => {
+                set.contains(&name.to_uppercase())
+            }
+        };
+        let cls = classify_scalar_numpy_field(
+            &base_dtype, name, bit_packed_opt_in)?;
         let array_count: usize =
             np_shape.iter().copied().product::<usize>().max(1);
-        // Total byte_width (and TFORM repeat for 'A' columns) depends
-        // on whether this is a string column: A counts total bytes
-        // per cell (chars × strings), other letters count elements.
-        let (repeat, byte_width) = match cls.chars_per_string {
-            Some(chars) => {
-                let total_bytes = chars * array_count;
-                (total_bytes, total_bytes)
+        // Total byte_width (and TFORM repeat) depends on the on-disk
+        // shape.  Three cases:
+        //   - X (bit-packed): TFORM repeat = bit count = array_count;
+        //     byte_width = ceil(repeat/8).  Trailing bits in the last
+        //     byte are zero per the FITS spec.
+        //   - A (strings): TFORM repeat = total bytes per cell
+        //     (chars × strings).
+        //   - Other letters: TFORM repeat = element count;
+        //     byte_width = repeat * elem_bytes.
+        let (repeat, byte_width) = if cls.bit_packed {
+            (array_count, array_count.div_ceil(8))
+        } else {
+            match cls.chars_per_string {
+                Some(chars) => {
+                    let total_bytes = chars * array_count;
+                    (total_bytes, total_bytes)
+                }
+                None => (array_count, cls.elem_bytes * array_count),
             }
-            None => (array_count, cls.elem_bytes * array_count),
         };
         // TDIM (FITS = FORTRAN, fastest-first).  Two distinct rules:
         //   - Strings ('A'): TDIM is (chars_per_string, ...reversed
@@ -319,6 +394,21 @@ pub(crate) fn dtype_to_write_columns(
                 return Err(PyValueError::new_err(format!(
                     "var_dtypes contains key '{}' that does not match \
                      any column in the dtype", k)));
+            }
+        }
+    }
+    // Same diff for bit_columns: an entry that names no column is a
+    // user error (typo or stale name).  Skip the check when the
+    // user passed `bit_columns=True`/`All` — that's intentionally
+    // universal and matches any future column.
+    if let Some(BitColumnsSpec::Names(provided)) = bit_columns {
+        let column_names_upper: std::collections::HashSet<String> =
+            out.iter().map(|c| c.name.to_uppercase()).collect();
+        for k in provided {
+            if !column_names_upper.contains(k) {
+                return Err(PyValueError::new_err(format!(
+                    "bit_columns contains entry '{}' that does not \
+                     match any column in the dtype", k)));
             }
         }
     }
@@ -391,12 +481,13 @@ pub(crate) fn normalize_and_build_table_header(
     extver: Option<i64>,
     units: Option<&Bound<'_, PyDict>>,
     var_dtypes: Option<&Bound<'_, PyDict>>,
+    bit_columns: Option<&BitColumnsSpec>,
     descriptor: char,
 ) -> PyResult<(Vec<String>, u64)> {
     let np = py.import("numpy")?;
     let np_dtype = np.getattr("dtype")?.call1((dtype_in,))?;
     let write_columns = dtype_to_write_columns(
-        &np_dtype, units, var_dtypes, descriptor)?;
+        &np_dtype, units, var_dtypes, bit_columns, descriptor)?;
     let row_width: u64 = write_columns.iter()
         .map(|c| c.byte_width as u64).sum();
     let cards = build_bintable_header_cards(
@@ -436,6 +527,12 @@ pub(crate) enum WriteTransform {
     // dst_size = num_chars.  Non-ASCII codepoints raise ValueError
     // up the stack (no silent lossy conversion).
     UnicodeToAscii { num_chars: usize },
+    // numpy bool (1 byte 0/1 per element) → FITS X (bit-packed,
+    // MSB-first per byte).  src_size = `num_bits` bytes; dst_size =
+    // ceil(num_bits/8) bytes.  Trailing bits in the last byte (when
+    // num_bits % 8 != 0) are zeroed.  Only valid on the slow path —
+    // the width difference rules out the bulk-memcpy fast path.
+    BitsPackMsb { num_bits: usize },
 }
 
 // Resolve the per-column write transform given the on-disk column
@@ -467,6 +564,23 @@ pub(crate) fn column_transform(
              input, got kind '{}' itemsize {}",
             col.name, per_string_bytes, per_string_bytes, per_string_bytes,
             input_kind, input_size)));
+    }
+
+    // BitsPackMsb: input is numpy bool, column letter is X.  src_size
+    // (num_bits bytes — one per bool) differs from dst_size
+    // (ceil(num_bits/8) bytes), which is why this transform is
+    // slow-path only.  col.repeat carries the bit count for X
+    // columns; col.byte_width = ceil(repeat/8).
+    if col.tform_letter == 'X' {
+        if input_kind == "b" && input_size == 1 {
+            return Ok(WriteTransform::BitsPackMsb {
+                num_bits: col.repeat,
+            });
+        }
+        return Err(PyValueError::new_err(format!(
+            "column '{}' (X, {} bits): expected numpy bool input, got \
+             kind '{}' itemsize {}",
+            col.name, col.repeat, input_kind, input_size)));
     }
 
     // Natural (no-scaling) input dtype per FITS letter; swap_unit is

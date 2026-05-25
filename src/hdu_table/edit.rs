@@ -827,6 +827,7 @@ fn build_single_write_column(
         &np_dtype,
         units_dict.as_ref(),
         /* var_dtypes = */ None,
+        /* bit_columns = */ None,
         /* descriptor (irrelevant for fixed) = */ 'P',
     )?;
     if cols.len() != 1 {

@@ -1485,14 +1485,19 @@ fn decompress_column_slab(
     col: &Column,
     rowspertile: usize,
 ) -> PyResult<Vec<u8>> {
-    let elem_bytes = bytes_per_element(col.tform_letter)
-        .ok_or_else(|| PyValueError::new_err(format!(
-            "column '{}': TFORM letter '{}' has no fixed element width",
-            col.name, col.tform_letter)))?;
-    // `col.repeat` is the number of elements per row for non-A;
-    // for A it's the total byte width per row (which == repeat
-    // since A's elem_bytes is 1).
-    let n_elements = rowspertile * col.repeat;
+    // X (bit-packed) columns are byte-flat on disk (one cell = ceil
+    // (repeat/8) bytes); the per-cell unpack into bool happens later
+    // in convert_x_cell.  All other letters have a fixed element
+    // width; A's elem_bytes is 1 and its repeat is total bytes.
+    let (elem_bytes, n_elements) = if col.tform_letter == 'X' {
+        (1usize, rowspertile * col.byte_width)
+    } else {
+        let n = bytes_per_element(col.tform_letter)
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "column '{}': TFORM letter '{}' has no fixed element \
+                 width", col.name, col.tform_letter)))?;
+        (n, rowspertile * col.repeat)
+    };
     let mut slab = match algo {
         CompressionAlgorithm::Gzip1 => {
             decode_gzip1(compressed, n_elements, elem_bytes as u32)?
@@ -2098,15 +2103,26 @@ pub(crate) fn prepare_fixed_column<'py>(
     let src_total_size = input_elem_size * cell_elements;
     let contig = np.call_method1("ascontiguousarray", (arr,))?;
     let buf = RawBuffer::acquire(&contig)?;
-    let inner_elem_size = bytes_per_element(col.tform_letter)
-        .ok_or_else(|| PyValueError::new_err(format!(
-            "column '{}': unsupported TFORM letter '{}' on compressed \
-             write", col.name, col.tform_letter)))?;
+    // X (bit-packed) columns are byte-flat on disk: byte_width =
+    // ceil(repeat/8).  The encoders only see bytes here; per_row_pixels
+    // is the byte-count rather than the bit-count so `n_pixels *
+    // elem_size = slab.len()` for the byte-shuffle / RICE arithmetic
+    // (only GZIP_1 is actually allowed for X per the table-allowed
+    // matrix, and GZIP_1 ignores both fields).
+    let (inner_elem_size, per_row_pixels) = if col.tform_letter == 'X' {
+        (1usize, col.byte_width)
+    } else {
+        let n = bytes_per_element(col.tform_letter)
+            .ok_or_else(|| PyValueError::new_err(format!(
+                "column '{}': unsupported TFORM letter '{}' on \
+                 compressed write", col.name, col.tform_letter)))?;
+        (n, col.repeat)
+    };
     Ok(ColPrep {
         buf, src_total_size, transform, contig_arr: contig,
         elem_size: inner_elem_size,
         per_row_bytes: col.byte_width,
-        per_row_pixels: col.repeat,
+        per_row_pixels,
         rice_blocksize: cfg.map(rice_blocksize_of).unwrap_or(32),
         gzip_level: cfg.and_then(gzip_level_of),
     })
