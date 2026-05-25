@@ -122,11 +122,16 @@ else stays private to its file.
   fallback, ~1 MiB peak memory), 6c-1b (VLA `append()`
   — existing per-cell compressed bytes copied verbatim, new
   rows encoded per-cell, ZPCOUNT updated for funpack interop),
-  and 6c-2a (VLA `repack()` — streaming staging-only path
+  6c-2a (VLA `repack()` — streaming staging-only path
   rewrites per-cell offsets in the dual-descriptor blob and
-  re-gzips it; also handles mixed fixed + VLA tables)
-  shipped; remaining: `__setitem__` (6c-2b through 6c-2e,
-  staged surface-by-surface — see roadmap below).  Detection lives in `header_has_ztable`; routing
+  re-gzips it; also handles mixed fixed + VLA tables), and
+  6c-2b (row `__setitem__` for fixed-column tables —
+  `hdu[i]=record` / `hdu[a:b]=arr` step=1 / `hdu[[i,j,k]]=arr`
+  modify affected tiles by decode → row-bytes replace →
+  re-encode + append to heap, with orphans reclaimed by
+  `repack()`) shipped; remaining: `__setitem__` for column /
+  cell / stepped-slice / VLA forms (6c-2c, 6c-2d, 6c-2e —
+  see roadmap below).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -981,11 +986,12 @@ Add / remove columns (`insert_column` / `delete_column`) shipped
 post-roadmap — see the "Add / remove columns" section under "Table
 write Supported" above for the API + implementation.
 
-**Coming next.**  Compressed-table (ZTABLE) — through Phase 6c-2a
-(VLA `repack()`) shipped; remaining work is `__setitem__`, staged
-6c-2b through 6c-2e.  See the dedicated "Tile-compressed tables
-(ZTABLE)" roadmap below for the full status table and the
-detailed step plan.
+**Coming next.**  Compressed-table (ZTABLE) — through Phase 6c-2b
+(row `__setitem__` for fixed-column tables) shipped; remaining
+work is `__setitem__` for column / cell / stepped-slice / VLA
+forms, staged 6c-2c through 6c-2e.  See the dedicated "Tile-
+compressed tables (ZTABLE)" roadmap below for the full status
+table and the detailed step plan.
 
 **Phase 6 — out of scope for now.**  ASCII tables (rare in modern
 files; create / write missing, read returns header only) and the
@@ -2392,8 +2398,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6c-1a | `repack()` for fixed-column tables (streaming + staging fallback) | ✅ Shipped |
 | 6c-1b | VLA `append()` (existing-cell copy + per-cell re-encode for new rows) | ✅ Shipped |
 | 6c-2a | VLA `repack()` (streaming staging + dual-descriptor blob re-gzip) | ✅ Shipped |
-| 6c-2b | Fixed-col row writes: `hdu[i]=record`, `hdu[a:b]=arr`, `hdu[[i,j,k]]=arr` | ⏳ Next |
-| 6c-2c | Fixed-col col/cell writes: `hdu["col"]=arr`, `hdu[r,"col"]=v`, `hdu[[c1,c2]]=arr` | ⏳ |
+| 6c-2b | Fixed-col row writes: `hdu[i]=record`, `hdu[a:b]=arr`, `hdu[[i,j,k]]=arr` | ✅ Shipped |
+| 6c-2c | Fixed-col col/cell writes: `hdu["col"]=arr`, `hdu[r,"col"]=v`, `hdu[[c1,c2]]=arr` | ⏳ Next |
 | 6c-2d | Stepped slices + subset-object writes (`hdu["name"][rows]=v`, `hdu[[a,b]][rows]=v`) | ⏳ |
 | 6c-2e | VLA `__setitem__` (all forms, decode → modify → re-encode dual-descriptor blob) | ⏳ |
 
@@ -3134,53 +3140,101 @@ column, same-handle + reopen parity.
 line 8003 and 8695 respectively).  Read/write loops there are
 the byte-exact spec.
 
-**Phase 6c-2b–e plan — `__setitem__` on compressed tables.**
+**Phase 6c-2b — row `__setitem__` on compressed tables (fixed
+columns).**  Shipped.
+
+Surface — all three forms touch ALL columns of the selected
+rows:
+  - `hdu[i] = record` — single-row write.  RHS is a `numpy.void`
+    scalar or a shape-`(1,)` structured ndarray with the
+    table's field names.  Negative `i` wraps; out-of-range
+    raises `IndexError`.
+  - `hdu[a:b] = arr` — step=1 slice write.  RHS is a
+    structured ndarray of length equal to the slicelength.
+    Step != 1 rejected with a 6c-2d phase pointer.  Empty slice
+    + empty RHS is a no-op (PCOUNT unchanged).
+  - `hdu[[i, j, k]] = arr` — fancy-row write.  RHS is a
+    structured ndarray of length = `len(row_list)`.  Duplicates
+    in the row list follow numpy fancy-assignment semantics
+    (last write wins in the input list).  Negative indices
+    wrap.
+
+Single-column / multi-column / single-cell forms reject with
+6c-2c phase pointers; VLA-bearing tables reject with a 6c-2e
+phase pointer.
+
+Algorithm.  Per affected tile (sorted by tile index for disk
+locality):
+
+  1. For each column: decode the existing tile blob to a BE
+     bytes slab (via `decode_existing_tile_to_be_bytes`, the
+     same Phase 6b helper that the merge-append path uses).
+  2. Overwrite the affected rows' per-cell bytes via
+     `apply_transform_cell` from the input ColPrep — handles
+     byteswap, unsigned-int trick XOR, bool → 'F'/'T' ASCII,
+     S-string verbatim copy, U-string UTF-32 → 7-bit ASCII.
+  3. Re-encode + append the new blob to the heap end via
+     `encode_be_slab_to_heap_and_record` (shared with the bulk
+     write and merge-append paths).  The old blob's heap bytes
+     become orphans; `repack()` reclaims them.
+  4. The in-RAM descriptor table tracks updated entries.
+
+After all tiles: rewrite the descriptor table region at
+`data_offset`, then update PCOUNT through the standard
+disk-write-before-commit + taint discipline.  Cache is cleared
+at the end (modified tiles' entries are stale).
+
+**Reused primitives** (already `pub(crate)` from earlier
+phases):
+- `classify_setitem_key` + `SetItemKey` + `coerce_to_len1_record`
+  (promoted from setitem.rs to `pub(crate)` for this phase) for
+  key dispatch + single-row coercion.
+- `extract_per_column_inputs` for the structured-ndarray → Vec
+  of per-column ndarrays unpack.
+- `prepare_fixed_column` + `ColPrep` for per-column input
+  validation (dtype, shape, length).  Validate-then-mutate:
+  ColPrep construction up front raises dtype/shape errors
+  before any file I/O.
+- `decode_existing_tile_to_be_bytes` for the per-(tile, col)
+  decode → BE slab.
+- `apply_transform_cell` for the per-cell row-bytes overwrite.
+- `encode_be_slab_to_heap_and_record` for the encode + heap
+  append + descriptor record.
+
+**Memory bound.**  Per affected tile, one BE-bytes slab per
+column at a time (rows_in_tile × per_row_bytes — tens of KB to
+a few MB), encoded and dropped before the next column.  Plus
+the full descriptor table in RAM (n_tiles × ncols × 16 bytes;
+small).  Heap writes go to the file as they're produced.
+
+**Implementation.**  `setitem_compressed_fixed_rows` +
+`normalize_disk_row` at the bottom of `hdu_table_compressed.rs`;
+dispatcher in the `__setitem__` pymethod uses the same shape as
+the uncompressed-side `TableHDU.__setitem__`.
+
+Tests in `tests/test_compressed_table_setitem_rows.py`
+(31 cases): single-row (middle of tile, length-1 ndarray RHS,
+negative index, out-of-range, orphan accounting, tile
+boundary), slice step=1 (within tile, across tiles, full
+slice, length mismatch, step != 1 rejection, empty slice
+no-op, empty slice + nonempty RHS), fancy rows (within tile,
+across tiles, negative indices, duplicates last-wins, length
+mismatch), cache cleared after setitem, repack reclaims
+orphans, non-last HDU preserves trailing, algorithm matrix
+(GZIP_1 / GZIP_2 / RICE_1 with i4 columns), subarray (TDIM)
+column round trip, **funpack byte-exact interop** on
+mutated files (slice + fancy + single-row mixed), all
+rejection paths (column / multi-col / cell / VLA), and
+same-handle vs reopen parity.
+
+**Phase 6c-2c–e plan — remaining `__setitem__` forms on
+compressed tables.**
 
 The natural primitive for compressed `__setitem__` is "modify
-rows R within tile T, columns C".  For each affected (tile,
-col): decode the existing blob (Phase 2 read path through
-`fetch_tile_payload_and_decode`), replace the chosen rows'
-bytes in the BE slab, re-encode per ZCTYPn (Phase 5 write
-path), append the new blob to the heap, orphan the old blob.
-Update the main-table descriptor entry, bump PCOUNT.  Same
-heap-append-orphan model as VLA `__setitem__` on uncompressed
-tables — `repack()` reclaims orphans later.
-
-All forms route through this primitive.  Stage-by-stage so
-each PR has a clean focus + a passing test suite at every
-boundary.
-
-**Phase 6c-2b — fixed-col row writes.**  Surface:
-  - `hdu[i] = record` (always one tile)
-  - `hdu[a:b] = arr` (step=1, one or more tiles)
-  - `hdu[[i, j, k]] = arr` (fancy rows, one or more tiles)
-
-All touch ALL columns of the selected rows.  Algorithm:
-  1. Classify the key (reuse `classify_table_key` /
-     `SetItemKey` from the uncompressed side, already
-     `pub(crate)`).
-  2. Bucket the affected row indices by tile.
-  3. For each affected tile:
-     a. Read the tile's descriptor row (every col's blob).
-     b. For each col: decode → replace rows R within the BE
-        slab via `apply_transform_cell` → re-encode →
-        append-and-record.
-     c. Mark the old blobs as orphans (just leave them; their
-        heap bytes stay until `repack()`).
-  4. Rewrite the descriptor table region for the affected
-     tiles.
-  5. Update PCOUNT.
-
-Reuse: `fetch_tile_payload_and_decode` for read-side decode (or
-a stripped-down variant that stops at BE bytes), the existing
-`ColPrep` + `prepare_fixed_column` + `apply_transform_cell` +
-`build_and_encode_tile_col` + `encode_be_slab_to_heap_and_record`
-for write-side encode.  Tile cache invalidation per modified
-tile (full clear is simplest; per-(tile, col) eviction is an
-optimization).
-
-Stepped slice (`step != 1`) is deferred to 6c-2d since it
-needs the same tile-bucket-then-encode flow.
+rows R within tile T, columns C".  6c-2b above implements the
+"all columns" case; the remaining stages narrow the column
+selection (6c-2c), extend the row selection (6c-2d), and
+handle VLA columns (6c-2e).
 
 **Phase 6c-2c — fixed-col col/cell writes.**  Surface:
   - `hdu["col"] = arr` — one column, all tiles.

@@ -63,7 +63,7 @@ fn find_column_by_name<'a>(
 // structured scalar) or a structured ndarray with shape `()` or `(1,)`.
 // Everything else (tuple, dict, plain ndarray, etc.) is rejected with
 // a clear message — those forms can be added later if requested.
-fn coerce_to_len1_record<'py>(
+pub(crate) fn coerce_to_len1_record<'py>(
     py: Python<'py>,
     value: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {

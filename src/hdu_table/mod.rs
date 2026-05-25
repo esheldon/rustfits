@@ -23,6 +23,9 @@ pub(crate) use columns::{
 pub(crate) use hdu::{
     classify_table_key, ColumnSubset, SingleColumnSubset, TableHDU, TableKey,
 };
+pub(crate) use setitem::{
+    classify_setitem_key, coerce_to_len1_record, SetItemKey,
+};
 pub(crate) use read::{
     build_numpy_dtype, build_var_cell_value, convert_column_cell,
     field_dtype_and_shape, numpy_field_layout, read_descriptor,
