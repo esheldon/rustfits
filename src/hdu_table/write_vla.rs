@@ -175,7 +175,9 @@ pub(crate) fn extract_per_column_inputs<'py>(
 // column type rather than dtype → letter mapping).
 fn vla_cell_expected_dtype(inner_letter: char) -> (&'static str, usize) {
     match inner_letter {
-        'L' => ("b", 1),
+        // X (bit-packed) VLA: each cell is a 1-D numpy bool array of
+        // length equal to the bit count.  Same dtype kind/size as L.
+        'L' | 'X' => ("b", 1),
         'B' => ("u", 1),
         'I' => ("i", 2),
         'J' => ("i", 4),
@@ -320,12 +322,19 @@ pub(crate) fn plan_vla_heap_layout(
             if col.var_kind.is_none() {
                 continue;
             }
-            let elem_size = bytes_per_element(col.tform_letter)
-                .unwrap_or(0);
             let cell = per_col[col_idx].get_item(row_idx)?;
             let nelements = validate_vla_cell(
                 &cell, ndarray, col.tform_letter, &col.name, row_idx)?;
-            let bytes = nelements * elem_size;
+            // X (bit-packed) VLA: nelements is the bit count; the
+            // heap holds ceil(nelements/8) bytes per cell.  All
+            // other inner letters have a fixed element width.
+            let bytes = if col.tform_letter == 'X' {
+                nelements.div_ceil(8)
+            } else {
+                let elem_size = bytes_per_element(col.tform_letter)
+                    .unwrap_or(0);
+                nelements * elem_size
+            };
             plans[col_idx].push(VlaCellPlan {
                 nelements,
                 bytes_offset_in_heap: cursor,
@@ -360,6 +369,30 @@ pub(crate) fn serialize_vla_cell(
                 bytes.len(), nelements)));
         }
         dst[..nelements].copy_from_slice(&bytes);
+        return Ok(());
+    }
+    if inner_letter == 'X' {
+        // X (bit-packed) VLA cell: pack `nelements` bool source
+        // bytes (one per element in numpy) into ceil(nelements/8)
+        // MSB-first bytes; trailing bits in the last byte are
+        // zeroed per the FITS spec.  Inverse of read.rs::
+        // build_var_cell_value's X branch.
+        let buf = RawBuffer::acquire(cell)?;
+        let src = buf.as_slice();
+        if src.len() < nelements {
+            return Err(PyValueError::new_err(format!(
+                "VLA X cell buffer length {} smaller than expected \
+                 {} bools", src.len(), nelements)));
+        }
+        let n_bytes = nelements.div_ceil(8);
+        for b in dst[..n_bytes].iter_mut() {
+            *b = 0;
+        }
+        for i in 0..nelements {
+            if src[i] != 0 {
+                dst[i / 8] |= 1u8 << (7 - (i % 8));
+            }
+        }
         return Ok(());
     }
     let buf = RawBuffer::acquire(cell)?;
@@ -562,15 +595,26 @@ pub(crate) fn write_vla_data_range(
     let mut heap_buf: Vec<u8> = vec![0u8; added_heap_bytes];
     for (col_idx, col) in columns.iter().enumerate() {
         let Some(vci) = &vla[col_idx] else { continue; };
-        let elem_size = bytes_per_element(col.tform_letter)
-            .unwrap_or(0);
+        // X (bit-packed) VLA: byte count per cell is ceil(nelements/8),
+        // not nelements * elem_size — the planner already uses this
+        // rule (see plan_vla_heap_layout) so we must match it here.
+        let is_x = col.tform_letter == 'X';
+        let elem_size = if is_x {
+            0
+        } else {
+            bytes_per_element(col.tform_letter).unwrap_or(0)
+        };
         for input_row in 0..input_nrows {
             let plan = vci.plans[input_row];
             if plan.nelements == 0 { continue; }
             let cell = vci.per_col_array.get_item(input_row)?;
             let local_off =
                 plan.bytes_offset_in_heap - heap_start_offset_in_heap;
-            let n_bytes = plan.nelements * elem_size;
+            let n_bytes = if is_x {
+                plan.nelements.div_ceil(8)
+            } else {
+                plan.nelements * elem_size
+            };
             let dst = &mut heap_buf[local_off..local_off + n_bytes];
             serialize_vla_cell(&cell, col.tform_letter, plan.nelements, dst)?;
         }
@@ -727,11 +771,24 @@ pub(crate) fn write_vla_aware(
         &super_.file, data_offset, heap_offset_in_file,
         nrows, row_width, &super_.tainted)?;
 
-    // PCOUNT update — disk-write-before-commit ordering.
+    // PCOUNT update — disk-write-before-commit ordering.  Also
+    // refresh the TFORMn `(maxlen)` hint for any PX/QX columns so
+    // astropy's strict TFORM parser will accept the file (other
+    // VLA letters round-trip fine without the hint).
     let mut cards_guard = super_.header.lock()
         .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
     let mut new_cards = cards_guard.clone();
     set_pcount_in_cards(&mut new_cards, total_heap_bytes as u64);
+    for (col_idx, col) in columns.iter().enumerate() {
+        if col.tform_letter != 'X' { continue; }
+        let Some(desc) = col.var_kind else { continue; };
+        let Some(vci) = &vla[col_idx] else { continue; };
+        let max_bits = vci.plans.iter()
+            .map(|p| p.nelements).max().unwrap_or(0);
+        super::write_fixed::set_x_vla_tform_maxlen_in_cards(
+            &mut new_cards, col_idx + 1, desc, max_bits,
+        );
+    }
     {
         let mut g = lock_file(&super_.file)?;
         let f = g.as_mut()
@@ -1025,9 +1082,16 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
             }
             let nelements = nelements_s as u64;
             let old_off = old_off_s as u64;
-            let elem_size = bytes_per_element(col.tform_letter)
-                .unwrap_or(0) as u64;
-            let n_bytes = nelements * elem_size;
+            // X (bit-packed) VLA: nelements is the bit count;
+            // heap bytes per cell = ceil(nelements/8).  Other
+            // letters use a fixed element width.
+            let n_bytes = if col.tform_letter == 'X' {
+                nelements.div_ceil(8)
+            } else {
+                let elem_size = bytes_per_element(col.tform_letter)
+                    .unwrap_or(0) as u64;
+                nelements * elem_size
+            };
             if old_off + n_bytes > current_pcount {
                 return Err(PyValueError::new_err(format!(
                     "repack: column '{}' row {}: descriptor points \

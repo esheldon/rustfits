@@ -1621,16 +1621,6 @@ def test_var_missing_inner_letter_rejected():
                 fits[1].read()
 
 
-def test_var_inner_x_rejected():
-    fields = [("VLA", "1PX(10)")]
-    with tempfile.TemporaryDirectory() as tmp:
-        fname = os.path.join(tmp, "t.fits")
-        _write_bintable(fname, _bintable_cards(8, 0, fields), b"")
-        with rustfits.FITS(fname, "r") as fits:
-            with pytest.raises(ValueError, match="bit"):
-                fits[1].read()
-
-
 # ---------------------------------------------------------------------------
 # TSCAL/TZERO scaling: unsigned-int trick + general linear scaling
 # ---------------------------------------------------------------------------

@@ -340,18 +340,21 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
                 )));
             }
             let inner = inner_letter.unwrap();
-            if inner == 'X' {
-                return Err(PyValueError::new_err(format!(
-                    "column {}: variable-length TFORM='{}' inner bit type \
-                     (X) not yet supported", i, tform
-                )));
+            // X (bit-packed) is byte-flat on disk; its
+            // "bytes per element" doesn't fit the usual fixed-
+            // width model.  Skip the bytes_per_element check —
+            // the read/write paths special-case X (descriptor
+            // nelements = bit count, on-disk bytes per cell =
+            // ceil(nelements/8)).
+            if inner != 'X' {
+                bytes_per_element(inner).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "column {}: variable-length TFORM='{}' has \
+                         unsupported inner element letter '{}'",
+                        i, tform, inner,
+                    ))
+                })?;
             }
-            bytes_per_element(inner).ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "column {}: variable-length TFORM='{}' has unsupported \
-                     inner element letter '{}'", i, tform, inner
-                ))
-            })?;
             // TDIM on P/Q would mean "reshape each cell to these dims",
             // which is a useful feature but adds a heap-side reshape step.
             // Reject for now so behavior is predictable.

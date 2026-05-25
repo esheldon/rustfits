@@ -475,12 +475,19 @@ fn setitem_cell_vla(
 ) -> PyResult<()> {
     let col = &columns[col_idx];
     let descriptor_kind = col.var_kind.unwrap();
-    let elem_size = bytes_per_element(col.tform_letter).unwrap_or(0);
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
     let nelements = validate_vla_cell(
         value, &ndarray, col.tform_letter, &col.name, row_idx)?;
-    let n_bytes = nelements * elem_size;
+    // X (bit-packed) VLA: descriptor nelements is the bit count,
+    // heap bytes per cell = ceil(nelements/8).  Other letters use
+    // a fixed element width.
+    let n_bytes = if col.tform_letter == 'X' {
+        nelements.div_ceil(8)
+    } else {
+        let elem_size = bytes_per_element(col.tform_letter).unwrap_or(0);
+        nelements * elem_size
+    };
 
     let current_pcount = parse_keyword(cards, "PCOUNT")
         .unwrap_or(0).max(0) as u64;
@@ -1005,7 +1012,12 @@ pub(crate) fn setitem_single_column_vla(
 ) -> PyResult<()> {
     let col = &columns[col_idx];
     let descriptor_kind = col.var_kind.unwrap();
-    let elem_size = bytes_per_element(col.tform_letter).unwrap_or(0);
+    let is_x = col.tform_letter == 'X';
+    let elem_size = if is_x {
+        0
+    } else {
+        bytes_per_element(col.tform_letter).unwrap_or(0)
+    };
 
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
@@ -1028,7 +1040,9 @@ pub(crate) fn setitem_single_column_vla(
             col.name, dtype_kind)));
     }
 
-    // Plan + validate every cell up front.
+    // Plan + validate every cell up front.  X (bit-packed) cells
+    // contribute ceil(nelements/8) bytes per cell to the heap;
+    // other letters contribute nelements * elem_size.
     let current_pcount = parse_keyword(cards, "PCOUNT")
         .unwrap_or(0).max(0) as u64;
     let mut plans: Vec<VlaCellPlan> = Vec::with_capacity(nrows);
@@ -1040,7 +1054,12 @@ pub(crate) fn setitem_single_column_vla(
         plans.push(VlaCellPlan {
             nelements, bytes_offset_in_heap: cursor,
         });
-        cursor = cursor.checked_add(nelements * elem_size)
+        let cell_bytes = if is_x {
+            nelements.div_ceil(8)
+        } else {
+            nelements * elem_size
+        };
+        cursor = cursor.checked_add(cell_bytes)
             .ok_or_else(|| PyValueError::new_err("heap size overflow"))?;
     }
     let new_pcount = cursor as u64;
@@ -1081,7 +1100,9 @@ pub(crate) fn setitem_single_column_vla(
         }
     }
 
-    // Build the heap-bytes buffer + per-row descriptor bytes.
+    // Build the heap-bytes buffer + per-row descriptor bytes.  X
+    // (bit-packed) cells contribute ceil(nelements/8) bytes;
+    // other letters use the fixed elem_size.
     let mut heap_buf = vec![0u8; added_heap_bytes];
     let desc_width = col.byte_width;
     let mut desc_bytes = vec![0u8; nrows * desc_width];
@@ -1091,7 +1112,11 @@ pub(crate) fn setitem_single_column_vla(
         if plan.nelements > 0 {
             let local_off = plan.bytes_offset_in_heap
                 - current_pcount as usize;
-            let n_bytes = plan.nelements * elem_size;
+            let n_bytes = if is_x {
+                plan.nelements.div_ceil(8)
+            } else {
+                plan.nelements * elem_size
+            };
             serialize_vla_cell(
                 &cell, col.tform_letter, plan.nelements,
                 &mut heap_buf[local_off..local_off + n_bytes])?;

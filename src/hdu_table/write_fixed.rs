@@ -841,6 +841,45 @@ pub(crate) fn append_fixed_only(
 // PCOUNT is mandatory in BINTABLE headers so we expect it to exist;
 // fall back to inserting it just before TFIELDS if it's missing,
 // which keeps things sane for hand-built headers.
+// Rewrite the TFORMn card for a PX/QX VLA column so its optional
+// `(maxlen)` hint reflects at least `new_max_bits`.  The FITS spec
+// treats `(maxlen)` as informational (the per-cell descriptor is
+// the actual length), but astropy's TFORM parser strictly rejects
+// `1PX` without it, so we always emit the hint for X-inner VLA
+// columns.  Monotonic: if the existing TFORM already has a larger
+// hint, keep the larger value (so append/setitem never shrink it
+// below a previously-recorded peak).
+pub(crate) fn set_x_vla_tform_maxlen_in_cards(
+    new_cards: &mut Vec<String>,
+    column_index_1based: usize,
+    descriptor_kind: char,
+    new_max_bits: usize,
+) {
+    use crate::header::card_string;
+    let key = format!("TFORM{}", column_index_1based);
+    let kw_len = key.len();
+    let Some(idx) = new_cards.iter().position(|c|
+        c.len() >= kw_len && c[..kw_len].trim_end() == key
+    ) else {
+        return;  // No TFORMn card to update — shouldn't happen for
+                 // a column the caller is actively writing.
+    };
+    // Parse the existing maxlen from "1{P|Q}X(<n>)" if present.
+    let existing = new_cards[idx].as_str();
+    let mut prev_max = 0usize;
+    if let (Some(lp), Some(rp)) = (existing.find('('), existing.rfind(')')) {
+        if rp > lp {
+            if let Ok(n) = existing[lp + 1..rp].trim().parse::<usize>() {
+                prev_max = n;
+            }
+        }
+    }
+    let max_bits = prev_max.max(new_max_bits);
+    let tform = format!("1{}X({})", descriptor_kind, max_bits);
+    new_cards[idx] = card_string(
+        &key, &tform, "data format of column");
+}
+
 pub(crate) fn set_pcount_in_cards(new_cards: &mut Vec<String>, new_pcount: u64) {
     let card = card_int(
         "PCOUNT", new_pcount as i64, "size of special data area");

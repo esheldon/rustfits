@@ -47,17 +47,6 @@ pub(crate) enum BitColumnsSpec {
     Names(std::collections::HashSet<String>),
 }
 
-impl BitColumnsSpec {
-    fn contains(&self, name: &str) -> bool {
-        match self {
-            BitColumnsSpec::All => true,
-            BitColumnsSpec::Names(set) => {
-                set.contains(&name.to_uppercase())
-            }
-        }
-    }
-}
-
 // Classification of a single numpy field base dtype.  For numeric
 // kinds, `chars_per_string` is None and `elem_bytes` is the per-
 // element byte width on disk (and in memory).  For string kinds (S
@@ -281,6 +270,32 @@ pub(crate) fn dtype_to_write_columns(
                     name))),
             };
             let vc = classify_var_numpy_field(&inner_dtype_str, name)?;
+            // bit_columns can also promote a VLA bool column to X
+            // inner: same opt-in semantics as Phase 1 fixed cols.
+            // `All` silently filters to bool inners; `Names`
+            // strictly requires the listed column to be bool.
+            let inner_letter = match bit_columns {
+                None => vc.inner_letter,
+                Some(BitColumnsSpec::All) => {
+                    if vc.inner_letter == 'L' { 'X' }
+                    else { vc.inner_letter }
+                }
+                Some(BitColumnsSpec::Names(set)) => {
+                    if set.contains(&name.to_uppercase()) {
+                        if vc.inner_letter != 'L' {
+                            return Err(PyValueError::new_err(format!(
+                                "column '{}': bit_columns= entry on a \
+                                 VLA column requires bool inner type \
+                                 (var_dtypes['{}']='?'/'bool'/'b1'), \
+                                 got inner FITS letter '{}'",
+                                name, name, vc.inner_letter)));
+                        }
+                        'X'
+                    } else {
+                        vc.inner_letter
+                    }
+                }
+            };
             let descriptor_size = if descriptor == 'P' { 8 } else { 16 };
             let tunit = units.and_then(|d| {
                 d.get_item(name.as_str()).ok().flatten()
@@ -292,7 +307,7 @@ pub(crate) fn dtype_to_write_columns(
             let _ = vc.elem_size;
             out.push(WriteColumn {
                 name: name.clone(),
-                tform_letter: vc.inner_letter,
+                tform_letter: inner_letter,
                 repeat: 1,
                 byte_width: descriptor_size,
                 tzero: None,

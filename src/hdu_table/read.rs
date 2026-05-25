@@ -617,6 +617,31 @@ pub(crate) fn build_var_cell_value(
         return Ok(s.into_pyobject(py)?.into_any().unbind());
     }
     let np = py.import("numpy")?;
+    // X (bit) VLA cell: descriptor nelements is the bit count; the
+    // heap holds ceil(nelements/8) MSB-packed bytes.  Build a bool
+    // ndarray of length nelements (one byte per bool in numpy) and
+    // unpack MSB-first — the inverse of write_vla.rs::serialize
+    // for X and a per-cell version of read.rs::convert_x_cell.
+    if inner_letter == 'X' {
+        let arr = np.call_method1("empty", (nelements, "?"))?;
+        if nelements == 0 {
+            return Ok(arr.unbind());
+        }
+        let expected_bytes = nelements.div_ceil(8);
+        if src_bytes.len() != expected_bytes {
+            return Err(PyIOError::new_err(format!(
+                "variable X cell heap read length mismatch: got {} \
+                 bytes, expected {} (ceil({} bits / 8))",
+                src_bytes.len(), expected_bytes, nelements,
+            )));
+        }
+        let mut buf = RawBuffer::acquire_writable(&arr)?;
+        let dst = buf.as_mut_slice();
+        for i in 0..nelements {
+            dst[i] = (src_bytes[i / 8] >> (7 - (i % 8))) & 1;
+        }
+        return Ok(arr.unbind());
+    }
     let dtype_str: &str = match kind {
         ScalingKind::None => match inner_letter {
             'L' => "?",
@@ -719,8 +744,16 @@ fn heap_pass(
         let n = cell.nelements as usize;
         let col = &columns[cell.col_idx];
         let inner = col.tform_letter;
-        let elem_size = bytes_per_element(inner).unwrap();
-        let read_len = n * elem_size;
+        // X (bit-packed) VLA: descriptor `nelements` is the BIT count
+        // (per the FITS spec), and the on-disk heap holds
+        // ceil(nelements/8) bytes per cell.  All other inner letters
+        // have a fixed element width on disk.
+        let read_len = if inner == 'X' {
+            n.div_ceil(8)
+        } else {
+            let elem_size = bytes_per_element(inner).unwrap();
+            n * elem_size
+        };
         let abs_offset = heap_base_file + cell.heap_offset as u64;
         f.seek(SeekFrom::Start(abs_offset))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
