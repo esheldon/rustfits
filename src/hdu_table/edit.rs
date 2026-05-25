@@ -37,10 +37,16 @@ use crate::hdu::HDU;
 use crate::hdu_image::round_up_to_block;
 use crate::header::{card_int, card_string, card_uint, rewrite_header_to_disk};
 
-use super::columns::{parse_columns, Column};
-use super::write_fixed::{acquire_per_column_array, apply_transform_cell};
+use super::columns::{bytes_per_element, parse_columns, Column};
+use super::write_fixed::{
+    acquire_per_column_array, apply_transform_cell,
+    set_x_vla_tform_maxlen_in_cards,
+};
 use super::write_setup::{
     dtype_to_write_columns, WriteColumn, WriteTransform,
+};
+use super::write_vla::{
+    plan_vla_heap_layout, serialize_vla_cell, write_descriptor,
 };
 
 // Strip target: ~1 MiB per buffer.  Same constant the bulk-write path
@@ -53,6 +59,7 @@ const STRIP_TARGET_BYTES: usize = 1 << 20;
 // --------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_column_impl(
     py: Python<'_>,
     super_: &HDU,
@@ -62,6 +69,9 @@ pub(crate) fn insert_column_impl(
     after: Option<&Bound<'_, PyAny>>,
     before: Option<&Bound<'_, PyAny>>,
     unit: Option<&str>,
+    inner_dtype: Option<&str>,
+    heap_format: Option<&str>,
+    bit_packed: bool,
 ) -> PyResult<()> {
     check_not_tainted(&super_.tainted)?;
 
@@ -86,8 +96,37 @@ pub(crate) fn insert_column_impl(
     }
     let insert_idx =
         resolve_insert_index(&columns, position, after, before)?;
+
+    // Dispatch on data.dtype.kind == 'O': route Object-dtype input
+    // to the VLA-aware path (Phase: VLA insert_column), everything
+    // else to the existing fixed-column path.  The two paths share
+    // the header-card prep, insert-index resolution, and the
+    // row-shuffler shape but diverge in how the new column's bytes
+    // are produced (fixed = per-cell transform from input ndarray;
+    // VLA = descriptor bytes referencing planned heap offsets).
+    let arr_dtype = data.getattr("dtype")?;
+    let arr_kind: String = arr_dtype.getattr("kind")?.extract()?;
+    if arr_kind == "O" {
+        return insert_vla_column_impl(
+            py, super_, &cards, &columns, nrows, row_width, pcount,
+            name, data, insert_idx, unit, inner_dtype, heap_format,
+            bit_packed,
+        );
+    }
+    // Reject VLA-only kwargs on non-Object input — silent ignore
+    // would hide typos.
+    if inner_dtype.is_some() {
+        return Err(PyValueError::new_err(
+            "insert_column: inner_dtype= is only valid when data is \
+             an Object-dtype ndarray (VLA column)"));
+    }
+    if heap_format.is_some() {
+        return Err(PyValueError::new_err(
+            "insert_column: heap_format= is only valid when data is \
+             an Object-dtype ndarray (VLA column)"));
+    }
     let new_write_col =
-        build_single_write_column(py, name, data, unit)?;
+        build_single_write_column(py, name, data, unit, bit_packed)?;
     let new_col_byte_width = new_write_col.byte_width;
 
     // Input validation + RawBuffer acquisition.  The RawBuffer pins the
@@ -155,6 +194,320 @@ pub(crate) fn insert_column_impl(
     let mut cards_guard = super_.header.lock()
         .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
     *cards_guard = new_cards;
+    Ok(())
+}
+
+// VLA branch of insert_column.  Same shape as the fixed branch
+// (header rewrite → grow → relocate heap → shuffle main rows) with
+// two divergences: the new column slot in each row gets a P or Q
+// descriptor (not the cell bytes), and the cell bytes themselves
+// are written into the heap AFTER the main shuffle.  The existing
+// heap is relocated forward by `nrows * descriptor_size` (the row-
+// layout growth) plus has the new heap cells appended at its end.
+//
+// Caller must have already verified:
+//   - data.dtype.kind == "O"
+//   - name + insert_idx are valid
+//   - the HDU isn't tainted and uses the default THEAP
+#[allow(clippy::too_many_arguments)]
+fn insert_vla_column_impl(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    current_pcount: u64,
+    name: &str,
+    data: &Bound<'_, PyAny>,
+    insert_idx: usize,
+    unit: Option<&str>,
+    inner_dtype: Option<&str>,
+    heap_format: Option<&str>,
+    bit_packed: bool,
+) -> PyResult<()> {
+    let inner_dtype = inner_dtype.ok_or_else(|| PyValueError::new_err(
+        "insert_column: VLA (Object dtype) columns require the \
+         inner_dtype= kwarg (e.g. 'f4', 'i4', '?' / 'bool')",
+    ))?;
+    let desc_char = match heap_format {
+        None | Some("P") | Some("p") => 'P',
+        Some("Q") | Some("q") => 'Q',
+        Some(other) => return Err(PyValueError::new_err(format!(
+            "insert_column: heap_format must be 'P' or 'Q', got '{}'",
+            other))),
+    };
+    let descriptor_size = if desc_char == 'P' { 8usize } else { 16 };
+
+    // Build the WriteColumn via the same classifier path
+    // create_table_hdu uses: a one-field Object structured dtype +
+    // var_dtypes={name: inner_dtype} + optional bit_columns=[name].
+    let np = py.import("numpy")?;
+    let arr_shape: Vec<usize> = data.getattr("shape")?.extract()?;
+    if arr_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "insert_column: data must have at least one dimension (rows)"));
+    }
+    if arr_shape.len() != 1 || arr_shape[0] != nrows {
+        return Err(PyValueError::new_err(format!(
+            "insert_column: VLA data must be a 1-D Object ndarray \
+             of shape ({},); got {:?}", nrows, arr_shape)));
+    }
+    let field_tuple = PyTuple::new(py, [
+        name.into_py_any(py)?, "O".into_py_any(py)?,
+    ])?;
+    let descr = PyList::new(py, [field_tuple])?;
+    let np_dtype = np.getattr("dtype")?.call1((descr,))?;
+    let var_dtypes_dict = PyDict::new(py);
+    var_dtypes_dict.set_item(name, inner_dtype)?;
+    let units_dict = if let Some(u) = unit {
+        let d = PyDict::new(py);
+        d.set_item(name, u)?;
+        Some(d)
+    } else {
+        None
+    };
+    let bit_columns_spec = if bit_packed {
+        let mut set = std::collections::HashSet::new();
+        set.insert(name.to_uppercase());
+        Some(super::write_setup::BitColumnsSpec::Names(set))
+    } else {
+        None
+    };
+    let cols = dtype_to_write_columns(
+        &np_dtype,
+        units_dict.as_ref(),
+        Some(&var_dtypes_dict),
+        bit_columns_spec.as_ref(),
+        desc_char,
+    )?;
+    if cols.len() != 1 {
+        return Err(PyValueError::new_err(
+            "internal: dtype_to_write_columns returned wrong column count"));
+    }
+    let new_write_col = cols.into_iter().next().unwrap();
+    let inner_letter = new_write_col.tform_letter;
+    let is_x = inner_letter == 'X';
+
+    // Validate-then-mutate: plan the heap layout for the new
+    // column's cells using the existing planner.  Each cell's
+    // bytes_offset_in_heap is relative to the (post-relocation)
+    // heap start; we start the cursor at current_pcount so the new
+    // cells append to the existing heap.
+    let ndarray = np.getattr("ndarray")?;
+    let synth_col = synth_column_for_encode(&new_write_col)?;
+    let synth_cols = vec![synth_col];
+    let per_col_inputs: Vec<Bound<'_, PyAny>> = vec![data.clone()];
+    let (vla_plans, new_pcount_usize) = plan_vla_heap_layout(
+        &synth_cols, &per_col_inputs, nrows, &ndarray,
+        current_pcount as usize,
+    )?;
+    let new_pcount = new_pcount_usize as u64;
+    let plans = &vla_plans[0];
+
+    // Element size used for the heap-cell byte count.  X is
+    // bit-counted (not byte-counted); other letters have a fixed
+    // element width.
+    let elem_size = if is_x {
+        0  // sentinel; X path uses div_ceil(8) below
+    } else {
+        bytes_per_element(inner_letter).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "insert_column: VLA inner letter '{}' has no fixed \
+                 element width", inner_letter))
+        })?
+    };
+
+    // Header card rewrite.  Same prep as the fixed path PLUS the
+    // PCOUNT bump (the new heap grows by sum of new cell bytes).
+    let pre_width: usize = columns.iter().take(insert_idx)
+        .map(|c| c.byte_width).sum();
+    let new_row_width = row_width + descriptor_size;
+    let mut new_cards = cards.to_vec();
+    renumber_per_column_cards(&mut new_cards, insert_idx, /* delta = */ 1)?;
+    let new_column_cards = build_new_column_cards(&new_write_col, insert_idx);
+    insert_cards_before_end(&mut new_cards, &new_column_cards)?;
+    update_int_card(&mut new_cards, "TFIELDS", (columns.len() + 1) as i64)?;
+    update_int_card(&mut new_cards, "NAXIS1", new_row_width as i64)?;
+    update_int_card(&mut new_cards, "PCOUNT", new_pcount as i64)?;
+    // X-inner VLA columns get a (maxbits) hint in their TFORM so
+    // astropy's strict parser accepts the file (other libraries
+    // and the FITS spec itself treat it as informational).
+    if is_x {
+        let max_bits = plans.iter()
+            .map(|p| p.nelements).max().unwrap_or(0);
+        set_x_vla_tform_maxlen_in_cards(
+            &mut new_cards, insert_idx + 1, desc_char, max_bits,
+        );
+    }
+
+    // (1) Header rewrite first — may grow header blocks.
+    rewrite_header_to_disk(
+        &super_.file, &super_.offsets, &super_.layout,
+        &new_cards, &super_.tainted,
+    )?;
+    let data_offset = super_.offsets.data_offset();
+
+    // (2) Extend data section.
+    let old_main_bytes = (nrows * row_width) as u64;
+    let new_main_bytes = (nrows * new_row_width) as u64;
+    grow_or_shrink_data_extent(
+        super_, data_offset,
+        old_main_bytes + current_pcount,
+        new_main_bytes + new_pcount,
+    )?;
+
+    // (3) Relocate existing heap forward to sit after the new
+    //     (wider) main-row region.  The relocated heap occupies
+    //     [new_main_bytes, new_main_bytes + current_pcount); the
+    //     new cells will append at [new_main_bytes + current_pcount,
+    //     new_main_bytes + new_pcount).
+    if current_pcount > 0 {
+        relocate_region_forward(
+            &super_.file,
+            data_offset + old_main_bytes,
+            data_offset + new_main_bytes,
+            current_pcount,
+            &super_.tainted,
+        )?;
+    }
+
+    // (4) Shuffle main rows back-to-front into the new layout,
+    //     writing a descriptor (nelements, heap_offset) at the
+    //     new column's slot per row.
+    shuffle_main_for_vla_insert(
+        super_, data_offset, nrows, row_width, new_row_width,
+        pre_width, descriptor_size, desc_char, plans,
+    )?;
+
+    // (5) Write new VLA cells to the heap.  Cell K lands at
+    //     data_offset + new_main_bytes + plans[K].bytes_offset_in_heap
+    //     (the planner used heap_start_offset=current_pcount, so
+    //     new cells append at the relocated heap's tail).
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        for r in 0..nrows {
+            let plan = plans[r];
+            if plan.nelements == 0 {
+                continue;
+            }
+            let cell = data.get_item(r)?;
+            let cell_bytes = if is_x {
+                plan.nelements.div_ceil(8)
+            } else {
+                plan.nelements * elem_size
+            };
+            let mut buf = vec![0u8; cell_bytes];
+            serialize_vla_cell(&cell, inner_letter, plan.nelements, &mut buf)?;
+            let abs_offset = data_offset + new_main_bytes
+                + plan.bytes_offset_in_heap as u64;
+            f.seek(SeekFrom::Start(abs_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.write_all(&buf).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "insert_column: VLA cell heap write row {}: {}; \
+                     close + reopen", r, e))
+            })?;
+        }
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "insert_column: VLA heap flush: {}; close + reopen", e))
+        })?;
+    }
+
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    *cards_guard = new_cards;
+    Ok(())
+}
+
+// Variant of shuffle_main_for_insert for VLA columns: instead of
+// running a per-cell transform from an input buffer, emit a
+// descriptor (nelements, heap_offset) per row at the new column's
+// slot.  Heap offsets come from plan_vla_heap_layout (relative to
+// the heap start that the caller has already established with the
+// `forward` relocate).
+#[allow(clippy::too_many_arguments)]
+fn shuffle_main_for_vla_insert(
+    super_: &HDU,
+    data_offset: u64,
+    nrows: usize,
+    row_width: usize,
+    new_row_width: usize,
+    pre_width: usize,
+    descriptor_size: usize,
+    descriptor_kind: char,
+    plans: &[super::write_vla::VlaCellPlan],
+) -> PyResult<()> {
+    if nrows == 0 {
+        return Ok(());
+    }
+    let post_width = row_width - pre_width;
+    let strip_rows = ((STRIP_TARGET_BYTES / new_row_width.max(1)).max(1))
+        .min(nrows);
+    let mut old_buf = vec![0u8; strip_rows * row_width];
+    let mut new_buf = vec![0u8; strip_rows * new_row_width];
+
+    let mut row_end = nrows;
+    while row_end > 0 {
+        let chunk = row_end.min(strip_rows);
+        let row_start = row_end - chunk;
+        old_buf.resize(chunk * row_width, 0);
+        new_buf.resize(chunk * new_row_width, 0);
+        {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.seek(SeekFrom::Start(
+                data_offset + (row_start * row_width) as u64))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut old_buf).map_err(|e| {
+                super_.tainted.store(true, Ordering::Release);
+                PyIOError::new_err(format!(
+                    "insert_column (VLA): read main strip failed: {}; \
+                     close + reopen", e))
+            })?;
+        }
+        for r in 0..chunk {
+            let src_row = &old_buf[r * row_width..(r + 1) * row_width];
+            let dst_row =
+                &mut new_buf[r * new_row_width..(r + 1) * new_row_width];
+            dst_row[..pre_width].copy_from_slice(&src_row[..pre_width]);
+            let input_row = row_start + r;
+            let plan = plans[input_row];
+            write_descriptor(
+                descriptor_kind, plan.nelements, plan.bytes_offset_in_heap,
+                &mut dst_row[pre_width..pre_width + descriptor_size],
+            );
+            dst_row[pre_width + descriptor_size..]
+                .copy_from_slice(&src_row[pre_width..pre_width + post_width]);
+        }
+        {
+            let mut g = lock_file(&super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.seek(SeekFrom::Start(
+                data_offset + (row_start * new_row_width) as u64))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            if let Err(e) = f.write_all(&new_buf) {
+                super_.tainted.store(true, Ordering::Release);
+                return Err(PyIOError::new_err(format!(
+                    "insert_column (VLA): write main strip failed: {}; \
+                     close + reopen", e)));
+            }
+            if let Err(e) = f.flush() {
+                super_.tainted.store(true, Ordering::Release);
+                return Err(PyIOError::new_err(format!(
+                    "insert_column (VLA): flush failed: {}; \
+                     close + reopen", e)));
+            }
+        }
+        row_end = row_start;
+    }
     Ok(())
 }
 
@@ -781,15 +1134,17 @@ fn build_single_write_column(
     name: &str,
     data: &Bound<'_, PyAny>,
     unit: Option<&str>,
+    bit_packed: bool,
 ) -> PyResult<WriteColumn> {
+    use super::write_setup::BitColumnsSpec;
     let np = py.import("numpy")?;
     let arr_dtype = data.getattr("dtype")?;
     let arr_kind: String = arr_dtype.getattr("kind")?.extract()?;
+    // VLA is dispatched by the caller; this helper is fixed-only.
     if arr_kind == "O" {
         return Err(PyValueError::new_err(
-            "insert_column: VLA (Object dtype) columns are not yet \
-             supported on insert — rebuild the table via create_table_hdu \
-             + write if you need to add a VLA column"));
+            "internal: build_single_write_column called with Object \
+             dtype (caller should route to insert_vla_column_impl)"));
     }
     let arr_shape: Vec<usize> = data.getattr("shape")?.extract()?;
     if arr_shape.is_empty() {
@@ -823,11 +1178,21 @@ fn build_single_write_column(
     } else {
         None
     };
+    // bit_packed=true on a fixed column opts it into FITS X (one
+    // bit per element, MSB-packed); the classifier rejects if the
+    // column isn't b1.
+    let bit_columns_spec = if bit_packed {
+        let mut set = std::collections::HashSet::new();
+        set.insert(name.to_uppercase());
+        Some(BitColumnsSpec::Names(set))
+    } else {
+        None
+    };
     let cols = dtype_to_write_columns(
         &np_dtype,
         units_dict.as_ref(),
         /* var_dtypes = */ None,
-        /* bit_columns = */ None,
+        bit_columns_spec.as_ref(),
         /* descriptor (irrelevant for fixed) = */ 'P',
     )?;
     if cols.len() != 1 {

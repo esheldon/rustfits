@@ -605,9 +605,10 @@ def test_insert_shape_mismatch_rejected():
                 f[1].insert_column("d", np.arange(7, dtype="i4"))
 
 
-def test_insert_object_dtype_rejected():
+def test_insert_object_dtype_without_inner_dtype_rejected():
     """
-    VLA insertion is a follow-up; first cut rejects Object dtype.
+    Object dtype input requires the inner_dtype= kwarg to pick the
+    on-disk FITS letter (just like create_table_hdu's var_dtypes=).
     """
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
@@ -616,8 +617,31 @@ def test_insert_object_dtype_rejected():
             obj = np.empty(5, dtype="O")
             for i in range(5):
                 obj[i] = np.arange(i + 1, dtype="f4")
-            with pytest.raises(ValueError, match="VLA"):
+            with pytest.raises(ValueError, match="inner_dtype"):
                 f[1].insert_column("v", obj)
+
+
+def test_insert_inner_dtype_on_non_object_rejected():
+    """inner_dtype= is only meaningful when the input is Object."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError, match="inner_dtype"):
+                f[1].insert_column(
+                    "x", np.arange(5, dtype="i4"), inner_dtype="f4"
+                )
+
+
+def test_insert_heap_format_on_non_object_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError, match="heap_format"):
+                f[1].insert_column(
+                    "x", np.arange(5, dtype="i4"), heap_format="P"
+                )
 
 
 def test_delete_unknown_column_rejected():
@@ -701,6 +725,288 @@ def test_delete_from_large_table():
             r = f[1].read()
             np.testing.assert_array_equal(r["a"], arr["a"])
             np.testing.assert_array_equal(r["c"], arr["c"])
+
+
+# ---------------------------------------------------------------------
+# insert_column with VLA (Object dtype) input
+# ---------------------------------------------------------------------
+
+
+def _make_vla_object_array(nrows, *, inner_dtype="f4", seed=0):
+    """Build a 1-D Object ndarray of nrows cells with varying lengths."""
+    rng = np.random.default_rng(seed)
+    arr = np.empty(nrows, dtype=object)
+    for i in range(nrows):
+        n = rng.integers(0, 8)  # mix of empty / short / longer cells
+        arr[i] = rng.standard_normal(n).astype(inner_dtype)
+    return arr
+
+
+def _assert_vla_cells_equal(out_col, expected_col):
+    assert len(out_col) == len(expected_col)
+    for i in range(len(out_col)):
+        np.testing.assert_array_equal(out_col[i], expected_col[i])
+
+
+def test_insert_vla_into_fixed_table_appends_at_end():
+    """Insert PE into a fixed-only table; heap created from scratch."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=1)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, inner_dtype="f4")
+        with rustfits.FITS(fname, "r") as f:
+            out = f[1].read()
+            colnames = list(f[1].colnames)
+            tform4 = f[1].header["TFORM4"]
+            pcount = int(f[1].header["PCOUNT"])
+        assert colnames == ["a", "b", "c", "v"]
+        assert tform4.strip().upper().startswith("1PE")
+        # Fixed cols preserved.
+        original = _basic_data()
+        np.testing.assert_array_equal(out["a"], original["a"])
+        np.testing.assert_array_equal(out["b"], original["b"])
+        np.testing.assert_array_equal(out["c"], original["c"])
+        _assert_vla_cells_equal(out["v"], vla)
+        # PCOUNT equals sum of cell bytes.
+        expected_pcount = sum(c.size * 4 for c in vla)
+        assert pcount == expected_pcount
+
+
+def test_insert_vla_at_position():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=2)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, position=1, inner_dtype="f4")
+        with rustfits.FITS(fname, "r") as f:
+            colnames = list(f[1].colnames)
+            out = f[1].read()
+        assert colnames == ["a", "v", "b", "c"]
+        _assert_vla_cells_equal(out["v"], vla)
+
+
+def test_insert_vla_after_named_column():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=3)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, after="b", inner_dtype="f4")
+        with rustfits.FITS(fname, "r") as f:
+            colnames = list(f[1].colnames)
+            out = f[1].read()
+        assert colnames == ["a", "b", "v", "c"]
+        _assert_vla_cells_equal(out["v"], vla)
+
+
+def test_insert_vla_before_named_column():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=4)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, before="a", inner_dtype="f4")
+        with rustfits.FITS(fname, "r") as f:
+            colnames = list(f[1].colnames)
+            out = f[1].read()
+        assert colnames == ["v", "a", "b", "c"]
+        _assert_vla_cells_equal(out["v"], vla)
+
+
+def test_insert_vla_into_vla_bearing_table():
+    """Existing heap relocates forward; new VLA cells append to its tail."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        # Create a table with an existing VLA column.
+        dt = np.dtype([("id", "i4"), ("u", "O")])
+        u0 = _make_vla_object_array(4, seed=5)
+        data = np.zeros(4, dtype=dt)
+        data["id"] = np.arange(4, dtype="i4")
+        for i in range(4):
+            data["u"][i] = u0[i]
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=4, var_dtypes={"u": "f4"})
+            f[1].write(data)
+        # Insert a second VLA column.
+        v_new = _make_vla_object_array(4, inner_dtype="i4", seed=6)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", v_new, inner_dtype="i4")
+        with rustfits.FITS(fname, "r") as f:
+            colnames = list(f[1].colnames)
+            out = f[1].read()
+        assert colnames == ["id", "u", "v"]
+        np.testing.assert_array_equal(out["id"], data["id"])
+        _assert_vla_cells_equal(out["u"], u0)
+        _assert_vla_cells_equal(out["v"], v_new)
+
+
+def test_insert_vla_q_descriptor():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=7)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, inner_dtype="f4", heap_format="Q")
+        with rustfits.FITS(fname, "r") as f:
+            tform4 = f[1].header["TFORM4"]
+            out = f[1].read()
+        assert tform4.strip().upper().startswith("1QE")
+        _assert_vla_cells_equal(out["v"], vla)
+
+
+def test_insert_vla_bit_packed_px():
+    """bit_packed=True + bool inner → PX column."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        nrows = 5
+        bool_cells = np.empty(nrows, dtype=object)
+        rng = np.random.default_rng(8)
+        for i in range(nrows):
+            n = rng.integers(0, 17)
+            bool_cells[i] = rng.integers(0, 2, n, dtype=bool)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column(
+                "flags", bool_cells, inner_dtype="?", bit_packed=True
+            )
+        with rustfits.FITS(fname, "r") as f:
+            tform4 = f[1].header["TFORM4"]
+            out = f[1].read()
+        assert "X" in tform4.upper()
+        _assert_vla_cells_equal(out["flags"], bool_cells)
+
+
+def test_insert_vla_empty_cells():
+    """All-empty VLA insert: descriptors record (0,0); heap stays size 0."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = np.empty(5, dtype=object)
+        for i in range(5):
+            vla[i] = np.array([], dtype="f4")
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, inner_dtype="f4")
+        with rustfits.FITS(fname, "r") as f:
+            pcount = int(f[1].header["PCOUNT"])
+            out = f[1].read()
+        assert pcount == 0
+        for i in range(5):
+            assert len(out["v"][i]) == 0
+
+
+def test_insert_vla_wrong_row_count_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        wrong = np.empty(3, dtype=object)
+        for i in range(3):
+            wrong[i] = np.arange(2, dtype="f4")
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError):
+                f[1].insert_column("v", wrong, inner_dtype="f4")
+
+
+def test_insert_vla_unknown_inner_dtype_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=9)
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError):
+                f[1].insert_column("v", vla, inner_dtype="nonsense")
+
+
+def test_insert_vla_wrong_inner_cell_dtype_rejected():
+    """Cells must match the declared inner_dtype."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = np.empty(5, dtype=object)
+        for i in range(5):
+            vla[i] = np.arange(2, dtype="i4")  # i4, not f4
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError):
+                f[1].insert_column("v", vla, inner_dtype="f4")
+
+
+def test_insert_vla_name_collision_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=10)
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError, match="already exists"):
+                f[1].insert_column("a", vla, inner_dtype="f4")
+
+
+def test_insert_vla_non_last_hdu_preserves_trailing():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        # Add a trailing image HDU.
+        trail = np.arange(40, dtype="i2")
+        with rustfits.FITS(fname, "r+") as f:
+            f.create_image_hdu("i2", trail.shape, extname="TRAIL")
+            f[2].write(trail)
+        vla = _make_vla_object_array(5, seed=11)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, inner_dtype="f4")
+            np.testing.assert_array_equal(f[2].read(), trail)
+            assert f[2].extname == "TRAIL"
+        with rustfits.FITS(fname, "r") as f:
+            out = f[1].read()
+            np.testing.assert_array_equal(f[2].read(), trail)
+            assert f[2].extname == "TRAIL"
+        _assert_vla_cells_equal(out["v"], vla)
+
+
+def test_insert_vla_then_delete_restores_table():
+    """insert + delete round-trips the column layout AND the heap."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        # Start with a VLA column so the delete reclaims the inserted
+        # column's bytes (delete itself leaves cells as orphans;
+        # repack reclaims).
+        dt = np.dtype([("id", "i4"), ("u", "O")])
+        u0 = _make_vla_object_array(4, seed=12)
+        data = np.zeros(4, dtype=dt)
+        data["id"] = np.arange(4, dtype="i4")
+        for i in range(4):
+            data["u"][i] = u0[i]
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=4, var_dtypes={"u": "f4"})
+            f[1].write(data)
+        v = _make_vla_object_array(4, seed=13)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", v, inner_dtype="f4")
+            f[1].delete_column("v")
+            f[1].repack()
+        with rustfits.FITS(fname, "r") as f:
+            colnames = list(f[1].colnames)
+            out = f[1].read()
+        assert colnames == ["id", "u"]
+        _assert_vla_cells_equal(out["u"], u0)
+
+
+def test_insert_vla_astropy_cross_read():
+    pytest.importorskip("astropy")
+    import astropy.io.fits as ap
+
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_table(fname)
+        vla = _make_vla_object_array(5, seed=14)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].insert_column("v", vla, inner_dtype="f4")
+        with ap.open(fname) as hdul:
+            ap_v = hdul[1].data["v"]
+        for i in range(5):
+            np.testing.assert_array_equal(
+                np.asarray(ap_v[i], dtype="f4"), vla[i].astype("f4")
+            )
 
 
 if __name__ == "__main__":

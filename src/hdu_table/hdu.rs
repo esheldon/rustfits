@@ -585,7 +585,9 @@ impl TableHDU {
     // I/O failures taint the file (close + reopen to recover).
     #[pyo3(signature = (
         name, data, *, position=None, after=None, before=None, unit=None,
+        inner_dtype=None, heap_format=None, bit_packed=false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn insert_column(
         slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -595,10 +597,14 @@ impl TableHDU {
         after: Option<&Bound<'_, PyAny>>,
         before: Option<&Bound<'_, PyAny>>,
         unit: Option<&str>,
+        inner_dtype: Option<&str>,
+        heap_format: Option<&str>,
+        bit_packed: bool,
     ) -> PyResult<()> {
         let super_: PyRefMut<HDU> = slf.into_super();
         insert_column_impl(
             py, &super_, name, data, position, after, before, unit,
+            inner_dtype, heap_format, bit_packed,
         )
     }
 
