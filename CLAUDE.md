@@ -2414,18 +2414,29 @@ Per HDU type:
   FITS Tile Compression Convention, the integrity check is
   against the *equivalent uncompressed image*, not the
   on-disk BINTABLE).  Astropy uses the same convention.
-- **CompressedTableHDU** (fixed columns): same ZHECKSUM +
-  ZDATASUM convention; the equivalent uncompressed bytes are
-  reconstructed tile-by-tile (decode each (tile, col) blob to
-  BE bytes, interleave per row) and fed to a streaming
-  checksum.  Peak memory bounded at one tile's main buffer +
-  per-column slab, regardless of file size.  VLA-bearing
-  compressed tables raise `NotImplementedError` —
-  reconstructing the equivalent-uncompressed heap with the
-  file's original cell offsets is a deferred follow-up;
-  workaround is to rebuild via `create_table_hdu` (without
-  compress) + `write`, then `add_checksum` the uncompressed
-  TableHDU.
+- **CompressedTableHDU** (fixed + VLA columns): same
+  ZHECKSUM + ZDATASUM convention; the equivalent
+  uncompressed bytes are reconstructed tile-by-tile (decode
+  each (tile, col) blob to BE bytes, interleave per row)
+  and fed to a streaming checksum.  For VLA columns: the
+  per-tile dual-descriptor blob is GZIP-decompressed, the
+  ORIGINAL P/Q descriptors are copied into the tile's main
+  buffer at the column's offset, and per-cell metadata
+  `(orig_offset, vlalen, cvlalen, cvlastart, col_idx)` is
+  collected.  After the tile walk feeds all main buffers,
+  cell metadata is sorted by `orig_offset` and walked in
+  order: gap bytes between cells (zero padding from sparse
+  layouts) are fed as zeros in <=64 KiB chunks, then each
+  cell's compressed bytes are read from the heap and
+  decompressed to BE (with cfitsio's uncompressed-fallback
+  branch when `cvlalen == vlalen * elem_size`) and fed to
+  the stream.  Trailing zeros are fed to reach ZPCOUNT.
+  Peak memory bounded at one tile's main buffer + one
+  decompressed dual-desc blob + one per-cell decoded buffer
+  + the cell-metadata vector (~40 bytes per non-empty VLA
+  cell), regardless of file size.  Compressed-VLA-X cells
+  are rejected (matches the read-path scope: X inner letter
+  isn't supported in compressed VLA columns).
 
 Manual semantics — re-run `add_checksum()` after any mutation
 (write / __setitem__ / extend / append).  Auto-update on
@@ -2490,18 +2501,22 @@ independence, None when absent, corruption detection on
 ZDATASUM card + heap byte, astropy/fitsio cross-verify
 (uncompressed), algorithm matrix (compressed image), ZDATASUM
 = uncompressed-equivalent DATASUM.
-Plus `tests/test_compressed_table_checksum.py` (17 cases) for
+Plus `tests/test_compressed_table_checksum.py` (22 cases) for
 the table side: round-trip with various nrows/ztilelen
 combinations (single tile, partial last tile, parametrized
 matrix), add_datasum-only, verify-None-when-absent, ZDATASUM
 card corruption detection, heap-byte corruption raising
 ValueError (mirrors the image-side test), ZDATASUM equals
-the DATASUM of the equivalent uncompressed table, VLA-bearing
-table rejection with a clear NotImplementedError, funpack
+the DATASUM of the equivalent uncompressed table, funpack
 cross-tool (cfitsio decompresses our file → the reconstructed
 DATASUM matches our ZDATASUM), same-handle vs reopen parity,
-and refresh-after-setitem (re-running add_checksum on a
-mutated table picks up the new value).
+refresh-after-setitem (re-running add_checksum on a mutated
+table picks up the new value), and VLA-bearing tables across
+six cases: VLA-only round trip, mixed fixed+VLA round trip,
+empty cells, ZDATASUM equals the uncompressed-equivalent
+DATASUM (anchors the synthetic-heap walk), ZDATASUM card
+corruption detected, and funpack-decompresses VLA file →
+DATASUM matches ZDATASUM (strongest interop check).
 
 ## Tile-compressed tables (ZTABLE) roadmap
 

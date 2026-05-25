@@ -7,10 +7,11 @@ values are computed against the EQUIVALENT UNCOMPRESSED table — the
 BITPIX-native big-endian bytes the original BINTABLE would have
 stored.  Astropy + cfitsio use the same convention.
 
-Scope: fixed-column compressed tables.  VLA-bearing compressed
-tables raise NotImplementedError (reconstructing the equivalent-
-uncompressed heap with the file's original cell offsets is a
-deferred follow-up); the rejection path is tested here too.
+Scope: fixed-column AND VLA-bearing compressed tables.  For VLA
+columns, the per-tile dual-descriptor blob is decompressed and the
+original P/Q descriptors + per-cell metadata are fed through a
+synthetic-heap walk sorted by original-offset; compressed-VLA-X
+cells (X inner letter) are rejected to match the read-path scope.
 
 The streaming implementation walks tiles one at a time and feeds
 the running checksum incrementally, so peak memory stays bounded
@@ -278,33 +279,203 @@ def test_compressed_table_round_trip_matrix(nrows, ztilelen):
 
 
 # ---------------------------------------------------------------------
-# VLA-bearing tables rejected with a clear pointer
+# VLA-bearing compressed tables — round-trip + interop
 # ---------------------------------------------------------------------
 
 
-def test_compressed_vla_table_checksum_rejected():
-    """VLA-bearing compressed-table checksums raise (deferred)."""
+def _make_vla_only_table(fname, *, nrows=8, ztilelen=4):
+    """VLA-only table: id (fixed i4) + v (VLA f4) with varying lengths."""
+    dt = np.dtype([("id", "i4"), ("v", "O")])
+    with rustfits.FITS(fname, "w+") as f:
+        f.create_table_hdu(
+            dt,
+            nrows=nrows,
+            compress=True,
+            ztilelen=ztilelen,
+            var_dtypes={"v": "f4"},
+        )
+        data = np.zeros(nrows, dtype=dt)
+        data["id"] = np.arange(nrows, dtype="i4")
+        for i in range(nrows):
+            data["v"][i] = np.arange(i + 1, dtype="f4") + 0.5
+        f[1].write(data)
+
+
+def test_compressed_vla_round_trip():
+    """VLA-bearing table — add + verify, same handle + reopen."""
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
+        _make_vla_only_table(fname, nrows=12, ztilelen=4)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].add_checksum()
+            assert "ZDATASUM" in f[1].header
+            assert "ZHECKSUM" in f[1].header
+            assert f[1].verify_datasum() is True
+            assert f[1].verify_checksum() is True
+        with rustfits.FITS(fname) as f:
+            assert f[1].verify_datasum() is True
+            assert f[1].verify_checksum() is True
+
+
+def test_compressed_vla_mixed_fixed_round_trip():
+    """Table with both fixed and VLA columns — checksum round-trips."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 20
+        dt = np.dtype([("id", "i4"), ("flag", "i2"), ("v", "O"), ("w", "O")])
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(
+                dt,
+                nrows=nrows,
+                compress=True,
+                ztilelen=7,
+                var_dtypes={"v": "f8", "w": "i4"},
+            )
+            data = np.zeros(nrows, dtype=dt)
+            data["id"] = np.arange(nrows, dtype="i4")
+            data["flag"] = (np.arange(nrows, dtype="i2") * 3) % 7
+            for i in range(nrows):
+                data["v"][i] = np.linspace(0.0, 1.0, i + 2)
+                data["w"][i] = np.arange(i, dtype="i4")
+            f[1].write(data)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].add_checksum()
+            assert f[1].verify_datasum() is True
+            assert f[1].verify_checksum() is True
+        with rustfits.FITS(fname) as f:
+            assert f[1].verify_datasum() is True
+            assert f[1].verify_checksum() is True
+
+
+def test_compressed_vla_with_empty_cells():
+    """Empty VLA cells (vlalen=0) — must still round-trip cleanly."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 6
         dt = np.dtype([("id", "i4"), ("v", "O")])
         with rustfits.FITS(fname, "w+") as f:
             f.create_table_hdu(
                 dt,
-                nrows=5,
+                nrows=nrows,
                 compress=True,
                 ztilelen=3,
                 var_dtypes={"v": "f4"},
             )
-            data = np.zeros(5, dtype=dt)
-            data["id"] = np.arange(5, dtype="i4")
-            for i in range(5):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
+            data = np.zeros(nrows, dtype=dt)
+            data["id"] = np.arange(nrows, dtype="i4")
+            # Alternating empty / non-empty.
+            for i in range(nrows):
+                data["v"][i] = (
+                    np.empty(0, dtype="f4")
+                    if i % 2 == 0
+                    else np.arange(i, dtype="f4")
+                )
             f[1].write(data)
         with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError, match="VLA"):
-                f[1].add_datasum()
-            with pytest.raises(NotImplementedError, match="VLA"):
-                f[1].add_checksum()
+            f[1].add_checksum()
+            assert f[1].verify_datasum() is True
+            assert f[1].verify_checksum() is True
+
+
+def test_compressed_vla_zdatasum_equals_uncompressed_datasum():
+    """
+    ZDATASUM of a VLA-bearing compressed table equals the DATASUM of
+    the equivalent uncompressed table.  Strongest correctness check
+    for the synthetic-heap walk — anchors that the bytes we feed
+    into the checksum match what an uncompressed file would store.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        fname_z = os.path.join(td, "z.fits")
+        fname_u = os.path.join(td, "u.fits")
+        nrows = 12
+        dt = np.dtype([("id", "i4"), ("v", "O")])
+        data = np.zeros(nrows, dtype=dt)
+        data["id"] = np.arange(nrows, dtype="i4")
+        for i in range(nrows):
+            data["v"][i] = np.arange(i + 1, dtype="f4") + 0.5
+        with rustfits.FITS(fname_z, "w+") as f:
+            f.create_table_hdu(
+                dt,
+                nrows=nrows,
+                compress=True,
+                ztilelen=4,
+                var_dtypes={"v": "f4"},
+            )
+            f[1].write(data)
+        with rustfits.FITS(fname_u, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, var_dtypes={"v": "f4"})
+            f[1].write(data)
+        with rustfits.FITS(fname_z, "r+") as f:
+            f[1].add_datasum()
+            z = f[1].header["ZDATASUM"]
+        with rustfits.FITS(fname_u, "r+") as f:
+            f[1].add_datasum()
+            u = f[1].header["DATASUM"]
+        assert z == u
+
+
+def test_compressed_vla_zdatasum_corruption_detected():
+    """ZDATASUM card corruption on a VLA-bearing table — verify→False."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_vla_only_table(fname, nrows=8, ztilelen=4)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].add_checksum()
+            original = f[1].header["ZDATASUM"]
+        with open(fname, "rb") as fp:
+            buf = fp.read()
+        idx = buf.find(b"ZDATASUM= '")
+        assert idx > 0
+        val_start = idx + len(b"ZDATASUM= '")
+        digit_off = None
+        for k in range(20):
+            ch = buf[val_start + k]
+            if ch == ord("'"):
+                break
+            if ord("0") <= ch <= ord("9"):
+                digit_off = val_start + k
+                break
+        assert digit_off is not None
+        orig_digit = buf[digit_off]
+        new_digit = ord("0") if orig_digit != ord("0") else ord("1")
+        with open(fname, "r+b") as fp:
+            fp.seek(digit_off)
+            fp.write(bytes([new_digit]))
+        with rustfits.FITS(fname) as f:
+            assert f[1].header["ZDATASUM"] != original
+            assert f[1].verify_datasum() is False
+
+
+@pytest.mark.skipif(
+    not _have_funpack() or not _have_fitsio(),
+    reason="funpack + fitsio required for cross-tool verification",
+)
+def test_compressed_vla_funpack_verifies_zdatasum():
+    """
+    funpack our VLA-bearing compressed file; the resulting
+    uncompressed table's DATASUM must match our ZDATASUM (per the
+    convention).  Catches any byte-ordering / offset / padding bug
+    in the synthetic-heap reconstruction.
+    """
+    import fitsio
+
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _make_vla_only_table(fname, nrows=10, ztilelen=4)
+        with rustfits.FITS(fname, "r+") as f:
+            f[1].add_checksum()
+            zdatasum = int(f[1].header["ZDATASUM"])
+        out = os.path.join(td, "unfz.fits")
+        subprocess.run(
+            ["funpack", "-O", out, fname],
+            check=True,
+            capture_output=True,
+        )
+        with fitsio.FITS(out, "r") as f:
+            hdr = f[1].read_header()
+            ds = hdr.get("DATASUM")
+            assert ds is not None, "funpack didn't carry DATASUM"
+            assert int(ds) == zdatasum
 
 
 # ---------------------------------------------------------------------

@@ -5234,6 +5234,18 @@ fn normalize_disk_row(i: i64, nrows: usize) -> PyResult<usize> {
 //
 // `seed` is the running checksum seed — pass 0 for DATASUM, or the
 // already-summed header bytes for the verify_checksum path.
+// Per-VLA-cell metadata collected during the tile walk, then sorted
+// by original_offset for the synthetic-heap pass.  Holds just enough
+// to read + decompress the cell at feed time; the compressed bytes
+// themselves stay on disk until needed.  ~40 bytes per cell.
+struct VlaCellMeta {
+    orig_offset: u64,
+    vlalen: usize,
+    cvlalen: usize,
+    cvlastart: u64,
+    col_idx: usize,
+}
+
 fn stream_uncompressed_table_data_checksum(
     super_: &HDU,
     seed: u32,
@@ -5244,19 +5256,13 @@ fn stream_uncompressed_table_data_checksum(
     let cards = super_.header_snapshot()?;
     let virtual_cards = synthesize_uncompressed_cards(&cards);
     let columns = parse_columns(&virtual_cards)?;
-    if columns.iter().any(|c| c.var_kind.is_some()) {
-        return Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU checksum: VLA-bearing tables aren't \
-             supported yet (reconstructing the equivalent-uncompressed \
-             heap with the file's original cell offsets is a deferred \
-             follow-up).  Workaround: rebuild via create_table_hdu \
-             (without compress) + write, then add_checksum the \
-             uncompressed TableHDU"));
-    }
+    let any_vla = columns.iter().any(|c| c.var_kind.is_some());
     let nrows_orig = parse_keyword(&cards, "ZNAXIS2")
         .unwrap_or(0).max(0) as usize;
     let row_width = parse_keyword(&cards, "ZNAXIS1")
         .unwrap_or(0).max(0) as usize;
+    let zpcount = parse_keyword(&cards, "ZPCOUNT")
+        .unwrap_or(0).max(0) as u64;
     let n_tiles = parse_keyword(&cards, "NAXIS2")
         .unwrap_or(0).max(0) as usize;
     let ztilelen = parse_keyword(&cards, "ZTILELEN")
@@ -5279,6 +5285,9 @@ fn stream_uncompressed_table_data_checksum(
 
     let mut stream = crate::checksum::ChecksumStream::new(seed);
     let mut tile_buf: Vec<u8> = Vec::new();
+    // Collected per-VLA-cell metadata across the tile walk; sorted
+    // by orig_offset before the heap pass.  Empty when no VLA cols.
+    let mut vla_cells: Vec<VlaCellMeta> = Vec::new();
     for tile_idx in 0..n_tiles {
         let tile_row_start = tile_idx * ztilelen;
         let rows_in_tile = if tile_idx + 1 == n_tiles {
@@ -5289,6 +5298,68 @@ fn stream_uncompressed_table_data_checksum(
         tile_buf.clear();
         tile_buf.resize(rows_in_tile * row_width, 0);
         for (col_idx, col) in columns.iter().enumerate() {
+            if col.var_kind.is_some() {
+                // VLA column: decode the dual-descriptor blob and
+                // copy the ORIGINAL P/Q descriptors into the tile
+                // main buffer at the row's col.byte_offset slot;
+                // also collect per-cell metadata (vlalen, cvlalen,
+                // cvlastart, orig_offset) for the heap pass below.
+                let blob = read_vla_merge_old_blob(
+                    &super_.file, data_offset, tile_idx, col_idx,
+                    col, rows_in_tile, n_tiles, descriptor_row_width,
+                )?;
+                let width_orig = blob.width_orig;
+                let comp_desc_start = rows_in_tile * width_orig;
+                let orig_kind = col.var_kind.unwrap();
+                for r in 0..rows_in_tile {
+                    let orig_desc_off = r * width_orig;
+                    let orig_desc = &blob.decompressed
+                        [orig_desc_off..orig_desc_off + width_orig];
+                    let (vlalen_s, orig_off_s) =
+                        read_descriptor(orig_kind, orig_desc);
+                    if vlalen_s < 0 || orig_off_s < 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "compressed table checksum: tile {} col '{}' \
+                             row {} original descriptor has negative \
+                             field (vlalen={}, orig_offset={})",
+                            tile_idx, col.name, r, vlalen_s, orig_off_s)));
+                    }
+                    // Copy the original descriptor into the tile main
+                    // buffer at this row's col.byte_offset slot — same
+                    // bytes the equivalent uncompressed table would
+                    // store in its main rows.
+                    let dst_off = r * row_width + col.byte_offset;
+                    tile_buf[dst_off..dst_off + width_orig]
+                        .copy_from_slice(orig_desc);
+                    // Collect per-cell metadata for non-empty cells;
+                    // empty cells contribute zero bytes to the heap.
+                    let vlalen = vlalen_s as usize;
+                    if vlalen == 0 {
+                        continue;
+                    }
+                    let comp_off = comp_desc_start + r * 16;
+                    let (cvlalen_s, cvlastart_s) = read_descriptor(
+                        'Q', &blob.decompressed[comp_off..comp_off + 16]);
+                    if cvlalen_s < 0 || cvlastart_s < 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "compressed table checksum: tile {} col '{}' \
+                             row {} compressed descriptor has negative \
+                             field (cvlalen={}, cvlastart={})",
+                            tile_idx, col.name, r,
+                            cvlalen_s, cvlastart_s)));
+                    }
+                    vla_cells.push(VlaCellMeta {
+                        orig_offset: orig_off_s as u64,
+                        vlalen,
+                        cvlalen: cvlalen_s as usize,
+                        cvlastart: cvlastart_s as u64,
+                        col_idx,
+                    });
+                }
+                continue;
+            }
+            // Fixed column: decode (tile, col) blob to BE bytes,
+            // interleave into the tile main buffer.
             let slab = decode_existing_tile_to_be_bytes(
                 &super_.file, &cards, data_offset, tile_idx, col_idx,
                 col, algorithms[col_idx], rows_in_tile,
@@ -5305,12 +5376,97 @@ fn stream_uncompressed_table_data_checksum(
         stream.feed(&tile_buf);
     }
 
+    // Heap pass.  For VLA-bearing tables, walk per-cell metadata in
+    // ORIGINAL-OFFSET order so we feed the synthetic heap bytes in
+    // the order they'd appear in a real uncompressed file.  Between
+    // cells we fill gaps with zeros (some writers may use sparse
+    // layouts).  After the last cell, pad to ZPCOUNT.
+    if any_vla {
+        vla_cells.sort_by_key(|c| c.orig_offset);
+        let heap_start = data_offset
+            + (n_tiles as u64) * (descriptor_row_width as u64);
+        let mut current_pos: u64 = 0;
+        // Reusable zero-pad buffer for gap fills.
+        const ZERO_CHUNK: usize = 1 << 16;  // 64 KiB
+        let zeros = vec![0u8; ZERO_CHUNK];
+        let feed_zeros = |stream: &mut crate::checksum::ChecksumStream,
+                          count: u64| {
+            let mut remaining = count;
+            while remaining > 0 {
+                let n = remaining.min(ZERO_CHUNK as u64) as usize;
+                stream.feed(&zeros[..n]);
+                remaining -= n as u64;
+            }
+        };
+        // Re-used per-cell buffers.  Lock the file once for the
+        // whole heap pass.
+        let mut compressed = Vec::<u8>::new();
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        for cell in &vla_cells {
+            // Gap to this cell's start.
+            if cell.orig_offset < current_pos {
+                return Err(PyValueError::new_err(format!(
+                    "compressed table checksum: VLA cell at orig_offset \
+                     {} overlaps a previous cell (current_pos={})",
+                    cell.orig_offset, current_pos)));
+            }
+            if cell.orig_offset > current_pos {
+                feed_zeros(&mut stream, cell.orig_offset - current_pos);
+                current_pos = cell.orig_offset;
+            }
+            // Read the cell's compressed bytes from the heap.
+            compressed.resize(cell.cvlalen, 0);
+            f.seek(SeekFrom::Start(heap_start + cell.cvlastart))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut compressed).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "compressed table checksum: read VLA cell at \
+                     cvlastart={}: {}", cell.cvlastart, e))
+            })?;
+            // Decompress to BE bytes (with uncompressed-fallback per
+            // cfitsio's table-compression convention).
+            let col = &columns[cell.col_idx];
+            let elem_size = bytes_per_element(col.tform_letter)
+                .ok_or_else(|| PyValueError::new_err(format!(
+                    "compressed table checksum: column '{}' inner \
+                     letter '{}' isn't supported in VLA checksum \
+                     (X-inner VLA in compressed tables is a deferred \
+                     follow-up)", col.name, col.tform_letter)))?;
+            let raw_bytes_len = cell.vlalen.checked_mul(elem_size)
+                .ok_or_else(|| PyValueError::new_err(
+                    "compressed table checksum: VLA cell size overflow"))?;
+            let cell_be_bytes = if cell.cvlalen == raw_bytes_len {
+                // Uncompressed fallback — bytes are already BE.
+                compressed.clone()
+            } else {
+                decompress_vla_cell(
+                    algorithms[cell.col_idx], &compressed, col, cell.vlalen,
+                )?
+            };
+            stream.feed(&cell_be_bytes);
+            current_pos += cell_be_bytes.len() as u64;
+        }
+        // Trailing zeros to reach ZPCOUNT.
+        if current_pos > zpcount {
+            return Err(PyValueError::new_err(format!(
+                "compressed table checksum: VLA cells exceed ZPCOUNT \
+                 (sum={}, ZPCOUNT={})", current_pos, zpcount)));
+        }
+        if current_pos < zpcount {
+            feed_zeros(&mut stream, zpcount - current_pos);
+        }
+        drop(g);
+    }
+
     // Feed BLOCK_SIZE zero-pad so the equivalent-uncompressed data
     // section ends on the FITS block boundary it would naturally
     // have if it were stored uncompressed.
     let total_main = (nrows_orig as u64) * (row_width as u64);
-    let padded = round_up_to_block(total_main);
-    let pad = (padded - total_main) as usize;
+    let total_data = total_main + zpcount;
+    let padded = round_up_to_block(total_data);
+    let pad = (padded - total_data) as usize;
     if pad > 0 {
         // Pad in <= BLOCK_SIZE chunks (only one needed in practice;
         // BLOCK_SIZE = 2880).
