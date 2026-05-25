@@ -734,19 +734,16 @@ against `nomask`.
    a P/Q column would mean "reshape each heap cell to these dims",
    useful for VLA-of-images.  Each cell still uses the inner element
    type; the reshape is just on the ndarray after the heap read.
-3. **Variable-length P/QX (bit array in heap)** — rejected (inner X).
-   Niche.  Heap bytes are the same MSB-packed format as fixed X;
-   the heap-side unpacker would mirror `convert_x_cell`.
-4. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
+3. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
    columns with TNULL in the header are rejected when `mask_null=
    True`.  Adding support means a per-row bool ndarray for each
    masked VLA cell (parallel Object dtype mask field, or
    MaskedArrays for each cell — decide representation before coding).
-5. **`max_size`-style read for variable columns** — fitsio offers a
+4. **`max_size`-style read for variable columns** — fitsio offers a
    mode where each variable cell becomes a fixed-size N-D array
    padded to the largest cell.  Explicitly deferred (user request);
    noted here so we don't forget.
-6. **`TDISPn`** — display format hint.  Informational, similar
+5. **`TDISPn`** — display format hint.  Informational, similar
    shape to TUNIT but rarely used.
 
 ### Table write
@@ -961,11 +958,89 @@ fine for tables small enough to fit in RAM, which is the typical
 "I want to add a column" workload.
 
 **Missing (low priority / niche):**
-- **Bit VLAs (`PX`) on write** — paired with the read-side gap.
-- **`X` (bit) columns on write** — numpy `bool` currently maps to
-  `L` (one byte per bool).  True `X` would need an explicit opt-in.
 - **ASCII tables (creating, writing)** — rare in modern files.
 - **`TDISPn` on write** — informational, low priority.
+
+### Bit-packed `X` columns
+
+FITS `X` columns store booleans 8-per-byte (MSB-first within
+each byte; trailing bits in the last byte are zero).  Default
+for `numpy.bool_` stays `L` (one byte per bool) for ecosystem
+parity with astropy / fitsio / cfitsio — those all default to
+`L` as well, and rustfits files would look unusual in diff/repr
+if we flipped the default.  Opt-in is via the `bit_columns=`
+kwarg on `create_table_hdu`:
+
+  - `bit_columns=["flags", "mask"]` — per-column opt-in (most
+    explicit).  Listed name must resolve to a bool column on
+    disk; non-bool / unknown names rejected with a clear
+    message.  Name matching is case-insensitive against the
+    table columns.
+  - `bit_columns=True` — soft global toggle.  Promotes ALL b1
+    columns to `X`; leaves non-bool columns at their natural
+    letter.  Matches fitsio's `write_bitcols=True` semantics.
+  - `bit_columns=False` / `None` / absent — default: b1 stays
+    as `L`.
+
+Works for both fixed and VLA columns:
+
+  - **Fixed `X` / `NX`**: scalar `b1` → `1X`, subarray
+    `("mask", "b1", (4, 8))` → `32X` + `TDIM='(8,4)'`.
+    Non-multiple-of-8 repeats (`13X` → 2 bytes/row, top 13
+    bits used, bottom 3 zero) round-trip correctly.
+  - **VLA `PX`/`QX`**: combine `var_dtypes={col: "?"}` (or
+    `"bool"` / `"b1"`) with `bit_columns=[col]`.  Without
+    `bit_columns`, a bool VLA stays as `PL`/`QL` (one byte per
+    bool on the heap).  With it, the heap holds
+    `ceil(nelements/8)` MSB-packed bytes per cell.  Per the
+    FITS spec, the descriptor's `nelements` is the BIT count
+    (not byte count).
+
+  The compressed-table path (`compress=...`) also handles `X`
+  columns — they go through `GZIP_1` (the only algorithm
+  cfitsio's table compressor accepts for X).
+
+**Implementation.**  Read path is straightforward — `convert_x_cell`
+(fixed) and `build_var_cell_value`'s X branch (VLA) MSB-unpack
+into a numpy bool ndarray.  Write path adds a
+`WriteTransform::BitsPackMsb { num_bits }` variant (slow-path
+only — source per-cell width = `num_bits` bytes, destination
+width = `ceil(num_bits/8)` bytes, so the bulk-memcpy fast path
+can't apply; `prepare_structured_input` forces
+`layout_matches = false` whenever any column is `X`).  The
+classifier (`classify_scalar_numpy_field` / `dtype_to_write_columns`'s
+VLA branch) consults `bit_columns` to override `L` → `X` per
+the rules above.  `bytes_per_element('X')` returns `None`
+(X is bit-counted, not byte-counted); every byte-size
+computation in the write/append/setitem/repack paths
+explicitly branches on `tform_letter == 'X'` to use
+`ceil(nelements/8)`.
+
+**Astropy `(maxlen)` hint on PX/QX.**  The FITS spec treats
+the `(maxlen)` field on `1PX(N)` as informational (the real
+per-cell length is the descriptor's `nelements`), but
+astropy's `from_tform()` rejects `1PX` without it (regex
+parses fine, but `FITS2NUMPY` doesn't include `X` — see the
+documented limitation note below).  rustfits emits
+`1{P,Q}X(maxbits)` after each VLA-X write via
+`set_x_vla_tform_maxlen_in_cards`; the update is monotonic
+(an `append` or `__setitem__` that lengthens a cell bumps the
+hint, but a shorter write never decreases it).  Other VLA
+letters (`PE`, `PJ`, etc.) still ship without the hint
+because no library needs it for those.
+
+**Astropy limitation (documented, not a bug here).**
+`astropy.io.fits.column.FITS2NUMPY` doesn't include `'X'`, so
+even with `(maxlen)` present, `_FormatP.from_tform('1PX(N)')`
+raises `VerifyError: Invalid column format`.  rustfits' tests
+pin this limitation (`test_astropy_pxqx_documented_limitation`)
+so an astropy upgrade that adds X support surfaces here.
+fitsio reads PX/QX correctly (with a one-time warning about
+the maxlen) and cfitsio supports it natively, so cross-tool
+interop is solid in practice — just not with astropy.
+
+Tests: `tests/test_table_bit_columns.py` (18 cases, fixed X)
+and `tests/test_vla_x_bit.py` (16 cases, VLA PX/QX).
 
 ### Cross-cutting (read + write)
 
@@ -1004,11 +1079,10 @@ prompts).  See the dedicated "Tile-compressed tables (ZTABLE)"
 roadmap below for the full status table.
 
 **Phase 6 — out of scope for now.**  ASCII tables (rare in modern
-files; create / write missing, read returns header only) and the
-two niche column-format gaps: bit VLAs (`PX`) on write (paired
-with the same read-side gap), and `X` (fixed bit) columns on
-write (numpy `bool` currently maps to `L` = one byte per bool;
-true `X` packing would need an explicit opt-in).
+files; create / write missing, read returns header only).  `X`
+(bit-packed) BINTABLE columns — both fixed and VLA PX/QX — are
+fully supported on both read and write (opt-in via `bit_columns=`;
+see the "Bit-packed `X` columns" section).
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -1018,8 +1092,9 @@ for everything else.
   zero-filled bytes.
 - `TableHDU.write(data)` — dtype-checked, byteswapped bulk overwrite.
 - Scope: fixed-width columns only (B/I/J/K/A/E/D/L/C/M, plus subarray
-  fields via numpy `(T, shape)`).  No VLA, no `X` bit columns, no
-  ASCII tables.
+  fields via numpy `(T, shape)`).  No VLA, no ASCII tables.  (`X`
+  bit columns were added later; see the "Bit-packed `X` columns"
+  section.)
 
 **Phase 2 — `TableHDU.__setitem__`.**  Done.  Symmetric with
 `__getitem__`, reusing the Phase 1 `prepare_structured_input` +
@@ -1099,14 +1174,15 @@ sidecar mirrors the existing `units=` pattern and keeps numpy
 dtypes free of FITS-specific DSL).  `heap_format=` is `'P'`
 (default; 8-byte descriptors, 32-bit nelements/offset, 4 GB heap
 ceiling) or `'Q'` (16-byte, 64-bit, no practical ceiling).  No
-maxlen hint is emitted in TFORM for now (read side already accepts
-both `1PE` and `1PE(100)` shapes).
+maxlen hint is emitted in TFORM for numeric inner letters (read
+side already accepts both `1PE` and `1PE(100)` shapes); for `PX`/
+`QX` we DO emit `(maxbits)` because astropy's TFORM parser
+strictly requires it — see the "Bit-packed `X` columns" section.
 
 **Inner types supported.**  Numeric: `B / I / J / K / E / D / C /
-M`; plus `L` (bool) and `A` (ASCII string — see "String VLAs (`PA`)
-on write" under Supported above for the API).  Bit VLAs (`PX`) are
-NOT implemented on write — paired with the read-side gap; defer
-until a user asks.
+M`; plus `L` (bool), `A` (ASCII string — see "String VLAs (`PA`)
+on write"), and `X` (bit-packed; opt-in via `bit_columns=`; see
+"Bit-packed `X` columns").
 
 **Write path.**  Dispatches on `any_var_column(&columns)`.  No-VLA
 tables take the existing fast/slow strip writer untouched.  With
