@@ -241,16 +241,20 @@ def test_setitem_slice_length_mismatch_raises():
                 f[1][50:70] = wrong_len  # selects 20, value has 5
 
 
-def test_setitem_slice_step_not_one_raises():
+def test_setitem_slice_negative_step_rejected():
+    """
+    Negative-step slices are rejected for parity with the
+    uncompressed-side setitem (which also rejects them).
+    """
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         _make_table(fname, nrows=400, ztilelen=200)
         dt = _dt_basic()
         chunk = _basic_data(0, 5, dt)
         with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][0:50:10] = chunk
-            assert "6c-2d" in str(ei.value)
+            with pytest.raises(ValueError) as ei:
+                f[1][100:50:-1] = chunk
+            assert "negative" in str(ei.value).lower()
 
 
 def test_setitem_empty_slice_with_empty_value_noop():

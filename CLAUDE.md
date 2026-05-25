@@ -129,12 +129,15 @@ else stays private to its file.
   `hdu[i]=record` / `hdu[a:b]=arr` step=1 / `hdu[[i,j,k]]=arr`
   modify affected tiles by decode → row-bytes replace →
   re-encode + append to heap, with orphans reclaimed by
-  `repack()`), and 6c-2c (column-targeted `__setitem__`
+  `repack()`), 6c-2c (column-targeted `__setitem__`
   forms — `hdu["col"]=arr`, `hdu[r,"col"]=v`,
   `hdu[[c1,c2]]=arr` — sharing the same per-tile primitive
-  but narrowing the column selection per call) shipped;
-  remaining: `__setitem__` for stepped-slice / subset-object
-  / VLA forms (6c-2d, 6c-2e — see roadmap below).  Detection lives in `header_has_ztable`; routing
+  but narrowing the column selection per call), and 6c-2d
+  (stepped-slice row writes + subset-object writes —
+  `hdu[a:b:s]=arr`, `hdu["col"][rows]=v`,
+  `hdu[[a,b]][rows]=v`, completing the fixed-column
+  `__setitem__` surface) shipped; remaining: `__setitem__`
+  for VLA columns (6c-2e — see roadmap below).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -989,12 +992,12 @@ Add / remove columns (`insert_column` / `delete_column`) shipped
 post-roadmap — see the "Add / remove columns" section under "Table
 write Supported" above for the API + implementation.
 
-**Coming next.**  Compressed-table (ZTABLE) — through Phase 6c-2c
-(column-targeted `__setitem__` forms on fixed-column tables)
-shipped; remaining work is `__setitem__` for stepped-slice /
-subset-object / VLA forms, staged 6c-2d and 6c-2e.  See the
-dedicated "Tile-compressed tables (ZTABLE)" roadmap below for
-the full status table and the detailed step plan.
+**Coming next.**  Compressed-table (ZTABLE) — through Phase 6c-2d
+(complete fixed-column `__setitem__` surface, including
+stepped slices and subset-object writes) shipped; remaining
+work is VLA `__setitem__` (Phase 6c-2e).  See the dedicated
+"Tile-compressed tables (ZTABLE)" roadmap below for the full
+status table and the detailed step plan.
 
 **Phase 6 — out of scope for now.**  ASCII tables (rare in modern
 files; create / write missing, read returns header only) and the
@@ -2403,8 +2406,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6c-2a | VLA `repack()` (streaming staging + dual-descriptor blob re-gzip) | ✅ Shipped |
 | 6c-2b | Fixed-col row writes: `hdu[i]=record`, `hdu[a:b]=arr`, `hdu[[i,j,k]]=arr` | ✅ Shipped |
 | 6c-2c | Fixed-col col/cell/multi writes: `hdu["col"]=arr`, `hdu[r,"col"]=v`, `hdu[[c1,c2]]=arr` | ✅ Shipped |
-| 6c-2d | Stepped slices + subset-object writes (`hdu["name"][rows]=v`, `hdu[[a,b]][rows]=v`) | ⏳ Next |
-| 6c-2e | VLA `__setitem__` (all forms, decode → modify → re-encode dual-descriptor blob) | ⏳ |
+| 6c-2d | Stepped slices + subset-object writes (`hdu[a:b:s]=arr`, `hdu["name"][rows]=v`, `hdu[[a,b]][rows]=v`) | ✅ Shipped |
+| 6c-2e | VLA `__setitem__` (all forms, decode → modify → re-encode dual-descriptor blob) | ⏳ Next |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -3143,12 +3146,12 @@ column, same-handle + reopen parity.
 line 8003 and 8695 respectively).  Read/write loops there are
 the byte-exact spec.
 
-**Phase 6c-2b / 6c-2c — `__setitem__` on compressed tables
-(fixed columns).**  Both shipped.
+**Phase 6c-2b / 6c-2c / 6c-2d — `__setitem__` on compressed
+tables (fixed columns).**  Complete.
 
-Surface — six forms now supported, dispatched by
-`classify_setitem_key` (shared with uncompressed-side
-`TableHDU.__setitem__`):
+Surface — nine forms supported across the main HDU and the
+two subset pyclasses, dispatched by `classify_setitem_key`
+(shared with uncompressed-side `TableHDU.__setitem__`):
 
 **Row-targeted (6c-2b — touch ALL columns of the selected rows):**
   - `hdu[i] = record` — single-row write.  RHS is a `numpy.void`
@@ -3157,8 +3160,7 @@ Surface — six forms now supported, dispatched by
     raises `IndexError`.
   - `hdu[a:b] = arr` — step=1 slice write.  RHS is a
     structured ndarray of length equal to the slicelength.
-    Step != 1 rejected with a 6c-2d phase pointer.  Empty slice
-    + empty RHS is a no-op (PCOUNT unchanged).
+    Empty slice + empty RHS is a no-op (PCOUNT unchanged).
   - `hdu[[i, j, k]] = arr` — fancy-row write.  RHS is a
     structured ndarray of length = `len(row_list)`.  Duplicates
     in the row list follow numpy fancy-assignment semantics
@@ -3181,12 +3183,30 @@ Surface — six forms now supported, dispatched by
     independently per tile; unnamed columns untouched.  Names
     are case-insensitive against the table columns.
 
+**Stepped / subset-object (6c-2d — generalize row + col selection):**
+  - `hdu[a:b:s] = arr` — stepped slice (positive step only).
+    Negative or zero step rejected for parity with the
+    uncompressed-side `TableHDU[slice] = value`.  Disk rows
+    enumerate `(start, start+step, ..., start+(N-1)*step)`;
+    bucketed by tile by the shared primitive.
+  - `hdu["name"][rows] = value` — single-column subset write.
+    `rows` accepts int (bare-int shortcut, value is scalar /
+    0-d / per-cell ndarray), slice (any positive step), or
+    iterable of ints (negative indices wrap).  Value is an
+    ndarray of shape `(len(rows),) + per_cell_shape` for
+    non-int row keys.
+  - `hdu[[c1, c2]][rows] = value` — multi-column subset write.
+    `rows` shapes as above; value is a structured ndarray of
+    length `len(rows)` with the subset's field names (extras
+    tolerated).  For bare-int `rows`, value is a structured
+    record / shape-`(1,)` ndarray.
+
 A targeted VLA column (whole-column / cell / multi-col that
-includes a VLA name) raises `NotImplementedError` pointing at
-6c-2e.  Non-targeted VLA columns elsewhere in the table are
-fine — the primitive only touches selected columns.  Row-form
-writes (6c-2b) still reject any-VLA-in-table because they
-touch every column.
+includes a VLA name, OR a subset object built from a VLA name)
+raises `NotImplementedError` pointing at 6c-2e.  Non-targeted
+VLA columns elsewhere in the table are fine — the primitive
+only touches selected columns.  Row-form writes (6c-2b) still
+reject any-VLA-in-table because they touch every column.
 
 **Shared primitive: `setitem_compressed_fixed_rows`.**  Takes
 `disk_rows: &[usize]` (the disk rows to modify, input row K →
@@ -3200,9 +3220,12 @@ dispatcher branch narrows one or both axes:
 | `hdu[i]=record` (6c-2b) | all columns | `[i]` |
 | `hdu[a:b]=arr` (6c-2b) | all columns | `a..b` |
 | `hdu[[i,j,k]]=arr` (6c-2b) | all columns | row list |
+| `hdu[a:b:s]=arr` (6c-2d) | all columns | stepped range |
 | `hdu["col"]=arr` (6c-2c) | `[col_idx]` | `0..nrows` |
 | `hdu[r,"col"]=v` (6c-2c) | `[col_idx]` | `[r]` |
 | `hdu[[c1,c2]]=arr` (6c-2c) | `[c1_idx, c2_idx]` | `0..nrows` |
+| `hdu["col"][rows]=v` (6c-2d) | `[col_idx]` | rows |
+| `hdu[[c1,c2]][rows]=v` (6c-2d) | `[c1_idx, c2_idx]` | rows |
 
 Algorithm.  Per affected tile (sorted by tile index for disk
 locality):
@@ -3248,7 +3271,7 @@ phases):
   np.ascontiguousarray`.
 
 **Dispatcher refactor (6c-2c).**  The dispatcher branches share
-14 stable arguments (super_, cards, columns, algorithms,
+12 stable arguments (super_, cards, columns, algorithms,
 configs, nrows, ztilelen, n_tiles, descriptor_row_width,
 data_offset, current_pcount, cache).  Bundled into a
 `SetItemCtx` struct so each branch's call to the primitive is
@@ -3261,6 +3284,24 @@ dtype-name resolution + per-column ascontiguousarray
 materialization), plus `coerce_cell_value_to_len1` for the
 single-cell path.
 
+**Prelude helper (6c-2d).**  `read_compressed_table_meta(super_)
+→ CompressedTableMeta` packages the cards / columns /
+algorithms / nrows / ztilelen / n_tiles / descriptor_row_width
+/ current_pcount / data_offset parse done at the top of
+`__setitem__`.  The subset pyclasses (`CompressedSingleColumnSubset`,
+`CompressedColumnSubset`) call the same helper so the dispatch
+prelude lives in one place.  Each subset method then builds
+its own `SetItemCtx` from the meta + Arc-cloned cache + cfgs.
+
+**Rows-key resolver (6c-2d).**  `resolve_compressed_rows_key`
+mirrors uncompressed-side `resolve_rows_key` (int / slice /
+iterable → `(Vec<usize>, was_single)`) but with
+"CompressedTableHDU" error messages and direct dependency on
+`normalize_disk_row`.  Returns `was_single = true` only for a
+bare int key, so the subset dispatch can route through
+`coerce_cell_value_to_len1` (or `coerce_to_len1_record` for
+multi-col) instead of requiring an ndarray RHS.
+
 **Memory bound.**  Per affected tile, one BE-bytes slab per
 selected column at a time (rows_in_tile × per_row_bytes — tens
 of KB to a few MB), encoded and dropped before the next
@@ -3270,51 +3311,43 @@ they're produced.
 
 **Implementation.**  `setitem_compressed_fixed_rows` +
 `SetItemCtx` + dispatcher helpers
-(`find_compressed_column_index`, `normalize_disk_row`,
+(`read_compressed_table_meta`, `find_compressed_column_index`,
+`normalize_disk_row`, `resolve_compressed_rows_key`,
 `require_ndarray*`, `resolve_structured_subset_value`,
 `coerce_cell_value_to_len1`) at the bottom of
 `hdu_table_compressed.rs`; dispatcher in the `__setitem__`
-pymethod uses the same shape as the uncompressed-side
-`TableHDU.__setitem__`.
+pymethod plus the two subset pyclasses' `__setitem__` methods
+all use the same shape.
 
 Tests in `tests/test_compressed_table_setitem_rows.py`
-(28 cases for 6c-2b) and `tests/test_compressed_table_setitem_cols.py`
-(37 cases for 6c-2c): row-form coverage (single-row +
-slice-step=1 + fancy-row × within-tile / across-tiles /
-negative indices / duplicates last-wins / boundary), column-
-form coverage (whole-col + cell + multi-col × case-insensitive
-lookup / extra fields tolerated / missing fields rejected /
-duplicate names rejected / subarray TDIM column / scalar
-broadcast over subarray), algorithm matrix
-(GZIP_1 / GZIP_2 / RICE_1), cache invalidation, repack
+(28 cases for 6c-2b), `tests/test_compressed_table_setitem_cols.py`
+(37 cases for 6c-2c), and
+`tests/test_compressed_table_setitem_stepped_subsets.py`
+(27 cases for 6c-2d).  Combined coverage: row-form (single-row
+/ slice-step=1 / fancy-row / stepped slice × within-tile /
+across-tiles / negative indices / duplicates last-wins /
+boundary), column-form (whole-col / cell / multi-col ×
+case-insensitive lookup / extra fields tolerated / missing
+fields rejected / duplicate names rejected / subarray TDIM
+column / scalar broadcast over subarray), subset-object form
+(single-col + multi-col subset × int-row / slice / stepped /
+fancy / full-slice / negative int / out-of-range), algorithm
+matrix (GZIP_1 / GZIP_2 / RICE_1), cache invalidation, repack
 reclaims orphans, non-last HDU preserves trailing, **funpack
-byte-exact interop** on mutated files (col + cell + multi-col
-combined and row-form combined), same-handle vs reopen parity,
-VLA-targeted column rejection with 6c-2e phase pointer, and
-the positive case "non-VLA multi-col on a VLA-bearing table
-works".
+byte-exact interop** on mutated files combining stepped /
+single-col / multi-col writes, same-handle vs reopen parity,
+VLA-targeted rejection with 6c-2e phase pointer in every
+relevant dispatch path, and positive "non-VLA on a VLA-bearing
+table works" cases for both column-targeted and multi-col
+subset writes.
 
-**Phase 6c-2d–e plan — remaining `__setitem__` forms on
-compressed tables.**
+**Phase 6c-2e plan — VLA `__setitem__` on compressed tables.**
 
 The natural primitive for compressed `__setitem__` is "modify
-rows R within tile T, columns C".  6c-2b/c above implement the
-combinations where rows are integer-indexed or contiguous and
-columns are explicitly named.  The remaining stages extend
-the row selection (6c-2d) and handle VLA columns (6c-2e).
-
-**Phase 6c-2d — stepped slices + subset-object writes.**
-Surface:
-  - `hdu[a:b:s] = arr` — non-contiguous rows; bucket by tile.
-  - `hdu["name"][rows] = v` — rows-restricted whole-column.
-  - `hdu[[a, b]][rows] = v` — rows-restricted multi-col.
-
-Stepped slice just expands the iterable form of fancy rows.
-Subset objects wrap calls to the underlying primitives (the
-uncompressed side's `CompressedSingleColumnSubset` /
-`CompressedColumnSubset` are currently READ-ONLY — promote
-them to writable via the per-cell loop pattern used by the
-uncompressed subset writes).
+rows R within tile T, columns C".  6c-2b/c/d above implement
+the fixed-column variants — every (rows, cols) combination
+except when the column itself is a VLA column.  6c-2e adds the
+VLA-column case.
 
 **Phase 6c-2e — VLA `__setitem__`.**  Surface:
   - `hdu[i] = record` and `hdu[a:b] = arr` and
