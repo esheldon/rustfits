@@ -20,8 +20,9 @@ use super::read::{
 };
 use super::setitem::{
     classify_setitem_key, setitem_cell, setitem_fancy_rows,
-    setitem_multi_columns, setitem_row_slice, setitem_row_slice_vla_aware,
-    setitem_single_column, setitem_single_column_vla, setitem_single_row,
+    setitem_fancy_rows_vla_aware, setitem_multi_columns, setitem_row_slice,
+    setitem_row_slice_vla_aware, setitem_single_column,
+    setitem_single_column_vla, setitem_single_row,
     setitem_single_row_vla_aware, try_extract_column_name,
     write_column_subset_at_rows, write_one_column_at_rows, SetItemKey,
 };
@@ -467,9 +468,17 @@ impl TableHDU {
                     py, &columns, &super_.file, data_offset, nrows,
                     row_width, &name, value, &super_.tainted)
             }
-            SetItemKey::FancyRows(rows) => setitem_fancy_rows(
-                py, &columns, &super_.file, data_offset, nrows,
-                row_width, &rows, value, &super_.tainted),
+            SetItemKey::FancyRows(rows) => {
+                if has_vla {
+                    setitem_fancy_rows_vla_aware(
+                        py, &super_, &cards, &columns, nrows, row_width,
+                        &rows, value, data_offset)
+                } else {
+                    setitem_fancy_rows(
+                        py, &columns, &super_.file, data_offset, nrows,
+                        row_width, &rows, value, &super_.tainted)
+                }
+            }
             SetItemKey::MultiColumns(names) => setitem_multi_columns(
                 py, &super_, &cards, &columns, nrows, row_width,
                 &names, value, data_offset),

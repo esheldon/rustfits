@@ -572,32 +572,27 @@ fn fill_main_row(
 //
 // Mid-write I/O failures taint the file.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_vla_data_range(
+// Build the per-write VLA heap buffer in RAM.  Walks every VLA
+// column's per-row plan and serializes each cell's bytes into the
+// right offset within the buffer.  Shared between write_vla_data_range
+// (contiguous main-row write) and write_vla_data_strided (per-row
+// seek + write) — the heap layout depends only on the per-input-row
+// plans, not on where each main row lands on disk.
+//
+// `added_heap_bytes = total_heap_bytes - heap_start_offset_in_heap`.
+// X (bit-packed) cells contribute ceil(nelements/8) bytes; other
+// inner letters use a fixed element width.  No file I/O.
+fn build_vla_heap_buf(
     columns: &[Column],
-    fixed: &[Option<FixedColInfo>],
     vla: &[Option<VlaColInfo<'_>>],
     total_heap_bytes: usize,
     heap_start_offset_in_heap: usize,
-    file: &FileHandle,
-    main_start_offset: u64,
-    heap_start_offset_in_file: u64,
     input_nrows: usize,
-    row_width: usize,
-    tainted: &crate::common::TaintFlag,
-) -> PyResult<usize> {
-    if input_nrows == 0 {
-        return Ok(0);
-    }
-    // Build the heap buffer in memory.  For very large heaps this
-    // could be streamed but for MVP we accumulate; total_heap_bytes
-    // is the upper bound (matches the planner output).
+) -> PyResult<Vec<u8>> {
     let added_heap_bytes = total_heap_bytes - heap_start_offset_in_heap;
     let mut heap_buf: Vec<u8> = vec![0u8; added_heap_bytes];
     for (col_idx, col) in columns.iter().enumerate() {
         let Some(vci) = &vla[col_idx] else { continue; };
-        // X (bit-packed) VLA: byte count per cell is ceil(nelements/8),
-        // not nelements * elem_size — the planner already uses this
-        // rule (see plan_vla_heap_layout) so we must match it here.
         let is_x = col.tform_letter == 'X';
         let elem_size = if is_x {
             0
@@ -619,6 +614,57 @@ pub(crate) fn write_vla_data_range(
             serialize_vla_cell(&cell, col.tform_letter, plan.nelements, dst)?;
         }
     }
+    Ok(heap_buf)
+}
+
+// Write the in-memory heap buffer at its absolute position, then
+// flush.  Caller passes the already-locked file ref so this runs
+// under the same lock as the main-row writes that precede it.
+// Mid-write failures taint per the standard discipline.
+fn write_heap_and_flush(
+    f: &mut std::fs::File,
+    heap_buf: &[u8],
+    heap_start_offset_in_file: u64,
+    tainted: &crate::common::TaintFlag,
+) -> PyResult<()> {
+    if !heap_buf.is_empty() {
+        f.seek(SeekFrom::Start(heap_start_offset_in_file))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(heap_buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "write error during VLA heap write: {}", e)));
+        }
+    }
+    if let Err(e) = f.flush() {
+        tainted.store(true, Ordering::Release);
+        return Err(PyIOError::new_err(format!(
+            "flush error during VLA write: {}", e)));
+    }
+    Ok(())
+}
+
+pub(crate) fn write_vla_data_range(
+    columns: &[Column],
+    fixed: &[Option<FixedColInfo>],
+    vla: &[Option<VlaColInfo<'_>>],
+    total_heap_bytes: usize,
+    heap_start_offset_in_heap: usize,
+    file: &FileHandle,
+    main_start_offset: u64,
+    heap_start_offset_in_file: u64,
+    input_nrows: usize,
+    row_width: usize,
+    tainted: &crate::common::TaintFlag,
+) -> PyResult<usize> {
+    if input_nrows == 0 {
+        return Ok(0);
+    }
+    let heap_buf = build_vla_heap_buf(
+        columns, vla, total_heap_bytes,
+        heap_start_offset_in_heap, input_nrows,
+    )?;
+    let added_heap_bytes = heap_buf.len();
 
     // Main data strip writer.  Same strip sizing as the fixed path;
     // each row is built one at a time via fill_main_row (which mixes
@@ -656,22 +702,71 @@ pub(crate) fn write_vla_data_range(
         row_start += chunk;
     }
 
-    // Now write the heap.  Single seek + write; heap_buf can be
-    // large but we already committed to building it in RAM.
-    if !heap_buf.is_empty() {
-        f.seek(SeekFrom::Start(heap_start_offset_in_file))
+    write_heap_and_flush(f, &heap_buf, heap_start_offset_in_file, tainted)?;
+    Ok(added_heap_bytes)
+}
+
+// Strided / fancy-row variant of write_vla_data_range: instead of
+// writing `input_nrows` CONTIGUOUS main rows starting at one
+// offset, walk a flat list of disk-row indices and seek+write each
+// row's main bytes individually.  The heap pass is the same (one
+// bulk write at the heap end) because the heap layout is per-input-
+// row regardless of where each row's main bytes land on disk.
+//
+// Used by setitem_row_slice_vla_aware (step != 1) and
+// setitem_fancy_rows_vla_aware.  Caller's `disk_rows.len()` must
+// equal `input_nrows` (each input row maps to one disk row).
+//
+// Per-row seek+write cost: O(input_nrows) syscalls.  Acceptable
+// because strided/fancy VLA writes are uncommon and each row's
+// main bytes are typically a few tens of bytes.  If a hot-path
+// workload demands it, a "bucket-by-tile + write-contiguous-
+// strips" optimization is possible but adds complexity for
+// negligible win on typical tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_vla_data_strided(
+    columns: &[Column],
+    fixed: &[Option<FixedColInfo>],
+    vla: &[Option<VlaColInfo<'_>>],
+    total_heap_bytes: usize,
+    heap_start_offset_in_heap: usize,
+    file: &FileHandle,
+    data_offset: u64,
+    heap_start_offset_in_file: u64,
+    disk_rows: &[usize],
+    row_width: usize,
+    tainted: &crate::common::TaintFlag,
+) -> PyResult<usize> {
+    let input_nrows = disk_rows.len();
+    if input_nrows == 0 {
+        return Ok(0);
+    }
+    let heap_buf = build_vla_heap_buf(
+        columns, vla, total_heap_bytes,
+        heap_start_offset_in_heap, input_nrows,
+    )?;
+    let added_heap_bytes = heap_buf.len();
+
+    // Per-row build + write.  No strip buffer (rows are non-
+    // contiguous on disk); one row_width buffer reused per row.
+    let mut row_buf: Vec<u8> = vec![0u8; row_width];
+    let mut guard = lock_file(file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    for (input_row, &disk_row) in disk_rows.iter().enumerate() {
+        for b in row_buf.iter_mut() { *b = 0; }
+        fill_main_row(columns, fixed, vla, input_row, &mut row_buf)?;
+        let off = data_offset + (disk_row as u64) * row_width as u64;
+        f.seek(SeekFrom::Start(off))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        if let Err(e) = f.write_all(&heap_buf) {
+        if let Err(e) = f.write_all(&row_buf) {
             tainted.store(true, Ordering::Release);
             return Err(PyIOError::new_err(format!(
-                "write error during VLA heap write: {}", e)));
+                "write error during VLA strided/fancy row write: {}", e)));
         }
     }
-    if let Err(e) = f.flush() {
-        tainted.store(true, Ordering::Release);
-        return Err(PyIOError::new_err(format!(
-            "flush error during VLA write: {}", e)));
-    }
+
+    write_heap_and_flush(f, &heap_buf, heap_start_offset_in_file, tainted)?;
     Ok(added_heap_bytes)
 }
 

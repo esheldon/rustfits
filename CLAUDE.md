@@ -772,11 +772,14 @@ forward to sit after the new main rows.  Validate-then-mutate so
 dtype errors leave the file untouched.  Mid-write I/O failures
 taint the file the same way as image writes.
 
-**VLA `__setitem__`.**  Shipped.  Three forms supported on tables
-with at least one variable-length column:
+**VLA `__setitem__`.**  Shipped.  Full row-selection surface
+supported on tables with at least one variable-length column:
 - `hdu[i] = record` — single row write.
-- `hdu[a:b] = arr` — slice write (step=1 only; strided rejected
-  with a clear error — would need per-row main-data seeks; defer).
+- `hdu[a:b] = arr` — step=1 slice write (contiguous strip writer).
+- `hdu[a:b:s] = arr` — stepped slice (positive step; negative or
+  zero step rejected for parity with fixed).
+- `hdu[[i, j, k]] = arr` — fancy-row write.  Duplicates in the
+  list follow numpy fancy-assignment semantics (last write wins).
 - `hdu["vla_col"] = arr` — whole-column write (Object dtype, one
   inner ndarray per row).
 
@@ -788,15 +791,22 @@ rebuild the heap with only live cells (see "Heap repack" below).
 
 Implementation lives in `src/hdu_table/setitem.rs` (with the VLA
 primitives it calls — `validate_vla_cell`, `plan_vla_heap_layout`,
-`write_vla_data_range` — in `write_vla.rs`).  Three helpers:
-- `setitem_single_row_vla_aware` and `setitem_row_slice_vla_aware`
-  share a `setitem_rows_vla_aware_inner` core that reuses
-  `plan_vla_heap_layout` (with `heap_start_offset = current_pcount`)
-  and `write_vla_data_range` to write `input_nrows` contiguous main
-  rows + appended heap.
+`write_vla_data_range`, `write_vla_data_strided` — in `write_vla.rs`).
+Four helpers:
+- `setitem_single_row_vla_aware`, `setitem_row_slice_vla_aware`,
+  and `setitem_fancy_rows_vla_aware` share a
+  `setitem_rows_vla_aware_inner` core that takes a `VlaRowSpec`
+  enum (`Contiguous { first_row, count }` or `Strided { disk_rows }`)
+  and routes to either `write_vla_data_range` (strip-walk) or
+  `write_vla_data_strided` (per-row seek+write) accordingly.
 - `setitem_single_column_vla` writes ONLY the column's descriptor
   bytes at each row (other columns' bytes untouched) plus the new
   heap.
+
+The two writers in `write_vla.rs` share the heap-buffer build
+(`build_vla_heap_buf`) and the heap-write + flush tail
+(`write_heap_and_flush`); they differ only in their main-row write
+loop (1 MiB strip walk vs per-row seek+write).
 
 Validate-then-mutate (input fully validated before any file/header
 bytes are touched).  Same taint discipline as every other write —

@@ -229,16 +229,84 @@ def test_slice_write_full_range():
                 np.testing.assert_array_equal(got["v"][i], new["v"][i])
 
 
-def test_slice_write_step2_rejected():
-    """Strided slice writes on VLA tables raise."""
+def test_slice_write_stepped_round_trip():
+    """Stepped slice writes on VLA tables go through write_vla_data_strided."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _single_vla_table(tmp, nrows=6)
+        new = np.zeros(3, dtype=arr.dtype)
+        new["v"][0] = np.array([1.5, 2.5], dtype="f4")
+        new["v"][1] = np.array([], dtype="f4")
+        new["v"][2] = np.array([7.0, 8.0, 9.0, 10.0], dtype="f4")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[1][0:6:2] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        for out_k, in_k in enumerate([0, 2, 4]):
+            np.testing.assert_array_equal(got["v"][in_k], new["v"][out_k])
+        # Untouched rows (1, 3, 5) still have the originals.
+        for i in [1, 3, 5]:
+            np.testing.assert_array_equal(got["v"][i], arr["v"][i])
+
+
+def test_slice_write_negative_step_rejected():
+    """Negative-step slice writes still raise (parity with fixed-cols)."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, arr = _single_vla_table(tmp, nrows=4)
         new = np.zeros(2, dtype=arr.dtype)
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(ValueError, match="negative"):
+                fits[1][3:0:-1] = new
+
+
+def test_fancy_rows_write_round_trip():
+    """Fancy-row writes on VLA tables go through the strided helper."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _single_vla_table(tmp, nrows=5)
+        new = np.zeros(3, dtype=arr.dtype)
+        new["v"][0] = np.array([10.0], dtype="f4")
+        new["v"][1] = np.array([20.0, 21.0, 22.0], dtype="f4")
+        new["v"][2] = np.array([], dtype="f4")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[1][[1, 3, 4]] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        for out_k, in_k in enumerate([1, 3, 4]):
+            np.testing.assert_array_equal(got["v"][in_k], new["v"][out_k])
+        # Untouched rows (0, 2) still have the originals.
+        for i in [0, 2]:
+            np.testing.assert_array_equal(got["v"][i], arr["v"][i])
+
+
+def test_fancy_rows_duplicate_indices_last_wins():
+    """Duplicate rows in the fancy list — last write wins (numpy semantics)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _single_vla_table(tmp, nrows=4)
+        new = np.zeros(3, dtype=arr.dtype)
         new["v"][0] = np.array([1.0], dtype="f4")
         new["v"][1] = np.array([2.0], dtype="f4")
+        new["v"][2] = np.array([3.0, 4.0], dtype="f4")
+        # Indices [2, 2, 1] → row 2 written twice; last write wins.
         with rustfits.FITS(fname, "r+") as fits:
-            with pytest.raises(ValueError, match="step=1"):
-                fits[1][0:4:2] = new
+            fits[1][[2, 2, 1]] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        # Row 2 reflects new[1] (second write); row 1 reflects new[2].
+        np.testing.assert_array_equal(got["v"][2], new["v"][1])
+        np.testing.assert_array_equal(got["v"][1], new["v"][2])
+
+
+def test_fancy_rows_negative_indices_wrap():
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _single_vla_table(tmp, nrows=5)
+        new = np.zeros(2, dtype=arr.dtype)
+        new["v"][0] = np.array([1.0, 2.0], dtype="f4")
+        new["v"][1] = np.array([], dtype="f4")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[1][[-1, -2]] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        np.testing.assert_array_equal(got["v"][4], new["v"][0])
+        np.testing.assert_array_equal(got["v"][3], new["v"][1])
 
 
 def test_slice_write_empty_noop():
@@ -435,6 +503,78 @@ def test_fixed_column_write_on_vla_table_still_fixed_only():
                 np.testing.assert_array_equal(got["lc"][i], arr["lc"][i])
             # PCOUNT unchanged.
             assert int(fits[1].header["PCOUNT"]) == p0
+
+
+def test_stepped_slice_mixed_table_round_trip():
+    """Stepped slice on a mixed fixed+VLA table; both round-trip."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _mixed_table(tmp, nrows=6)
+        new = np.zeros(3, dtype=arr.dtype)
+        new["id"] = [10, 20, 30]
+        new["flux"] = [1.0, 2.0, 3.0]
+        new["lc"][0] = np.array([0.5], dtype="f4")
+        new["lc"][1] = np.array([], dtype="f4")
+        new["lc"][2] = np.array([4.0, 5.0, 6.0], dtype="f4")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[1][0:6:2] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        for out_k, in_k in enumerate([0, 2, 4]):
+            assert got["id"][in_k] == new["id"][out_k]
+            assert got["flux"][in_k] == new["flux"][out_k]
+            np.testing.assert_array_equal(got["lc"][in_k], new["lc"][out_k])
+        # Untouched rows preserved.
+        for i in [1, 3, 5]:
+            assert got["id"][i] == arr["id"][i]
+            assert got["flux"][i] == arr["flux"][i]
+            np.testing.assert_array_equal(got["lc"][i], arr["lc"][i])
+
+
+def test_fancy_rows_mixed_table_round_trip():
+    """Fancy rows on a mixed fixed+VLA table."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _mixed_table(tmp, nrows=5)
+        new = np.zeros(2, dtype=arr.dtype)
+        new["id"] = [77, 88]
+        new["flux"] = [-1.0, -2.0]
+        new["lc"][0] = np.array([100.0, 200.0], dtype="f4")
+        new["lc"][1] = np.array([], dtype="f4")
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[1][[1, 4]] = new
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        for out_k, in_k in enumerate([1, 4]):
+            assert got["id"][in_k] == new["id"][out_k]
+            assert got["flux"][in_k] == new["flux"][out_k]
+            np.testing.assert_array_equal(got["lc"][in_k], new["lc"][out_k])
+        # Untouched rows preserved.
+        for i in [0, 2, 3]:
+            assert got["id"][i] == arr["id"][i]
+            assert got["flux"][i] == arr["flux"][i]
+            np.testing.assert_array_equal(got["lc"][i], arr["lc"][i])
+
+
+def test_stepped_slice_then_repack_reclaims_orphans():
+    """Multiple stepped writes orphan old cells; repack reclaims."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, arr = _single_vla_table(tmp, nrows=6)
+        with rustfits.FITS(fname, "r+") as fits:
+            for k in range(3):
+                new = np.zeros(3, dtype=arr.dtype)
+                for r in range(3):
+                    new["v"][r] = np.arange(k + 2, dtype="f4")
+                fits[1][0:6:2] = new
+            p_before = int(fits[1].header["PCOUNT"])
+            fits[1].repack()
+            p_after = int(fits[1].header["PCOUNT"])
+        assert p_after < p_before
+        # Last write wins.
+        with rustfits.FITS(fname) as fits:
+            got = fits[1].read()
+        for i in [0, 2, 4]:
+            np.testing.assert_array_equal(
+                got["v"][i], np.arange(4, dtype="f4")
+            )
 
 
 if __name__ == "__main__":

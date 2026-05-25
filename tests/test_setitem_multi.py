@@ -107,19 +107,29 @@ def test_fancy_rows_out_of_range_raises():
                 f[1][[5]] = new
 
 
-def test_fancy_rows_on_vla_table_rejected():
-    """Fancy-row writes on tables with VLA columns are deferred."""
+def test_fancy_rows_on_vla_table_round_trip():
+    """Fancy-row writes on VLA tables go through the strided helper."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "v.fits")
         dt = np.dtype([("v", "O")])
         with rustfits.FITS(fname, "w+") as f:
             f.create_table_hdu(dt, nrows=3, var_dtypes={"v": "f4"})
+            # Initialize all rows with placeholder cells.
+            init = np.zeros(3, dtype=dt)
+            for i in range(3):
+                init["v"][i] = np.array([0.0], dtype="f4")
+            f[1].write(init)
         new = np.zeros(2, dtype=dt)
-        new["v"][0] = np.array([1.0], dtype="f4")
-        new["v"][1] = np.array([2.0], dtype="f4")
+        new["v"][0] = np.array([1.0, 2.0], dtype="f4")
+        new["v"][1] = np.array([], dtype="f4")
         with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(ValueError, match="VLA"):
-                f[1][[0, 2]] = new
+            f[1][[0, 2]] = new
+        with rustfits.FITS(fname) as f:
+            got = f[1].read()
+        np.testing.assert_array_equal(got["v"][0], new["v"][0])
+        np.testing.assert_array_equal(got["v"][2], new["v"][1])
+        # Row 1 untouched (still the placeholder).
+        np.testing.assert_array_equal(got["v"][1], init["v"][1])
 
 
 # ---------------------------------------------------------------------------

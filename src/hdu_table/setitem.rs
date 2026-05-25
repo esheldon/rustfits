@@ -26,8 +26,8 @@ use super::write_setup::column_expected_shape;
 use super::write_vla::{
     any_var_column, build_fixed_col_info, extract_per_column_inputs,
     plan_vla_heap_layout, serialize_vla_cell, validate_vla_cell,
-    write_descriptor, write_vla_data_range, FixedColInfo, VlaCellPlan,
-    VlaColInfo,
+    write_descriptor, write_vla_data_range, write_vla_data_strided,
+    FixedColInfo, VlaCellPlan, VlaColInfo,
 };
 
 // Normalize a possibly-negative row index against nrows; reject
@@ -237,13 +237,12 @@ pub(crate) fn setitem_fancy_rows(
     value: &Bound<'_, PyAny>,
     tainted: &TaintFlag,
 ) -> PyResult<()> {
-    if any_var_column(columns) {
-        return Err(PyValueError::new_err(
-            "TableHDU[[rows]] = value: fancy-row writes are not yet \
-             supported for tables with VLA columns; use hdu[i] = \
-             record per row, or hdu['vla_col'] = arr for a whole-\
-             column write"));
-    }
+    // VLA-bearing tables go through the VLA-aware fancy-row helper
+    // (which routes through write_vla_data_strided).  The dispatcher
+    // in hdu.rs picks the right entry point per HDU; reaching this
+    // branch with any VLA column is an internal routing error.
+    debug_assert!(!any_var_column(columns),
+        "setitem_fancy_rows called on a VLA-bearing table");
     let count = row_indices_signed.len();
     let row_indices: Vec<i64> = row_indices_signed.iter()
         .map(|&i| normalize_row_index(i, nrows).map(|r| r as i64))
@@ -798,17 +797,36 @@ pub(crate) fn write_column_subset_at_rows(
 // current PCOUNT.  Caller has already extracted the per-column input
 // ndarrays and validated their length == input_nrows.
 #[allow(clippy::too_many_arguments)]
+// Row-selection shape passed to the VLA-aware inner helper.
+// Contiguous(first_row, count) → write_vla_data_range (strip-walk
+// fast path).  Strided(&[disk_rows]) → write_vla_data_strided
+// (per-row seek+write).  Both produce the same on-disk result for
+// the contiguous case; the split is purely a performance choice.
+enum VlaRowSpec<'a> {
+    Contiguous { first_row: usize, count: usize },
+    Strided { disk_rows: &'a [usize] },
+}
+
+impl<'a> VlaRowSpec<'a> {
+    fn input_nrows(&self) -> usize {
+        match self {
+            VlaRowSpec::Contiguous { count, .. } => *count,
+            VlaRowSpec::Strided { disk_rows } => disk_rows.len(),
+        }
+    }
+}
+
 fn setitem_rows_vla_aware_inner(
     py: Python<'_>,
     super_: &HDU,
     cards: &[String],
     columns: &[Column],
     per_col: Vec<Bound<'_, PyAny>>,
-    first_row: usize,
-    input_nrows: usize,
+    rows: VlaRowSpec<'_>,
     row_width: usize,
     data_offset: u64,
 ) -> PyResult<()> {
+    let input_nrows = rows.input_nrows();
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
 
@@ -877,17 +895,27 @@ fn setitem_rows_vla_aware_inner(
         }
     }
 
-    // Main rows start at the first-modified-row's offset; new heap
-    // bytes start right after the existing heap end.
-    let main_start_offset =
-        data_offset + (first_row as u64) * row_width as u64;
+    // New heap bytes start right after the existing heap end.
     let heap_start_offset_in_file =
         data_offset + main_bytes + current_pcount;
-    write_vla_data_range(
-        columns, &fixed, &vla, total_heap_bytes,
-        current_pcount as usize,
-        &super_.file, main_start_offset, heap_start_offset_in_file,
-        input_nrows, row_width, &super_.tainted)?;
+    match rows {
+        VlaRowSpec::Contiguous { first_row, count } => {
+            let main_start_offset =
+                data_offset + (first_row as u64) * row_width as u64;
+            write_vla_data_range(
+                columns, &fixed, &vla, total_heap_bytes,
+                current_pcount as usize,
+                &super_.file, main_start_offset, heap_start_offset_in_file,
+                count, row_width, &super_.tainted)?;
+        }
+        VlaRowSpec::Strided { disk_rows } => {
+            write_vla_data_strided(
+                columns, &fixed, &vla, total_heap_bytes,
+                current_pcount as usize,
+                &super_.file, data_offset, heap_start_offset_in_file,
+                disk_rows, row_width, &super_.tainted)?;
+        }
+    }
 
     // PCOUNT update — disk-write-before-commit.  No NAXIS2 change
     // (row count unchanged).
@@ -938,12 +966,15 @@ pub(crate) fn setitem_single_row_vla_aware(
     let per_col = extract_per_column_inputs(
         py, &arr, None, columns)?;
     setitem_rows_vla_aware_inner(
-        py, super_, cards, columns, per_col, r, 1, row_width, data_offset)
+        py, super_, cards, columns, per_col,
+        VlaRowSpec::Contiguous { first_row: r, count: 1 },
+        row_width, data_offset)
 }
 
-// hdu[a:b] = arr on a VLA-bearing table.  Only step=1 is supported;
-// strided writes are rejected because the contiguous main-row writer
-// (write_vla_data_range) can't emit non-contiguous rows in one pass.
+// hdu[a:b[:s]] = arr on a VLA-bearing table.  step=1 uses the
+// contiguous strip-walk writer; step>1 routes to the strided per-
+// row writer.  Negative or zero step is rejected (parity with the
+// fixed-column slice path).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn setitem_row_slice_vla_aware(
     py: Python<'_>,
@@ -957,14 +988,14 @@ pub(crate) fn setitem_row_slice_vla_aware(
     data_offset: u64,
 ) -> PyResult<()> {
     let indices = slice_py.indices(nrows as isize)?;
-    if indices.step != 1 {
+    if indices.step <= 0 {
         return Err(PyValueError::new_err(
-            "TableHDU[slice] = value: only step=1 slices are supported \
-             for tables with VLA columns (strided writes would require \
-             per-row heap layouts; not implemented)"));
+            "TableHDU[slice] = value: negative or zero step is not \
+             supported"));
     }
     let count = indices.slicelength as usize;
     let start = indices.start as usize;
+    let step = indices.step as usize;
     if count == 0 {
         let v_len: usize = value.len().unwrap_or(0);
         if v_len != 0 {
@@ -989,9 +1020,72 @@ pub(crate) fn setitem_row_slice_vla_aware(
     }
     let per_col = extract_per_column_inputs(
         py, value, None, columns)?;
+    let rows = if step == 1 {
+        VlaRowSpec::Contiguous { first_row: start, count }
+    } else {
+        let disk_rows: Vec<usize> =
+            (0..count).map(|r| start + r * step).collect();
+        // Build owned Vec, then borrow it for the call.  Lifetimes
+        // work because the helper takes the slice by reference for
+        // the duration of the call.
+        return setitem_rows_vla_aware_inner(
+            py, super_, cards, columns, per_col,
+            VlaRowSpec::Strided { disk_rows: &disk_rows },
+            row_width, data_offset);
+    };
     setitem_rows_vla_aware_inner(
-        py, super_, cards, columns, per_col, start, count, row_width,
-        data_offset)
+        py, super_, cards, columns, per_col, rows, row_width, data_offset)
+}
+
+// hdu[[i, j, k]] = arr on a VLA-bearing table.  Routes a flat
+// list of disk-row indices through the strided per-row writer.
+// Same heap-append-orphan model as the contiguous case; duplicate
+// row indices in the input list follow numpy fancy-assignment
+// semantics (last write wins).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn setitem_fancy_rows_vla_aware(
+    py: Python<'_>,
+    super_: &HDU,
+    cards: &[String],
+    columns: &[Column],
+    nrows: usize,
+    row_width: usize,
+    row_indices_signed: &[i64],
+    value: &Bound<'_, PyAny>,
+    data_offset: u64,
+) -> PyResult<()> {
+    let count = row_indices_signed.len();
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(
+            "TableHDU[[rows]] = value: value must be a structured \
+             numpy ndarray of length equal to the row list"));
+    }
+    if count == 0 {
+        let v_len: usize = value.len().unwrap_or(0);
+        if v_len != 0 {
+            return Err(PyValueError::new_err(format!(
+                "TableHDU[[rows]] = value: row list is empty but value \
+                 has length {}", v_len)));
+        }
+        return Ok(());
+    }
+    let v_len: usize = value.len()?;
+    if v_len != count {
+        return Err(PyValueError::new_err(format!(
+            "TableHDU[[rows]] = value: row list has {} entries but \
+             value has length {}", count, v_len)));
+    }
+    let disk_rows: Vec<usize> = row_indices_signed.iter()
+        .map(|&i| normalize_row_index(i, nrows))
+        .collect::<PyResult<_>>()?;
+    let per_col = extract_per_column_inputs(
+        py, value, None, columns)?;
+    setitem_rows_vla_aware_inner(
+        py, super_, cards, columns, per_col,
+        VlaRowSpec::Strided { disk_rows: &disk_rows },
+        row_width, data_offset)
 }
 
 // hdu["vla_col"] = arr where the named column is variable-length.
