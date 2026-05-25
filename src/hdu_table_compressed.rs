@@ -483,8 +483,23 @@ impl CompressedTableHDU {
             algorithms.push(parse_algorithm(&zctyp)?);
         }
 
-        let kind = classify_setitem_key(key)?;
-        match kind {
+        let ctx = SetItemCtx {
+            super_: &super_,
+            cards: &cards,
+            columns: &columns,
+            algorithms: &algorithms,
+            per_col_configs: cfgs.as_deref(),
+            nrows,
+            ztilelen,
+            n_tiles,
+            descriptor_row_width,
+            data_offset,
+            current_pcount,
+            cache: &cache,
+        };
+        let all_cols: Vec<usize> = (0..columns.len()).collect();
+
+        match classify_setitem_key(key)? {
             SetItemKey::SingleRow(i) => {
                 let r = normalize_disk_row(i, nrows)?;
                 let arr = coerce_to_len1_record(py, value)?;
@@ -492,10 +507,7 @@ impl CompressedTableHDU {
                     crate::hdu_table::extract_per_column_inputs(
                         py, &arr, None, &columns)?;
                 setitem_compressed_fixed_rows(
-                    py, &super_, &cards, &per_column, &columns,
-                    &algorithms, cfgs.as_deref(), nrows, ztilelen,
-                    n_tiles, descriptor_row_width, data_offset,
-                    current_pcount, &[r], &cache,
+                    py, &ctx, &per_column, &all_cols, &[r],
                 )
             }
             SetItemKey::RowSlice => {
@@ -507,23 +519,11 @@ impl CompressedTableHDU {
                          is not yet supported (ZTABLE Phase 6c-2d); use a \
                          step=1 slice or a fancy-row list"));
                 }
-                let np = py.import("numpy")?;
-                let ndarray = np.getattr("ndarray")?;
-                if !value.is_instance(&ndarray)? {
-                    return Err(PyValueError::new_err(
-                        "CompressedTableHDU[slice] = value: value must be \
-                         a structured numpy ndarray of length equal to \
-                         the slice length"));
-                }
                 let count = indices.slicelength as usize;
+                require_ndarray_with_length(
+                    py, value, count, "CompressedTableHDU[slice]",
+                )?;
                 if count == 0 {
-                    let v_len: usize = value.len().unwrap_or(0);
-                    if v_len != 0 {
-                        return Err(PyValueError::new_err(format!(
-                            "CompressedTableHDU[slice] = value: slice \
-                             selects 0 rows but value has length {}",
-                            v_len)));
-                    }
                     return Ok(());
                 }
                 let start = indices.start as usize;
@@ -533,37 +533,16 @@ impl CompressedTableHDU {
                     crate::hdu_table::extract_per_column_inputs(
                         py, value, None, &columns)?;
                 setitem_compressed_fixed_rows(
-                    py, &super_, &cards, &per_column, &columns,
-                    &algorithms, cfgs.as_deref(), nrows, ztilelen,
-                    n_tiles, descriptor_row_width, data_offset,
-                    current_pcount, &disk_rows, &cache,
+                    py, &ctx, &per_column, &all_cols, &disk_rows,
                 )
             }
             SetItemKey::FancyRows(rows) => {
-                let np = py.import("numpy")?;
-                let ndarray = np.getattr("ndarray")?;
-                if !value.is_instance(&ndarray)? {
-                    return Err(PyValueError::new_err(
-                        "CompressedTableHDU[[rows]] = value: value must \
-                         be a structured numpy ndarray of length equal \
-                         to the row list"));
-                }
                 let count = rows.len();
+                require_ndarray_with_length(
+                    py, value, count, "CompressedTableHDU[[rows]]",
+                )?;
                 if count == 0 {
-                    let v_len: usize = value.len().unwrap_or(0);
-                    if v_len != 0 {
-                        return Err(PyValueError::new_err(format!(
-                            "CompressedTableHDU[[rows]] = value: row list \
-                             is empty but value has length {}", v_len)));
-                    }
                     return Ok(());
-                }
-                let v_len: usize = value.len()?;
-                if v_len != count {
-                    return Err(PyValueError::new_err(format!(
-                        "CompressedTableHDU[[rows]] = value: row list has \
-                         {} entries but value has length {}",
-                        count, v_len)));
                 }
                 let disk_rows: Vec<usize> = rows.iter()
                     .map(|&i| normalize_disk_row(i, nrows))
@@ -572,23 +551,54 @@ impl CompressedTableHDU {
                     crate::hdu_table::extract_per_column_inputs(
                         py, value, None, &columns)?;
                 setitem_compressed_fixed_rows(
-                    py, &super_, &cards, &per_column, &columns,
-                    &algorithms, cfgs.as_deref(), nrows, ztilelen,
-                    n_tiles, descriptor_row_width, data_offset,
-                    current_pcount, &disk_rows, &cache,
+                    py, &ctx, &per_column, &all_cols, &disk_rows,
                 )
             }
-            SetItemKey::SingleColumn(_) | SetItemKey::MultiColumns(_) => {
-                Err(PyNotImplementedError::new_err(
-                    "CompressedTableHDU[col] = value — column writes on \
-                     compressed tables are not yet supported (ZTABLE \
-                     Phase 6c-2c)"))
+            SetItemKey::SingleColumn(name) => {
+                let col_idx = find_compressed_column_index(
+                    &columns, &name)?;
+                let label = format!("CompressedTableHDU['{}']", name);
+                require_ndarray(py, value, &label)?;
+                let disk_rows: Vec<usize> = (0..nrows).collect();
+                let per_column = vec![value.clone()];
+                setitem_compressed_fixed_rows(
+                    py, &ctx, &per_column, &[col_idx], &disk_rows,
+                )
             }
-            SetItemKey::Cell(_, _) => {
-                Err(PyNotImplementedError::new_err(
-                    "CompressedTableHDU[row, col] = value — single-cell \
-                     writes on compressed tables are not yet supported \
-                     (ZTABLE Phase 6c-2c)"))
+            SetItemKey::MultiColumns(names) => {
+                if names.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "CompressedTableHDU[[names]] = value: empty \
+                         column list"));
+                }
+                require_ndarray_with_length(
+                    py, value, nrows, "CompressedTableHDU[[names]]",
+                )?;
+                let (selected, per_column) =
+                    resolve_structured_subset_value(
+                        py, value, &columns, &names,
+                    )?;
+                let disk_rows: Vec<usize> = (0..nrows).collect();
+                setitem_compressed_fixed_rows(
+                    py, &ctx, &per_column, &selected, &disk_rows,
+                )
+            }
+            SetItemKey::Cell(row_idx_signed, name) => {
+                let r = normalize_disk_row(row_idx_signed, nrows)?;
+                let col_idx = find_compressed_column_index(
+                    &columns, &name)?;
+                let col = &columns[col_idx];
+                if col.var_kind.is_some() {
+                    return Err(PyNotImplementedError::new_err(format!(
+                        "CompressedTableHDU[row, '{}'] = value: VLA \
+                         cell writes are not yet supported (ZTABLE \
+                         Phase 6c-2e)", name)));
+                }
+                let promoted = coerce_cell_value_to_len1(py, col, value)?;
+                let per_column = vec![promoted];
+                setitem_compressed_fixed_rows(
+                    py, &ctx, &per_column, &[col_idx], &[r],
+                )
             }
         }
     }
@@ -4295,81 +4305,118 @@ fn stream_copy_in_file(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6c-2b — row __setitem__ on compressed tables (fixed columns)
+// Phase 6c-2b / 6c-2c — __setitem__ primitive on compressed tables
 // ---------------------------------------------------------------------------
 //
-// Modify selected rows of a compressed fixed-column table by
-// re-encoding the affected tiles.  For each tile that contains any
-// modified row, each column's blob is decoded to BE bytes, the
-// rows' bytes are replaced via `apply_transform_cell` from the
-// input, and the slab is re-encoded + appended to the heap end.
-// Old blobs become orphans (reclaimed by `repack()`).
+// Modify a selected set of (row, column) cells of a compressed
+// fixed-column table by re-encoding the affected tiles.  For each
+// tile that contains any modified row, the SELECTED columns' blobs
+// are decoded to BE bytes, the rows' bytes are replaced via
+// `apply_transform_cell` from the input, and each slab is
+// re-encoded + appended to the heap end.  Non-selected columns'
+// descriptors stay unchanged.  Old blobs become orphans (reclaimed
+// by `repack()`).
 //
-// Surface (the dispatcher classifies the key; this primitive just
-// takes a flat list of disk rows):
-//   - hdu[i] = record       (single tile)
-//   - hdu[a:b] = arr        (step=1; one or more tiles)
-//   - hdu[[i, j, k]] = arr  (fancy rows; one or more tiles)
+// The primitive takes:
+//   - `disk_rows`: flat list of disk row indices to modify (input
+//     row K corresponds to disk row `disk_rows[K]`).
+//   - `selected_col_indices`: indices into `columns` and
+//     `algorithms` naming the columns to modify.  Length must
+//     match `per_column_inputs.len()`.
+//   - `per_column_inputs[K]`: a per-column ndarray of shape
+//     `(disk_rows.len(),) + per_cell_shape` for the K-th selected
+//     column.
 //
-// All forms touch ALL columns of the selected rows.  VLA-bearing
-// tables are rejected here (Phase 6c-2e adds VLA-aware row writes).
+// Dispatcher use cases (column / row narrowing combinations):
+//   - 6c-2b row writes (`hdu[i]=record`, `hdu[a:b]=arr`,
+//     `hdu[[i,j,k]]=arr`): `selected_col_indices` = all columns;
+//     `disk_rows` = the row selection.
+//   - 6c-2c whole-column (`hdu["col"]=arr`): `selected_col_indices`
+//     = [col_idx]; `disk_rows` = `0..nrows`.
+//   - 6c-2c single-cell (`hdu[r, "col"]=v`): `selected_col_indices`
+//     = [col_idx]; `disk_rows` = `[r]`.
+//   - 6c-2c multi-column (`hdu[[c1, c2]]=arr`):
+//     `selected_col_indices` = [c1_idx, c2_idx];
+//     `disk_rows` = `0..nrows`.
 //
-// Memory bound: per affected tile, one BE-bytes slab per column at
-// a time (rows_in_tile * per_row_bytes — typically a few tens of
-// KB up to a few MB), encoded and dropped before the next column.
-// Plus the full descriptor table held in RAM (n_tiles * ncols * 16
-// bytes; small).
+// VLA selected columns are rejected here (Phase 6c-2e adds VLA-aware
+// writes); non-selected VLA columns elsewhere in the table are fine
+// (we don't touch them).
+//
+// Memory bound: per affected tile, one BE-bytes slab per selected
+// column at a time (rows_in_tile * per_row_bytes — typically a few
+// tens of KB up to a few MB), encoded and dropped before the next
+// column.  Plus the full descriptor table held in RAM
+// (n_tiles * ncols * 16 bytes; small).
 //
 // Validate-then-mutate: ColPrep construction up front guarantees
 // dtype/shape errors raise BEFORE any file mutation; failures
 // inside the encode/write loop taint the file.
-#[allow(clippy::too_many_arguments)]
+// Stable arguments shared across every __setitem__ dispatch branch
+// + the per-tile rewrite primitive.  Bundling them avoids 14-arg
+// call sites that obscure the per-branch variation (which is just
+// `per_column_inputs`, `selected_col_indices`, and `disk_rows`).
+pub(crate) struct SetItemCtx<'a> {
+    pub(crate) super_: &'a HDU,
+    pub(crate) cards: &'a [String],
+    pub(crate) columns: &'a [Column],
+    pub(crate) algorithms: &'a [CompressionAlgorithm],
+    pub(crate) per_col_configs: Option<&'a [CompressionConfigKind]>,
+    pub(crate) nrows: usize,
+    pub(crate) ztilelen: usize,
+    pub(crate) n_tiles: usize,
+    pub(crate) descriptor_row_width: usize,
+    pub(crate) data_offset: u64,
+    pub(crate) current_pcount: u64,
+    pub(crate) cache: &'a ColumnTileCache,
+}
+
 pub(crate) fn setitem_compressed_fixed_rows(
     py: Python<'_>,
-    super_: &HDU,
-    cards: &[String],
+    ctx: &SetItemCtx<'_>,
     per_column_inputs: &[Bound<'_, PyAny>],
-    columns: &[Column],
-    algorithms: &[CompressionAlgorithm],
-    per_col_configs: Option<&[CompressionConfigKind]>,
-    nrows: usize,
-    ztilelen: usize,
-    n_tiles: usize,
-    descriptor_row_width: usize,
-    data_offset: u64,
-    current_pcount: u64,
+    selected_col_indices: &[usize],
     disk_rows: &[usize],
-    cache: &ColumnTileCache,
 ) -> PyResult<()> {
     use std::io::Write;
     use std::sync::atomic::Ordering;
 
-    crate::common::check_not_tainted(&super_.tainted)?;
+    crate::common::check_not_tainted(&ctx.super_.tainted)?;
 
-    if disk_rows.is_empty() {
+    if disk_rows.is_empty() || selected_col_indices.is_empty() {
         return Ok(());
     }
-    if per_column_inputs.len() != columns.len() {
+    if per_column_inputs.len() != selected_col_indices.len() {
         return Err(PyValueError::new_err(format!(
-            "internal: per-column inputs len {} != columns len {}",
-            per_column_inputs.len(), columns.len())));
+            "internal: per-column inputs len {} != selected columns len {}",
+            per_column_inputs.len(), selected_col_indices.len())));
     }
-    if columns.iter().any(|c| c.var_kind.is_some()) {
-        return Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.__setitem__: row writes on tables with \
-             VLA columns are not yet supported (ZTABLE Phase 6c-2e)"));
+    for &col_idx in selected_col_indices {
+        if col_idx >= ctx.columns.len() {
+            return Err(PyValueError::new_err(format!(
+                "internal: selected col_idx {} out of range (ncols={})",
+                col_idx, ctx.columns.len())));
+        }
+        if ctx.columns[col_idx].var_kind.is_some() {
+            return Err(PyNotImplementedError::new_err(format!(
+                "CompressedTableHDU.__setitem__: VLA column '{}' \
+                 cannot be written yet (ZTABLE Phase 6c-2e)",
+                ctx.columns[col_idx].name)));
+        }
     }
     let n_input_rows = disk_rows.len();
 
-    // Validate-then-mutate: build a ColPrep per column up front.
-    // dtype/shape errors surface before any file I/O.
+    // Validate-then-mutate: build a ColPrep per selected column up
+    // front.  dtype/shape errors surface before any file I/O.
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
-    let mut preps: Vec<ColPrep<'_>> = Vec::with_capacity(columns.len());
-    for (i, (col, arr)) in columns.iter()
-        .zip(per_column_inputs.iter()).enumerate()
+    let mut preps: Vec<ColPrep<'_>> =
+        Vec::with_capacity(selected_col_indices.len());
+    for (&col_idx, arr) in selected_col_indices.iter()
+        .zip(per_column_inputs.iter())
     {
-        let cfg = per_col_configs.and_then(|cs| cs.get(i));
+        let col = &ctx.columns[col_idx];
+        let cfg = ctx.per_col_configs.and_then(|cs| cs.get(col_idx));
         preps.push(prepare_fixed_column(
             &np, &ndarray, arr, col, n_input_rows, cfg,
         )?);
@@ -4380,7 +4427,7 @@ pub(crate) fn setitem_compressed_fixed_rows(
     // descriptor + existing-heap reads).  Each entry is a vec of
     // (in_tile_offset, input_row_idx) pairs.
     use std::collections::BTreeMap;
-    let zt = ztilelen.max(1);
+    let zt = ctx.ztilelen.max(1);
     let mut by_tile: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
     for (input_row, &disk_row) in disk_rows.iter().enumerate() {
         let tile_idx = disk_row / zt;
@@ -4390,13 +4437,13 @@ pub(crate) fn setitem_compressed_fixed_rows(
 
     // Read the full descriptor table.  Small (n_tiles * ncols * 16
     // bytes; typically a few KB).  Re-emitted in full at the end.
-    let desc_table_size = n_tiles * descriptor_row_width;
+    let desc_table_size = ctx.n_tiles * ctx.descriptor_row_width;
     let mut desc_table = vec![0u8; desc_table_size];
     if desc_table_size > 0 {
-        let mut g = lock_file(&super_.file)?;
+        let mut g = lock_file(&ctx.super_.file)?;
         let f = g.as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.seek(SeekFrom::Start(data_offset))
+        f.seek(SeekFrom::Start(ctx.data_offset))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         f.read_exact(&mut desc_table).map_err(|e| {
             PyIOError::new_err(format!(
@@ -4404,27 +4451,28 @@ pub(crate) fn setitem_compressed_fixed_rows(
         })?;
     }
 
-    let heap_start_offset = data_offset
-        + (n_tiles as u64) * (descriptor_row_width as u64);
+    let heap_start_offset = ctx.data_offset
+        + (ctx.n_tiles as u64) * (ctx.descriptor_row_width as u64);
     // Heap cursor starts at current PCOUNT — new blobs append to
     // the heap end, orphaning the old blobs (their heap bytes stay
     // until `repack()` reclaims them).
-    let mut heap_cursor = current_pcount;
+    let mut heap_cursor = ctx.current_pcount;
 
     for (&tile_idx, edits) in by_tile.iter() {
-        let tile_row_start = tile_idx * ztilelen;
-        let rows_in_tile = if tile_idx + 1 == n_tiles {
-            nrows - tile_row_start
+        let tile_row_start = tile_idx * ctx.ztilelen;
+        let rows_in_tile = if tile_idx + 1 == ctx.n_tiles {
+            ctx.nrows - tile_row_start
         } else {
-            ztilelen
+            ctx.ztilelen
         };
-        for (col_idx, col) in columns.iter().enumerate() {
-            let prep = &preps[col_idx];
+        for (sel_k, &col_idx) in selected_col_indices.iter().enumerate() {
+            let col = &ctx.columns[col_idx];
+            let prep = &preps[sel_k];
             // Decode the existing tile blob into a BE-bytes slab.
             let mut slab = decode_existing_tile_to_be_bytes(
-                &super_.file, cards, data_offset, tile_idx, col_idx,
-                col, algorithms[col_idx], rows_in_tile,
-                descriptor_row_width,
+                &ctx.super_.file, ctx.cards, ctx.data_offset, tile_idx,
+                col_idx, col, ctx.algorithms[col_idx], rows_in_tile,
+                ctx.descriptor_row_width,
             )?;
             // Overwrite the affected rows.  Per-cell layout matches
             // what the encoder expects (rows_in_tile * per_row_bytes).
@@ -4443,30 +4491,30 @@ pub(crate) fn setitem_compressed_fixed_rows(
             // Re-encode + append to heap + record new descriptor.
             let n_pixels = rows_in_tile * prep.per_row_pixels;
             heap_cursor = encode_be_slab_to_heap_and_record(
-                &slab, n_pixels, algorithms[col_idx],
+                &slab, n_pixels, ctx.algorithms[col_idx],
                 prep.elem_size, prep.rice_blocksize, prep.gzip_level,
-                tile_idx, col_idx, &col.name, descriptor_row_width,
+                tile_idx, col_idx, &col.name, ctx.descriptor_row_width,
                 heap_start_offset, heap_cursor, &mut desc_table,
-                &super_.file, &super_.layout, data_offset,
-                &super_.tainted,
+                &ctx.super_.file, &ctx.super_.layout, ctx.data_offset,
+                &ctx.super_.tainted,
             )?;
         }
     }
 
     // Write the (modified) descriptor table back at data_offset.
     {
-        let mut g = lock_file(&super_.file)?;
+        let mut g = lock_file(&ctx.super_.file)?;
         let f = g.as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.seek(SeekFrom::Start(data_offset))
+        f.seek(SeekFrom::Start(ctx.data_offset))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         f.write_all(&desc_table).map_err(|e| {
-            super_.tainted.store(true, Ordering::Release);
+            ctx.super_.tainted.store(true, Ordering::Release);
             PyIOError::new_err(format!(
                 "__setitem__: descriptor-table write failed: {}", e))
         })?;
         f.flush().map_err(|e| {
-            super_.tainted.store(true, Ordering::Release);
+            ctx.super_.tainted.store(true, Ordering::Release);
             PyIOError::new_err(format!(
                 "__setitem__: flush failed: {}", e))
         })?;
@@ -4474,13 +4522,13 @@ pub(crate) fn setitem_compressed_fixed_rows(
 
     // Update PCOUNT — the heap monotonically grew.  Standard
     // disk-write-before-commit + taint discipline.
-    let mut cards_guard = super_.header.lock()
+    let mut cards_guard = ctx.super_.header.lock()
         .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards.to_vec();
+    let mut new_cards = ctx.cards.to_vec();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
     crate::header::rewrite_header_to_disk(
-        &super_.file, &super_.offsets, &super_.layout,
-        &new_cards, &super_.tainted,
+        &ctx.super_.file, &ctx.super_.offsets, &ctx.super_.layout,
+        &new_cards, &ctx.super_.tainted,
     )?;
     *cards_guard = new_cards;
 
@@ -4489,8 +4537,131 @@ pub(crate) fn setitem_compressed_fixed_rows(
     // differ).  Full clear is simplest and correct; per-(tile, col)
     // eviction would only matter for hot-path workloads that
     // interleave setitem with reads of unmodified tiles.
-    cache.clear();
+    ctx.cache.clear();
     Ok(())
+}
+
+// Dispatcher helpers — small input-validation primitives shared
+// across the __setitem__ branches.
+
+// Reject value if it isn't a numpy ndarray instance.  Error message
+// names the user-facing key form via `key_label`.
+fn require_ndarray(
+    py: Python<'_>, value: &Bound<'_, PyAny>, key_label: &str,
+) -> PyResult<()> {
+    let np = py.import("numpy")?;
+    let ndarray = np.getattr("ndarray")?;
+    if !value.is_instance(&ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "{} = value: value must be a numpy ndarray", key_label)));
+    }
+    Ok(())
+}
+
+// require_ndarray + an exact length check.  Used by branches whose
+// `value.len()` is meaningful (slices, fancy rows, multi-col).
+fn require_ndarray_with_length(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    expected_len: usize,
+    key_label: &str,
+) -> PyResult<()> {
+    require_ndarray(py, value, key_label)?;
+    let v_len: usize = value.len().unwrap_or(0);
+    if v_len != expected_len {
+        return Err(PyValueError::new_err(format!(
+            "{} = value: expected length {}, got {}",
+            key_label, expected_len, v_len)));
+    }
+    Ok(())
+}
+
+// Validate a structured-ndarray multi-column subset value: check
+// for named fields, case-insensitive resolve each name against the
+// table columns, dedup, and materialize each per-column view as a
+// contiguous ndarray.  Returns (selected_col_indices, per_column).
+fn resolve_structured_subset_value<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+    columns: &[Column],
+    names: &[String],
+) -> PyResult<(Vec<usize>, Vec<Bound<'py, PyAny>>)> {
+    let dtype = value.getattr("dtype")?;
+    let value_names_attr = dtype.getattr("names")?;
+    if value_names_attr.is_none() {
+        return Err(PyValueError::new_err(
+            "CompressedTableHDU[[names]] = value: value must be a \
+             structured ndarray with named fields"));
+    }
+    let value_names: Vec<String> = value_names_attr.extract()?;
+    let value_names_upper: std::collections::HashSet<String> =
+        value_names.iter().map(|n| n.to_uppercase()).collect();
+    let np = py.import("numpy")?;
+    let mut selected: Vec<usize> = Vec::with_capacity(names.len());
+    let mut seen_upper: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut per_column: Vec<Bound<'py, PyAny>> =
+        Vec::with_capacity(names.len());
+    for name in names {
+        let name_u = name.to_uppercase();
+        if !seen_upper.insert(name_u.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "CompressedTableHDU[[names]] = value: duplicate \
+                 column name '{}'", name)));
+        }
+        let idx = find_compressed_column_index(columns, name)?;
+        if !value_names_upper.contains(&name_u) {
+            return Err(PyValueError::new_err(format!(
+                "CompressedTableHDU[[names]] = value: value \
+                 structured dtype is missing field '{}'", name)));
+        }
+        selected.push(idx);
+        let field_view = value.get_item(name.as_str())?;
+        let per_col = np.call_method1(
+            "ascontiguousarray", (field_view,))?;
+        per_column.push(per_col);
+    }
+    Ok((selected, per_column))
+}
+
+// Promote a single-cell RHS to a length-1 per-column ndarray
+// matching the column's expected dtype + per-cell shape.  Same
+// coercion shape as the uncompressed-side `setitem_cell` helper:
+// asarray(value, dtype) + broadcast_to((1,) + per_cell_shape) +
+// ascontiguousarray.  Numpy's asarray + broadcast_to handle the
+// scalar / 0-d / pre-shaped cases uniformly and surface shape
+// mismatches as `ValueError`.
+fn coerce_cell_value_to_len1<'py>(
+    py: Python<'py>,
+    col: &Column,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let np = py.import("numpy")?;
+    let expected_shape: Vec<usize> = column_expected_shape(col);
+    let full_shape: Vec<usize> = std::iter::once(1)
+        .chain(expected_shape.iter().copied()).collect();
+    let (dtype_str, _) = field_dtype_and_shape(col, false)?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", &dtype_str)?;
+    let arr = np.call_method("asarray", (value,), Some(&kwargs))?;
+    let broadcast = np.getattr("broadcast_to")?
+        .call1((arr, full_shape))?;
+    np.call_method1("ascontiguousarray", (broadcast,))
+}
+
+// Find a column by name (case-insensitive); shared by the __setitem__
+// dispatch branches that take a column name (SingleColumn /
+// MultiColumns / Cell).  Error message names the user-supplied
+// spelling so the diagnostic is useful regardless of case.
+fn find_compressed_column_index(
+    columns: &[Column], name: &str,
+) -> PyResult<usize> {
+    let name_u = name.to_uppercase();
+    columns.iter()
+        .position(|c| c.name.to_uppercase() == name_u)
+        .ok_or_else(|| PyValueError::new_err(format!(
+            "CompressedTableHDU[name] = value: no column named '{}'",
+            name)))
 }
 
 // Normalize a possibly-negative disk row index against ZNAXIS2;

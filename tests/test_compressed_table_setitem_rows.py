@@ -579,41 +579,8 @@ def test_funpack_decompresses_setitem_modified_file():
 
 
 # ---------------------------------------------------------------------
-# Rejections: column / cell writes and VLA tables still raise pointers
+# VLA tables still rejected (6c-2e will lift)
 # ---------------------------------------------------------------------
-
-
-def test_setitem_single_column_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        _make_table(fname, nrows=100, ztilelen=50)
-        arr = np.arange(100, dtype="i4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1]["id"] = arr
-            assert "6c-2c" in str(ei.value)
-
-
-def test_setitem_multi_columns_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        _make_table(fname, nrows=100, ztilelen=50)
-        dt = np.dtype([("id", "i4"), ("v", "f8")])
-        arr = np.zeros(100, dtype=dt)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][["id", "v"]] = arr
-            assert "6c-2c" in str(ei.value)
-
-
-def test_setitem_cell_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        _make_table(fname, nrows=100, ztilelen=50)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][10, "id"] = np.int32(42)
-            assert "6c-2c" in str(ei.value)
 
 
 def test_setitem_vla_table_rejected_with_phase_pointer():
