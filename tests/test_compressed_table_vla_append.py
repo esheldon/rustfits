@@ -488,32 +488,5 @@ def test_funpack_decompresses_vla_appended_file():
             )
 
 
-# ---------------------------------------------------------------------
-# repack() still rejects VLA (Phase 6c-2 work)
-# ---------------------------------------------------------------------
-
-
-def test_repack_still_rejects_vla_after_append():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        base = _make_vla_data(0, 250, dt)
-        more = _make_vla_data(250, 350, dt)
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=250,
-                var_dtypes={"v": "f4"},
-                compress=True,
-                ztilelen=400,
-            )
-            f[1].write(base)
-        with rustfits.FITS(fname, "r+") as f:
-            f[1].append(more)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError, match="VLA"):
-                f[1].repack()
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])

@@ -251,33 +251,6 @@ def test_funpack_decompresses_repacked_file():
 
 
 # ---------------------------------------------------------------------
-# VLA rejection
-# ---------------------------------------------------------------------
-
-
-def test_repack_rejects_vla_table():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        nrows = 500
-        src = np.empty(nrows, dtype=dt)
-        src["id"] = np.arange(nrows, dtype="i4")
-        for i in range(nrows):
-            src["v"][i] = np.arange(i % 5, dtype="f4")
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=nrows,
-                var_dtypes={"v": "f4"},
-                compress=True,
-            )
-            f[1].write(src)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError, match="VLA"):
-                f[1].repack()
-
-
-# ---------------------------------------------------------------------
 # Same-handle vs post-reopen verification
 # ---------------------------------------------------------------------
 

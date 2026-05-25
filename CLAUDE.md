@@ -119,10 +119,13 @@ else stays private to its file.
   funpack interop), 6b (`append()` for fixed-column tables
   with merge-into-partial-last-tile), 6c-1a (`repack()`
   for fixed-column tables — streaming fast path + staging
-  fallback, ~1 MiB peak memory), and 6c-1b (VLA `append()`
+  fallback, ~1 MiB peak memory), 6c-1b (VLA `append()`
   — existing per-cell compressed bytes copied verbatim, new
-  rows encoded per-cell, ZPCOUNT updated for funpack interop)
-  shipped; remaining: `__setitem__` + VLA `repack()` (6c-2).  Detection lives in `header_has_ztable`; routing
+  rows encoded per-cell, ZPCOUNT updated for funpack interop),
+  and 6c-2a (VLA `repack()` — streaming staging-only path
+  rewrites per-cell offsets in the dual-descriptor blob and
+  re-gzips it; also handles mixed fixed + VLA tables)
+  shipped; remaining: `__setitem__` (6c-2b).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2385,7 +2388,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6b | `append()` for fixed-column tables (merge into partial last tile) | ✅ Shipped |
 | 6c-1a | `repack()` for fixed-column tables (streaming + staging fallback) | ✅ Shipped |
 | 6c-1b | VLA `append()` (existing-cell copy + per-cell re-encode for new rows) | ✅ Shipped |
-| 6c-2 | `__setitem__` on compressed tables + VLA `repack()` | ⏳ Next |
+| 6c-2a | VLA `repack()` (streaming staging + dual-descriptor blob re-gzip) | ✅ Shipped |
+| 6c-2b | `__setitem__` on compressed tables | ⏳ Next |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -3048,6 +3052,78 @@ multiple sequential appends, **non-last HDU preserves trailing**
 (catches the grow_file_to_at_least bug above), string VLA
 ('PA') append, funpack interop, and repack-still-rejects-VLA
 (confirms 6c-2 work remains).
+
+**Phase 6c-2a — VLA `repack()` on compressed tables.**  Shipped.
+
+`CompressedTableHDU.repack()` now handles tables with VLA
+columns (including mixed fixed + VLA).  Reclaims orphans from
+append-with-merge (and the upcoming __setitem__ once 6c-2b
+lands).  Streaming, staging-only path — no in-place fast path
+for VLA because the per-cell+per-blob interleaving makes the
+safety check substantially more complex and the staging path's
+2× new_pcount of I/O is already acceptable.
+
+**Mechanics.**  Walk each (tile, col) in scan order:
+
+  - **Fixed col**: stream-copy the existing blob (heap_start +
+    old_offset, length=descriptor.nelements) to the staging area
+    at staging_cursor; record (staging_cursor, length) for the
+    new main descriptor.
+  - **VLA col**: read + GZIP-decompress the dual-descriptor blob
+    from the OLD heap into RAM.  For each row, stream-copy the
+    cell's compressed bytes from `heap_start + cvlastart_old` to
+    `staging_start + staging_cursor`, then rewrite the row's
+    compressed-descriptor in the in-RAM blob with the new
+    cvlastart.  After all rows: re-GZIP the blob (now with new
+    cvlastart values inside) and stage-write it; record the new
+    main descriptor at the blob's staging position.
+
+Then one big front-to-back stream copy moves
+`staging[0..new_pcount]` to `heap_start[0..new_pcount]` (safe
+because dst < src by exactly `current_pcount`).  Then descriptor
+table rewrite, file shrink (set_len for last HDU,
+shift_file_tail_backward for non-last), PCOUNT update, cache
+clear — mirroring the fixed repack tail.
+
+**ZPCOUNT invariant.**  Repack reorganizes COMPRESSED heap
+bytes; cell `nelements` values are unchanged, so the
+ORIGINAL-heap size (the sum of `nelements * elem_size` over
+live cells, recorded in ZPCOUNT) doesn't move.  Don't touch
+ZPCOUNT.
+
+**Bug fixed in the same change: descriptor-bytes off-by-N in
+`grow_file_to_at_least` `want_total`.**  The staging area
+starts at `data_offset + desc_bytes + current_pcount`, but the
+initial `want_total` I computed forgot `desc_bytes`.  For a
+typical multi-col 1QB descriptor row that's 64 bytes — small,
+but enough that the trail-HDU shift under-counted by one block,
+letting staging writes clobber the start of HDU N+1's header.
+Same-handle reads passed (in-memory layout was right); reopen
+failed because the on-disk XTENSION card was overwritten by
+heap floats.  The non-last HDU test caught it.
+
+**Memory bound.**  ~1 MiB chunk + one decompressed dual-desc
+blob at a time (`rowspertile * (width_orig + 16)` bytes) + one
+gzipped blob held briefly while staging + descriptor table
+(few KB to few MB) + per-(tile, col) move-plan vector
+(~32 bytes per entry).  No heap-in-RAM allocation.  Staging
+temporarily roughly doubles the file's heap region; reclaimed
+on shrink.
+
+**Mixed-table handling.**  Pure-fixed tables take the
+streamlined fixed-only path (with fast path + slow path);
+any-VLA tables take the VLA-aware path which handles both kinds
+of columns uniformly per (tile, col).
+
+Tests: `tests/test_compressed_table_vla_repack.py` (14 cases) —
+PCOUNT shrinks after merge orphan, no-op when compact, multi-
+append accumulation then one repack, last-HDU file shrinks,
+**non-last HDU preserves trailing HDU** (catches the want_total
+bug above), mixed fixed + VLA cols, multiple VLA cols, ZPCOUNT
+preserved, cache cleared, empty cells survive, **funpack
+byte-exact interop on repacked file** (strongest correctness
+check), repack→append→repack composition, string VLA ('PA')
+column, same-handle + reopen parity.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around
