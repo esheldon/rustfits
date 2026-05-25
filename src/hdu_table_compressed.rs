@@ -481,7 +481,7 @@ impl CompressedTableHDU {
                 let per_column =
                     crate::hdu_table::extract_per_column_inputs(
                         py, &arr, None, &meta.columns)?;
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &all_cols, &[r],
                 )
             }
@@ -507,7 +507,7 @@ impl CompressedTableHDU {
                 let per_column =
                     crate::hdu_table::extract_per_column_inputs(
                         py, value, None, &meta.columns)?;
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &all_cols, &disk_rows,
                 )
             }
@@ -525,7 +525,7 @@ impl CompressedTableHDU {
                 let per_column =
                     crate::hdu_table::extract_per_column_inputs(
                         py, value, None, &meta.columns)?;
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &all_cols, &disk_rows,
                 )
             }
@@ -536,7 +536,7 @@ impl CompressedTableHDU {
                 require_ndarray(py, value, &label)?;
                 let disk_rows: Vec<usize> = (0..meta.nrows).collect();
                 let per_column = vec![value.clone()];
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &[col_idx], &disk_rows,
                 )
             }
@@ -554,7 +554,7 @@ impl CompressedTableHDU {
                         py, value, &meta.columns, &names,
                     )?;
                 let disk_rows: Vec<usize> = (0..meta.nrows).collect();
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &selected, &disk_rows,
                 )
             }
@@ -563,15 +563,13 @@ impl CompressedTableHDU {
                 let col_idx = find_compressed_column_index(
                     &meta.columns, &name)?;
                 let col = &meta.columns[col_idx];
-                if col.var_kind.is_some() {
-                    return Err(PyNotImplementedError::new_err(format!(
-                        "CompressedTableHDU[row, '{}'] = value: VLA \
-                         cell writes are not yet supported (ZTABLE \
-                         Phase 6c-2e)", name)));
-                }
-                let promoted = coerce_cell_value_to_len1(py, col, value)?;
+                let promoted = if col.var_kind.is_some() {
+                    coerce_vla_cell_value_to_len1(py, value)?
+                } else {
+                    coerce_cell_value_to_len1(py, col, value)?
+                };
                 let per_column = vec![promoted];
-                setitem_compressed_fixed_rows(
+                setitem_compressed_cols(
                     py, &ctx, &per_column, &[col_idx], &[r],
                 )
             }
@@ -1335,27 +1333,32 @@ impl CompressedSingleColumnSubset {
         };
         let col_idx = find_compressed_column_index(&meta.columns, &self.name)?;
         let col = &meta.columns[col_idx];
-        if col.var_kind.is_some() {
-            return Err(PyNotImplementedError::new_err(format!(
-                "CompressedTableHDU['{}'][rows] = value: VLA column \
-                 writes are not yet supported (ZTABLE Phase 6c-2e)",
-                self.name)));
-        }
         let (disk_rows, was_single) =
             resolve_compressed_rows_key(rows, meta.nrows)?;
         if disk_rows.is_empty() {
             return Ok(());
         }
+        let is_vla = col.var_kind.is_some();
         let per_column = if was_single {
-            vec![coerce_cell_value_to_len1(py, col, value)?]
+            let promoted = if is_vla {
+                coerce_vla_cell_value_to_len1(py, value)?
+            } else {
+                coerce_cell_value_to_len1(py, col, value)?
+            };
+            vec![promoted]
         } else {
             let label = format!(
                 "CompressedTableHDU['{}'][rows]", self.name);
+            // For VLA columns, the value is an Object-dtype ndarray
+            // of length len(rows); the primitive validates the
+            // Object kind itself.  For fixed columns it's an
+            // ndarray of `(len(rows),) + per_cell_shape`.  Either
+            // way we just check the outer length here.
             require_ndarray_with_length(
                 py, value, disk_rows.len(), &label)?;
             vec![value.clone()]
         };
-        setitem_compressed_fixed_rows(
+        setitem_compressed_cols(
             py, &ctx, &per_column, &[col_idx], &disk_rows,
         )
     }
@@ -1462,7 +1465,7 @@ impl CompressedColumnSubset {
         let (selected, per_column) = resolve_structured_subset_value(
             py, &value_arr, &meta.columns, &self.columns,
         )?;
-        setitem_compressed_fixed_rows(
+        setitem_compressed_cols(
             py, &ctx, &per_column, &selected, &disk_rows,
         )
     }
@@ -4445,15 +4448,25 @@ fn stream_copy_in_file(
 //     `selected_col_indices` = [c1_idx, c2_idx];
 //     `disk_rows` = `0..nrows`.
 //
-// VLA selected columns are rejected here (Phase 6c-2e adds VLA-aware
-// writes); non-selected VLA columns elsewhere in the table are fine
-// (we don't touch them).
+// VLA selected columns are handled per-(tile, col) by
+// `setitem_vla_column_tile`: the existing dual-descriptor blob is
+// GZIP-decompressed, each edited cell is re-encoded with the
+// uncompressed-fallback rule and appended to the heap (orphaning
+// the old cell's compressed bytes), the in-RAM blob's
+// compressed-Q descriptor is updated with the new (cvlalen,
+// cvlastart), and the original-side descriptor gets a fresh
+// `original_offset = current ZPCOUNT` (orphaning the cell's old
+// original-heap slot in funpack's reconstructed view).  The
+// re-GZIP'd blob is appended to heap end and the main-table
+// descriptor is rewritten.  ZPCOUNT bumps by the new cell's
+// uncompressed-byte size on every edited cell; PCOUNT bumps by
+// the new per-cell payload + the new dual-desc blob.
 //
-// Memory bound: per affected tile, one BE-bytes slab per selected
-// column at a time (rows_in_tile * per_row_bytes — typically a few
-// tens of KB up to a few MB), encoded and dropped before the next
-// column.  Plus the full descriptor table held in RAM
-// (n_tiles * ncols * 16 bytes; small).
+// Memory bound: per affected (tile, col), one BE-bytes slab
+// (fixed) or one decompressed dual-desc blob (VLA) plus one
+// per-cell BE-bytes buffer.  Per-tile work is encoded, written,
+// and dropped before the next column.  Plus the full descriptor
+// table held in RAM (n_tiles * ncols * 16 bytes; small).
 //
 // Validate-then-mutate: ColPrep construction up front guarantees
 // dtype/shape errors raise BEFORE any file mutation; failures
@@ -4477,7 +4490,7 @@ pub(crate) struct SetItemCtx<'a> {
     pub(crate) cache: &'a ColumnTileCache,
 }
 
-pub(crate) fn setitem_compressed_fixed_rows(
+pub(crate) fn setitem_compressed_cols(
     py: Python<'_>,
     ctx: &SetItemCtx<'_>,
     per_column_inputs: &[Bound<'_, PyAny>],
@@ -4503,29 +4516,52 @@ pub(crate) fn setitem_compressed_fixed_rows(
                 "internal: selected col_idx {} out of range (ncols={})",
                 col_idx, ctx.columns.len())));
         }
-        if ctx.columns[col_idx].var_kind.is_some() {
-            return Err(PyNotImplementedError::new_err(format!(
-                "CompressedTableHDU.__setitem__: VLA column '{}' \
-                 cannot be written yet (ZTABLE Phase 6c-2e)",
-                ctx.columns[col_idx].name)));
-        }
     }
     let n_input_rows = disk_rows.len();
 
-    // Validate-then-mutate: build a ColPrep per selected column up
-    // front.  dtype/shape errors surface before any file I/O.
+    // Validate-then-mutate: per selected column, either build a
+    // ColPrep (fixed) or validate the VLA Object-dtype + length.
+    // dtype/shape errors surface before any file I/O.  preps[i] is
+    // None for VLA columns; the VLA cells are validated lazily
+    // inside the per-tile loop (one call per edited cell).
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
-    let mut preps: Vec<ColPrep<'_>> =
+    let mut preps: Vec<Option<ColPrep<'_>>> =
         Vec::with_capacity(selected_col_indices.len());
+    let mut any_vla = false;
     for (&col_idx, arr) in selected_col_indices.iter()
         .zip(per_column_inputs.iter())
     {
         let col = &ctx.columns[col_idx];
+        if col.var_kind.is_some() {
+            any_vla = true;
+            if !arr.is_instance(&ndarray)? {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.__setitem__: VLA column '{}' \
+                     value must be a numpy ndarray", col.name)));
+            }
+            let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+            if shape.is_empty() || shape[0] != n_input_rows {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.__setitem__: VLA column '{}' \
+                     shape {:?} does not have first axis == {}",
+                    col.name, shape, n_input_rows)));
+            }
+            let kind: String = arr.getattr("dtype")?
+                .getattr("kind")?.extract()?;
+            if kind != "O" {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.__setitem__: VLA column '{}' \
+                     input must be a numpy Object dtype ndarray \
+                     (kind 'O'), got kind '{}'", col.name, kind)));
+            }
+            preps.push(None);
+            continue;
+        }
         let cfg = ctx.per_col_configs.and_then(|cs| cs.get(col_idx));
-        preps.push(prepare_fixed_column(
+        preps.push(Some(prepare_fixed_column(
             &np, &ndarray, arr, col, n_input_rows, cfg,
-        )?);
+        )?));
     }
 
     // Bucket affected disk rows by tile.  BTreeMap so we walk tiles
@@ -4563,6 +4599,15 @@ pub(crate) fn setitem_compressed_fixed_rows(
     // the heap end, orphaning the old blobs (their heap bytes stay
     // until `repack()` reclaims them).
     let mut heap_cursor = ctx.current_pcount;
+    // ZPCOUNT cursor: start from the current value parsed from the
+    // header.  Each edited VLA cell appends a fresh original-heap
+    // slot at `new_zpcount` (orphaning the cell's old original-heap
+    // position).  Only rewritten if any VLA col was actually
+    // touched, since fixed-only edits leave the original heap
+    // untouched.  funpack copies ZPCOUNT → PCOUNT on reconstruction,
+    // so this must reflect the new total.
+    let mut new_zpcount = parse_keyword(ctx.cards, "ZPCOUNT")
+        .unwrap_or(0).max(0) as u64;
 
     for (&tile_idx, edits) in by_tile.iter() {
         let tile_row_start = tile_idx * ctx.ztilelen;
@@ -4573,7 +4618,23 @@ pub(crate) fn setitem_compressed_fixed_rows(
         };
         for (sel_k, &col_idx) in selected_col_indices.iter().enumerate() {
             let col = &ctx.columns[col_idx];
-            let prep = &preps[sel_k];
+            if col.var_kind.is_some() {
+                let cfg = ctx.per_col_configs
+                    .and_then(|cs| cs.get(col_idx));
+                heap_cursor = setitem_vla_column_tile(
+                    py, &ndarray, ctx, heap_start_offset, heap_cursor,
+                    tile_idx, col_idx, col, rows_in_tile, edits,
+                    &per_column_inputs[sel_k],
+                    ctx.algorithms[col_idx],
+                    cfg.map(rice_blocksize_of).unwrap_or(32),
+                    cfg.and_then(gzip_level_of),
+                    &mut desc_table, &mut new_zpcount,
+                )?;
+                continue;
+            }
+            // Fixed-column path.
+            let prep = preps[sel_k].as_ref()
+                .expect("non-VLA col has a ColPrep");
             // Decode the existing tile blob into a BE-bytes slab.
             let mut slab = decode_existing_tile_to_be_bytes(
                 &ctx.super_.file, ctx.cards, ctx.data_offset, tile_idx,
@@ -4626,12 +4687,15 @@ pub(crate) fn setitem_compressed_fixed_rows(
         })?;
     }
 
-    // Update PCOUNT — the heap monotonically grew.  Standard
-    // disk-write-before-commit + taint discipline.
+    // Update PCOUNT (and ZPCOUNT if any VLA col was touched).
+    // Standard disk-write-before-commit + taint discipline.
     let mut cards_guard = ctx.super_.header.lock()
         .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
     let mut new_cards = ctx.cards.to_vec();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
+    if any_vla {
+        set_zpcount_in_cards(&mut new_cards, new_zpcount);
+    }
     crate::header::rewrite_header_to_disk(
         &ctx.super_.file, &ctx.super_.offsets, &ctx.super_.layout,
         &new_cards, &ctx.super_.tainted,
@@ -4645,6 +4709,193 @@ pub(crate) fn setitem_compressed_fixed_rows(
     // interleave setitem with reads of unmodified tiles.
     ctx.cache.clear();
     Ok(())
+}
+
+// Modify selected rows of ONE VLA column in ONE tile.  Mirrors
+// `encode_vla_column_tile_with_merge` (append's merge path) in
+// spirit but only the EDITED rows are re-encoded; non-edited rows
+// keep their compressed bytes in place (their cvlastart values in
+// the in-RAM blob are unchanged) and their original-side descriptors
+// unchanged.  Each edited cell gets a fresh `original_offset =
+// new_zpcount` so funpack's reconstructed heap stays consistent
+// even when nelements changes per cell — the cell's old original-
+// heap slot becomes a phantom orphan that funpack never references.
+//
+// Returns the updated `heap_cursor` (one past the appended GZIP'd
+// dual-descriptor blob); `new_zpcount` is mutated in place.
+#[allow(clippy::too_many_arguments)]
+fn setitem_vla_column_tile(
+    py: Python<'_>,
+    ndarray: &Bound<'_, PyAny>,
+    ctx: &SetItemCtx<'_>,
+    heap_start_offset: u64,
+    mut heap_cursor: u64,
+    tile_idx: usize,
+    col_idx: usize,
+    col: &Column,
+    rows_in_tile: usize,
+    edits: &[(usize, usize)],
+    cell_inputs: &Bound<'_, PyAny>,
+    algo: CompressionAlgorithm,
+    rice_blocksize: u32,
+    gzip_level: Option<u32>,
+    desc_table: &mut [u8],
+    new_zpcount: &mut u64,
+) -> PyResult<u64> {
+    use crate::zimage::gzip::encode_gzip1;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    let inner_letter = col.tform_letter;
+    let elem_size = bytes_per_element(inner_letter).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "VLA column '{}': unsupported inner letter '{}'",
+            col.name, inner_letter))
+    })?;
+    let descriptor_kind = col.var_kind
+        .expect("setitem_vla_column_tile called for non-VLA column");
+    let width_orig = if descriptor_kind == 'P' { 8 } else { 16 };
+
+    // 1. Read the existing main descriptor entry for this (tile, col).
+    let main_desc_off = tile_idx * ctx.descriptor_row_width + col_idx * 16;
+    let blob_nelems_s = i64::from_be_bytes(
+        desc_table[main_desc_off..main_desc_off + 8].try_into().unwrap());
+    let blob_offset_s = i64::from_be_bytes(
+        desc_table[main_desc_off + 8..main_desc_off + 16]
+            .try_into().unwrap());
+    let blob_nelems = blob_nelems_s.max(0) as usize;
+    let blob_heap_offset = blob_offset_s.max(0) as u64;
+
+    // 2. Read + GZIP-decompress the existing dual-descriptor blob.
+    let expected_blob_size = rows_in_tile * width_orig + rows_in_tile * 16;
+    let mut blob = if blob_nelems > 0 {
+        let mut compressed = vec![0u8; blob_nelems];
+        {
+            let mut g = lock_file(&ctx.super_.file)?;
+            let f = g.as_mut()
+                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+            f.seek(SeekFrom::Start(heap_start_offset + blob_heap_offset))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            f.read_exact(&mut compressed).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "__setitem__: read VLA dual-descriptor blob for \
+                     tile {} col '{}': {}", tile_idx, col.name, e))
+            })?;
+        }
+        gzip_decompress_bytes(&compressed, expected_blob_size)?
+    } else {
+        // Empty tile slot — start from zeroed blob (shouldn't
+        // normally happen, since 6c-1b's write/append emits a
+        // populated blob even when every cell has nelements == 0).
+        vec![0u8; expected_blob_size]
+    };
+    let comp_desc_start = rows_in_tile * width_orig;
+
+    // 3. For each edit: serialize + encode the new cell, append to
+    // heap, rewrite both descriptors in the blob.
+    for &(in_tile, input_row) in edits {
+        let cell = cell_inputs.get_item(input_row)?;
+        let nelements = validate_vla_cell(
+            &cell, ndarray, inner_letter, &col.name, input_row)?;
+        let mut cell_bytes_be = vec![0u8; nelements * elem_size];
+        if nelements > 0 {
+            serialize_vla_cell(
+                &cell, inner_letter, nelements, &mut cell_bytes_be)?;
+        }
+        let (cvlalen, cvlastart) = if nelements == 0 {
+            (0u64, 0u64)
+        } else {
+            // Try compressing; fall back to the raw bytes when the
+            // compressed payload isn't smaller.  cfitsio's table
+            // VLA encoder uses the same rule; Phase 4 read handles
+            // both forms.
+            let compressed = encode_table_column_slab(
+                algo, &cell_bytes_be, nelements, elem_size,
+                rice_blocksize, gzip_level)?;
+            let payload = if compressed.len() >= cell_bytes_be.len() {
+                &cell_bytes_be[..]
+            } else {
+                &compressed[..]
+            };
+            let plen = payload.len() as u64;
+            let want_total = heap_start_offset + heap_cursor + plen
+                - ctx.data_offset;
+            grow_file_to_at_least(
+                &ctx.super_.file, &ctx.super_.layout, ctx.data_offset,
+                want_total, &ctx.super_.tainted)?;
+            {
+                let mut g = lock_file(&ctx.super_.file)?;
+                let f = g.as_mut()
+                    .ok_or_else(|| PyIOError::new_err(
+                        "file is closed"))?;
+                f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                f.write_all(payload).map_err(|e| {
+                    ctx.super_.tainted.store(true, Ordering::Release);
+                    PyIOError::new_err(format!(
+                        "__setitem__: VLA cell heap write at tile {} \
+                         col '{}' input_row {}: {}; close + reopen",
+                        tile_idx, col.name, input_row, e))
+                })?;
+            }
+            let placed = heap_cursor;
+            heap_cursor += plen;
+            (plen, placed)
+        };
+        // Compressed-side Q descriptor (always 16 bytes).
+        let comp_off = comp_desc_start + in_tile * 16;
+        write_descriptor(
+            'Q', cvlalen as usize, cvlastart as usize,
+            &mut blob[comp_off..comp_off + 16],
+        );
+        // Original-side descriptor: assign a fresh slot at
+        // new_zpcount and bump.  Old slot becomes a phantom
+        // orphan in funpack's reconstructed heap.
+        let orig_off = in_tile * width_orig;
+        let new_original_offset = *new_zpcount;
+        write_descriptor(
+            descriptor_kind, nelements, new_original_offset as usize,
+            &mut blob[orig_off..orig_off + width_orig],
+        );
+        *new_zpcount = new_zpcount.checked_add(
+            (nelements * elem_size) as u64,
+        ).ok_or_else(|| PyValueError::new_err(format!(
+            "__setitem__: ZPCOUNT overflow at tile {} col '{}'",
+            tile_idx, col.name)))?;
+    }
+    let _ = py;
+
+    // 4. Re-GZIP the (modified) blob and append to the heap end.
+    let gzipped = encode_gzip1(&blob, None)?;
+    let want_total = heap_start_offset + heap_cursor
+        + gzipped.len() as u64 - ctx.data_offset;
+    grow_file_to_at_least(
+        &ctx.super_.file, &ctx.super_.layout, ctx.data_offset,
+        want_total, &ctx.super_.tainted)?;
+    let blob_new_offset = heap_cursor;
+    {
+        let mut g = lock_file(&ctx.super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&gzipped).map_err(|e| {
+            ctx.super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "__setitem__: VLA dual-descriptor blob write at \
+                 tile {} col '{}': {}; close + reopen",
+                tile_idx, col.name, e))
+        })?;
+    }
+    heap_cursor += gzipped.len() as u64;
+
+    // 5. Update the main-table descriptor for this (tile, col).
+    desc_table[main_desc_off..main_desc_off + 8]
+        .copy_from_slice(&(gzipped.len() as i64).to_be_bytes());
+    desc_table[main_desc_off + 8..main_desc_off + 16]
+        .copy_from_slice(&(blob_new_offset as i64).to_be_bytes());
+
+    Ok(heap_cursor)
 }
 
 // Dispatcher helpers — small input-validation primitives shared
@@ -4753,6 +5004,24 @@ fn coerce_cell_value_to_len1<'py>(
     let broadcast = np.getattr("broadcast_to")?
         .call1((arr, full_shape))?;
     np.call_method1("ascontiguousarray", (broadcast,))
+}
+
+// Wrap a single VLA cell value as a length-1 Object-dtype ndarray
+// for the setitem primitive.  Used by `hdu[r, "vla_col"] = v` and
+// by `hdu["vla_col"][int_row] = v` — both paths want to dispatch
+// to the same per-row VLA encoder, which expects an Object ndarray
+// it can index via `arr.get_item(0)`.  The inner-element type
+// validation runs later via `validate_vla_cell`.
+fn coerce_vla_cell_value_to_len1<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "O")?;
+    let arr = np.call_method("empty", ((1usize,),), Some(&kwargs))?;
+    arr.set_item(0, value)?;
+    Ok(arr)
 }
 
 // Snapshot of the compressed-table metadata needed by every

@@ -583,41 +583,6 @@ def test_funpack_decompresses_setitem_modified_file():
 
 
 # ---------------------------------------------------------------------
-# VLA tables still rejected (6c-2e will lift)
-# ---------------------------------------------------------------------
-
-
-def test_setitem_vla_table_rejected_with_phase_pointer():
-    """
-    A table with a VLA column rejects setitem with the 6c-2e pointer
-    (any row form).
-    """
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        rec = np.zeros(1, dtype=dt)
-        rec["id"] = 99
-        rec["v"][0] = np.arange(2, dtype="f4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][0] = rec[0]
-            assert "6c-2e" in str(ei.value)
-
-
-# ---------------------------------------------------------------------
 # Same-handle vs reopen parity
 # ---------------------------------------------------------------------
 

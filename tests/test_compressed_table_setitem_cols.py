@@ -567,86 +567,9 @@ def test_funpack_decompresses_col_cell_multi_modified_file():
 
 
 # ---------------------------------------------------------------------
-# VLA selected column → 6c-2e phase pointer
+# Positive non-VLA-on-VLA-table case (VLA-targeting tests live in
+# tests/test_compressed_table_setitem_vla.py)
 # ---------------------------------------------------------------------
-
-
-def test_setitem_whole_column_vla_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        arr = np.empty(10, dtype="O")
-        for i in range(10):
-            arr[i] = np.zeros(2, dtype="f4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1]["v"] = arr
-            assert "6c-2e" in str(ei.value)
-
-
-def test_setitem_cell_vla_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][3, "v"] = np.arange(3, dtype="f4")
-            assert "6c-2e" in str(ei.value)
-
-
-def test_setitem_multi_columns_with_vla_rejected_with_phase_pointer():
-    """If any of the named columns is VLA, the call rejects."""
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        sub_dt = np.dtype([("id", "i4"), ("v", "O")])
-        sub = np.zeros(10, dtype=sub_dt)
-        sub["id"] = np.arange(10, dtype="i4") + 100
-        for i in range(10):
-            sub["v"][i] = np.arange(2, dtype="f4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][["id", "v"]] = sub
-            assert "6c-2e" in str(ei.value)
 
 
 def test_setitem_multi_columns_non_vla_subset_on_vla_table_works():

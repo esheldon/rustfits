@@ -228,29 +228,6 @@ def test_subset_single_col_out_of_range_raises():
                 f[1]["v"][-101] = 1.0
 
 
-def test_subset_single_col_vla_rejected_with_phase_pointer():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1]["v"][0] = np.arange(2, dtype="f4")
-            assert "6c-2e" in str(ei.value)
-
-
 def test_subset_single_col_subarray_round_trip():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
@@ -395,34 +372,6 @@ def test_subset_multi_col_unknown_column_raises():
             with pytest.raises(ValueError) as ei:
                 f[1][["nope"]][0:10] = sub
             assert "nope" in str(ei.value)
-
-
-def test_subset_multi_col_with_vla_rejected():
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=10,
-                compress=True,
-                ztilelen=5,
-                var_dtypes={"v": "f4"},
-            )
-            data = np.zeros(10, dtype=dt)
-            data["id"] = np.arange(10, dtype="i4")
-            for i in range(10):
-                data["v"][i] = np.arange(i + 1, dtype="f4")
-            f[1].write(data)
-        sub_dt = np.dtype([("id", "i4"), ("v", "O")])
-        sub = np.zeros(5, dtype=sub_dt)
-        sub["id"] = np.arange(5, dtype="i4") + 100
-        for i in range(5):
-            sub["v"][i] = np.arange(2, dtype="f4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError) as ei:
-                f[1][["id", "v"]][0:5] = sub
-            assert "6c-2e" in str(ei.value)
 
 
 def test_subset_multi_col_non_vla_subset_on_vla_table_works():
