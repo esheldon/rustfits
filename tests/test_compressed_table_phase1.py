@@ -318,19 +318,6 @@ def test_setitem_stub_raises():
                 f[1][0] = np.zeros(1)
 
 
-def test_repack_stub_raises():
-    with tempfile.TemporaryDirectory() as td:
-        fz = _make_ztable_fixture(
-            td,
-            _basic_dtype(),
-            _basic_data(),
-            units=["count", "Jy", "m", "char"],
-        )
-        with rustfits.FITS(fz, "r+") as f:
-            with pytest.raises(NotImplementedError, match="Phase 6"):
-                f[1].repack()
-
-
 def test_insert_column_stub_raises():
     with tempfile.TemporaryDirectory() as td:
         fz = _make_ztable_fixture(

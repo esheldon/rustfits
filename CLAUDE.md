@@ -116,10 +116,12 @@ else stays private to its file.
   4 (VLA-column read via dual-descriptor heap), 5 (bulk write
   via `create_table_hdu(..., compress=...)` for fixed columns),
   6a (VLA write via dual-descriptor heap + ZPCOUNT for
-  funpack interop), and 6b (`append()` for fixed-column tables
-  with merge-into-partial-last-tile) shipped; remaining (Phase
-  6c, deferred until a user asks): `__setitem__` + `repack()` +
-  VLA `append`.  Detection lives in `header_has_ztable`; routing
+  funpack interop), 6b (`append()` for fixed-column tables
+  with merge-into-partial-last-tile), and 6c-1a (`repack()`
+  for fixed-column tables — streaming fast path + staging
+  fallback, ~1 MiB peak memory) shipped; remaining: VLA
+  `append()` (6c-1b, next), then `__setitem__` + VLA
+  `repack()` (6c-2).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2380,7 +2382,9 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 5 | Bulk write — `create_table_hdu(..., compress=...)` for fixed cols | ✅ Shipped |
 | 6a | VLA write (dual-descriptor heap, ZPCOUNT, funpack interop) | ✅ Shipped |
 | 6b | `append()` for fixed-column tables (merge into partial last tile) | ✅ Shipped |
-| 6c | `__setitem__` + `repack()` + VLA `append` | ⏳ Planned (only if a user asks) |
+| 6c-1a | `repack()` for fixed-column tables (streaming + staging fallback) | ✅ Shipped |
+| 6c-1b | VLA `append()` (dual-descriptor merge + per-cell re-encode) | ⏳ Next |
+| 6c-2 | `__setitem__` on compressed tables + VLA `repack()` | ⏳ Planned |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -2875,22 +2879,102 @@ tile), multiple appends accumulating, three input forms,
 trailing HDU**, **funpack byte-exact interop**, VLA rejection,
 PCOUNT grows after merge, ZNAXIS2 + NAXIS2 update correctly.
 
-**Refactor opportunity (post-6b).**  `write_compressed_table_data`
-and `append_compressed_table_data` overlap heavily on the
-per-(tile, col) encode → heap-write → descriptor-fill loop and
-on the per-column prep struct (`FixedColPrep` ↔ `AppendColPrep`
-have basically the same fields).  Candidates for extraction:
+**Shared encode primitives (refactor done post-6b).**  Three
+helpers in `hdu_table_compressed.rs` carry the per-column +
+per-tile work for both write and append (and any future
+mutator):
 
-  - A shared per-column-prep struct (combine `FixedColPrep` +
-    `AppendColPrep`).
-  - A shared `encode_tile_column_and_record` helper that takes a
-    `(tile_idx, col_idx, rows_in_tile, source_row_offset)` plus
-    per-column prep + algorithm + heap_cursor + descriptor table,
-    and writes the blob + fills the descriptor entry.
+  - `ColPrep` struct — unified per-column metadata (RawBuffer
+    pin + src_total_size + WriteTransform + encoder params).
+  - `prepare_fixed_column(...)` — validates one input ndarray
+    against the column's expected per-cell shape, builds the
+    `ColPrep`.  Used by both write and append.
+  - `encode_be_slab_to_heap_and_record(...)` — takes a
+    pre-built BE slab, encodes per algorithm, writes blob to
+    heap, fills the descriptor entry, returns updated
+    `heap_cursor`.  Used by write's per-tile loop, append's
+    new-tiles loop, AND append's merge branch (where the slab
+    is decoded-old + new-transformed bytes).
+  - `build_and_encode_tile_col(...)` — wrapper that builds the
+    BE slab via `apply_transform_cell` from a `ColPrep`'s
+    source bytes, then defers to
+    `encode_be_slab_to_heap_and_record`.  Used by both write's
+    per-(tile, col) loop and append's new-tiles loop.
 
-Deferred until after Phase 6c (if it ships) so the write-set's
-shape is fully settled.  ~200 lines could come out of the table-
-compressed file with this refactor.
+Net result: 33 lines removed from the file, 200 lines of
+duplication eliminated.  The merge branch in append keeps its
+own per-cell-transform loop (it builds the slab differently —
+existing BE bytes ++ new transformed bytes) and uses
+`encode_be_slab_to_heap_and_record` to finish.
+
+**Phase 6c-1a — `repack()` for fixed-column compressed tables.**
+Shipped.
+
+`CompressedTableHDU.repack()` reclaims heap orphans (from
+append-with-merge and any future mutation that always-appends).
+Walks descriptors in scan order, computes each live blob's
+compact-heap position, moves bytes from old → new with chunked
+I/O.
+
+**Two move strategies; same plan-build, descriptor-rewrite, file-
+shrink + PCOUNT-commit code; only the heap I/O differs.**
+
+  - **Fast path (in-place streaming)**: blobs read in old-offset
+    order, written to their new positions in place.  Requires
+    `new_offset[i] + length[i] <= old_offset[i+1]` for every
+    adjacent pair (so writes never clobber unread bytes).
+    Holds for the post-merge orphan pattern that Phase 6b
+    produces.  Cost: `~sum_of_live_blob_bytes_that_move` of I/O
+    — typically just the rewritten last tile (~10 MB).
+  - **Slow path (staging at end-of-file)**: copy blobs to a
+    staging area appended past the current heap (writes go to
+    fresh space — always safe), then copy staging back to the
+    final in-heap positions (front-to-back; dst < src by
+    `current_pcount`).  Cost: `~2 × new_pcount` of I/O.  Used
+    when the fast path's safety check fails — handles any
+    orphan pattern, including the arbitrary ones that
+    `__setitem__` will produce in Phase 6c-2.
+
+The slow path is the contract: works for any future mutator.
+The fast path is an optimization for the merge-orphan common
+case.  A single runtime check picks between them; same code
+path for everything else.
+
+**Memory bound**: ~1 MiB chunk + the descriptor table (`n_tiles
+× ncols × 16` bytes; KB to a few MB) + the per-blob move-plan
+vector (~32 bytes per live blob).  **No heap-in-RAM** — even a
+10 GB compressed heap repacks within this budget.
+
+**Cache invalidation**: descriptors all rewrite to new heap
+offsets, so the per-(tile, col) tile cache is cleared at the
+end of repack.
+
+**Block-aligned shrink**: `new_hdu_end = data_offset +
+round_up_to_block(desc_bytes + new_pcount)`.  For the last
+HDU, `set_len(new_hdu_end)` trims.  For non-last,
+`shift_file_tail_backward_and_update_offsets` at the next
+HDU's current offset with `delta = next_off - new_hdu_end`
+slides everything after back into place.  (Earlier bug: I
+initially used `delta = file_len - new_hdu_end`, which
+double-counted the trailing HDU's own size.  Fixed.)
+
+**Promoted to `pub(crate)`**: `repack_compressed_table_heap`,
+`stream_copy_in_file` (the chunked read-then-write primitive
+used by both fast and slow paths).
+
+**Scope limitation — VLA tables rejected.**  The dual-descriptor
+heap layout used by VLA columns requires indirection-aware
+rewriting (per-cell compressed bytes referenced from inside
+each tile's GZIP_1'd descriptor blob).  Deferred until VLA
+repack is genuinely needed.
+
+Tests: `tests/test_compressed_table_repack.py` (9 cases) —
+PCOUNT shrinks after merge orphan, no-op when compact,
+multiple appends accumulating then one repack, last-HDU file
+shrinks via set_len, **non-last-HDU preserves trailing HDU**
+(catches the delta-computation bug), cache cleared, funpack
+interop on repacked file, VLA rejection, same-handle + reopen
+parity.
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

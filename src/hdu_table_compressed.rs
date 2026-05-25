@@ -596,9 +596,20 @@ impl CompressedTableHDU {
         Self::append(slf, py, data, names)
     }
 
-    fn repack(_slf: PyRef<'_, Self>) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.repack() — ZTABLE Phase 6 will add this"))
+    // Rewrite the heap with only live blobs (those pointed at by
+    // current descriptors), dropping orphans left behind by
+    // append-with-merge (and any future mutation that always-
+    // appends).  Shrinks the on-disk file when the new heap is
+    // smaller.  No-op when the heap is already compact (PCOUNT
+    // unchanged after the rewrite).
+    //
+    // VLA columns add a level of indirection (dual-descriptor
+    // blobs contain compressed-Q descriptors pointing at per-cell
+    // bytes); not yet supported by repack().
+    fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let cache = Arc::clone(&slf.cache);
+        let super_ = slf.into_super().into_super();
+        repack_compressed_table_heap(&super_, &cache)
     }
 
     fn insert_column(
@@ -1760,6 +1771,192 @@ pub(crate) fn gzip_level_of(cfg: &CompressionConfigKind) -> Option<u32> {
     }
 }
 
+// Per-column setup shared between the bulk write and append paths.
+// Holds everything the per-tile encode loop needs:
+//   - the source ndarray's raw byte buffer (`buf`) + per-row stride
+//     (`src_total_size`) + the per-cell `WriteTransform` derived from
+//     the column's TFORM letter and the input dtype;
+//   - encoder-side params (`elem_size` / `per_row_bytes` /
+//     `per_row_pixels`) for the slab→blob call;
+//   - per-column algorithm params (`rice_blocksize`, `gzip_level`)
+//     pulled from the user's compression config.
+//
+// `contig_arr` pins the ndarray for the buf's lifetime; numpy could
+// otherwise free the underlying buffer mid-encode.  Field is held,
+// not read.
+pub(crate) struct ColPrep<'py> {
+    pub(crate) buf: RawBuffer,
+    pub(crate) src_total_size: usize,
+    pub(crate) transform: WriteTransform,
+    #[allow(dead_code)]
+    pub(crate) contig_arr: Bound<'py, PyAny>,
+    pub(crate) elem_size: usize,
+    pub(crate) per_row_bytes: usize,
+    pub(crate) per_row_pixels: usize,
+    pub(crate) rice_blocksize: u32,
+    pub(crate) gzip_level: Option<u32>,
+}
+
+// Build a ColPrep from one input ndarray + column metadata + the
+// per-column compression config (None when the HDU was reopened,
+// in which case algorithm-level defaults apply).  Validates the
+// input shape against the column's expected per-cell shape and
+// derives the per-cell WriteTransform via the shared classifier;
+// failures here surface before any file mutation.
+pub(crate) fn prepare_fixed_column<'py>(
+    np: &Bound<'py, PyAny>,
+    ndarray: &Bound<'py, PyAny>,
+    arr: &Bound<'py, PyAny>,
+    col: &Column,
+    nrows: usize,
+    cfg: Option<&CompressionConfigKind>,
+) -> PyResult<ColPrep<'py>> {
+    if !arr.is_instance(ndarray)? {
+        return Err(PyValueError::new_err(format!(
+            "compressed table: column '{}' value must be a numpy ndarray",
+            col.name)));
+    }
+    let arr_shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    if arr_shape.is_empty() || arr_shape[0] != nrows {
+        return Err(PyValueError::new_err(format!(
+            "compressed table: column '{}' shape {:?} does not have \
+             first axis == {}", col.name, arr_shape, nrows)));
+    }
+    let per_cell_shape: Vec<usize> = arr_shape[1..].to_vec();
+    let expected_shape = column_expected_shape(col);
+    if per_cell_shape != expected_shape {
+        return Err(PyValueError::new_err(format!(
+            "compressed table: column '{}' per-cell shape {:?} does \
+             not match expected {:?}",
+            col.name, per_cell_shape, expected_shape)));
+    }
+    let dtype = arr.getattr("dtype")?;
+    let kind: String = dtype.getattr("kind")?.extract()?;
+    let input_elem_size: usize = dtype.getattr("itemsize")?.extract()?;
+    let transform = column_transform(col, &kind, input_elem_size)?;
+    let cell_elements: usize = per_cell_shape.iter()
+        .product::<usize>().max(1);
+    let src_total_size = input_elem_size * cell_elements;
+    let contig = np.call_method1("ascontiguousarray", (arr,))?;
+    let buf = RawBuffer::acquire(&contig)?;
+    let inner_elem_size = bytes_per_element(col.tform_letter)
+        .ok_or_else(|| PyValueError::new_err(format!(
+            "column '{}': unsupported TFORM letter '{}' on compressed \
+             write", col.name, col.tform_letter)))?;
+    Ok(ColPrep {
+        buf, src_total_size, transform, contig_arr: contig,
+        elem_size: inner_elem_size,
+        per_row_bytes: col.byte_width,
+        per_row_pixels: col.repeat,
+        rice_blocksize: cfg.map(rice_blocksize_of).unwrap_or(32),
+        gzip_level: cfg.and_then(gzip_level_of),
+    })
+}
+
+// Take a pre-built FITS big-endian slab (one column × `n_pixels`
+// elements), encode it per algorithm, write the compressed blob to
+// the heap, and fill the descriptor table entry for this
+// (tile_idx, col_idx).  Used by both the write path (after building
+// the slab via per-cell transforms) and the append-merge path
+// (slab is already in hand from decoded-old + new-transformed bytes).
+// Returns the updated heap_cursor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_be_slab_to_heap_and_record(
+    slab: &[u8],
+    n_pixels: usize,
+    algo: CompressionAlgorithm,
+    elem_size: usize,
+    rice_blocksize: u32,
+    gzip_level: Option<u32>,
+    tile_idx: usize,
+    col_idx: usize,
+    col_name: &str,
+    descriptor_row_width: usize,
+    heap_start_offset: u64,
+    mut heap_cursor: u64,
+    desc_table: &mut [u8],
+    file: &FileHandle,
+    layout: &Arc<FileLayout>,
+    data_offset: u64,
+    tainted: &TaintFlag,
+) -> PyResult<u64> {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let blob = encode_table_column_slab(
+        algo, slab, n_pixels, elem_size, rice_blocksize, gzip_level,
+    )?;
+    let want_total =
+        heap_start_offset + heap_cursor + blob.len() as u64 - data_offset;
+    grow_file_to_at_least(file, layout, data_offset, want_total, tainted)?;
+    {
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&blob).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed table write: heap write failed at \
+                 tile {} col '{}': {}", tile_idx, col_name, e))
+        })?;
+    }
+    let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
+    let nelems_be = (blob.len() as i64).to_be_bytes();
+    let off_be = (heap_cursor as i64).to_be_bytes();
+    desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
+    desc_table[desc_off + 8..desc_off + 16].copy_from_slice(&off_be);
+    heap_cursor += blob.len() as u64;
+    Ok(heap_cursor)
+}
+
+// Build the per-tile per-column BE slab from `prep`'s native-order
+// source bytes (applying the per-cell WriteTransform — byteswap,
+// unsigned-int trick XOR, bool→ASCII, etc.) and hand off to
+// `encode_be_slab_to_heap_and_record`.  Used by both write (with
+// `source_row_offset = tile_row_start`) and append's new-tile branch
+// (with `source_row_offset` past the merged rows).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_and_encode_tile_col(
+    prep: &ColPrep,
+    col: &Column,
+    algo: CompressionAlgorithm,
+    tile_idx: usize,
+    col_idx: usize,
+    rows_in_tile: usize,
+    source_row_offset: usize,
+    descriptor_row_width: usize,
+    heap_start_offset: u64,
+    heap_cursor: u64,
+    desc_table: &mut [u8],
+    file: &FileHandle,
+    layout: &Arc<FileLayout>,
+    data_offset: u64,
+    tainted: &TaintFlag,
+) -> PyResult<u64> {
+    let src_bytes = prep.buf.as_slice();
+    let mut slab = vec![0u8; rows_in_tile * prep.per_row_bytes];
+    for r in 0..rows_in_tile {
+        let src_row = source_row_offset + r;
+        let src_off = src_row * prep.src_total_size;
+        let src = &src_bytes
+            [src_off..src_off + prep.src_total_size];
+        let dst_off = r * prep.per_row_bytes;
+        let dst = &mut slab[dst_off..dst_off + prep.per_row_bytes];
+        apply_transform_cell(
+            &prep.transform, src, dst, &col.name, src_row,
+        )?;
+    }
+    let n_pixels = rows_in_tile * prep.per_row_pixels;
+    encode_be_slab_to_heap_and_record(
+        &slab, n_pixels, algo, prep.elem_size,
+        prep.rice_blocksize, prep.gzip_level,
+        tile_idx, col_idx, &col.name, descriptor_row_width,
+        heap_start_offset, heap_cursor, desc_table,
+        file, layout, data_offset, tainted,
+    )
+}
+
 pub(crate) fn rice_blocksize_of(cfg: &CompressionConfigKind) -> u32 {
     match cfg {
         CompressionConfigKind::Rice1(r) => r.blocksize,
@@ -1958,45 +2155,32 @@ pub(crate) fn write_compressed_table_data<'py>(
         (Vec::new(), 0u64)
     };
 
-    // Per-column setup.  Fixed and VLA columns take different
-    // paths:
-    //   Fixed cols: validate shape + per-cell WriteTransform; pin
-    //     the contig native-order ndarray via RawBuffer for the
-    //     per-tile slab loop.
-    //   VLA cols: validate the input is an Object ndarray of the
-    //     right length; per-row cells are pulled out lazily inside
-    //     the tile loop and serialized via the shared
-    //     validate_vla_cell / serialize_vla_cell helpers.
+    // Per-column setup.  Fixed cols go through the shared
+    // `prepare_fixed_column` helper; VLA cols are validated to be
+    // Object-dtype ndarrays and their per-row cells are handled
+    // lazily inside the tile loop via `encode_vla_column_tile`.
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
-    struct FixedColPrep<'py> {
-        buf: RawBuffer,
-        src_total_size: usize,
-        transform: WriteTransform,
-        // Pin the contiguous ndarray for the buf's lifetime — numpy
-        // could otherwise free the buffer mid-loop.  Field is held,
-        // not read.
-        #[allow(dead_code)]
-        contig_arr: Bound<'py, PyAny>,
-    }
-    let mut fixed_preps: Vec<Option<FixedColPrep<'_>>> =
+    let mut preps: Vec<Option<ColPrep<'_>>> =
         Vec::with_capacity(columns.len());
-    for (col, arr) in columns.iter().zip(per_column_inputs.iter()) {
-        if !arr.is_instance(&ndarray)? {
-            return Err(PyValueError::new_err(format!(
-                "CompressedTableHDU.write: column '{}' value must be a \
-                 numpy ndarray", col.name)));
-        }
-        let arr_shape: Vec<usize> = arr.getattr("shape")?.extract()?;
-        if arr_shape.is_empty() || arr_shape[0] != nrows {
-            return Err(PyValueError::new_err(format!(
-                "CompressedTableHDU.write: column '{}' shape {:?} does \
-                 not have first axis == ZNAXIS2 ({})",
-                col.name, arr_shape, nrows)));
-        }
+    for (i, (col, arr)) in columns.iter()
+        .zip(per_column_inputs.iter()).enumerate()
+    {
         if col.var_kind.is_some() {
-            // VLA column: input must be an Object-dtype ndarray.
-            // Per-cell validation happens inside the tile loop.
+            // VLA: validate Object-dtype ndarray with the right
+            // length; deeper validation happens per cell.
+            if !arr.is_instance(&ndarray)? {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.write: column '{}' value must \
+                     be a numpy ndarray", col.name)));
+            }
+            let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+            if shape.is_empty() || shape[0] != nrows {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.write: column '{}' shape {:?} \
+                     does not have first axis == ZNAXIS2 ({})",
+                    col.name, shape, nrows)));
+            }
             let dtype = arr.getattr("dtype")?;
             let kind: String = dtype.getattr("kind")?.extract()?;
             if kind != "O" {
@@ -2005,29 +2189,13 @@ pub(crate) fn write_compressed_table_data<'py>(
                      must be a numpy Object dtype ndarray (kind 'O'), \
                      got kind '{}'", col.name, kind)));
             }
-            fixed_preps.push(None);
+            preps.push(None);
             continue;
         }
-        let per_cell_shape: Vec<usize> = arr_shape[1..].to_vec();
-        let expected_shape = column_expected_shape(col);
-        if per_cell_shape != expected_shape {
-            return Err(PyValueError::new_err(format!(
-                "CompressedTableHDU.write: column '{}' per-cell shape \
-                 {:?} does not match expected {:?}",
-                col.name, per_cell_shape, expected_shape)));
-        }
-        let dtype = arr.getattr("dtype")?;
-        let kind: String = dtype.getattr("kind")?.extract()?;
-        let elem_size: usize = dtype.getattr("itemsize")?.extract()?;
-        let transform = column_transform(col, &kind, elem_size)?;
-        let cell_elements: usize = per_cell_shape.iter()
-            .product::<usize>().max(1);
-        let src_total_size = elem_size * cell_elements;
-        let contig = np.call_method1("ascontiguousarray", (arr,))?;
-        let buf = RawBuffer::acquire(&contig)?;
-        fixed_preps.push(Some(FixedColPrep {
-            buf, src_total_size, transform, contig_arr: contig,
-        }));
+        let cfg = per_col_configs.and_then(|cs| cs.get(i));
+        preps.push(Some(prepare_fixed_column(
+            &np, &ndarray, arr, col, nrows, cfg,
+        )?));
     }
 
     // Stream-encode tile by tile, writing each blob to the heap as
@@ -2057,34 +2225,6 @@ pub(crate) fn write_compressed_table_data<'py>(
         }
     }
 
-    // Per-column metadata for the encode loop.
-    struct ColMeta {
-        elem_size: usize,        // bytes per inner element
-        algo: CompressionAlgorithm,
-        gzip_level: Option<u32>,
-        rice_blocksize: u32,
-        per_row_bytes: usize,    // = col.byte_width = repeat * elem_size for non-A
-        per_row_pixels: usize,   // n_pixels per row for the encoder (= repeat for most)
-    }
-    let mut metas: Vec<ColMeta> = Vec::with_capacity(columns.len());
-    for (i, col) in columns.iter().enumerate() {
-        let elem_size = bytes_per_element(col.tform_letter)
-            .ok_or_else(|| PyValueError::new_err(format!(
-                "column '{}': unsupported TFORM letter '{}' on compressed \
-                 write", col.name, col.tform_letter)))?;
-        let cfg = per_col_configs.and_then(|cs| cs.get(i));
-        let gzip_level = cfg.and_then(gzip_level_of);
-        let rice_blocksize = cfg.map(rice_blocksize_of).unwrap_or(32);
-        metas.push(ColMeta {
-            elem_size,
-            algo: algorithms[i],
-            gzip_level,
-            rice_blocksize,
-            per_row_bytes: col.byte_width,
-            per_row_pixels: col.repeat,
-        });
-    }
-
     for tile_idx in 0..n_tiles {
         let tile_row_start = tile_idx * ztilelen;
         let rows_in_tile = if tile_idx + 1 == n_tiles {
@@ -2093,89 +2233,35 @@ pub(crate) fn write_compressed_table_data<'py>(
             ztilelen
         };
 
-        for (col_idx, (col, meta)) in columns.iter().zip(metas.iter())
-            .enumerate()
-        {
-            // VLA columns take the dual-descriptor blob path: for
-            // each cell, compress its bytes per ZCTYPn (with the
-            // cfitsio uncompressed-fallback when compression
-            // doesn't help), record the original + compressed
-            // descriptors, then GZIP_1 the descriptor array into
-            // the column's main heap blob.
+        for (col_idx, col) in columns.iter().enumerate() {
             if col.var_kind.is_some() {
+                // VLA dual-descriptor blob path.
+                let cfg = per_col_configs.and_then(|cs| cs.get(col_idx));
                 heap_cursor = encode_vla_column_tile(
                     py, &ndarray, &super_.file, &super_.layout,
                     &super_.tainted, data_offset, heap_start_offset,
                     heap_cursor, col, &per_column_inputs[col_idx],
                     &vla_plans[col_idx], tile_row_start, rows_in_tile,
-                    meta.algo, meta.rice_blocksize, meta.gzip_level,
+                    algorithms[col_idx],
+                    cfg.map(rice_blocksize_of).unwrap_or(32),
+                    cfg.and_then(gzip_level_of),
                     &mut desc_table, tile_idx, col_idx,
                     descriptor_row_width,
                 )?;
                 continue;
             }
-
-            // Fixed-column path: build the per-tile BE slab by
-            // applying the per-cell transform from this column's
-            // native-order source bytes.  The shared
-            // `apply_transform_cell` handles byteswap (Identity),
-            // unsigned-int trick XOR (UnsignedXor), bool 0/1 →
-            // 'F'/'T' ASCII (BoolToLogical), S<n> verbatim copy
-            // (BytesCopy), and U<n> UTF-32 → 7-bit ASCII
-            // (UnicodeToAscii).
-            let prep = fixed_preps[col_idx].as_ref().expect(
-                "fixed_preps[i] is Some for non-VLA columns");
-            let src_bytes = prep.buf.as_slice();
-            let mut slab = vec![0u8; rows_in_tile * meta.per_row_bytes];
-            for r in 0..rows_in_tile {
-                let disk_row = tile_row_start + r;
-                let src_off = disk_row * prep.src_total_size;
-                let src = &src_bytes
-                    [src_off..src_off + prep.src_total_size];
-                let dst_off = r * meta.per_row_bytes;
-                let dst = &mut slab[dst_off..dst_off + meta.per_row_bytes];
-                apply_transform_cell(
-                    &prep.transform, src, dst, &col.name, disk_row,
-                )?;
-            }
-
-            let n_pixels = rows_in_tile * meta.per_row_pixels;
-            let blob = encode_table_column_slab(
-                meta.algo, &slab, n_pixels, meta.elem_size,
-                meta.rice_blocksize, meta.gzip_level,
+            // Fixed-column path: per-cell transform → encode → write
+            // → record, all in the shared helper.
+            let prep = preps[col_idx].as_ref()
+                .expect("preps[i] is Some for non-VLA columns");
+            heap_cursor = build_and_encode_tile_col(
+                prep, col, algorithms[col_idx],
+                tile_idx, col_idx, rows_in_tile,
+                /* source_row_offset = */ tile_row_start,
+                descriptor_row_width, heap_start_offset, heap_cursor,
+                &mut desc_table, &super_.file, &super_.layout,
+                data_offset, &super_.tainted,
             )?;
-
-            // Write blob to heap.  Grow file as needed.
-            let want_heap_end = heap_cursor + blob.len() as u64;
-            let want_total = heap_start_offset + want_heap_end - data_offset;
-            grow_file_to_at_least(
-                &super_.file, &super_.layout, data_offset,
-                want_total, &super_.tainted,
-            )?;
-            {
-                let mut guard = lock_file(&super_.file)?;
-                let f = guard.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                f.write_all(&blob).map_err(|e| {
-                    super_.tainted.store(true, Ordering::Release);
-                    PyIOError::new_err(format!(
-                        "compressed table write: heap write failed at \
-                         tile {} col '{}': {}", tile_idx, col.name, e))
-                })?;
-            }
-
-            // Fill the descriptor for this (tile, col).  1QB =
-            // two big-endian i64.  nelements = compressed bytes;
-            // offset = current heap cursor (relative to heap start).
-            let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
-            let nelems_be = (blob.len() as i64).to_be_bytes();
-            let off_be = (heap_cursor as i64).to_be_bytes();
-            desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
-            desc_table[desc_off + 8..desc_off + 16].copy_from_slice(&off_be);
-
-            heap_cursor += blob.len() as u64;
         }
     }
 
@@ -2600,63 +2686,19 @@ pub(crate) fn append_compressed_table_data(
     let merge_rows = append_nrows.min(room_in_last_tile);
     let _rows_in_new_tiles = append_nrows - merge_rows;
 
-    // Per-column prep: validate shapes + capture transforms / source
-    // buffers, exactly like the write path (only the fixed-column
-    // branch — VLA columns are rejected by the pymethod upstream).
+    // Per-column prep via the shared helper.  VLA columns are
+    // rejected by the pymethod upstream so every column lands as a
+    // ColPrep here.
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
-    struct AppendColPrep<'py> {
-        buf: RawBuffer,
-        src_total_size: usize,
-        transform: WriteTransform,
-        #[allow(dead_code)]
-        contig_arr: Bound<'py, PyAny>,
-        elem_size: usize,
-        per_row_bytes: usize,
-        per_row_pixels: usize,
-        rice_blocksize: u32,
-        gzip_level: Option<u32>,
-    }
-    let mut preps: Vec<AppendColPrep<'_>> = Vec::with_capacity(columns.len());
+    let mut preps: Vec<ColPrep<'_>> = Vec::with_capacity(columns.len());
     for (i, (col, arr)) in columns.iter()
         .zip(per_column_inputs.iter()).enumerate()
     {
-        if !arr.is_instance(&ndarray)? {
-            return Err(PyValueError::new_err(format!(
-                "append: column '{}' value must be a numpy ndarray",
-                col.name)));
-        }
-        let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
-        let per_cell_shape: Vec<usize> = shape[1..].to_vec();
-        let expected_shape = column_expected_shape(col);
-        if per_cell_shape != expected_shape {
-            return Err(PyValueError::new_err(format!(
-                "append: column '{}' per-cell shape {:?} does not \
-                 match expected {:?}",
-                col.name, per_cell_shape, expected_shape)));
-        }
-        let dtype = arr.getattr("dtype")?;
-        let kind: String = dtype.getattr("kind")?.extract()?;
-        let elem_size: usize = dtype.getattr("itemsize")?.extract()?;
-        let transform = column_transform(col, &kind, elem_size)?;
-        let cell_elements: usize = per_cell_shape.iter()
-            .product::<usize>().max(1);
-        let src_total_size = elem_size * cell_elements;
-        let contig = np.call_method1("ascontiguousarray", (arr,))?;
-        let buf = RawBuffer::acquire(&contig)?;
-        let inner_elem_size = bytes_per_element(col.tform_letter)
-            .ok_or_else(|| PyValueError::new_err(format!(
-                "append: column '{}': unsupported TFORM letter '{}'",
-                col.name, col.tform_letter)))?;
         let cfg = per_col_configs.and_then(|cs| cs.get(i));
-        preps.push(AppendColPrep {
-            buf, src_total_size, transform, contig_arr: contig,
-            elem_size: inner_elem_size,
-            per_row_bytes: col.byte_width,
-            per_row_pixels: col.repeat,
-            rice_blocksize: cfg.map(rice_blocksize_of).unwrap_or(32),
-            gzip_level: cfg.and_then(gzip_level_of),
-        });
+        preps.push(prepare_fixed_column(
+            &np, &ndarray, arr, col, append_nrows, cfg,
+        )?);
     }
 
     // Step 1: decode the existing last tile if we're going to
@@ -2735,20 +2777,17 @@ pub(crate) fn append_compressed_table_data(
     // to the heap end (orphaning old last-tile blobs on merge).
     let mut heap_cursor = current_pcount;
 
-    // Step 4: merge into last tile if applicable.
+    // Step 4: merge into last tile if applicable.  For each column,
+    // concatenate the freshly-transformed new rows onto a clone of
+    // the existing BE bytes (decoded in step 1), then encode the
+    // merged slab and write to the heap end via the shared helper.
     if merge_rows > 0 {
         let last_tile_idx = existing_n_tiles - 1;
         let merged_rows = last_existing_tile_rows + merge_rows;
-
         for (col_idx, col) in columns.iter().enumerate() {
             let prep = &preps[col_idx];
-            // Existing BE bytes were decoded in step 1 (before
-            // the shift); concatenate the freshly-transformed new
-            // rows onto a clone.
             let mut merged = existing_be_per_col[col_idx].clone();
             merged.reserve(merge_rows * prep.per_row_bytes);
-            // Apply per-cell transform to the first `merge_rows`
-            // rows of the input.
             let src_bytes = prep.buf.as_slice();
             for r in 0..merge_rows {
                 let src_off = r * prep.src_total_size;
@@ -2759,44 +2798,19 @@ pub(crate) fn append_compressed_table_data(
                     &prep.transform, src, &mut cell, &col.name, r)?;
                 merged.extend_from_slice(&cell);
             }
-
             let n_pixels = merged_rows * prep.per_row_pixels;
-            let blob = encode_table_column_slab(
-                algorithms[col_idx], &merged, n_pixels,
+            heap_cursor = encode_be_slab_to_heap_and_record(
+                &merged, n_pixels, algorithms[col_idx],
                 prep.elem_size, prep.rice_blocksize, prep.gzip_level,
+                last_tile_idx, col_idx, &col.name, descriptor_row_width,
+                new_heap_start, heap_cursor, &mut desc_table,
+                &super_.file, &super_.layout, data_offset, &super_.tainted,
             )?;
-
-            let want_total = new_heap_start + heap_cursor
-                + blob.len() as u64 - data_offset;
-            grow_file_to_at_least(
-                &super_.file, &super_.layout, data_offset,
-                want_total, &super_.tainted)?;
-            {
-                let mut g = lock_file(&super_.file)?;
-                let f = g.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.seek(SeekFrom::Start(new_heap_start + heap_cursor))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                f.write_all(&blob).map_err(|e| {
-                    super_.tainted.store(true, Ordering::Release);
-                    PyIOError::new_err(format!(
-                        "append: heap write for merged tile {} col '{}' \
-                         failed: {}", last_tile_idx, col.name, e))
-                })?;
-            }
-            // Update last-tile descriptor for this column.
-            let desc_off = last_tile_idx * descriptor_row_width
-                + col_idx * 16;
-            let nelems_be = (blob.len() as i64).to_be_bytes();
-            let off_be = (heap_cursor as i64).to_be_bytes();
-            desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
-            desc_table[desc_off + 8..desc_off + 16]
-                .copy_from_slice(&off_be);
-            heap_cursor += blob.len() as u64;
         }
     }
 
-    // Step 4: encode fresh tiles for any remaining rows.
+    // Step 5: encode fresh tiles for any remaining rows via the
+    // shared per-(tile, col) helper.
     let mut new_input_row_cursor = merge_rows;
     for new_tile_offset in 0..added_n_tiles {
         let tile_idx = existing_n_tiles + new_tile_offset;
@@ -2807,50 +2821,14 @@ pub(crate) fn append_compressed_table_data(
             ztilelen
         };
         for (col_idx, col) in columns.iter().enumerate() {
-            let prep = &preps[col_idx];
-            let src_bytes = prep.buf.as_slice();
-            let mut slab = vec![0u8; rows_in_tile * prep.per_row_bytes];
-            for r in 0..rows_in_tile {
-                let input_row = tile_row_start_in_new + r;
-                let src_off = input_row * prep.src_total_size;
-                let src = &src_bytes
-                    [src_off..src_off + prep.src_total_size];
-                let dst_off = r * prep.per_row_bytes;
-                let dst = &mut slab[dst_off..dst_off + prep.per_row_bytes];
-                apply_transform_cell(
-                    &prep.transform, src, dst, &col.name, input_row)?;
-            }
-            let n_pixels = rows_in_tile * prep.per_row_pixels;
-            let blob = encode_table_column_slab(
-                algorithms[col_idx], &slab, n_pixels,
-                prep.elem_size, prep.rice_blocksize, prep.gzip_level,
+            heap_cursor = build_and_encode_tile_col(
+                &preps[col_idx], col, algorithms[col_idx],
+                tile_idx, col_idx, rows_in_tile,
+                /* source_row_offset = */ tile_row_start_in_new,
+                descriptor_row_width, new_heap_start, heap_cursor,
+                &mut desc_table, &super_.file, &super_.layout,
+                data_offset, &super_.tainted,
             )?;
-            let want_total = new_heap_start + heap_cursor
-                + blob.len() as u64 - data_offset;
-            grow_file_to_at_least(
-                &super_.file, &super_.layout, data_offset,
-                want_total, &super_.tainted)?;
-            {
-                let mut g = lock_file(&super_.file)?;
-                let f = g.as_mut()
-                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.seek(SeekFrom::Start(new_heap_start + heap_cursor))
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                f.write_all(&blob).map_err(|e| {
-                    super_.tainted.store(true, Ordering::Release);
-                    PyIOError::new_err(format!(
-                        "append: heap write for new tile {} col '{}' \
-                         failed: {}", tile_idx, col.name, e))
-                })?;
-            }
-            let desc_off = tile_idx * descriptor_row_width
-                + col_idx * 16;
-            let nelems_be = (blob.len() as i64).to_be_bytes();
-            let off_be = (heap_cursor as i64).to_be_bytes();
-            desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
-            desc_table[desc_off + 8..desc_off + 16]
-                .copy_from_slice(&off_be);
-            heap_cursor += blob.len() as u64;
         }
         new_input_row_cursor += rows_in_tile;
     }
@@ -3044,6 +3022,400 @@ fn decode_existing_tile_to_be_bytes(
         })?;
     }
     decompress_column_slab(algo, &compressed, col, rows_in_tile)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6c-1 — repack() on compressed tables (streaming)
+// ---------------------------------------------------------------------------
+//
+// Walk descriptors in scan order ((tile, col) lex), compute each
+// live blob's compact-heap position (= cumulative size of live
+// blobs), then move bytes from old → new position with chunked
+// I/O.  Two move strategies:
+//
+//   Fast path (in-place streaming): blobs read in old-offset
+//   order, written to their new positions in place.  Requires
+//   `new_offset[i] + length[i] <= old_offset[i+1]` for every
+//   adjacent pair (so writes never clobber unread blobs).  This
+//   holds for the post-merge orphan pattern that Phase 6b's
+//   append produces (orphans contiguous before live tail).
+//   Cost: ≤ `sum_of_live_blobs_that_move` bytes of I/O —
+//   typically just the rewritten last tile (~10 MB).
+//
+//   Slow path (staging): blobs first copied to a "staging" area
+//   appended to the file end (read source → write past current
+//   heap end), then staged bytes copied back to their new
+//   in-heap positions, then file shrunk.  Always safe for
+//   arbitrary orphan patterns (writes go to fresh space; the
+//   back-copy is front-to-back since dst < src by `new_pcount`).
+//   Cost: ~`2 × new_pcount` bytes of I/O.  Used as a fallback
+//   when the fast path's safety check fails — important for
+//   future mutators (`__setitem__`) that create arbitrary
+//   orphans.
+//
+// Memory bound: ~1 MiB chunk + the descriptor table (`n_tiles *
+// ncols * 16` bytes; a few KB to a few MB) + the move-plan
+// vector (~32 bytes per live blob).  No heap-in-RAM allocation.
+pub(crate) fn repack_compressed_table_heap(
+    super_: &HDU,
+    cache: &ColumnTileCache,
+) -> PyResult<()> {
+    use crate::common::shift_file_tail_backward_and_update_offsets;
+    use crate::hdu_image::{round_up_to_block, serialize_header_to_disk_bytes};
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    crate::common::check_not_tainted(&super_.tainted)?;
+
+    let cards = super_.header_snapshot()?;
+    let virtual_cards = synthesize_uncompressed_cards(&cards);
+    let columns = parse_columns(&virtual_cards)?;
+
+    // VLA repack is more involved (dual-descriptor blobs hold
+    // compressed-Q descriptors pointing at per-cell bytes that
+    // ALSO need to move + the dual-descriptor blob itself
+    // rewritten + re-GZIP'd).  Defer until a user reports
+    // compressed-VLA heap growth as a problem.
+    for col in &columns {
+        if col.var_kind.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU.repack: VLA columns are not yet \
+                 supported — the dual-descriptor heap layout needs \
+                 indirection-aware rewriting; defer until a real \
+                 workload demonstrates the orphan growth is a problem"));
+        }
+    }
+
+    let n_tiles = parse_keyword(&cards, "NAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let descriptor_row_width = parse_keyword(&cards, "NAXIS1")
+        .unwrap_or(0).max(0) as usize;
+    let current_pcount = parse_keyword(&cards, "PCOUNT")
+        .unwrap_or(0).max(0) as u64;
+    if n_tiles == 0 || columns.is_empty() || current_pcount == 0 {
+        return Ok(());
+    }
+    let ncols = columns.len();
+    let data_offset = super_.offsets.data_offset();
+    let heap_start = data_offset
+        + (n_tiles as u64) * (descriptor_row_width as u64);
+
+    // Read just the descriptor table (small; bounded by n_tiles *
+    // ncols * 16 bytes).
+    let desc_table_size = n_tiles * descriptor_row_width;
+    let mut desc_table = vec![0u8; desc_table_size];
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut desc_table).map_err(|e| {
+            PyIOError::new_err(format!(
+                "repack: read descriptor table: {}", e))
+        })?;
+    }
+
+    // Build per-blob move plan in scan order: cumulative sum of
+    // lengths gives each live blob its new offset.  Skip empty
+    // cells (descriptor stays (0, 0)).
+    struct MovePlan {
+        old_offset: u64,
+        length: u64,
+        new_offset: u64,
+        tile_idx: usize,
+        col_idx: usize,
+    }
+    let mut plans: Vec<MovePlan> = Vec::new();
+    let mut cursor: u64 = 0;
+    for tile_idx in 0..n_tiles {
+        for col_idx in 0..ncols {
+            let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
+            let nelems_s = i64::from_be_bytes(
+                desc_table[desc_off..desc_off + 8].try_into().unwrap(),
+            );
+            let old_off_s = i64::from_be_bytes(
+                desc_table[desc_off + 8..desc_off + 16].try_into().unwrap(),
+            );
+            if nelems_s < 0 || old_off_s < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "repack: tile {} col {} descriptor negative: \
+                     nelems={} offset={}",
+                    tile_idx, col_idx, nelems_s, old_off_s)));
+            }
+            let length = nelems_s as u64;
+            let old_offset = old_off_s as u64;
+            if length == 0 {
+                continue;
+            }
+            if old_offset.checked_add(length)
+                .map(|e| e > current_pcount)
+                .unwrap_or(true)
+            {
+                return Err(PyValueError::new_err(format!(
+                    "repack: tile {} col {} descriptor points past \
+                     heap end (offset+bytes={} > PCOUNT={})",
+                    tile_idx, col_idx,
+                    old_offset.wrapping_add(length), current_pcount)));
+            }
+            plans.push(MovePlan {
+                old_offset, length, new_offset: cursor,
+                tile_idx, col_idx,
+            });
+            cursor += length;
+        }
+    }
+    let new_pcount = cursor;
+    if new_pcount == current_pcount {
+        return Ok(());  // Already compact.
+    }
+
+    // Sort by old_offset so the in-place fast path reads sequentially.
+    plans.sort_by_key(|p| p.old_offset);
+
+    // Decide fast vs slow path.  Fast path needs: for every
+    // adjacent (i, i+1) pair in old-offset order, the i-th
+    // blob's write region must end at or before the (i+1)-th
+    // blob's read region (otherwise the write clobbers an
+    // unread blob).  Holds for the post-merge orphan pattern.
+    let mut fast_path_safe = true;
+    for i in 0..plans.len() {
+        let cur = &plans[i];
+        let next_read_start = if i + 1 < plans.len() {
+            plans[i + 1].old_offset
+        } else {
+            current_pcount
+        };
+        if cur.new_offset + cur.length > next_read_start {
+            fast_path_safe = false;
+            break;
+        }
+    }
+
+    const CHUNK: u64 = 1 << 20;
+    let mut buf = vec![0u8; CHUNK as usize];
+
+    if fast_path_safe {
+        // In-place streaming.  Reading in old-offset order means
+        // every subsequent read is past any prior write, so no
+        // clobbering.
+        for plan in &plans {
+            if plan.new_offset == plan.old_offset {
+                continue;
+            }
+            stream_copy_in_file(
+                &super_.file, heap_start + plan.old_offset,
+                heap_start + plan.new_offset, plan.length,
+                &mut buf, CHUNK, &super_.tainted,
+                "repack: in-place move",
+            )?;
+        }
+    } else {
+        // Slow path — copy blobs to a staging area appended past
+        // the current heap, then back-copy staging → final heap
+        // positions.  Always safe regardless of orphan pattern.
+        //
+        // Step 1: grow data section so the staging area sits at
+        // [heap_start + current_pcount, heap_start + current_pcount + new_pcount).
+        // grow_file_to_at_least rounds to block-aligned, so the
+        // actual staging area may extend a few hundred bytes
+        // beyond — that's fine since we only read/write the
+        // first new_pcount bytes.
+        let staged_data_bytes = (n_tiles as u64
+            * descriptor_row_width as u64)
+            + current_pcount + new_pcount;
+        grow_file_to_at_least(
+            &super_.file, &super_.layout, data_offset,
+            staged_data_bytes, &super_.tainted,
+        )?;
+        let staging_start = heap_start + current_pcount;
+
+        // Step 2: copy each blob from its old position to its
+        // staging position.  Staging is past the live heap, so
+        // these writes never clobber any read.
+        for plan in &plans {
+            stream_copy_in_file(
+                &super_.file, heap_start + plan.old_offset,
+                staging_start + plan.new_offset, plan.length,
+                &mut buf, CHUNK, &super_.tainted,
+                "repack: copy to staging",
+            )?;
+        }
+
+        // Step 3: copy staging back to the heap's final positions.
+        // For each blob: dst = heap_start + new_offset, src =
+        // staging_start + new_offset.  dst < src by current_pcount
+        // (= the gap between heap and staging), so a front-to-back
+        // chunked copy never clobbers an unread source byte.
+        for plan in &plans {
+            stream_copy_in_file(
+                &super_.file, staging_start + plan.new_offset,
+                heap_start + plan.new_offset, plan.length,
+                &mut buf, CHUNK, &super_.tainted,
+                "repack: copy from staging",
+            )?;
+        }
+        // (Staging contents now stale; the file-shrink below
+        // reclaims those bytes.)
+    }
+
+    // Rewrite descriptor entries with the new offsets.
+    for plan in &plans {
+        let desc_off = plan.tile_idx * descriptor_row_width
+            + plan.col_idx * 16;
+        desc_table[desc_off..desc_off + 8]
+            .copy_from_slice(&(plan.length as i64).to_be_bytes());
+        desc_table[desc_off + 8..desc_off + 16]
+            .copy_from_slice(&(plan.new_offset as i64).to_be_bytes());
+    }
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(data_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(&desc_table) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "repack: descriptor table rewrite: {}; close + reopen", e)));
+        }
+        if let Err(e) = f.flush() {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "repack: flush: {}; close + reopen", e)));
+        }
+    }
+
+    // Shrink file.  For the fast path, current_padded → new_padded.
+    // For the slow path, the staging temporarily grew the file by
+    // up to new_pcount; the shrink reclaims both the orphans AND
+    // the staging.  Same computation either way: new HDU end is
+    // at `data_offset + round_up_to_block(desc_bytes + new_pcount)`.
+    let new_data_bytes = (n_tiles as u64
+        * descriptor_row_width as u64) + new_pcount;
+    let new_padded = round_up_to_block(new_data_bytes);
+    let new_hdu_end = data_offset + new_padded;
+    let file_len = {
+        let g = lock_file(&super_.file)?;
+        let f = g.as_ref()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.metadata().map_err(|e| PyIOError::new_err(e.to_string()))?.len()
+    };
+    if new_hdu_end < file_len {
+        // Identify the next HDU on disk (if any) to decide
+        // last-HDU (set_len) vs non-last (shift_file_tail_backward).
+        let next_hdu_off: Option<u64> = {
+            let guard = super_.layout.hdus.lock()
+                .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+            guard.iter()
+                .map(|o| o.header_offset())
+                .filter(|&h| h > data_offset)
+                .min()
+        };
+        match next_hdu_off {
+            None => {
+                // Last HDU — just trim the file.
+                let mut g = lock_file(&super_.file)?;
+                let f = g.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.set_len(new_hdu_end).map_err(|e| {
+                    super_.tainted.store(true, Ordering::Release);
+                    PyIOError::new_err(format!(
+                        "repack: set_len({}) failed: {}; close + reopen",
+                        new_hdu_end, e))
+                })?;
+            }
+            Some(next_off) => {
+                // Non-last HDU.  After grow_file_to_at_least's
+                // staging extension (slow path) or the post-merge
+                // append's grow (fast path), the next HDU sits at
+                // `next_off`.  Slide it (and everything after)
+                // backward by `next_off - new_hdu_end` so the
+                // current HDU's data section ends precisely at
+                // `new_hdu_end` (block-aligned) and HDU N+1's
+                // header lands at `new_hdu_end` itself.
+                let delta = next_off - new_hdu_end;
+                if delta > 0 {
+                    shift_file_tail_backward_and_update_offsets(
+                        &super_.file, &super_.layout,
+                        next_off, delta, &super_.tainted)?;
+                }
+            }
+        }
+    }
+
+    // Update PCOUNT — disk-write-before-commit pattern.
+    let mut cards_guard = super_.header.lock()
+        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let mut new_cards = cards.clone();
+    crate::hdu_table::set_pcount_in_cards(&mut new_cards, new_pcount);
+    {
+        let mut g = lock_file(&super_.file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        let header_bytes = serialize_header_to_disk_bytes(&new_cards);
+        let header_offset = data_offset - header_bytes.len() as u64;
+        f.seek(SeekFrom::Start(header_offset))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&header_bytes).map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "repack: PCOUNT header write: {}; close + reopen", e))
+        })?;
+        f.flush().map_err(|e| {
+            super_.tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "repack: PCOUNT header flush: {}; close + reopen", e))
+        })?;
+    }
+    *cards_guard = new_cards;
+    cache.clear();
+    Ok(())
+}
+
+// Chunked read-then-write copy of `length` bytes from `src_off` to
+// `dst_off` in `file`.  Used by repack's in-place fast path AND the
+// staging slow path.  Caller is responsible for ensuring the move
+// is safe (writes don't clobber unread regions).
+#[allow(clippy::too_many_arguments)]
+fn stream_copy_in_file(
+    file: &FileHandle,
+    src_off: u64,
+    dst_off: u64,
+    length: u64,
+    buf: &mut Vec<u8>,
+    chunk: u64,
+    tainted: &TaintFlag,
+    op_label: &str,
+) -> PyResult<()> {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let mut processed: u64 = 0;
+    while processed < length {
+        let n = (length - processed).min(chunk);
+        buf.resize(n as usize, 0);
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(src_off + processed))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "{}: read at offset {}: {}; close + reopen",
+                op_label, src_off + processed, e))
+        })?;
+        f.seek(SeekFrom::Start(dst_off + processed))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "{}: write at offset {}: {}; close + reopen",
+                op_label, dst_off + processed, e)));
+        }
+        processed += n;
+    }
+    Ok(())
 }
 
 
