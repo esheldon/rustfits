@@ -214,18 +214,78 @@ pub(crate) fn compute_datasum_of(data_bytes: &[u8]) -> u32 {
     compute_checksum_bytes(0, data_bytes)
 }
 
-// Compute the full-HDU checksum (header bytes including any
-// existing CHECKSUM card + data bytes).  Used by verify_checksum:
-// the result should equal 0xFFFFFFFF when CHECKSUM is set
-// correctly.
-pub(crate) fn compute_hdu_checksum(
-    header_cards: &[String], data_bytes: &[u8],
-) -> u32 {
-    let header_bytes = crate::hdu_image::serialize_header_to_disk_bytes(
-        header_cards,
-    );
-    let hsum = compute_checksum_bytes(0, &header_bytes);
-    compute_checksum_bytes(hsum, data_bytes)
+// Streaming accumulator over the cfitsio-byte-exact checksum.
+// `compute_checksum_bytes` requires every intermediate call's
+// bytes to be a multiple of 4 (its tail-handling zero-pads
+// partial trailing groups, which produces wrong results when
+// followed by more bytes).  This accumulator buffers up to 3
+// leftover bytes between feeds so callers can stream arbitrary
+// chunk sizes safely — necessary whenever the data section is
+// too large to materialize in RAM as a single Vec<u8>.
+//
+// Used by the uncompressed-HDU checksum path (which reads the
+// data section in 1 MiB chunks) and by the compressed-table
+// checksum path (which walks tiles, decoding each per-(tile, col)
+// blob and feeding the assembled per-tile main rows).  In both
+// cases peak memory is bounded at a per-chunk constant
+// independent of file size.
+pub(crate) struct ChecksumStream {
+    seed: u32,
+    carry: Vec<u8>,
+}
+
+impl ChecksumStream {
+    pub(crate) fn new(seed: u32) -> Self {
+        Self { seed, carry: Vec::with_capacity(4) }
+    }
+
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // If carry is non-empty, stitch with the prefix of bytes
+        // up to a 4-byte boundary, process that one chunk, then
+        // continue with the remaining input.
+        if !self.carry.is_empty() {
+            let need = 4 - self.carry.len();
+            if bytes.len() < need {
+                self.carry.extend_from_slice(bytes);
+                return;
+            }
+            self.carry.extend_from_slice(&bytes[..need]);
+            self.seed = compute_checksum_bytes(self.seed, &self.carry);
+            self.carry.clear();
+            let rest = &bytes[need..];
+            let n_full = rest.len() / 4 * 4;
+            if n_full > 0 {
+                self.seed = compute_checksum_bytes(
+                    self.seed, &rest[..n_full],
+                );
+            }
+            if rest.len() > n_full {
+                self.carry.extend_from_slice(&rest[n_full..]);
+            }
+        } else {
+            let n_full = bytes.len() / 4 * 4;
+            if n_full > 0 {
+                self.seed = compute_checksum_bytes(
+                    self.seed, &bytes[..n_full],
+                );
+            }
+            if bytes.len() > n_full {
+                self.carry.extend_from_slice(&bytes[n_full..]);
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> u32 {
+        // Any remaining carry is the final tail; let
+        // compute_checksum_bytes apply its zero-pad rule.
+        if !self.carry.is_empty() {
+            self.seed = compute_checksum_bytes(self.seed, &self.carry);
+        }
+        self.seed
+    }
 }
 
 // Given a cards Vec, set DATASUM (overwrites or inserts) and

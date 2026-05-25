@@ -331,24 +331,6 @@ def test_delete_column_stub_raises():
                 f[1].delete_column("a")
 
 
-def test_checksum_stubs_raise():
-    with tempfile.TemporaryDirectory() as td:
-        fz = _make_ztable_fixture(
-            td,
-            _basic_dtype(),
-            _basic_data(),
-            units=["count", "Jy", "m", "char"],
-        )
-        with rustfits.FITS(fz, "r+") as f:
-            hdu = f[1]
-            for fn in ("add_datasum", "add_checksum"):
-                with pytest.raises(NotImplementedError, match="Phase 2"):
-                    getattr(hdu, fn)()
-            for fn in ("verify_datasum", "verify_checksum"):
-                with pytest.raises(NotImplementedError, match="Phase 2"):
-                    getattr(hdu, fn)()
-
-
 # ---------------------------------------------------------------------
 # Header still accessible (raw Z-prefixed cards visible to the user)
 # ---------------------------------------------------------------------

@@ -757,27 +757,40 @@ impl CompressedTableHDU {
     // Compressed tables use ZHECKSUM / ZDATASUM per the FITS Tile
     // Compression Convention (the integrity check is against the
     // equivalent uncompressed table, not the on-disk BINTABLE).
-    // Defer until the read path lands; computing ZDATASUM requires
-    // the uncompressed bytes which Phase 2 provides.
-    fn add_datasum(_slf: PyRef<'_, Self>) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.add_datasum — ZTABLE Phase 2+ will add \
-             this (ZDATASUM emitted, not DATASUM)"))
+    // Compressed tables use ZHECKSUM / ZDATASUM per the FITS Tile
+    // Compression Convention: both are computed against the
+    // EQUIVALENT UNCOMPRESSED table (the original schema rebuilt from
+    // the Z-prefixed cards, with cell data decoded back to its
+    // BITPIX-native big-endian layout).  Astropy uses the same
+    // convention and reads our values bit-exact.
+    //
+    // Manual semantics — re-run add_checksum after write / append /
+    // __setitem__ / repack to refresh.
+    //
+    // VLA-bearing compressed tables raise NotImplementedError —
+    // reconstructing the equivalent-uncompressed heap depends on
+    // per-cell ORIGINAL offsets stored in the dual-descriptor blob,
+    // which this implementation doesn't yet thread through to the
+    // checksum path.
+
+    fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super().into_super();
+        compressed_table_add_datasum(&super_)
     }
-    fn add_checksum(_slf: PyRef<'_, Self>) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.add_checksum — ZTABLE Phase 2+ will add \
-             this (ZHECKSUM emitted, not CHECKSUM)"))
+
+    fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super().into_super();
+        compressed_table_add_checksum(&super_)
     }
-    fn verify_datasum(_slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.verify_datasum — ZTABLE Phase 2+ will \
-             add this"))
+
+    fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super().into_super();
+        compressed_table_verify_datasum(&super_)
     }
-    fn verify_checksum(_slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
-        Err(PyNotImplementedError::new_err(
-            "CompressedTableHDU.verify_checksum — ZTABLE Phase 2+ will \
-             add this"))
+
+    fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super().into_super();
+        compressed_table_verify_checksum(&super_)
     }
 }
 
@@ -5184,4 +5197,240 @@ fn normalize_disk_row(i: i64, nrows: usize) -> PyResult<usize> {
             i, nrows)));
     }
     Ok(r as usize)
+}
+
+// ---------------------------------------------------------------------------
+// ZHECKSUM / ZDATASUM on compressed tables
+// ---------------------------------------------------------------------------
+//
+// Both are computed against the EQUIVALENT UNCOMPRESSED table — the
+// BITPIX-native big-endian bytes the original (pre-compression)
+// BINTABLE would have stored.  Astropy + cfitsio use the same
+// convention, so our values agree bit-exact with what funpack +
+// verify_checksum would compute on the decompressed file.
+//
+// Streaming: we never materialize the full equivalent-uncompressed
+// data section in RAM (real survey tables can be many GB after
+// decompression).  Per-tile decode happens one tile at a time and
+// feeds the running sum via `ChecksumStream`.  Peak memory bounded
+// at a few MiB per tile regardless of file size.
+//
+// Scope: fixed-column tables only.  VLA-bearing compressed tables
+// raise NotImplementedError because reconstructing their
+// equivalent-uncompressed heap requires per-cell ORIGINAL offsets
+// stored in the dual-descriptor blob — surfacing those to the
+// checksum path is a deferred follow-up.  Workaround for VLA:
+// rebuild via create_table_hdu (without compress) + write, then
+// add_checksum the resulting uncompressed TableHDU.
+
+// Walk every tile of a fixed-column compressed table, decode each
+// (tile, col) blob to BE bytes, interleave columns per row into a
+// tile-sized main buffer, and feed it to the streaming checksum.
+// After all tiles, pad to BLOCK_SIZE with zeros (so the equivalent-
+// uncompressed data section ends on a FITS block boundary, matching
+// what a fresh uncompressed write would produce).  Peak memory per
+// tile: rows_in_tile × row_width main buffer + one per-(tile,col)
+// decompressed slab.  No whole-file buffer is ever allocated.
+//
+// `seed` is the running checksum seed — pass 0 for DATASUM, or the
+// already-summed header bytes for the verify_checksum path.
+fn stream_uncompressed_table_data_checksum(
+    super_: &HDU,
+    seed: u32,
+) -> PyResult<u32> {
+    use crate::common::check_not_tainted;
+    use crate::hdu_image::round_up_to_block;
+    check_not_tainted(&super_.tainted)?;
+    let cards = super_.header_snapshot()?;
+    let virtual_cards = synthesize_uncompressed_cards(&cards);
+    let columns = parse_columns(&virtual_cards)?;
+    if columns.iter().any(|c| c.var_kind.is_some()) {
+        return Err(PyNotImplementedError::new_err(
+            "CompressedTableHDU checksum: VLA-bearing tables aren't \
+             supported yet (reconstructing the equivalent-uncompressed \
+             heap with the file's original cell offsets is a deferred \
+             follow-up).  Workaround: rebuild via create_table_hdu \
+             (without compress) + write, then add_checksum the \
+             uncompressed TableHDU"));
+    }
+    let nrows_orig = parse_keyword(&cards, "ZNAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let row_width = parse_keyword(&cards, "ZNAXIS1")
+        .unwrap_or(0).max(0) as usize;
+    let n_tiles = parse_keyword(&cards, "NAXIS2")
+        .unwrap_or(0).max(0) as usize;
+    let ztilelen = parse_keyword(&cards, "ZTILELEN")
+        .unwrap_or(0).max(0) as usize;
+    let descriptor_row_width = parse_keyword(&cards, "NAXIS1")
+        .unwrap_or(0).max(0) as usize;
+    let data_offset = super_.offsets.data_offset();
+
+    // Per-column algorithm from ZCTYPn.
+    let mut algorithms: Vec<CompressionAlgorithm> =
+        Vec::with_capacity(columns.len());
+    for i in 0..columns.len() {
+        let key = format!("ZCTYP{}", i + 1);
+        let zctyp = parse_string_keyword(&cards, &key).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "compressed table missing {} card", key))
+        })?;
+        algorithms.push(parse_algorithm(&zctyp)?);
+    }
+
+    let mut stream = crate::checksum::ChecksumStream::new(seed);
+    let mut tile_buf: Vec<u8> = Vec::new();
+    for tile_idx in 0..n_tiles {
+        let tile_row_start = tile_idx * ztilelen;
+        let rows_in_tile = if tile_idx + 1 == n_tiles {
+            nrows_orig - tile_row_start
+        } else {
+            ztilelen
+        };
+        tile_buf.clear();
+        tile_buf.resize(rows_in_tile * row_width, 0);
+        for (col_idx, col) in columns.iter().enumerate() {
+            let slab = decode_existing_tile_to_be_bytes(
+                &super_.file, &cards, data_offset, tile_idx, col_idx,
+                col, algorithms[col_idx], rows_in_tile,
+                descriptor_row_width,
+            )?;
+            for r in 0..rows_in_tile {
+                let src_off = r * col.byte_width;
+                let dst_off = r * row_width + col.byte_offset;
+                tile_buf[dst_off..dst_off + col.byte_width]
+                    .copy_from_slice(
+                        &slab[src_off..src_off + col.byte_width]);
+            }
+        }
+        stream.feed(&tile_buf);
+    }
+
+    // Feed BLOCK_SIZE zero-pad so the equivalent-uncompressed data
+    // section ends on the FITS block boundary it would naturally
+    // have if it were stored uncompressed.
+    let total_main = (nrows_orig as u64) * (row_width as u64);
+    let padded = round_up_to_block(total_main);
+    let pad = (padded - total_main) as usize;
+    if pad > 0 {
+        // Pad in <= BLOCK_SIZE chunks (only one needed in practice;
+        // BLOCK_SIZE = 2880).
+        let zeros = vec![0u8; pad];
+        stream.feed(&zeros);
+    }
+    Ok(stream.finish())
+}
+
+// Build the synthetic header bytes of the equivalent uncompressed
+// table HDU — what the BINTABLE header would look like if the same
+// table were stored without compression.  Used to compute ZHECKSUM:
+// we sum (synthetic_uncompressed_header + uncompressed data) and
+// encode the complement.
+//
+// Reuses synthesize_uncompressed_cards (which already substitutes
+// NAXIS1/NAXIS2/PCOUNT and TFORMn from their Z-prefixed counterparts
+// and drops Z-prefixed cards).  Then strips any existing
+// DATASUM/CHECKSUM cards (those refer to the on-disk compressed
+// BINTABLE, not the equivalent uncompressed) and inserts the
+// caller's datasum_value / checksum_value just before END.
+fn build_equivalent_uncompressed_table_header(
+    cards: &[String],
+    datasum_value: &str,
+    checksum_value: &str,
+) -> PyResult<Vec<String>> {
+    use crate::header::card_string;
+    let mut synth = synthesize_uncompressed_cards(cards);
+    synth.retain(|c| {
+        if c.len() < 8 {
+            return true;
+        }
+        let kw = c[..8].trim_end();
+        kw != "DATASUM" && kw != "CHECKSUM"
+    });
+    let datasum_card = card_string(
+        "DATASUM", datasum_value, "data unit checksum");
+    let checksum_card = card_string(
+        "CHECKSUM", checksum_value, "HDU checksum");
+    let end_idx = synth.iter().position(|c|
+        c.len() >= 3 && c[..3].trim() == "END"
+    ).unwrap_or(synth.len());
+    synth.insert(end_idx, datasum_card);
+    synth.insert(end_idx + 1, checksum_card);
+    Ok(synth)
+}
+
+fn compressed_table_add_datasum(super_: &HDU) -> PyResult<()> {
+    let sum = stream_uncompressed_table_data_checksum(super_, 0)?;
+    let cards = super_.header_snapshot()?;
+    let new_cards =
+        crate::checksum::cards_with_datasum(&cards, sum, "ZDATASUM");
+    crate::hdu_image::commit_header_update(super_, new_cards)
+}
+
+fn compressed_table_add_checksum(super_: &HDU) -> PyResult<()> {
+    let datasum = stream_uncompressed_table_data_checksum(super_, 0)?;
+    let datasum_str = crate::checksum::format_datasum(datasum);
+    let cards = super_.header_snapshot()?;
+    // ZHECKSUM: sum the equivalent-uncompressed header bytes with
+    // the CHECKSUM placeholder, add the data checksum, encode the
+    // complement.  Same recipe as the image side
+    // (compressed_add_checksum in hdu_image_compressed.rs).
+    let synth_zero = build_equivalent_uncompressed_table_header(
+        &cards, &datasum_str, "0000000000000000")?;
+    let synth_bytes =
+        crate::hdu_image::serialize_header_to_disk_bytes(&synth_zero);
+    let hsum = crate::checksum::compute_checksum_bytes(0, &synth_bytes);
+    let total = crate::checksum::ones_complement_add(hsum, datasum);
+    let encoded = crate::checksum::encode_checksum_ascii(total, true);
+    let encoded_str = std::str::from_utf8(&encoded)
+        .expect("encode_checksum_ascii produces printable ASCII");
+    let mut new_cards = cards.clone();
+    crate::checksum::set_or_insert_string_card(
+        &mut new_cards, "ZDATASUM", &datasum_str,
+        "checksum of uncompressed data",
+    );
+    crate::checksum::set_or_insert_string_card(
+        &mut new_cards, "ZHECKSUM", encoded_str,
+        "checksum of equivalent uncompressed HDU",
+    );
+    crate::hdu_image::commit_header_update(super_, new_cards)
+}
+
+fn compressed_table_verify_datasum(super_: &HDU) -> PyResult<Option<bool>> {
+    let cards = super_.header_snapshot()?;
+    let Some(expected_str) = parse_string_keyword(&cards, "ZDATASUM")
+    else {
+        return Ok(None);
+    };
+    let Some(expected) =
+        crate::checksum::parse_datasum(expected_str.trim())
+    else {
+        return Ok(None);
+    };
+    let computed = stream_uncompressed_table_data_checksum(super_, 0)?;
+    Ok(Some(computed == expected))
+}
+
+fn compressed_table_verify_checksum(super_: &HDU) -> PyResult<Option<bool>> {
+    let cards = super_.header_snapshot()?;
+    let Some(zhecksum_str) = parse_string_keyword(&cards, "ZHECKSUM")
+    else {
+        return Ok(None);
+    };
+    let Some(zdatasum_str) = parse_string_keyword(&cards, "ZDATASUM")
+    else {
+        // The convention requires ZDATASUM for the
+        // total == 0xFFFFFFFF invariant to hold.
+        return Ok(Some(false));
+    };
+    let synth = build_equivalent_uncompressed_table_header(
+        &cards, zdatasum_str.trim(), zhecksum_str.trim(),
+    )?;
+    let synth_bytes =
+        crate::hdu_image::serialize_header_to_disk_bytes(&synth);
+    let hsum = crate::checksum::compute_checksum_bytes(0, &synth_bytes);
+    // synth_bytes is BLOCK_SIZE-padded (2880 % 4 == 0), so we can
+    // seed the data stream with hsum directly — no leftover bytes
+    // straddle the header/data boundary.
+    let total = stream_uncompressed_table_data_checksum(super_, hsum)?;
+    Ok(Some(total == 0xFFFF_FFFF))
 }

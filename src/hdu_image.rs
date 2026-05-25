@@ -495,27 +495,39 @@ impl ImageHDU {
 // — so it implements its own dispatch and only shares the
 // card-rewrite + disk-IO scaffolding indirectly.
 
-// Read the entire on-disk data section (padded to BLOCK_SIZE)
-// for this HDU.  Used by every checksum operation that needs
-// raw bytes.  Returns 0 bytes for HDUs with no data section.
-pub(crate) fn read_padded_data_section(
-    super_: &HDU,
-) -> PyResult<Vec<u8>> {
+// Stream the padded data section through a `ChecksumStream` in
+// 1 MiB chunks, seeding with `seed` and returning the final sum.
+// Reads chunk-by-chunk so peak memory stays at the chunk size
+// regardless of the data section's actual size.  This matters for
+// real survey-scale tables and images (multi-GB uncompressed) —
+// the previous read-whole-section-into-Vec approach OOMs on
+// laptop-class RAM.
+fn stream_data_section_checksum(
+    super_: &HDU, seed: u32,
+) -> PyResult<u32> {
     let data_offset = super_.offsets.data_offset();
     let bytes_count = data_section_padded_size_for(super_)?;
+    let mut stream = crate::checksum::ChecksumStream::new(seed);
     if bytes_count == 0 {
-        return Ok(Vec::new());
+        return Ok(stream.finish());
     }
-    let mut buf = vec![0u8; bytes_count as usize];
+    const CHUNK: u64 = 1 << 20;  // 1 MiB
+    let mut buf = vec![0u8; CHUNK as usize];
     let mut g = lock_file(&super_.file)?;
-    let f = g
-        .as_mut()
+    let f = g.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
     f.seek(SeekFrom::Start(data_offset))
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    f.read_exact(&mut buf)
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-    Ok(buf)
+    let mut remaining = bytes_count;
+    while remaining > 0 {
+        let n = remaining.min(CHUNK) as usize;
+        buf.resize(n, 0);
+        f.read_exact(&mut buf)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        stream.feed(&buf);
+        remaining -= n as u64;
+    }
+    Ok(stream.finish())
 }
 
 // Compute the padded byte-size of the data section for any HDU
@@ -554,8 +566,7 @@ fn data_section_padded_size_for(super_: &HDU) -> PyResult<u64> {
 pub(crate) fn checksum_hdu_add_datasum(
     super_: &HDU, datasum_key: &str,
 ) -> PyResult<()> {
-    let data_bytes = read_padded_data_section(super_)?;
-    let sum = crate::checksum::compute_datasum_of(&data_bytes);
+    let sum = stream_data_section_checksum(super_, 0)?;
     let cards = super_.header_snapshot()?;
     let new_cards =
         crate::checksum::cards_with_datasum(&cards, sum, datasum_key);
@@ -565,8 +576,7 @@ pub(crate) fn checksum_hdu_add_datasum(
 pub(crate) fn checksum_hdu_add_checksum(
     super_: &HDU, checksum_key: &str, datasum_key: &str,
 ) -> PyResult<()> {
-    let data_bytes = read_padded_data_section(super_)?;
-    let datasum = crate::checksum::compute_datasum_of(&data_bytes);
+    let datasum = stream_data_section_checksum(super_, 0)?;
     let cards = super_.header_snapshot()?;
     // First put DATASUM in (so the checksum step sees its bytes
     // in the header buffer).
@@ -574,7 +584,9 @@ pub(crate) fn checksum_hdu_add_checksum(
         &cards, datasum, datasum_key,
     );
     // Then compute CHECKSUM against (header with placeholder +
-    // data) and encode the complement.
+    // data) and encode the complement.  The placeholder card is
+    // inserted by cards_with_checksum BEFORE the checksum step;
+    // we just hand it the data sum we already streamed.
     let new_cards = crate::checksum::cards_with_checksum(
         &cards, datasum, checksum_key,
     );
@@ -594,8 +606,7 @@ pub(crate) fn checksum_hdu_verify_datasum(
     else {
         return Ok(None);
     };
-    let data_bytes = read_padded_data_section(super_)?;
-    let computed = crate::checksum::compute_datasum_of(&data_bytes);
+    let computed = stream_data_section_checksum(super_, 0)?;
     Ok(Some(computed == expected))
 }
 
@@ -606,9 +617,11 @@ pub(crate) fn checksum_hdu_verify_checksum(
     if parse_string_keyword(&cards, checksum_key).is_none() {
         return Ok(None);
     }
-    let data_bytes = read_padded_data_section(super_)?;
-    let total =
-        crate::checksum::compute_hdu_checksum(&cards, &data_bytes);
+    // Header bytes are BLOCK_SIZE-padded (2880 % 4 == 0), so the
+    // header sum can seed the streaming data sum directly.
+    let header_bytes = serialize_header_to_disk_bytes(&cards);
+    let hsum = crate::checksum::compute_checksum_bytes(0, &header_bytes);
+    let total = stream_data_section_checksum(super_, hsum)?;
     Ok(Some(total == 0xFFFF_FFFF))
 }
 
