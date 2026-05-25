@@ -117,11 +117,12 @@ else stays private to its file.
   via `create_table_hdu(..., compress=...)` for fixed columns),
   6a (VLA write via dual-descriptor heap + ZPCOUNT for
   funpack interop), 6b (`append()` for fixed-column tables
-  with merge-into-partial-last-tile), and 6c-1a (`repack()`
+  with merge-into-partial-last-tile), 6c-1a (`repack()`
   for fixed-column tables — streaming fast path + staging
-  fallback, ~1 MiB peak memory) shipped; remaining: VLA
-  `append()` (6c-1b, next), then `__setitem__` + VLA
-  `repack()` (6c-2).  Detection lives in `header_has_ztable`; routing
+  fallback, ~1 MiB peak memory), and 6c-1b (VLA `append()`
+  — existing per-cell compressed bytes copied verbatim, new
+  rows encoded per-cell, ZPCOUNT updated for funpack interop)
+  shipped; remaining: `__setitem__` + VLA `repack()` (6c-2).  Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
   `colnames`, `units`, `__len__` override TableHDU's so they parse the
@@ -2383,8 +2384,8 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6a | VLA write (dual-descriptor heap, ZPCOUNT, funpack interop) | ✅ Shipped |
 | 6b | `append()` for fixed-column tables (merge into partial last tile) | ✅ Shipped |
 | 6c-1a | `repack()` for fixed-column tables (streaming + staging fallback) | ✅ Shipped |
-| 6c-1b | VLA `append()` (dual-descriptor merge + per-cell re-encode) | ⏳ Next |
-| 6c-2 | `__setitem__` on compressed tables + VLA `repack()` | ⏳ Planned |
+| 6c-1b | VLA `append()` (existing-cell copy + per-cell re-encode for new rows) | ✅ Shipped |
+| 6c-2 | `__setitem__` on compressed tables + VLA `repack()` | ⏳ Next |
 
 **Phase 1 — detection + accessors + stubs.**  Shipped.
 
@@ -2975,6 +2976,78 @@ shrinks via set_len, **non-last-HDU preserves trailing HDU**
 (catches the delta-computation bug), cache cleared, funpack
 interop on repacked file, VLA rejection, same-handle + reopen
 parity.
+
+**Phase 6c-1b — VLA `append()` on compressed tables.**  Shipped.
+
+`CompressedTableHDU.append()` now handles tables with VLA
+columns.  Existing per-cell compressed bytes on the merge tile
+are copied verbatim (no decompress / re-compress, no
+precision loss for lossy inner algorithms); merge-tile new
+rows go through the per-cell encode + uncompressed-fallback
+path; spillover into fresh tiles reuses the Phase 6a per-tile
+encoder.
+
+**Pre-mutation snapshot.**  For each VLA col, the existing
+last tile's dual-descriptor blob is fetched + GZIP_1-decompressed
+into a `VlaMergeOldBlob { decompressed, width_orig, rowspertile }`
+BEFORE any file mutation.  This snapshot is what later supplies
+the existing rows' original descriptors (preserved verbatim)
+AND their (cvlalen, cvlastart_old) pairs (used to drive the
+per-cell stream copy into the new heap).  Done pre-mutation so
+the read happens against the still-valid old heap position; the
+upcoming shift relocates the per-cell bytes themselves but their
+relative offsets in `cvlastart_old` still resolve correctly via
+the new `heap_start_offset`.
+
+**Original-heap planner.**  `plan_vla_heap_layout` is called
+with `heap_start_offset = current_zpcount` so the new rows'
+original-descriptor offsets extend the existing
+original heap rather than overlapping it.  funpack copies
+ZPCOUNT to the reconstructed output's PCOUNT and uses these
+offsets to place each cell; collisions corrupt the funpack
+output (this is the same gotcha that motivated the original
+6a planner).  ZPCOUNT is rewritten at the end to the new
+cursor value.
+
+**Per-cell stream copy.**  `stream_copy_in_file` (the same
+~1 MiB-chunked primitive added by repack) copies each existing
+cell's compressed bytes from its old heap position to the new
+heap end.  Source range always ends before destination starts
+(source < `current_pcount` ≤ `heap_cursor` ≤ destination), so
+no overlap-safety concerns.  Old positions become orphans (in
+the same heap region the merge-tile's old dual-descriptor blob
+is also orphaning); `repack()` would reclaim them — once VLA
+repack lands (6c-2 follow-up).
+
+**`grow_file_to_at_least` bug fixed in the same change.**  The
+function used to compare `want_end <= file_len` to decide
+whether a grow was needed.  That's wrong for non-last HDUs:
+`file_len` includes the trailing HDU's bytes, so a write that
+overlaps a trailing HDU's region passed silently as long as
+the overlap fit inside the block-alignment padding, and
+corrupted the trailing HDU once it exceeded the padding.  Fixed
+fixed-only append tests passed because their per-tile growth
+fit in padding; VLA append's larger per-cell growth tripped it.
+Fix: compare against `next_hdu_start` (the layout query already
+needed for the shift branch) when one exists, falling back to
+`file_len` for the genuine last-HDU case.
+
+**Validate-then-mutate.**  VLA input is dtype-checked (Object
+kind, length match) at the top of the prep loop, before any
+file shift or heap-relocate, so dtype errors leave the file
+untouched.  Per-cell `validate_vla_cell` is called twice (once
+during `plan_vla_heap_layout`, once during encode); both
+acceptable since the call is cheap and the second pass keeps
+the encode loop simple.
+
+Tests: `tests/test_compressed_table_vla_append.py` (12 cases) —
+append into fresh tile, merge-only, merge-and-spill, mixed
+fixed + VLA, empty cells, multiple VLA cols, ZPCOUNT
+accounting (bytes match the uncompressed-cell-bytes sum),
+multiple sequential appends, **non-last HDU preserves trailing**
+(catches the grow_file_to_at_least bug above), string VLA
+('PA') append, funpack interop, and repack-still-rejects-VLA
+(confirms 6c-2 work remains).
 
 **Reference source.**  cfitsio's `fits_compress_table` and
 `fits_uncompress_table` in `<cfitsio>/imcompress.c` (around

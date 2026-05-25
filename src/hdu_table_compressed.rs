@@ -36,8 +36,8 @@ use crate::hdu_table::{
     column_expected_shape, column_transform, convert_column_cell,
     field_dtype_and_shape, numpy_field_layout, parse_columns,
     plan_vla_heap_layout, read_descriptor, resolve_columns, resolve_rows,
-    scaling_kind, serialize_vla_cell, validate_vla_cell, Column,
-    ScalingKind, TableHDU, TableKey, VlaCellPlan, WriteTransform,
+    scaling_kind, serialize_vla_cell, validate_vla_cell, write_descriptor,
+    Column, ScalingKind, TableHDU, TableKey, VlaCellPlan, WriteTransform,
 };
 use crate::zimage::gzip::{decode_gzip1, decode_gzip2};
 use crate::zimage::rice::decode_rice;
@@ -524,9 +524,11 @@ impl CompressedTableHDU {
     // Compression Convention's "all tiles same size except the
     // last" invariant so funpack and our own reader both work.
     //
-    // VLA columns on compressed tables are not yet supported on
-    // append — rebuild the table via create_table_hdu + write if
-    // the table has VLA columns.
+    // VLA columns supported: existing per-cell compressed bytes are
+    // copied verbatim (no decode/re-encode); merge-tile new rows are
+    // encoded via the per-cell-then-fallback path; original-table
+    // heap offsets continue from current ZPCOUNT so the funpack-
+    // reconstructed file stays consistent.
     #[pyo3(signature = (data, *, names=None))]
     fn append(
         slf: PyRef<'_, Self>,
@@ -543,14 +545,6 @@ impl CompressedTableHDU {
         let cards = super_.header_snapshot()?;
         let virtual_cards = synthesize_uncompressed_cards(&cards);
         let columns = parse_columns(&virtual_cards)?;
-        for col in &columns {
-            if col.var_kind.is_some() {
-                return Err(PyNotImplementedError::new_err(
-                    "CompressedTableHDU.append: VLA columns are not yet \
-                     supported on append — rebuild the table via \
-                     create_table_hdu + write if you need to add rows"));
-            }
-        }
         let existing_nrows = parse_keyword(&cards, "ZNAXIS2")
             .unwrap_or(0).max(0) as usize;
         let ztilelen = parse_keyword(&cards, "ZTILELEN")
@@ -2356,7 +2350,15 @@ fn set_zpcount_in_cards(new_cards: &mut Vec<String>, new_value: u64) {
 // Grow this HDU's data extent so it covers at least `min_bytes`
 // (relative to data_offset).  Block-rounds; pushes later HDUs
 // forward via the shared shift primitive when needed.  No-op when
-// the file is already large enough.
+// this HDU's data section already extends past `want_end`.
+//
+// For non-last HDUs the upper bound is the NEXT HDU's start, not
+// the file length — file length includes trailing HDU bytes that
+// belong to those HDUs and must not be overwritten.  Bare file-
+// length as the cap (the original buggy form) silently passes
+// writes that overlap a trailing HDU's region whenever the
+// growth fits in the block-alignment padding, and corrupts the
+// trailing HDU once growth exceeds the padding.
 fn grow_file_to_at_least(
     file: &FileHandle,
     layout: &Arc<FileLayout>,
@@ -2369,23 +2371,6 @@ fn grow_file_to_at_least(
     use std::sync::atomic::Ordering;
 
     let want_end = data_offset + round_up_to_block(min_bytes);
-    let (file_len, current_end) = {
-        let g = lock_file(file)?;
-        let f = g.as_ref()
-            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        let len = f.metadata()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?.len();
-        // Take the larger of file_len and want_end as a baseline —
-        // if the HDU is the last one on disk, "current end" is just
-        // the file length.
-        (len, len)
-    };
-    if want_end <= file_len {
-        return Ok(());
-    }
-    // Two cases: this HDU is last on disk (just set_len) OR there's
-    // tail data after it (shift forward).  layout tells us where
-    // the next HDU lives if any.
     let next_hdu_start = {
         let guard = layout.hdus.lock()
             .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
@@ -2394,12 +2379,21 @@ fn grow_file_to_at_least(
             .filter(|&off| off > data_offset)
             .min()
     };
-    let is_last = next_hdu_start.is_none()
-        || next_hdu_start.unwrap() <= data_offset;
-    let delta = want_end.saturating_sub(file_len);
-    if is_last || file_len <= current_end {
-        // No later HDUs to shift OR layout puts the next HDU before
-        // the new end — either way, extend the file.
+    let file_len = {
+        let g = lock_file(file)?;
+        let f = g.as_ref()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.metadata()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?.len()
+    };
+    // Effective end is bounded by the next HDU's start (non-last)
+    // or by the file length (last HDU).
+    let effective_end = next_hdu_start.unwrap_or(file_len);
+    if want_end <= effective_end {
+        return Ok(());
+    }
+    let delta = want_end - effective_end;
+    if next_hdu_start.is_none() {
         let mut g = lock_file(file)?;
         let f = g.as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
@@ -2411,7 +2405,7 @@ fn grow_file_to_at_least(
         })?;
     } else {
         shift_file_tail_and_update_offsets(
-            file, layout, current_end, delta, tainted,
+            file, layout, effective_end, delta, tainted,
         )?;
     }
     Ok(())
@@ -2456,7 +2450,6 @@ fn encode_vla_column_tile(
     col_idx: usize,
     descriptor_row_width: usize,
 ) -> PyResult<u64> {
-    use crate::hdu_table::write_descriptor;
     use crate::zimage::gzip::encode_gzip1;
     use std::io::Write;
     use std::sync::atomic::Ordering;
@@ -2590,6 +2583,275 @@ fn encode_vla_column_tile(
     Ok(heap_cursor)
 }
 
+// Pre-mutation snapshot of an existing tile's VLA dual-descriptor
+// blob.  Decompressed eagerly so the original per-row descriptors
+// (vlalen, original-heap offset, cvlalen, cvlastart) are available
+// without re-touching the file after the heap relocates.
+struct VlaMergeOldBlob {
+    decompressed: Vec<u8>,
+    width_orig: usize,
+    rowspertile: usize,
+}
+
+// Read + decompress one (tile, col) dual-descriptor blob from the
+// CURRENT (pre-mutation) heap.  Called only when merging rows into
+// the existing last partial tile.
+fn read_vla_merge_old_blob(
+    file: &FileHandle,
+    data_offset: u64,
+    tile_idx: usize,
+    col_idx: usize,
+    col: &Column,
+    rowspertile: usize,
+    existing_n_tiles: usize,
+    descriptor_row_width: usize,
+) -> PyResult<VlaMergeOldBlob> {
+    let width_orig = match col.var_kind {
+        Some('P') => 8usize,
+        Some('Q') => 16usize,
+        _ => return Err(PyValueError::new_err(format!(
+            "column '{}': expected P or Q var_kind, got {:?}",
+            col.name, col.var_kind))),
+    };
+    let main_desc_off = data_offset
+        + (tile_idx as u64) * (descriptor_row_width as u64)
+        + (col_idx as u64) * 16;
+    let mut main_desc = [0u8; 16];
+    {
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(main_desc_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut main_desc).map_err(|e| {
+            PyIOError::new_err(format!(
+                "append: read main desc for VLA tile {} col '{}': {}",
+                tile_idx, col.name, e))
+        })?;
+    }
+    let (blob_nelems_s, blob_off_s) = read_descriptor('Q', &main_desc);
+    let blob_nelems = blob_nelems_s.max(0) as usize;
+    let blob_heap_off = blob_off_s.max(0) as u64;
+    let old_heap_start = data_offset
+        + (existing_n_tiles as u64) * (descriptor_row_width as u64);
+    let mut compressed = vec![0u8; blob_nelems];
+    if blob_nelems > 0 {
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(old_heap_start + blob_heap_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(&mut compressed).map_err(|e| {
+            PyIOError::new_err(format!(
+                "append: read existing VLA dual-descriptor blob for \
+                 tile {} col '{}': {}", tile_idx, col.name, e))
+        })?;
+    }
+    let expected_blob_size = rowspertile * width_orig + rowspertile * 16;
+    let decompressed = if blob_nelems > 0 {
+        gzip_decompress_bytes(&compressed, expected_blob_size)?
+    } else {
+        Vec::new()
+    };
+    Ok(VlaMergeOldBlob { decompressed, width_orig, rowspertile })
+}
+
+// Re-encode the last existing tile of a VLA column for the merge
+// path of append.  Existing rows: keep original descriptors verbatim
+// (no decompress / re-compress), copy per-cell compressed bytes from
+// their old heap position to the heap end, rewrite compressed
+// descriptors with the new offset.  New rows: encode per-cell with
+// the uncompressed-fallback contract, original-descriptor offset
+// from the planner (extends past current ZPCOUNT).
+#[allow(clippy::too_many_arguments)]
+fn encode_vla_column_tile_with_merge(
+    py: Python<'_>,
+    ndarray: &Bound<'_, PyAny>,
+    file: &FileHandle,
+    layout: &Arc<FileLayout>,
+    tainted: &TaintFlag,
+    data_offset: u64,
+    heap_start_offset: u64,
+    mut heap_cursor: u64,
+    col: &Column,
+    col_input: &Bound<'_, PyAny>,
+    col_plans: &[VlaCellPlan],
+    tile_idx: usize,
+    last_existing_tile_rows: usize,
+    merge_rows: usize,
+    old_blob: &VlaMergeOldBlob,
+    algo: CompressionAlgorithm,
+    rice_blocksize: u32,
+    gzip_level: Option<u32>,
+    desc_table: &mut [u8],
+    col_idx: usize,
+    descriptor_row_width: usize,
+) -> PyResult<u64> {
+    use crate::zimage::gzip::encode_gzip1;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    let inner_letter = col.tform_letter;
+    let elem_size = bytes_per_element(inner_letter).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "VLA column '{}': unsupported inner letter '{}'",
+            col.name, inner_letter))
+    })?;
+    let descriptor_kind = col.var_kind
+        .expect("encode_vla_column_tile_with_merge called for non-VLA");
+    let width_orig = if descriptor_kind == 'P' { 8 } else { 16 };
+    let merged_rows = last_existing_tile_rows + merge_rows;
+    let blob_size = merged_rows * width_orig + merged_rows * 16;
+    let mut new_blob = vec![0u8; blob_size];
+    let comp_desc_start = merged_rows * width_orig;
+    let old_comp_desc_start =
+        old_blob.rowspertile * old_blob.width_orig;
+
+    // Chunk buffer for the in-file copy of existing per-cell bytes.
+    // 1 MiB matches the rest of the file (~tight, peak-RSS-bounded).
+    let mut copy_buf: Vec<u8> = Vec::new();
+    let chunk_size: u64 = 1 << 20;
+
+    // Existing rows: copy descriptors + per-cell compressed bytes.
+    for r in 0..last_existing_tile_rows {
+        let old_orig_off = r * width_orig;
+        new_blob[r * width_orig..r * width_orig + width_orig]
+            .copy_from_slice(
+                &old_blob.decompressed
+                    [old_orig_off..old_orig_off + width_orig]);
+
+        let old_comp_off = old_comp_desc_start + r * 16;
+        let (cvlalen_s, cvlastart_s) = read_descriptor(
+            'Q', &old_blob.decompressed[old_comp_off..old_comp_off + 16]);
+        let cvlalen = cvlalen_s.max(0) as u64;
+        let cvlastart_old = cvlastart_s.max(0) as u64;
+
+        let new_cvlastart = if cvlalen == 0 {
+            0u64
+        } else {
+            let src_abs = heap_start_offset + cvlastart_old;
+            let dst_abs = heap_start_offset + heap_cursor;
+            // Source range [cvlastart_old, +cvlalen) lives in the
+            // old heap, which ends at current_pcount (relative to
+            // heap_start_offset).  heap_cursor starts at
+            // current_pcount and only grows, so dst is always past
+            // src — no overlap to worry about.
+            let want_total = (dst_abs + cvlalen) - data_offset;
+            grow_file_to_at_least(
+                file, layout, data_offset, want_total, tainted)?;
+            stream_copy_in_file(
+                file, src_abs, dst_abs, cvlalen, &mut copy_buf,
+                chunk_size, tainted,
+                "compressed VLA append: copy existing cell bytes",
+            )?;
+            let placed = heap_cursor;
+            heap_cursor += cvlalen;
+            placed
+        };
+        let new_comp_off = comp_desc_start + r * 16;
+        write_descriptor(
+            'Q', cvlalen as usize, new_cvlastart as usize,
+            &mut new_blob[new_comp_off..new_comp_off + 16],
+        );
+    }
+
+    // New rows (first `merge_rows` of the input): encode per-cell,
+    // original descriptor from the planner.
+    for r in 0..merge_rows {
+        let input_row_idx = r;
+        let cell = col_input.get_item(input_row_idx)?;
+        let nelements = validate_vla_cell(
+            &cell, ndarray, inner_letter, &col.name, input_row_idx)?;
+        let plan = &col_plans[input_row_idx];
+        debug_assert_eq!(plan.nelements, nelements);
+
+        let new_orig_off = (last_existing_tile_rows + r) * width_orig;
+        write_descriptor(
+            descriptor_kind, nelements, plan.bytes_offset_in_heap,
+            &mut new_blob[new_orig_off..new_orig_off + width_orig],
+        );
+
+        let mut cell_be = vec![0u8; nelements * elem_size];
+        if nelements > 0 {
+            serialize_vla_cell(
+                &cell, inner_letter, nelements, &mut cell_be)?;
+        }
+        let (cvlalen, cvlastart) = if nelements == 0 {
+            (0u64, 0u64)
+        } else {
+            let compressed = encode_table_column_slab(
+                algo, &cell_be, nelements, elem_size,
+                rice_blocksize, gzip_level,
+            )?;
+            let payload = if compressed.len() >= cell_be.len() {
+                &cell_be[..]
+            } else {
+                &compressed[..]
+            };
+            let plen = payload.len() as u64;
+            let want_total = heap_start_offset + heap_cursor
+                + plen - data_offset;
+            grow_file_to_at_least(
+                file, layout, data_offset, want_total, tainted)?;
+            {
+                let mut g = lock_file(file)?;
+                let f = g.as_mut()
+                    .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+                f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                f.write_all(payload).map_err(|e| {
+                    tainted.store(true, Ordering::Release);
+                    PyIOError::new_err(format!(
+                        "compressed VLA append: merge-tile new-row cell \
+                         write failed at col '{}' new-row {}: {}",
+                        col.name, r, e))
+                })?;
+            }
+            let placed = heap_cursor;
+            heap_cursor += plen;
+            (plen, placed)
+        };
+        let new_comp_off =
+            comp_desc_start + (last_existing_tile_rows + r) * 16;
+        write_descriptor(
+            'Q', cvlalen as usize, cvlastart as usize,
+            &mut new_blob[new_comp_off..new_comp_off + 16],
+        );
+    }
+    let _ = py;
+
+    // GZIP_1 the new dual-descriptor blob, write to heap end,
+    // record the main-table descriptor for this (tile, col).
+    let gzipped = encode_gzip1(&new_blob, None)?;
+    let want_total = heap_start_offset + heap_cursor
+        + gzipped.len() as u64 - data_offset;
+    grow_file_to_at_least(file, layout, data_offset, want_total, tainted)?;
+    let blob_heap_offset = heap_cursor;
+    {
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(heap_start_offset + heap_cursor))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.write_all(&gzipped).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "compressed VLA append: merged dual-descriptor blob \
+                 write failed at tile {} col '{}': {}",
+                tile_idx, col.name, e))
+        })?;
+    }
+    heap_cursor += gzipped.len() as u64;
+
+    let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
+    let nelems_be = (gzipped.len() as i64).to_be_bytes();
+    let off_be = (blob_heap_offset as i64).to_be_bytes();
+    desc_table[desc_off..desc_off + 8].copy_from_slice(&nelems_be);
+    desc_table[desc_off + 8..desc_off + 16].copy_from_slice(&off_be);
+
+    Ok(heap_cursor)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 6b — append rows to a compressed table
 // ---------------------------------------------------------------------------
@@ -2686,38 +2948,88 @@ pub(crate) fn append_compressed_table_data(
     let merge_rows = append_nrows.min(room_in_last_tile);
     let _rows_in_new_tiles = append_nrows - merge_rows;
 
-    // Per-column prep via the shared helper.  VLA columns are
-    // rejected by the pymethod upstream so every column lands as a
-    // ColPrep here.
+    // Per-column prep.  Fixed cols get a ColPrep; VLA cols get
+    // a None slot — their per-cell work happens later in
+    // encode_vla_column_tile{,_with_merge}.  VLA-input validation
+    // (Object dtype, length match) happens here so dtype errors
+    // raise before any file mutation.
     let np = py.import("numpy")?;
     let ndarray = np.getattr("ndarray")?;
-    let mut preps: Vec<ColPrep<'_>> = Vec::with_capacity(columns.len());
+    let mut preps: Vec<Option<ColPrep<'_>>> = Vec::with_capacity(columns.len());
     for (i, (col, arr)) in columns.iter()
         .zip(per_column_inputs.iter()).enumerate()
     {
+        if col.var_kind.is_some() {
+            if !arr.is_instance(&ndarray)? {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.append: column '{}' value must \
+                     be a numpy ndarray", col.name)));
+            }
+            let kind: String = arr.getattr("dtype")?
+                .getattr("kind")?.extract()?;
+            if kind != "O" {
+                return Err(PyValueError::new_err(format!(
+                    "CompressedTableHDU.append: VLA column '{}' input \
+                     must be a numpy Object dtype ndarray (kind 'O'), \
+                     got kind '{}'", col.name, kind)));
+            }
+            preps.push(None);
+            continue;
+        }
         let cfg = per_col_configs.and_then(|cs| cs.get(i));
-        preps.push(prepare_fixed_column(
+        preps.push(Some(prepare_fixed_column(
             &np, &ndarray, arr, col, append_nrows, cfg,
-        )?);
+        )?));
     }
+
+    let any_vla = columns.iter().any(|c| c.var_kind.is_some());
+    let current_zpcount = parse_keyword(cards, "ZPCOUNT")
+        .unwrap_or(0).max(0) as u64;
+
+    // Plan VLA original-heap offsets for the full input batch, so
+    // the original-descriptor offsets (used by funpack to
+    // reconstruct) extend the existing original heap.  Returns
+    // per-column per-row plans + the new total original-heap size.
+    let (vla_plans, new_orig_pcount) = if any_vla {
+        let (plans, cursor) = plan_vla_heap_layout(
+            columns, per_column_inputs, append_nrows, &ndarray,
+            current_zpcount as usize,
+        )?;
+        (plans, cursor as u64)
+    } else {
+        (Vec::new(), current_zpcount)
+    };
 
     // Step 1: decode the existing last tile if we're going to
     // merge into it.  Do this BEFORE any file mutation — the
-    // heap-offset math depends on the current layout.
-    let existing_be_per_col: Vec<Vec<u8>> = if merge_rows > 0 {
+    // heap-offset math depends on the current layout.  Fixed cols
+    // need their BE-bytes (decoded slab); VLA cols need their
+    // dual-descriptor blob (decompressed) so we can copy the
+    // existing per-row descriptors and per-cell compressed bytes.
+    let mut existing_be_per_col: Vec<Vec<u8>> = Vec::new();
+    let mut vla_merge_blobs: Vec<Option<VlaMergeOldBlob>> = Vec::new();
+    if merge_rows > 0 {
         let last_tile_idx = existing_n_tiles - 1;
-        let mut out = Vec::with_capacity(columns.len());
+        existing_be_per_col.reserve(columns.len());
+        vla_merge_blobs.reserve(columns.len());
         for (col_idx, col) in columns.iter().enumerate() {
-            out.push(decode_existing_tile_to_be_bytes(
-                &super_.file, cards, data_offset, last_tile_idx,
-                col_idx, col, algorithms[col_idx],
-                last_existing_tile_rows, descriptor_row_width,
-            )?);
+            if col.var_kind.is_some() {
+                existing_be_per_col.push(Vec::new());
+                vla_merge_blobs.push(Some(read_vla_merge_old_blob(
+                    &super_.file, data_offset, last_tile_idx, col_idx,
+                    col, last_existing_tile_rows, existing_n_tiles,
+                    descriptor_row_width,
+                )?));
+            } else {
+                existing_be_per_col.push(decode_existing_tile_to_be_bytes(
+                    &super_.file, cards, data_offset, last_tile_idx,
+                    col_idx, col, algorithms[col_idx],
+                    last_existing_tile_rows, descriptor_row_width,
+                )?);
+                vla_merge_blobs.push(None);
+            }
         }
-        out
-    } else {
-        Vec::new()
-    };
+    }
 
     // Step 2: grow the data section to make room for the new
     // descriptor rows + existing heap.  grow_file_to_at_least
@@ -2777,15 +3089,36 @@ pub(crate) fn append_compressed_table_data(
     // to the heap end (orphaning old last-tile blobs on merge).
     let mut heap_cursor = current_pcount;
 
-    // Step 4: merge into last tile if applicable.  For each column,
-    // concatenate the freshly-transformed new rows onto a clone of
-    // the existing BE bytes (decoded in step 1), then encode the
-    // merged slab and write to the heap end via the shared helper.
+    // Step 4: merge into last tile if applicable.  Fixed cols
+    // concatenate freshly-transformed new rows onto the decoded
+    // existing slab, then re-encode.  VLA cols copy each existing
+    // row's per-cell compressed bytes verbatim (no decode / re-
+    // encode) and append per-cell encoded bytes for new rows;
+    // existing rows' original-descriptor offsets are preserved so
+    // funpack's reconstructed heap stays consistent.
     if merge_rows > 0 {
         let last_tile_idx = existing_n_tiles - 1;
         let merged_rows = last_existing_tile_rows + merge_rows;
         for (col_idx, col) in columns.iter().enumerate() {
-            let prep = &preps[col_idx];
+            if col.var_kind.is_some() {
+                let cfg = per_col_configs.and_then(|cs| cs.get(col_idx));
+                heap_cursor = encode_vla_column_tile_with_merge(
+                    py, &ndarray, &super_.file, &super_.layout,
+                    &super_.tainted, data_offset, new_heap_start,
+                    heap_cursor, col, &per_column_inputs[col_idx],
+                    &vla_plans[col_idx], last_tile_idx,
+                    last_existing_tile_rows, merge_rows,
+                    vla_merge_blobs[col_idx].as_ref().expect(
+                        "VLA col has a merge-blob"),
+                    algorithms[col_idx],
+                    cfg.map(rice_blocksize_of).unwrap_or(32),
+                    cfg.and_then(gzip_level_of),
+                    &mut desc_table, col_idx, descriptor_row_width,
+                )?;
+                continue;
+            }
+            let prep = preps[col_idx].as_ref()
+                .expect("non-VLA col has a ColPrep");
             let mut merged = existing_be_per_col[col_idx].clone();
             merged.reserve(merge_rows * prep.per_row_bytes);
             let src_bytes = prep.buf.as_slice();
@@ -2809,8 +3142,10 @@ pub(crate) fn append_compressed_table_data(
         }
     }
 
-    // Step 5: encode fresh tiles for any remaining rows via the
-    // shared per-(tile, col) helper.
+    // Step 5: encode fresh tiles for any remaining rows.  Fixed
+    // cols go through the shared helper; VLA cols reuse the
+    // Phase 6a per-tile encoder with the planned original-heap
+    // offsets (which extend past current_zpcount).
     let mut new_input_row_cursor = merge_rows;
     for new_tile_offset in 0..added_n_tiles {
         let tile_idx = existing_n_tiles + new_tile_offset;
@@ -2821,8 +3156,25 @@ pub(crate) fn append_compressed_table_data(
             ztilelen
         };
         for (col_idx, col) in columns.iter().enumerate() {
+            if col.var_kind.is_some() {
+                let cfg = per_col_configs.and_then(|cs| cs.get(col_idx));
+                heap_cursor = encode_vla_column_tile(
+                    py, &ndarray, &super_.file, &super_.layout,
+                    &super_.tainted, data_offset, new_heap_start,
+                    heap_cursor, col, &per_column_inputs[col_idx],
+                    &vla_plans[col_idx], tile_row_start_in_new,
+                    rows_in_tile, algorithms[col_idx],
+                    cfg.map(rice_blocksize_of).unwrap_or(32),
+                    cfg.and_then(gzip_level_of),
+                    &mut desc_table, tile_idx, col_idx,
+                    descriptor_row_width,
+                )?;
+                continue;
+            }
+            let prep = preps[col_idx].as_ref()
+                .expect("non-VLA col has a ColPrep");
             heap_cursor = build_and_encode_tile_col(
-                &preps[col_idx], col, algorithms[col_idx],
+                prep, col, algorithms[col_idx],
                 tile_idx, col_idx, rows_in_tile,
                 /* source_row_offset = */ tile_row_start_in_new,
                 descriptor_row_width, new_heap_start, heap_cursor,
@@ -2858,8 +3210,10 @@ pub(crate) fn append_compressed_table_data(
     }
 
     // Step 6: update header.  NAXIS2 = new_n_tiles, PCOUNT =
-    // heap_cursor, ZNAXIS2 = new_nrows.  ZPCOUNT stays at 0 for
-    // fixed-only tables.
+    // heap_cursor, ZNAXIS2 = new_nrows.  ZPCOUNT only matters
+    // when any VLA col is present — it's the original
+    // (uncompressed) heap size and funpack copies it onto the
+    // output PCOUNT.  For fixed-only tables ZPCOUNT stays 0.
     let mut cards_guard = super_.header.lock()
         .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
     let mut new_cards = cards.to_vec();
@@ -2870,6 +3224,9 @@ pub(crate) fn append_compressed_table_data(
         &mut new_cards, "ZNAXIS2", new_nrows as i64,
         "original (uncompressed) row count")?;
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
+    if any_vla {
+        set_zpcount_in_cards(&mut new_cards, new_orig_pcount);
+    }
     crate::header::rewrite_header_to_disk(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,

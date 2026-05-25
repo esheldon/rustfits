@@ -298,39 +298,6 @@ def test_funpack_decompresses_appended_table():
 
 
 # ---------------------------------------------------------------------
-# VLA: rejected for now (Phase 6b-vla, future)
-# ---------------------------------------------------------------------
-
-
-def test_vla_append_rejected():
-    """append() on a compressed table with VLA columns is not yet supported."""
-    with tempfile.TemporaryDirectory() as td:
-        fname = os.path.join(td, "t.fits")
-        dt = np.dtype([("id", "i4"), ("v", "O")])
-        nrows = 500
-        src = np.empty(nrows, dtype=dt)
-        src["id"] = np.arange(nrows, dtype="i4")
-        for i in range(nrows):
-            src["v"][i] = np.arange(i % 5, dtype="f4")
-        with rustfits.FITS(fname, "w+") as f:
-            f.create_table_hdu(
-                dt,
-                nrows=nrows,
-                var_dtypes={"v": "f4"},
-                compress=True,
-            )
-            f[1].write(src)
-
-        added = np.empty(100, dtype=dt)
-        added["id"] = np.arange(nrows, nrows + 100, dtype="i4")
-        for i in range(100):
-            added["v"][i] = np.arange(i % 3, dtype="f4")
-        with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(NotImplementedError, match="VLA"):
-                f[1].append(added)
-
-
-# ---------------------------------------------------------------------
 # Header bookkeeping: PCOUNT grows monotonically, ZNAXIS2 updates
 # ---------------------------------------------------------------------
 
