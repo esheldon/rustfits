@@ -68,6 +68,55 @@ const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 // concurrency model.
 type TileCache = BytesBoundLruCache<u64>;
 
+/// A tile-compressed image HDU (``ZIMAGE=T`` on disk).
+///
+/// The user-facing surface mirrors :class:`ImageHDU` exactly:
+/// every accessor (:attr:`shape`, :attr:`dtype`, :attr:`bitpix`,
+/// ...) reports the **uncompressed** image properties, and every
+/// I/O method (:meth:`read`, :meth:`write`, :meth:`extend`,
+/// ``__getitem__``, ``__setitem__``) operates on the
+/// uncompressed pixels.  The tile-compressed storage is an
+/// implementation detail.
+///
+/// Subclasses :class:`ImageHDU` (so ``isinstance(hdu,
+/// ImageHDU)`` holds), but overrides every I/O method to handle
+/// per-tile (de)compression.  Returned by indexing a
+/// :class:`FITS` object at a position containing a ZIMAGE HDU.
+///
+/// Compression-specific surface beyond the inherited
+/// :class:`ImageHDU` API:
+///
+/// * :attr:`compression` — the algorithm config object (e.g.
+///   :class:`Rice1` instance) that would reproduce the on-disk
+///   layout.
+/// * :attr:`n_tiles` — number of tile chunks on disk.
+/// * :attr:`tile_cache_size`, :meth:`set_tile_cache_size`,
+///   :attr:`tile_cache_used`, :meth:`clear_tile_cache` — LRU
+///   cache controls for decoded tiles.
+/// * :meth:`repack` — drop orphaned tile bytes accumulated by
+///   ``__setitem__`` / :meth:`extend`.
+///
+/// Examples
+/// --------
+/// Read tile-compressed data the same way as uncompressed::
+///
+///     arr = hdu.read()
+///     stamp = hdu[100:200, 50:150]   # decodes only overlapping tiles
+///
+/// Inspect the compression::
+///
+///     print(hdu.compression)         # Rice1(tile_shape=[100,100], ...)
+///     print(hdu.n_tiles)
+///
+/// Tune the tile cache for a memory-constrained workflow::
+///
+///     hdu.set_tile_cache_size(0)     # disable caching
+///
+/// Notes
+/// -----
+/// Use :meth:`FITS.create_image_hdu` with ``compress=`` to
+/// create a tile-compressed image.  Direct construction from
+/// Python is not supported.
 #[pyclass(extends = ImageHDU)]
 pub(crate) struct CompressedImageHDU {
     cache: Arc<TileCache>,
@@ -230,13 +279,17 @@ impl CompressedImageHDU {
 
     // ----- image-side accessors (parallel to ImageHDU) -----
     //
-    // All of these go through `meta()` so a tight Python loop
-    // calling `hdu.shape` / `hdu.dtype` / etc. pays one Mutex
-    // lock + Acquire load + Arc clone per call, not a full
-    // re-parse of the cards Vec.  See Phase 2 in
-    // "Header-derived metadata caching" for the cache contract.
+    // These mirror ImageHDU's accessors exactly but report the
+    // ORIGINAL (uncompressed) image properties — `shape` is the
+    // shape pixels would have after `.read()`, NOT the on-disk
+    // BINTABLE shape.  Sources: ZBITPIX / ZNAXIS / ZNAXISn cards
+    // (the Z-prefixed substitutes the FITS Tile Compression
+    // Convention defines for the original image).
 
-    // Image dimensions in numpy axis order (slowest first).
+    /// Original image dimensions in numpy axis order (slowest
+    /// first).  Sourced from ``ZNAXISn``; the user sees what
+    /// :meth:`read` would return, not the on-disk BINTABLE
+    /// shape.
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let super_ = slf.as_super().as_super();
@@ -244,7 +297,8 @@ impl CompressedImageHDU {
         Ok(PyTuple::new(py, &meta.image_shape)?.unbind())
     }
 
-    // numpy dtype matching ZBITPIX — what .read() will return.
+    /// The numpy dtype :meth:`read` would return.  Sourced from
+    /// ``ZBITPIX``.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_ = slf.as_super().as_super();
@@ -254,7 +308,7 @@ impl CompressedImageHDU {
         Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
     }
 
-    // ZNAXIS — number of image axes.
+    /// Number of image axes.  Sourced from ``ZNAXIS``.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
@@ -262,7 +316,7 @@ impl CompressedImageHDU {
         Ok(meta.image_shape.len())
     }
 
-    // Total pixel count (product of all ZNAXISn).
+    /// Total pixel count (product of all ``ZNAXISn``).
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
         let super_ = slf.as_super().as_super();
@@ -270,7 +324,9 @@ impl CompressedImageHDU {
         Ok(meta.image_shape.iter().product())
     }
 
-    // Raw ZBITPIX — the image-side bitpix the user will read into.
+    /// Raw FITS ``ZBITPIX`` value (the image-side bitpix the
+    /// user reads into).  Distinct from ``hdu.header["BITPIX"]``
+    /// (which is 8, the BINTABLE BITPIX on disk).
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
         let super_ = slf.as_super().as_super();
@@ -278,15 +334,16 @@ impl CompressedImageHDU {
         Ok(meta.zbitpix)
     }
 
-    // numpy convention: `len(arr)` is shape[0].
+    // __len__ is a pyo3 slot dunder — no per-method docstring.
+    // numpy convention: shape[0] of the original image.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
         let meta = slf.meta(super_)?;
         Ok(meta.image_shape[0] as usize)
     }
 
-    // BUNIT (informational).  Not in the meta — single keyword
-    // lookup, called only when the user asks; not worth caching.
+    /// ``BUNIT`` header value, or ``None`` when unset.
+    /// Informational only.
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
         let super_ = slf.as_super().as_super();
@@ -296,23 +353,33 @@ impl CompressedImageHDU {
 
     // ----- compression-specific accessors -----
 
-    // Structured compression config: returns the same Gzip1 /
-    // Gzip2 / Rice1 / Hcompress1 pyclass instance that would have
-    // been passed to `create_image_hdu(..., compress=...)` to
-    // produce a file with the same on-disk parameters.  This is
-    // the single source of truth for "how is this HDU compressed":
-    //
-    //   if isinstance(hdu.compression, rustfits.Rice1):
-    //       print(hdu.compression.blocksize)
-    //
-    // The FITS-spec ZCMPTYPE string is available as
-    // `hdu.compression.zcmptype`; tile shape as
-    // `hdu.compression.tile_shape`.  Two HDUs can be compared with
-    // `hdu_a.compression == hdu_b.compression` (field-wise __eq__).
-    //
-    // Construction cost per access is small (parses cards, builds
-    // a tiny pyclass).  No caching — keep parity with the other
-    // accessors that re-parse the header on each call.
+    /// Compression configuration of this HDU.
+    ///
+    /// Returns the same :class:`Gzip1` / :class:`Gzip2` /
+    /// :class:`Rice1` / :class:`Hcompress1` / :class:`Plio1`
+    /// pyclass instance that would have been passed to
+    /// :meth:`FITS.create_image_hdu`'s ``compress=`` argument to
+    /// reproduce the on-disk layout.  Single source of truth for
+    /// "how is this HDU compressed"::
+    ///
+    ///     if isinstance(hdu.compression, rustfits.Rice1):
+    ///         print(hdu.compression.blocksize)
+    ///
+    /// The FITS-spec ``ZCMPTYPE`` string is available as
+    /// ``hdu.compression.zcmptype``; tile shape as
+    /// ``hdu.compression.tile_shape``.  Two HDUs can be compared
+    /// with ``hdu_a.compression == hdu_b.compression``
+    /// (field-wise ``__eq__``).
+    ///
+    /// Notes
+    /// -----
+    /// For HDUs that were just created in this Python session,
+    /// the returned object is the exact config passed to
+    /// ``create_image_hdu(..., compress=...)`` — write-only
+    /// parameters (like ``Gzip1(level=9)``) round-trip.  For
+    /// reopened HDUs, the config is rebuilt from header cards;
+    /// the ``level`` field comes back as ``None`` because gzip
+    /// framing doesn't preserve the level.
     #[getter]
     fn compression(
         slf: PyRef<'_, Self>, py: Python<'_>,
@@ -336,10 +403,12 @@ impl CompressedImageHDU {
         build_compression_config(py, &cards)
     }
 
-    // Total number of tiles in the image: product of
-    // ceil(NAXISn / TILEn).  Storage-layout property (kept here
-    // rather than on .compression because it's about how the
-    // BINTABLE is laid out, not the algorithm).
+    /// Number of tile chunks the image is split into on disk.
+    ///
+    /// Product of ``ceil(ZNAXISn / ZTILEn)`` across all axes.
+    /// Storage-layout property (kept here rather than on
+    /// :attr:`compression` because it's about how the BINTABLE
+    /// is laid out, not the algorithm).
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<u64> {
         let super_ = slf.as_super().as_super();
@@ -349,33 +418,41 @@ impl CompressedImageHDU {
 
     // ----- tile cache -----
 
-    // Current cache capacity in bytes.  Default 32 MiB; tune with
-    // `set_tile_cache_size`.  Reads and slicing both consult this
-    // budget — there's no per-call opt-out.
+    /// Current cache capacity in bytes.
+    ///
+    /// Default 32 MiB.  Reads and slicing both consult this
+    /// budget — there's no per-call opt-out.  Tune with
+    /// :meth:`set_tile_cache_size`.
     #[getter]
     fn tile_cache_size(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.capacity()
     }
 
-    // Configure the cache capacity in bytes.  Setting to 0
-    // disables caching entirely (every decode is one-shot —
-    // useful for memory-constrained workflows).  Shrinking the
-    // cap below current usage evicts LRU tiles to fit.
+    /// Set the cache capacity in bytes.
+    ///
+    /// Setting to ``0`` disables caching entirely — every decode
+    /// is one-shot, useful for memory-constrained workflows.
+    /// Shrinking the cap below current usage evicts LRU tiles to
+    /// fit.
     fn set_tile_cache_size(&self, bytes: u64) {
         self.cache.set_capacity(bytes);
     }
 
-    // Bytes currently held in the cache.  Useful for monitoring
-    // memory usage and for tests that assert eviction worked.
+    /// Bytes currently held in the tile cache.
+    ///
+    /// Useful for monitoring memory usage and for tests that
+    /// assert eviction worked.
     #[getter]
     fn tile_cache_used(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.used_bytes()
     }
 
-    // Drop every cached tile.  Keeps `tile_cache_size` as-is, so
-    // subsequent decodes will repopulate.  Useful right after a
-    // one-shot `read()` to release the tile copies while keeping
-    // the cache configured for later slicing.
+    /// Drop every cached tile.
+    ///
+    /// Keeps :attr:`tile_cache_size` as-is, so subsequent decodes
+    /// will repopulate.  Useful right after a one-shot
+    /// :meth:`read` to release the tile copies while keeping the
+    /// cache configured for later slicing.
     fn clear_tile_cache(&self) {
         self.cache.clear();
     }
@@ -384,22 +461,33 @@ impl CompressedImageHDU {
     //
     // Compressed HDUs use ZHECKSUM + ZDATASUM (not the BINTABLE-
     // level CHECKSUM/DATASUM) per the FITS Tile Compression
-    // Convention.  Both are computed against the *equivalent
-    // uncompressed image* — the BITPIX-native bytes the decoded
-    // data would occupy if it were stored uncompressed.  Astropy
-    // uses the same convention and reads our values bit-exact.
-    //
-    // Manual semantics — re-run add_checksum after extend /
-    // __setitem__ / write to refresh.
+    // Convention; both compute against the equivalent uncompressed
+    // image bytes (astropy uses the same convention).
 
+    /// Compute and store the ``ZDATASUM`` checksum card.
+    ///
+    /// Computed against the equivalent uncompressed image bytes,
+    /// not the on-disk BINTABLE, per the FITS Tile Compression
+    /// Convention.  Same manual-refresh contract as
+    /// :meth:`ImageHDU.add_datasum` — re-run after
+    /// :meth:`write` / :meth:`extend` / ``__setitem__``.
     fn add_datasum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
         compressed_add_datasum(slf, py)
     }
 
+    /// Compute and store both ``ZDATASUM`` and ``ZHECKSUM`` cards.
+    ///
+    /// Same convention as :meth:`add_datasum`.  This is the call
+    /// most users want.
     fn add_checksum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
         compressed_add_checksum(slf, py)
     }
 
+    /// Verify the stored ``ZDATASUM`` against the equivalent
+    /// uncompressed image bytes.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_datasum(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Option<bool>> {
@@ -415,20 +503,24 @@ impl CompressedImageHDU {
     // ----- overrides for ImageHDU's data-access methods -----
     //
     // These shadow ImageHDU's implementations so the uncompressed
-    // read/write paths never run on a compressed BINTABLE.  Only
-    // `read` does real work in Phase 2; everything else raises.
+    // read/write paths never run on a compressed BINTABLE.  User-
+    // facing semantics are identical to the ImageHDU versions;
+    // docstrings here cross-reference the parent and add the
+    // compression-specific notes (tile-cache behavior etc.).
 
-    // Whole-image read.  Walks every tile in the BINTABLE, decodes
-    // it (or pulls from the tile cache), places it in the output
-    // ndarray.  Honors `scale` and `mask_blank` for compatibility
-    // with the ImageHDU signature; `mask_blank=True` currently
-    // raises because ZBLANK isn't wired in yet.
-    //
-    // Cache behavior: every tile read/decode populates the LRU
-    // cache (subject to `tile_cache_size`).  This makes subsequent
-    // slicing into the same region cheap.  To run cache-free, set
-    // `tile_cache_size=0` before the read or call
-    // `clear_tile_cache()` afterward.
+    /// Read the (decompressed) image into a numpy array.
+    ///
+    /// Same signature and semantics as :meth:`ImageHDU.read`:
+    /// ``scale`` applies ``BSCALE``/``BZERO``; ``mask_blank``
+    /// returns a ``MaskedArray`` on ``ZBLANK`` matches.
+    ///
+    /// Notes
+    /// -----
+    /// Tile cache: every tile decoded during the read populates
+    /// the LRU cache (subject to :attr:`tile_cache_size`).  This
+    /// makes subsequent overlapping slicing reads hit warm tiles.
+    /// To run cache-free, set ``set_tile_cache_size(0)`` before
+    /// the read, or call :meth:`clear_tile_cache` afterward.
     #[pyo3(signature = (*, scale=true, mask_blank=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -444,21 +536,12 @@ impl CompressedImageHDU {
         )
     }
 
-    // Slicing on tile-compressed images.  Reuses the same slice-
-    // key parser as ImageHDU (slice + int + ellipsis per axis,
-    // with step support), and decodes only the tiles overlapping
-    // the requested region.  Each accessed tile is cached, so
-    // overlapping slices later hit warm tiles.
-    //
-    // Always applies BSCALE/BZERO (matches the table-side
-    // convention; use .read(scale=False) to bypass for the whole
-    // image).  All-int multi-axis (`hdu[i, j, k]`) returns a
-    // numpy scalar, matching ImageHDU semantics.
-    //
-    // Phase 3 supports the same slicing surface as ImageHDU
-    // (slice/int/ellipsis); fancy list/array indexing falls
-    // through `parse_axis_indexer` and raises the existing
-    // "unsupported index type" error.
+    // __getitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same slice surface as ImageHDU (slice / int / ellipsis per
+    // axis, stepped slices, mixed combinations), but decodes only
+    // the tiles overlapping the requested region.  Always scales
+    // (use .read(scale=False) for raw).  Tile cache populated on
+    // every access — see the read() docstring for cache control.
     fn __getitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -472,21 +555,28 @@ impl CompressedImageHDU {
         )
     }
 
-    // Compressed writes are Phase 7+ territory.  Reject every
-    // path that would otherwise inherit ImageHDU's uncompressed
-    // implementation, since those would happily blast bytes into
-    // the BINTABLE data area and produce a corrupt file.
-    // Bulk-write a compressed image.  Encodes every tile in RAM
-    // first (validate-then-mutate), then grows the file as needed,
-    // writes the per-tile descriptors into the main data section
-    // and the encoded bytes into the heap, and rewrites the PCOUNT
-    // card.  `start=` is not supported on compressed images (every
-    // tile is encoded independently; partial writes would mean a
-    // partial tile, which doesn't compose with the encode-once
-    // model).  Pass the full image array as `data`.
-    //
-    // Phase 7 supports Gzip1, Gzip2, and Rice1 with integer
-    // ZBITPIX (u1/i2/i4/i8 for GZIP; u1/i2/i4 for RICE).
+    /// Write the entire image (encoding tile-by-tile).
+    ///
+    /// Same input contract as :meth:`ImageHDU.write` — data must
+    /// match the HDU shape exactly.  ``start=`` is rejected
+    /// because compressed writes are encode-once per tile;
+    /// partial writes don't compose with the tile-encoding
+    /// model.  Use ``__setitem__`` for region updates instead.
+    ///
+    /// Validate-then-mutate: every tile is encoded into RAM
+    /// first; only after all encodes succeed does the file grow
+    /// + descriptor table + heap get written.  A dtype or shape
+    /// error leaves the file untouched.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray or numpy.ma.MaskedArray
+    ///     See :meth:`ImageHDU.write` for the dtype rules
+    ///     (BITPIX-native, scaled, or f8 for general scaling;
+    ///     MaskedArray auto-fills via ``ZBLANK`` or NaN).
+    /// start : Any, optional
+    ///     Not supported.  Passing anything other than ``None``
+    ///     raises ``NotImplementedError``.
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -519,9 +609,25 @@ impl CompressedImageHDU {
         )
     }
 
-    // No `start=` kwarg, unlike ImageHDU.extend: writing to existing
-    // tile rows is __setitem__'s job (re-encode the affected tiles
-    // in place).  extend only appends at the end of the slow axis.
+    /// Append new pixels along the slow axis.
+    ///
+    /// Same shape contract as :meth:`ImageHDU.extend`: ``data``
+    /// inner-axis shape must match ``hdu.shape[1:]``; the slow
+    /// axis can be any size.
+    ///
+    /// Unlike :meth:`ImageHDU.extend`, there is no ``start=``
+    /// argument — writes to existing tile rows are
+    /// ``__setitem__``'s job (which re-encodes the affected
+    /// tiles in place).  ``extend`` only appends at the end of
+    /// the slow axis.  Partial last tiles are handled: the
+    /// boundary tile is decoded, combined with the first portion
+    /// of new data, and re-encoded.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate; mid-write I/O failures taint the
+    /// file.  Old boundary-tile bytes become orphans; call
+    /// :meth:`repack` to reclaim them.
     fn extend(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -548,6 +654,11 @@ impl CompressedImageHDU {
         )
     }
 
+    // __setitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same slice surface as ImageHDU.__setitem__: anything
+    // hdu[key] reads, hdu[key] = value writes.  Internally
+    // re-encodes every overlapping tile + appends to the heap;
+    // old tile bytes become orphans that repack() reclaims.
     fn __setitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -576,12 +687,22 @@ impl CompressedImageHDU {
         )
     }
 
-    // Rebuild the tile-data heap with only the bytes that live
-    // descriptors point at, dropping orphans left behind by __setitem__
-    // / extend / boundary-tile re-encoding.  Shrinks the on-disk file
-    // when the new padded extent is smaller (last HDU: set_len; non-
-    // last HDU: tail shifts backward).  Clears the tile cache (its
-    // entries were keyed against the old heap layout).
+    /// Rebuild the tile-data heap, reclaiming orphan tiles.
+    ///
+    /// :meth:`extend` (when a partial last tile is re-encoded)
+    /// and ``__setitem__`` (every affected tile is re-encoded
+    /// and appended to the heap) both leave the old compressed
+    /// bytes as orphans referenced by no descriptor.  ``repack``
+    /// walks every live descriptor, streams its referenced bytes
+    /// into a compact new heap, and rewrites the descriptors to
+    /// point at it.  If the heap shrinks, the on-disk file
+    /// shrinks too: the last HDU uses ``set_len``, a non-last
+    /// HDU shifts the trailing HDUs backward in lockstep.
+    ///
+    /// Also clears the tile cache (its entries were keyed
+    /// against the old heap layout).
+    ///
+    /// No-op for an already-compact heap.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
         let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
