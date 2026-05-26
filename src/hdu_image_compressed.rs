@@ -37,7 +37,7 @@ use crate::common::{
     check_not_tainted, lock_file, parse_keyword, parse_string_keyword,
     shift_file_tail_and_update_offsets,
     shift_file_tail_backward_and_update_offsets,
-    FileHandle, FileLayout, HduOffsets, TaintFlag, BLOCK_SIZE,
+    FileHandle, FileLayout, HduOffsets, RawBuffer, TaintFlag, BLOCK_SIZE,
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{
@@ -876,19 +876,24 @@ fn read_compressed_image_data(
     // RAM on hit).  File I/O happens per tile under the file lock;
     // decode happens outside the lock so concurrent threads aren't
     // serialized through long decode runs.
+    let mut origin_buf = [0u64; MAX_NAXIS];
+    let mut shape_buf = [0u64; MAX_NAXIS];
     for tile_idx in 0..n_tiles {
-        let (origin, actual_shape) = tile_origin_and_shape(
+        let d = tile_origin_and_shape(
             tile_idx, &image_shape, &tile_shape,
+            &mut origin_buf, &mut shape_buf,
         );
+        let origin = &origin_buf[..d];
+        let actual_shape = &shape_buf[..d];
         let tile_bytes = get_or_decode_tile(
             py, cache, file_handle, tainted, tile_idx, data_offset,
-            naxis1, theap, &cols, algorithm, &actual_shape,
+            naxis1, theap, &cols, algorithm, actual_shape,
             bytepix, blocksize, stored_zbitpix,
             zbitpix, quant.as_ref(), smooth,
         )?;
         place_tile_bytes_into_output(
             py, &out_arr, &tile_bytes, dtype_str,
-            &actual_shape, &origin,
+            actual_shape, origin,
         )?;
     }
 
@@ -1629,37 +1634,58 @@ fn build_compression_config(
     }
 }
 
+// Upper bound on image dimensionality for the hot-loop stack
+// arrays in `tile_origin_and_shape`.  The FITS spec allows ZNAXIS
+// up to 999, but real images are 1-4 dims (sometimes 5 for
+// hyperspectral cubes); 8 is a comfortable margin.  The function
+// asserts d <= MAX_NAXIS so a malformed input fails fast rather
+// than silently truncating.
+const MAX_NAXIS: usize = 8;
+
 // Given a tile index (0..n_tiles, FITS-row-major), the image
 // shape (numpy order), and the nominal tile shape (numpy order),
-// return the tile's numpy-order origin and its actual shape
-// (which may be smaller than nominal at the image edges).
+// fill the caller-provided fixed-size buffers with the tile's
+// numpy-order origin and its actual shape (which may be smaller
+// than nominal at the image edges).  Returns the active length
+// `d`; callers slice the buffers with `[..d]` for the live data.
+//
+// Stack-allocates everything — no Vec, no allocator round-trip
+// per call.  This function runs millions of times on chunked
+// reads of large compressed images, where the three `vec![0u64; d]`
+// of the previous Vec-returning version dominated 12% of slice
+// time on small-chunk workloads.
 fn tile_origin_and_shape(
     tile_idx: u64,
     image_shape_numpy: &[u64],
     nominal_tile_shape_numpy: &[u64],
-) -> (Vec<u64>, Vec<u64>) {
+    origin_out: &mut [u64; MAX_NAXIS],
+    shape_out: &mut [u64; MAX_NAXIS],
+) -> usize {
     let d = image_shape_numpy.len();
+    assert!(
+        d <= MAX_NAXIS,
+        "tile_origin_and_shape: image NAXIS={} exceeds MAX_NAXIS={}",
+        d, MAX_NAXIS,
+    );
     let mut idx = tile_idx;
-    let mut tile_coord_numpy = vec![0u64; d];
+    let mut tile_coord = [0u64; MAX_NAXIS];
     // Unfold from numpy-last (= FITS-fastest = varies fastest in
     // the BINTABLE row ordering) to numpy-first.
     for axis_numpy in (0..d).rev() {
         let n_along = (image_shape_numpy[axis_numpy]
             + nominal_tile_shape_numpy[axis_numpy] - 1)
             / nominal_tile_shape_numpy[axis_numpy];
-        tile_coord_numpy[axis_numpy] = idx % n_along;
+        tile_coord[axis_numpy] = idx % n_along;
         idx /= n_along;
     }
-    let mut origin = vec![0u64; d];
-    let mut shape = vec![0u64; d];
     for axis in 0..d {
-        origin[axis] = tile_coord_numpy[axis]
+        origin_out[axis] = tile_coord[axis]
             * nominal_tile_shape_numpy[axis];
-        let end = (origin[axis] + nominal_tile_shape_numpy[axis])
+        let end = (origin_out[axis] + nominal_tile_shape_numpy[axis])
             .min(image_shape_numpy[axis]);
-        shape[axis] = end - origin[axis];
+        shape_out[axis] = end - origin_out[axis];
     }
-    (origin, shape)
+    d
 }
 
 // Look up a tile in the cache or, on miss, read payload + decode
@@ -2051,6 +2077,161 @@ struct AxisOverlap<'py> {
     output_indexer: Option<Bound<'py, PyAny>>,
 }
 
+// Pre-computed per-axis tile-coord range of tiles that overlap a
+// slice key.  Used by the slice_compressed_image fast path to
+// enumerate ONLY overlapping tiles (instead of walking
+// 0..n_tiles and rejecting most of them in the body).  Only
+// valid when every axis is a step=1 slice with !is_int — caller
+// checks first.
+//
+// `tc_first[ax]..=tc_first[ax]+tc_extent[ax]-1` is the range of
+// overlapping tile coords on axis `ax`; `n_along[ax]` is the
+// total tile count along that axis (used by `unfold` to convert
+// per-axis coords back into a BINTABLE row-major tile_idx).
+struct OverlappingTileRange {
+    n_along: [u64; MAX_NAXIS],
+    tc_first: [u64; MAX_NAXIS],
+    tc_extent: [u64; MAX_NAXIS],
+    d_img: usize,
+    total: u64,
+}
+
+impl OverlappingTileRange {
+    fn new(
+        image_shape: &[u64],
+        tile_shape: &[u64],
+        slices: &[AxisSlice],
+    ) -> Self {
+        let d_img = image_shape.len();
+        let mut n_along = [0u64; MAX_NAXIS];
+        let mut tc_first = [0u64; MAX_NAXIS];
+        let mut tc_extent = [0u64; MAX_NAXIS];
+        let mut total = 1u64;
+        for ax in 0..d_img {
+            n_along[ax] = (image_shape[ax] + tile_shape[ax] - 1)
+                / tile_shape[ax];
+            let s = &slices[ax];
+            debug_assert!(!s.is_int && s.step == 1 && s.count > 0);
+            tc_first[ax] = s.start / tile_shape[ax];
+            let last_image_idx = s.start + s.count - 1;
+            let tc_last = (last_image_idx / tile_shape[ax])
+                .min(n_along[ax] - 1);
+            tc_extent[ax] = tc_last - tc_first[ax] + 1;
+            total *= tc_extent[ax];
+        }
+        OverlappingTileRange { n_along, tc_first, tc_extent, d_img, total }
+    }
+
+    fn total(&self) -> u64 {
+        self.total
+    }
+
+    // For iter_idx in 0..total(), unfold into per-axis tile coords
+    // and return the BINTABLE row-major tile_idx.  Last numpy axis
+    // varies fastest inside the (tc_first..=tc_last) box so
+    // consecutive iter_idx values land on adjacent BINTABLE rows
+    // (best disk locality).
+    #[inline]
+    fn unfold(
+        &self,
+        iter_idx: u64,
+        tile_coord_out: &mut [u64; MAX_NAXIS],
+    ) -> u64 {
+        let mut idx = iter_idx;
+        for ax in (0..self.d_img).rev() {
+            tile_coord_out[ax] = self.tc_first[ax]
+                + idx % self.tc_extent[ax];
+            idx /= self.tc_extent[ax];
+        }
+        let mut tile_idx: u64 = 0;
+        for ax in 0..self.d_img {
+            tile_idx = tile_idx * self.n_along[ax] + tile_coord_out[ax];
+        }
+        tile_idx
+    }
+}
+
+// Copy a d-dimensional rectangular subregion from one C-contiguous
+// byte buffer to another.  Used by the slice_compressed_image
+// fast path to land decoded tile bytes directly into the output
+// ndarray's buffer, avoiding the PyBytes::new + frombuffer +
+// reshape + set_item round-trip.
+//
+// Both `dst` and `src` are interpreted as C-contiguous N-D arrays
+// of `itemsize` bytes per element.  The innermost axis becomes
+// one memcpy per outer-axis coordinate; for d == 1 it's a single
+// memcpy.  Stack-only — no heap allocations regardless of d.
+fn strided_copy_c_contig_to_c_contig(
+    dst: &mut [u8],
+    dst_shape: &[u64],
+    dst_start: &[u64],
+    src: &[u8],
+    src_shape: &[u64],
+    src_start: &[u64],
+    copy_shape: &[u64],
+    itemsize: usize,
+) {
+    let d = dst_shape.len();
+    debug_assert_eq!(d, src_shape.len());
+    debug_assert_eq!(d, copy_shape.len());
+    debug_assert_eq!(d, dst_start.len());
+    debug_assert_eq!(d, src_start.len());
+    debug_assert!(d >= 1 && d <= MAX_NAXIS);
+
+    let last = d - 1;
+    let row_bytes = (copy_shape[last] as usize) * itemsize;
+
+    // C-contiguous byte strides: stride[i] = itemsize * prod(shape[i+1..])
+    let mut dst_byte_strides = [0u64; MAX_NAXIS];
+    let mut src_byte_strides = [0u64; MAX_NAXIS];
+    {
+        let mut s_dst = itemsize as u64;
+        let mut s_src = itemsize as u64;
+        for i in (0..d).rev() {
+            dst_byte_strides[i] = s_dst;
+            src_byte_strides[i] = s_src;
+            s_dst *= dst_shape[i];
+            s_src *= src_shape[i];
+        }
+    }
+
+    // Base offsets at the start corner.
+    let mut base_dst_off: usize = 0;
+    let mut base_src_off: usize = 0;
+    for i in 0..d {
+        base_dst_off += (dst_start[i] * dst_byte_strides[i]) as usize;
+        base_src_off += (src_start[i] * src_byte_strides[i]) as usize;
+    }
+
+    if d == 1 {
+        dst[base_dst_off..base_dst_off + row_bytes]
+            .copy_from_slice(&src[base_src_off..base_src_off + row_bytes]);
+        return;
+    }
+
+    // Walk all outer (d-1) axes; innermost is one memcpy of row_bytes.
+    let outer_count: u64 = copy_shape[..last].iter().product();
+    let mut coord = [0u64; MAX_NAXIS];
+    for _ in 0..outer_count {
+        let mut dst_off = base_dst_off;
+        let mut src_off = base_src_off;
+        for ax in 0..last {
+            dst_off += (coord[ax] * dst_byte_strides[ax]) as usize;
+            src_off += (coord[ax] * src_byte_strides[ax]) as usize;
+        }
+        dst[dst_off..dst_off + row_bytes]
+            .copy_from_slice(&src[src_off..src_off + row_bytes]);
+        // Increment coord; innermost outer axis (last-1) varies fastest.
+        for ax in (0..last).rev() {
+            coord[ax] += 1;
+            if coord[ax] < copy_shape[ax] {
+                break;
+            }
+            coord[ax] = 0;
+        }
+    }
+}
+
 // For a tile at image-range [tile_origin, tile_origin+tile_size)
 // on one axis, decide which of the slice's image indices fall in
 // the tile, and build the numpy indexers needed to copy that
@@ -2214,11 +2395,74 @@ fn slice_compressed_image(
     // tile walk.  (np.empty with a 0 in the shape returns an empty
     // array of the right shape; that's the desired result.)
     let any_empty = slices.iter().any(|s| s.count == 0);
-    if !any_empty {
-        for tile_idx in 0..n_tiles {
-            let (origin, actual_shape) = tile_origin_and_shape(
-                tile_idx, &image_shape, &tile_shape,
+    // Fast path: every axis is a contiguous slice with step=1 and
+    // none are int-collapse.  In this regime we can land tile bytes
+    // directly into the output ndarray's buffer with a strided
+    // memcpy, skipping the per-tile PyBytes::new + frombuffer +
+    // reshape + set_item round-trip (which dominated the slice path
+    // on small-chunk workloads — see "Performance" in CLAUDE.md).
+    // Stepped slicing and int-collapse axes take the slow path
+    // below which still uses numpy's set_item for scatter semantics.
+    let fast_path = !any_empty
+        && slices.iter().all(|s| !s.is_int && s.step == 1);
+    if fast_path {
+        let out_itemsize = (zbitpix.unsigned_abs() / 8) as usize;
+        let mut out_buf = RawBuffer::acquire_writable(&out_arr)?;
+        let dst_bytes = out_buf.as_mut_slice();
+        let d_img = image_shape.len();
+        let range = OverlappingTileRange::new(
+            &image_shape, &tile_shape, &slices,
+        );
+        let mut tile_coord = [0u64; MAX_NAXIS];
+        let mut origin_buf = [0u64; MAX_NAXIS];
+        let mut shape_buf = [0u64; MAX_NAXIS];
+        let mut tile_start_buf = [0u64; MAX_NAXIS];
+        let mut out_start_buf = [0u64; MAX_NAXIS];
+        let mut copy_shape_buf = [0u64; MAX_NAXIS];
+        for iter_idx in 0..range.total() {
+            let tile_idx = range.unfold(iter_idx, &mut tile_coord);
+            // One pass: origin + actual_shape + per-axis overlap
+            // (tile-local + output-local start + copy count).
+            // Overlap is guaranteed non-empty for every axis by
+            // the tc_first/tc_extent pre-computation, so the
+            // saturating arithmetic always produces a positive
+            // copy count.
+            for ax in 0..d_img {
+                origin_buf[ax] = tile_coord[ax] * tile_shape[ax];
+                let tile_end = (origin_buf[ax] + tile_shape[ax])
+                    .min(image_shape[ax]);
+                shape_buf[ax] = tile_end - origin_buf[ax];
+                let s = &slices[ax];
+                let slice_end = s.start + s.count;
+                let overlap_start = s.start.max(origin_buf[ax]);
+                let overlap_end = slice_end.min(tile_end);
+                tile_start_buf[ax] = overlap_start - origin_buf[ax];
+                out_start_buf[ax] = overlap_start - s.start;
+                copy_shape_buf[ax] = overlap_end - overlap_start;
+            }
+            let actual_shape = &shape_buf[..d_img];
+            let tile_bytes = get_or_decode_tile(
+                py, cache, file_handle, tainted, tile_idx, data_offset,
+                naxis1, theap, &cols, algorithm, actual_shape,
+                bytepix, blocksize, stored_zbitpix,
+                zbitpix, quant.as_ref(), smooth,
+            )?;
+            strided_copy_c_contig_to_c_contig(
+                dst_bytes, &output_shape, &out_start_buf[..d_img],
+                &tile_bytes, actual_shape, &tile_start_buf[..d_img],
+                &copy_shape_buf[..d_img], out_itemsize,
             );
+        }
+    } else if !any_empty {
+        let mut origin_buf = [0u64; MAX_NAXIS];
+        let mut shape_buf = [0u64; MAX_NAXIS];
+        for tile_idx in 0..n_tiles {
+            let d = tile_origin_and_shape(
+                tile_idx, &image_shape, &tile_shape,
+                &mut origin_buf, &mut shape_buf,
+            );
+            let origin = &origin_buf[..d];
+            let actual_shape = &shape_buf[..d];
             // Per-axis overlap check.  If any axis returns None,
             // the tile doesn't intersect the slice — skip.
             let mut tile_indexers: Vec<Bound<PyAny>> =
@@ -2248,7 +2492,7 @@ fn slice_compressed_image(
             // Fetch tile bytes (cache or decode), wrap as ndarray.
             let tile_bytes = get_or_decode_tile(
                 py, cache, file_handle, tainted, tile_idx, data_offset,
-                naxis1, theap, &cols, algorithm, &actual_shape,
+                naxis1, theap, &cols, algorithm, actual_shape,
                 bytepix, blocksize, stored_zbitpix,
                 zbitpix, quant.as_ref(), smooth,
             )?;
@@ -2256,7 +2500,7 @@ fn slice_compressed_image(
             let arr1d = np.call_method1(
                 "frombuffer", (pybytes, dtype_str),
             )?;
-            let tile_shape_tuple = PyTuple::new(py, &actual_shape)?;
+            let tile_shape_tuple = PyTuple::new(py, actual_shape)?;
             let tile_arr = arr1d.call_method1(
                 "reshape", (tile_shape_tuple,),
             )?;
@@ -2868,10 +3112,15 @@ fn write_compressed_image_data(
     let mut primary_heap: Vec<u8> = Vec::new();
     let mut fallback_heap: Vec<u8> = Vec::new();
 
+    let mut origin_buf = [0u64; MAX_NAXIS];
+    let mut shape_buf = [0u64; MAX_NAXIS];
     for tile_idx in 0..n_tiles {
-        let (origin, actual_shape) = tile_origin_and_shape(
+        let d = tile_origin_and_shape(
             tile_idx, &image_shape, &tile_shape,
+            &mut origin_buf, &mut shape_buf,
         );
+        let origin = &origin_buf[..d];
+        let actual_shape = &shape_buf[..d];
         let slice_objs: Vec<Bound<'_, PySlice>> = origin.iter()
             .zip(actual_shape.iter())
             .map(|(&o, &s)| PySlice::new(
@@ -2902,7 +3151,7 @@ fn write_compressed_image_data(
         let row = if is_quantized_float {
             encode_tile_float(
                 float_ctx.as_ref().unwrap(),
-                &tile_bytes, tile_idx, &actual_shape, n_pixels,
+                &tile_bytes, tile_idx, actual_shape, n_pixels,
                 &mut primary_heap, &mut fallback_heap,
             )?
         } else {
@@ -2912,7 +3161,7 @@ fn write_compressed_image_data(
             // treats them opaquely).
             encode_tile_int(
                 int_ctx.as_ref().unwrap(),
-                &tile_bytes, tile_idx, &actual_shape, n_pixels,
+                &tile_bytes, tile_idx, actual_shape, n_pixels,
                 &mut primary_heap,
             )?
         };
@@ -3505,11 +3754,22 @@ fn extend_compressed_image_data(
         let theap = parse_keyword(cards, "THEAP")
             .map(|x| x.max(0) as u64)
             .unwrap_or(row_width * old_n_tiles);
+        let mut origin_buf = [0u64; MAX_NAXIS];
+        let mut new_shape_buf = [0u64; MAX_NAXIS];
+        let mut _scratch_origin = [0u64; MAX_NAXIS];
+        let mut old_shape_buf = [0u64; MAX_NAXIS];
         for tile_idx in b_start..b_end {
-            let (origin, new_actual_shape) =
-                tile_origin_and_shape(tile_idx, &new_image_shape, &tile_shape);
-            let (_, old_actual_shape) =
-                tile_origin_and_shape(tile_idx, &old_image_shape, &tile_shape);
+            let d = tile_origin_and_shape(
+                tile_idx, &new_image_shape, &tile_shape,
+                &mut origin_buf, &mut new_shape_buf,
+            );
+            tile_origin_and_shape(
+                tile_idx, &old_image_shape, &tile_shape,
+                &mut _scratch_origin, &mut old_shape_buf,
+            );
+            let origin = &origin_buf[..d];
+            let new_actual_shape = &new_shape_buf[..d];
+            let old_actual_shape = &old_shape_buf[..d];
             // For quantized-float HDUs the decoder runs the
             // dequantize step (i32 stored → f4/f8 physical),
             // returning float bytes.  For integer/unquantized-float
@@ -3530,7 +3790,7 @@ fn extend_compressed_image_data(
                 theap,
                 cols,
                 algorithm,
-                &old_actual_shape,
+                old_actual_shape,
                 dec_bytepix,
                 blocksize,
                 dec_stored_zbitpix,
@@ -3568,7 +3828,7 @@ fn extend_compressed_image_data(
             let old_pyb = PyBytes::new(py, &old_bytes_arc);
             let old_arr_flat =
                 np.call_method1("frombuffer", (old_pyb, native_dtype))?;
-            let old_shape_tuple = PyTuple::new(py, &old_actual_shape)?;
+            let old_shape_tuple = PyTuple::new(py, old_actual_shape)?;
             let old_arr =
                 old_arr_flat.call_method1("reshape", (old_shape_tuple,))?;
             let old_be =
@@ -3601,7 +3861,7 @@ fn extend_compressed_image_data(
                     heap_is_q,
                     quant_setup.unwrap(),
                     &combined_be,
-                    &new_actual_shape,
+                    new_actual_shape,
                     n_pixels,
                     &mut appended_heap,
                     &mut appended_fallback_heap,
@@ -3611,7 +3871,7 @@ fn extend_compressed_image_data(
                     &int_ctx,
                     &combined_be,
                     tile_idx,
-                    &new_actual_shape,
+                    new_actual_shape,
                     n_pixels,
                     &mut appended_heap,
                 )?
@@ -3621,9 +3881,15 @@ fn extend_compressed_image_data(
     }
 
     // ----- encode truly-new tile rows -----
+    let mut new_origin_buf = [0u64; MAX_NAXIS];
+    let mut new_shape_buf2 = [0u64; MAX_NAXIS];
     for tile_idx in first_new_tile..new_n_tiles {
-        let (origin, new_actual_shape) =
-            tile_origin_and_shape(tile_idx, &new_image_shape, &tile_shape);
+        let d = tile_origin_and_shape(
+            tile_idx, &new_image_shape, &tile_shape,
+            &mut new_origin_buf, &mut new_shape_buf2,
+        );
+        let origin = &new_origin_buf[..d];
+        let new_actual_shape = &new_shape_buf2[..d];
         // The tile's data lives entirely in the input array,
         // offset by old_naxis0 along axis 0.
         let data_axis0_start = origin[0].saturating_sub(old_naxis0);
@@ -3661,7 +3927,7 @@ fn extend_compressed_image_data(
                 float_ctx.as_ref().unwrap(),
                 &tile_bytes,
                 tile_idx,
-                &new_actual_shape,
+                new_actual_shape,
                 n_pixels,
                 &mut appended_heap,
                 &mut appended_fallback_heap,
@@ -3671,7 +3937,7 @@ fn extend_compressed_image_data(
                 &int_ctx,
                 &tile_bytes,
                 tile_idx,
-                &new_actual_shape,
+                new_actual_shape,
                 n_pixels,
                 &mut appended_heap,
             )?
@@ -4352,9 +4618,15 @@ fn setitem_compressed_image(
     let mut appended_fallback_heap: Vec<u8> = Vec::new();
     let mut tile_updates: Vec<(u64, TileRow)> = Vec::new();
 
+    let mut setitem_origin_buf = [0u64; MAX_NAXIS];
+    let mut setitem_shape_buf = [0u64; MAX_NAXIS];
     for tile_idx in 0..n_tiles {
-        let (origin, actual_shape) =
-            tile_origin_and_shape(tile_idx, &image_shape, &tile_shape);
+        let d = tile_origin_and_shape(
+            tile_idx, &image_shape, &tile_shape,
+            &mut setitem_origin_buf, &mut setitem_shape_buf,
+        );
+        let origin = &setitem_origin_buf[..d];
+        let actual_shape = &setitem_shape_buf[..d];
         // Build per-axis tile_indexer + output_indexer using the
         // same machinery __getitem__ uses.
         let mut tile_indexers: Vec<Bound<PyAny>> =
@@ -4405,7 +4677,7 @@ fn setitem_compressed_image(
             theap,
             &cols,
             algorithm,
-            &actual_shape,
+            actual_shape,
             dec_bytepix,
             blocksize,
             dec_stored_zbitpix,
@@ -4416,7 +4688,7 @@ fn setitem_compressed_image(
         let pyb = PyBytes::new(py, &old_bytes_arc);
         let arr_flat =
             np.call_method1("frombuffer", (pyb, native_dtype))?;
-        let shape_tuple = PyTuple::new(py, &actual_shape)?;
+        let shape_tuple = PyTuple::new(py, actual_shape)?;
         let arr_view = arr_flat.call_method1("reshape", (shape_tuple,))?;
         let tile_arr = arr_view.call_method0("copy")?;
 
@@ -4454,7 +4726,7 @@ fn setitem_compressed_image(
                 heap_is_q,
                 quant_setup.unwrap(),
                 &tile_bytes,
-                &actual_shape,
+                actual_shape,
                 n_pixels,
                 &mut appended_heap,
                 &mut appended_fallback_heap,
@@ -4464,7 +4736,7 @@ fn setitem_compressed_image(
                 &int_ctx,
                 &tile_bytes,
                 tile_idx,
-                &actual_shape,
+                actual_shape,
                 n_pixels,
                 &mut appended_heap,
             )?

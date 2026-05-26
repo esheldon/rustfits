@@ -1297,8 +1297,10 @@ the reader walks tiles and decodes them.
 
 **Open follow-ups (low priority):**
 
-- **Performance** — chunked-read of large GZIP_2 float files is
-  ~3× slower than cfitsio.  See "Performance TODO" below.
+- **Performance** — release-mode chunked-read of large GZIP_2
+  float files: ~30% FASTER than cfitsio on big chunks (50k rows),
+  ~5% slower on small chunks (1k rows).  See "Performance TODO"
+  below for the history of how the gap closed.
 - **Byte-exact heap agreement with cfitsio on quantized floats**
   — decoded values are bit-exact; raw heap bytes differ by qsort
   tie-breaking quirks.  Not worth fixing absent a specific need.
@@ -3733,50 +3735,73 @@ Don't aim for 100% on `/src`.  90-95% covered + the
 remaining gaps explicitly catalogued (in code comments or
 this section) is the actual target.
 
-## Performance TODO — ZIMAGE chunked-read profiling
+## Performance — ZIMAGE chunked-read profiling history
 
-**Observation (May 2026, post-Phase-5):** reading a 1.49-billion-
-pixel f8 GZIP_2 ZIMAGE file (~12 GB; per-user fixture, not
-committed — see "Performance / large fixture files" under
-"Build / dev workflow" for how to obtain or synthesize an
-equivalent) in chunks via `f[1][lo:hi]` slicing is **roughly 3×
-slower than cfitsio's equivalent read**.  The output is bit-
-exact; this is purely a throughput gap.
+Reading a 1.49-billion-pixel f8 GZIP_2 ZIMAGE file (~12 GB;
+per-user fixture, not committed — see "Performance / large
+fixture files" under "Build / dev workflow" for how to obtain or
+synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 
-No profiling done yet — this is just the baseline observation
-from the read-correctness work.  When we revisit, candidate
-suspects to rule in / out:
+**Current state (release builds; May 2026):**
 
-- **Per-tile file lock overhead** — `fetch_tile_payload_and_quant`
-  acquires the file mutex for each tile descriptor read; under
-  chunked reads that's one acquire per tile in the slice range.
-  cfitsio uses a single FILE* and no lock.
-- **Per-tile cache mutex** — `TileCache::get` / `put` lock the
-  inner Mutex twice per tile.  Briefly held, but the count
-  adds up on long slices.
-- **`GzDecoder` allocation per tile** — `flate2`'s decoder
-  is constructed fresh per call.  cfitsio reuses a single
-  `z_stream` across tiles in the inner loop.
-- **`place_tile_bytes_into_output` Python round-trips** — for
-  each tile we go Rust → `PyBytes::new` → numpy `frombuffer` →
-  `reshape` → `set_item` on the output ndarray.  That's several
-  PyO3 calls per tile; cfitsio writes directly into the output
-  buffer with a memcpy.
-- **`PyBytes::new` copy** — `frombuffer` views the PyBytes, but
-  `PyBytes::new` itself copies the Rust `Vec<u8>` into a new
-  Python-owned buffer.  A `PyArray` constructor that takes
-  ownership of the Vec would skip this copy.
-- **No I/O pipelining** — tiles are decoded strictly in order
-  with sync reads.  cfitsio also does sync reads but with a
-  warm OS page cache the kernel prefetch helps; we may be
-  paying for cold-cache lookups on first read.
+- **Big chunks (50k rows)**: rustfits is ~30% FASTER than
+  cfitsio.  Decode (flate2's GZIP_2 inflate + unshuffle +
+  byteswap) is already a strength.
+- **Small chunks (1k rows)**: rustfits is ~5% slower than
+  cfitsio.  Effectively at parity; the residual is
+  per-`__getitem__`-call Python interpreter dispatch overhead
+  that's hard to attack from the Rust side.
 
-When the time comes: pick the 12 GB GZIP_2 file as the
-benchmark target, use `cargo flamegraph` or `perf` for a
-profile of the slice path, compare against cfitsio's
-`imcomp_decompress_tile` hot loop.  The user-facing target is
-"competitive with cfitsio for typical chunked reads" — not
-necessarily faster, just not dramatically slower.
+**How the gap closed.**  The first profiling pass (with
+`OPENBLAS_NUM_THREADS=1` to silence BLAS spinner noise) found
+two per-tile micro-overhead hot spots:
+
+- `place_tile_bytes_into_output::PyBytes::new` — 14% on big
+  chunks, 24% on small chunks (Python-owned bytes alloc + copy).
+- `tile_origin_and_shape` — 0.4% on big chunks, **12% on small
+  chunks** (three `vec![0u64; d]` heap allocations per tile for
+  what's pure arithmetic on 2-element arrays).
+
+Fixing the second alone closed the small-chunks gap from 1.4× to
+1.05× — the dominant cost was allocator round-trips, not the
+PyBytes copy.  The fix: stack-allocate the origin/shape arrays
+via `[u64; MAX_NAXIS]` (MAX_NAXIS=8; spec allows up to 999 but
+real images are 1-4 dims), pass them as `&mut` to the function,
+return just the active length `d`.  See
+`tile_origin_and_shape` in `hdu_image_compressed.rs`.
+
+The PyBytes copy fix was never needed for parity.  If we ever
+want to push past parity into "always faster than cfitsio", the
+remaining candidates (ranked by previously-measured impact):
+
+- **`PyBytes::new` → numpy-owned ndarray (zero-copy)** — would
+  save the 14% copy on the big-chunks path.  Requires either
+  adding the `numpy` Rust crate dep (smallest diff,
+  ~10 lines) or writing directly into the output array's
+  buffer (~50 lines for the contiguous fast path, more for
+  stepped slices).
+- **`Vec::with_capacity` + `set_len` in `unshuffle`** — kills a
+  small per-tile zero-init pass.  Trivial diff, ~2% saved.
+- **GZIP_2 unshuffle loop** — ~19% inside `decode_gzip2`.
+  Harder to attack without rewriting the codec layer; would
+  matter only for big-chunk workloads where we're already
+  winning.
+
+**Profiling gotchas worth remembering.**
+
+- numpy on import spawns OpenBLAS worker threads that
+  busy-spin even when idle.  They'll dominate any flamegraph
+  100% unless you set `OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+  OMP_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1` in the env.
+- Even with `OPENBLAS_NUM_THREADS=1`, Python interpreter
+  startup dominates short workloads.  Scale the benchmark up
+  until the read loop takes ≥30s of wall time so it dominates
+  the sampling window.
+- Debug-build profiles are misleading — the original "3×
+  slower" observation in this file came from a debug build.
+  Always profile with `maturin develop --release` (debug
+  symbols stay via `[profile.release] debug = "line-tables-only"`
+  in Cargo.toml).
 
 Do **not** chase this incrementally during ZIMAGE Phase 6+
 feature work — fold it in with the post-feature coverage

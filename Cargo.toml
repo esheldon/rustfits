@@ -10,3 +10,6 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.28" }
 lru = "0.18"
 flate2 = "1"
+
+[profile.release]
+debug = "line-tables-only"   # ~10–15% bigger .so; near-zero perf hit
