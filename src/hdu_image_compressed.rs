@@ -124,7 +124,7 @@ impl CompressedImageHDU {
             header, index, filename, offsets, layout, file, tainted,
         );
         PyClassInitializer::from(hdu)
-            .add_subclass(ImageHDU)
+            .add_subclass(ImageHDU::new_empty_cache())
             .add_subclass(CompressedImageHDU {
                 cache: Arc::new(TileCache::new(DEFAULT_TILE_CACHE_BYTES)),
                 quantize_config: Arc::new(Mutex::new(quantize_config)),

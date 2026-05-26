@@ -7,7 +7,7 @@ use pyo3::types::{PyEllipsis, PySlice, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::Bound;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::sync::atomic::Ordering;
 
@@ -22,7 +22,14 @@ use crate::hdu::HDU;
 use crate::header::card_int;
 
 #[pyclass(extends = HDU, subclass)]
-pub(crate) struct ImageHDU;
+pub(crate) struct ImageHDU {
+    // Phase 5 meta cache: parsed ImageMeta keyed by cards_version.
+    // Mirrors TableHDU + CompressedImageHDU + CompressedTableHDU.
+    // First hit re-parses BITPIX + NAXIS + NAXISn + BSCALE + BZERO
+    // + BLANK; subsequent hits return an Arc clone.  Invalidates on
+    // every cards mutation via the version bump in CardsWriteGuard.
+    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<ImageMeta>)>>>,
+}
 
 impl ImageHDU {
     pub(crate) fn new(
@@ -35,9 +42,44 @@ impl ImageHDU {
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
-            ImageHDU,
+            ImageHDU::new_empty_cache(),
             HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
+    }
+
+    // Factory for the subclass-construction path: CompressedImageHDU
+    // builds its PyClassInitializer with `.add_subclass(ImageHDU)`,
+    // which now requires a populated struct.
+    pub(crate) fn new_empty_cache() -> Self {
+        ImageHDU { meta_cache: Arc::new(Mutex::new(None)) }
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit) an
+    // Arc clone.  On miss takes a header snapshot and re-parses.
+    // Same shape as the other three HDU types' meta() methods;
+    // callers reach this via `slf.as_super()` to keep both `slf`
+    // and the base HDU alive for the call.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<ImageMeta>> {
+        let cur_version = super_.cards_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_image_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
@@ -48,10 +90,10 @@ impl ImageHDU {
     // axis order (slowest first — same order the user gets back from
     // a read).  Primary HDUs with NAXIS=0 show `dims: []`.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dtype = bitpix_to_native_dtype(meta.bitpix)?;
         let cards = super_.header_snapshot()?;
-        let (bitpix, shape) = parse_image_hdu_shape_lax(&cards)?;
-        let dtype = bitpix_to_native_dtype(bitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
 
@@ -64,7 +106,7 @@ impl ImageHDU {
         }
         out.push_str("  image info:\n");
         out.push_str(&format!("    data type: {}\n", dtype));
-        out.push_str(&format!("    dims: {:?}\n", shape));
+        out.push_str(&format!("    dims: {:?}\n", meta.shape));
         if let Some(u) = bunit {
             out.push_str(&format!("    unit: {}\n", u));
         }
@@ -72,11 +114,11 @@ impl ImageHDU {
     }
 
     // BUNIT header value (e.g. "Jy", "counts/s"), or None when unset.
-    // Purely informational; nothing in the read/write path consumes
-    // it.  Mirrors TableHDU.units (per-column) at the image level.
+    // Purely informational; not in the meta cache (only this accessor
+    // consults it; single keyword lookup is cheap).
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
     }
@@ -85,19 +127,17 @@ impl ImageHDU {
     // tuple.  Primary HDUs with NAXIS=0 return ().
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(PyTuple::new(py, &shape)?.unbind())
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(PyTuple::new(py, &meta.shape)?.unbind())
     }
 
     // numpy dtype matching BITPIX — the type `read()` would return.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
-        let dtype_str = bitpix_to_native_dtype(bitpix)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dtype_str = bitpix_to_native_dtype(meta.bitpix)?;
         let np = py.import("numpy")?;
         Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
     }
@@ -105,10 +145,9 @@ impl ImageHDU {
     // NAXIS — number of image axes.  0 for primary HDUs with no data.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(shape.len())
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.shape.len())
     }
 
     // Total pixel count (product of all NAXISn).  Returns 0 for
@@ -116,10 +155,9 @@ impl ImageHDU {
     // identity 1, which is wrong for "no data").
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(if meta.shape.is_empty() { 0 } else { meta.shape.iter().product() })
     }
 
     // Raw FITS BITPIX value (e.g. 8, 16, -32, -64).  Useful for
@@ -127,20 +165,17 @@ impl ImageHDU {
     // prefer `.dtype`.
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(bitpix)
+        let super_ = slf.as_super();
+        Ok(slf.meta(super_)?.bitpix)
     }
 
     // numpy convention: `len(arr)` is shape[0].  For a 2-D image
     // that's the row count; for a 1-D image the pixel count.  Returns
     // 0 when NAXIS=0 (no data section).
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(shape.first().copied().unwrap_or(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.shape.first().copied().unwrap_or(0) as usize)
     }
 
     #[pyo3(signature = (data, start=None))]
@@ -1541,6 +1576,32 @@ pub(crate) fn parse_bscale_bzero(header: &[String]) -> (f64, f64) {
     let bscale = parse_keyword_float(header, "BSCALE").unwrap_or(1.0);
     let bzero = parse_keyword_float(header, "BZERO").unwrap_or(0.0);
     (bscale, bzero)
+}
+
+// Parsed-once snapshot of all per-HDU image metadata.  Cached on
+// the ImageHDU keyed by `cards_version` (see `ImageHDU::meta()`)
+// so a tight loop of accessor calls or `f[idx][...]` slice reads
+// pays one Mutex lock + integer compare + Arc clone instead of
+// re-parsing BITPIX + NAXIS + NAXISn + BSCALE + BZERO every time.
+//
+// Lax parsing: NAXIS=0 yields an empty shape rather than an error.
+// Read/write paths that genuinely need a data section check
+// `shape.is_empty()` themselves and raise the appropriate
+// "HDU has no data" error.  Same pattern the accessors already
+// used via `parse_image_hdu_shape_lax`.
+pub(crate) struct ImageMeta {
+    pub(crate) bitpix: i32,
+    pub(crate) shape: Vec<u64>, // numpy axis order (slowest first)
+    pub(crate) bscale: f64,
+    pub(crate) bzero: f64,
+    pub(crate) blank: Option<i64>,
+}
+
+pub(crate) fn parse_image_meta(cards: &[String]) -> PyResult<ImageMeta> {
+    let (bitpix, shape) = parse_image_hdu_shape_lax(cards)?;
+    let (bscale, bzero) = parse_bscale_bzero(cards);
+    let blank = parse_keyword(cards, "BLANK");
+    Ok(ImageMeta { bitpix, shape, bscale, bzero, blank })
 }
 
 pub(crate) fn image_scaling_kind(bitpix: i32, bscale: f64, bzero: f64) -> ScalingKind {
