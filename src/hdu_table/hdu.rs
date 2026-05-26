@@ -2,10 +2,11 @@
 // __getitem__ classifier (TableKey) and the SingleColumnSubset /
 // ColumnSubset pyclasses used for chained subset reads.
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PySlice, PyTuple};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
 use crate::common::{
     check_not_tainted, parse_keyword, parse_string_keyword, FileHandle,
@@ -13,7 +14,7 @@ use crate::common::{
 };
 use crate::hdu::HDU;
 
-use super::columns::{parse_columns, Column};
+use super::columns::{parse_columns, parse_table_meta, Column, TableMeta};
 use super::edit::{delete_column_impl, insert_column_impl};
 use super::read::{
     build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
@@ -34,7 +35,17 @@ use super::write_vla::{
 };
 
 #[pyclass(extends = HDU, subclass)]
-pub(crate) struct TableHDU;
+pub(crate) struct TableHDU {
+    // Lazily-populated per-HDU parsed-metadata cache.  See `meta()`
+    // for the hot-path accessor; entry is `(version, meta)` where
+    // `version` is the value of the base-HDU `cards_version` at
+    // the time of the parse.  None until the first call; auto-
+    // invalidates on any cards mutation because the next `meta()`
+    // call observes a higher version (Phase 1 atomic) and re-parses.
+    // See `CompressedImageHDU.meta_cache` for the parallel pattern
+    // on the image side.
+    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<TableMeta>)>>>,
+}
 
 impl TableHDU {
     pub(crate) fn new(
@@ -47,9 +58,51 @@ impl TableHDU {
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
-            TableHDU,
+            TableHDU::new_empty_cache(),
             HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
+    }
+
+    // Factory for the subclass-construction path: CompressedTableHDU
+    // builds its PyClassInitializer with `.add_subclass(TableHDU)`,
+    // which requires a fresh value.
+    pub(crate) fn new_empty_cache() -> Self {
+        TableHDU { meta_cache: Arc::new(Mutex::new(None)) }
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit)
+    // an Arc clone.  On miss (first call, or any cards mutation
+    // since the previous call) takes a header snapshot under the
+    // cards mutex and re-parses.  See `TableMeta` for what's cached.
+    //
+    // Callers reach this method while also needing the base HDU
+    // (for offsets / file / etc.) by going through
+    // `slf.as_super()`, which borrows up the class chain instead
+    // of consuming `slf` — keeping both alive for the call.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<TableMeta>> {
+        let cur_version = super_.cards_version.load(Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        // Miss: re-parse outside the lock so concurrent readers
+        // racing the same miss each parse once but only one wins
+        // the cache slot — same loss-of-work pattern as the
+        // ZIMAGE meta cache.
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_table_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
@@ -123,10 +176,19 @@ impl TableHDU {
     // annotation.  Column lines are dynamically aligned to the longest
     // column name.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
+        // Try the cached meta first; fall back to a fresh cards
+        // snapshot + tolerant parse if the file is degenerate enough
+        // that meta parsing raises — repr must never crash.
+        let cached = slf.meta(super_).ok();
         let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0);
+        let (columns, nrows): (Vec<Column>, i64) = match &cached {
+            Some(m) => (m.columns.clone(), m.nrows as i64),
+            None => (
+                parse_columns(&cards)?,
+                parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0),
+            ),
+        };
         let extname = parse_string_keyword(&cards, "EXTNAME");
 
         let mut out = String::new();
@@ -164,10 +226,9 @@ impl TableHDU {
     // trick appear as u2/u4/u8/i1, and other scaled columns as f8.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        build_numpy_dtype(py, &columns, /* scale = */ true)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        build_numpy_dtype(py, &meta.columns, /* scale = */ true)
     }
 
     // Column-units dict: maps column name (case preserved) to the
@@ -176,41 +237,39 @@ impl TableHDU {
     // Dict preserves the on-disk column order.
     #[getter]
     fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let dict = PyDict::new(py);
-        for col in &columns {
+        for col in &meta.columns {
             dict.set_item(&col.name, col.tunit.as_deref())?;
         }
         Ok(dict.unbind())
     }
 
-    // Number of rows (NAXIS2).  Returns 0 if the keyword is absent
-    // (malformed header) or set to a negative value.
+    // Number of rows (NAXIS2).
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
     }
 
     // Number of columns (TFIELDS).
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "TFIELDS").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.columns.len())
     }
 
     // Column names in file order (case preserved verbatim).  Returns
     // a Python tuple so the value is immutable from the caller side.
     #[getter]
     fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let names: Vec<&str> =
+            meta.columns.iter().map(|c| c.name.as_str()).collect();
         Ok(PyTuple::new(py, &names)?.unbind())
     }
 
@@ -218,9 +277,9 @@ impl TableHDU {
     // `len(structured_array)` for the equivalent numpy structured
     // array a full read would return.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
     }
 
     // Read the table into a numpy structured array of native-endian
@@ -250,11 +309,11 @@ impl TableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_table(
-            py, &cards, data_offset, &super_.file, rows, columns, scale,
+            py, &meta, data_offset, &super_.file, rows, columns, scale,
             mask_null,
         )
     }
@@ -277,11 +336,11 @@ impl TableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
-            py, &cards, data_offset, &super_.file, name, rows, as_bytes,
+            py, &meta, data_offset, &super_.file, name, rows, as_bytes,
             scale, mask_null,
         )
     }
@@ -306,25 +365,25 @@ impl TableHDU {
         match kind {
             TableKey::Rows => {
                 let pyref = slf.borrow();
-                let super_ = pyref.into_super();
-                let cards = super_.header_snapshot()?;
+                let super_ = pyref.as_super();
+                let meta = pyref.meta(super_)?;
                 let data_offset = super_.offsets.data_offset();
                 read_table(
-                    py, &cards, data_offset, &super_.file, Some(key), None,
+                    py, &meta, data_offset, &super_.file, Some(key), None,
                     /* scale = */ true, /* mask_null = */ false,
                 )
             }
             TableKey::SingleRow(idx) => {
                 let pyref = slf.borrow();
-                let super_ = pyref.into_super();
-                let cards = super_.header_snapshot()?;
+                let super_ = pyref.as_super();
+                let meta = pyref.meta(super_)?;
                 let data_offset = super_.offsets.data_offset();
                 // Wrap idx in a single-element list so resolve_rows
                 // handles negative-index normalization and range
                 // validation the same way it does for `hdu[[idx]]`.
                 let one = PyList::new(py, [idx])?;
                 let arr_py = read_table(
-                    py, &cards, data_offset, &super_.file,
+                    py, &meta, data_offset, &super_.file,
                     Some(one.as_any()), None,
                     /* scale = */ true, /* mask_null = */ false,
                 )?;
@@ -749,11 +808,11 @@ impl SingleColumnSubset {
     ) -> PyResult<Py<PyAny>> {
         let bound = self.hdu.bind(py);
         let pyref = bound.borrow();
-        let super_ = pyref.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
-            py, &cards, data_offset, &super_.file,
+            py, &meta, data_offset, &super_.file,
             &self.name, Some(rows), /* as_bytes = */ false,
             /* scale = */ true, /* mask_null = */ false,
         )
@@ -818,11 +877,11 @@ impl ColumnSubset {
     ) -> PyResult<Py<PyAny>> {
         let bound = self.hdu.bind(py);
         let pyref = bound.borrow();
-        let super_ = pyref.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_table(
-            py, &cards, data_offset, &super_.file,
+            py, &meta, data_offset, &super_.file,
             Some(rows), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
         )

@@ -133,7 +133,7 @@ impl CompressedTableHDU {
             header, index, filename, offsets, layout, file, tainted,
         );
         PyClassInitializer::from(hdu)
-            .add_subclass(TableHDU)
+            .add_subclass(TableHDU::new_empty_cache())
             .add_subclass(CompressedTableHDU {
                 cache: Arc::new(ColumnTileCache::new(
                     DEFAULT_TILE_CACHE_BYTES,
@@ -218,6 +218,19 @@ impl CompressedTableHDU {
         let super_ = slf.into_super().into_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_keyword(&cards, "ZNAXIS2").unwrap_or(0).max(0) as usize)
+    }
+
+    // Number of columns (TFIELDS).  Same value on both the
+    // compressed and uncompressed views, but the inherited
+    // TableHDU.ncols routes through the meta cache, which parses
+    // the full schema and trips on the ZIMAGE TDIM-on-VLA cards
+    // present in a compressed table's on-disk header.  Override
+    // to do a direct keyword lookup on the raw cards instead.
+    #[getter]
+    fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        Ok(parse_keyword(&cards, "TFIELDS").unwrap_or(0).max(0) as usize)
     }
 
     // numpy structured dtype the original (uncompressed) table would
