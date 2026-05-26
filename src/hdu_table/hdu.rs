@@ -34,6 +34,45 @@ use super::write_vla::{
     any_var_column, append_vla_aware, repack_table_heap, write_vla_aware,
 };
 
+/// A binary-table HDU (``XTENSION='BINTABLE'``).
+///
+/// Returned by indexing a :class:`FITS` object at a position
+/// containing a binary table — e.g. ``hdu = fits[1]``.  Carries
+/// the table's schema (column names, dtypes, units, scaling) and
+/// the I/O surface for reading and modifying rows.
+///
+/// All reads return numpy structured arrays whose dtype reflects
+/// the on-disk schema after the default ``scale=True`` mapping:
+/// the unsigned-int trick (BSCALE=1 + BZERO=2**(n-1)) promotes
+/// to the matching unsigned dtype, other scaling produces ``f8``,
+/// and TNULL-bearing integer columns can be returned as
+/// ``numpy.ma.MaskedArray`` via ``mask_null=True``.
+///
+/// Indexing is symmetric for reads and writes: anything readable
+/// via ``hdu[key]`` (rows, single column, multi-column subset,
+/// ``(row, col)`` cell) is writable via ``hdu[key] = value``.
+/// See the individual methods for details.
+///
+/// Examples
+/// --------
+/// Read a whole table::
+///
+///     arr = hdu.read()
+///
+/// Read a column subset::
+///
+///     ra_dec = hdu.read(columns=["RA", "DEC"])
+///
+/// Iterate rows lazily via slicing::
+///
+///     for chunk in (hdu[i:i+1000] for i in range(0, len(hdu), 1000)):
+///         process(chunk)
+///
+/// Notes
+/// -----
+/// Compressed binary tables (``ZTABLE=T``) return the subclass
+/// :class:`CompressedTableHDU` instead, which overrides the read
+/// and write methods to handle per-tile decompression.
 #[pyclass(extends = HDU, subclass)]
 pub(crate) struct TableHDU {
     // Lazily-populated per-HDU parsed-metadata cache.  See `meta()`
@@ -219,11 +258,18 @@ impl TableHDU {
         Ok(out)
     }
 
-    // numpy structured dtype the table would read into.  Useful for
-    // inspecting the column layout (names, per-cell shapes, types)
-    // without paying for an actual read.  Reflects the default-read
-    // (scale=True) dtype — i.e. columns with the TSCAL/TZERO unsigned
-    // trick appear as u2/u4/u8/i1, and other scaled columns as f8.
+    /// The numpy structured dtype the table reads into.
+    ///
+    /// Reflects the default-read (``scale=True``) dtype — i.e.
+    /// columns with the TSCAL/TZERO unsigned trick appear as
+    /// ``u2`` / ``u4`` / ``u8`` / ``i1``, and other scaled columns
+    /// as ``f8``.  Useful for inspecting the column layout (names,
+    /// per-cell shapes, types) without paying for an actual read.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.dtype
+    ///     Structured dtype with one field per column.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_ = slf.as_super();
@@ -246,7 +292,11 @@ impl TableHDU {
         Ok(dict.unbind())
     }
 
-    // Number of rows (NAXIS2).
+    /// Number of rows in the table.
+    ///
+    /// Reads the ``NAXIS2`` header keyword.  Equivalent to
+    /// ``len(hdu)``; both are provided for symmetry with numpy
+    /// (``len(arr)``) and pandas (``df.nrows``) idioms.
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super();
@@ -276,30 +326,82 @@ impl TableHDU {
     // Pythonic length: `len(table_hdu)` == row count.  Mirrors
     // `len(structured_array)` for the equivalent numpy structured
     // array a full read would return.
+    //
+    // No `///` docstring here: pyo3 installs __len__ as the C
+    // `tp_len` slot, whose canonical "Return len(self)." overrides
+    // any per-method docstring.  The semantics are covered in the
+    // class docstring instead.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super();
         let meta = slf.meta(super_)?;
         Ok(meta.nrows as usize)
     }
 
-    // Read the table into a numpy structured array of native-endian
-    // dtype.  Returned shape is `(n_selected,)`:
-    //   - rows=None: every row in file order (n_selected == NAXIS2).
-    //   - rows=slice or iterable of int: deduped, in user-requested
-    //     order; negative indices supported.
-    //   - columns=None: every column in file order.
-    //   - columns=list of names: subset + reorder, case-insensitive.
-    //   - scale=True (default): apply TSCAL/TZERO; the unsigned-int
-    //     trick promotes to the matching unsigned dtype, other scaling
-    //     produces f8.  scale=False returns raw stored values.
-    //   - mask_null=False (default): return a plain structured ndarray;
-    //     integer columns with TNULL set return the raw sentinel.
-    //     mask_null=True: return numpy.ma.MaskedArray with per-field
-    //     bool masks set True where the stored integer equals TNULLn.
-    //     Mask compare is in stored-int space (pre-scaling).  TNULL on
-    //     variable-length columns is not yet supported and raises.
-    //
-    // Both subsets validate fully before any I/O happens.
+    /// Read rows from the table into a numpy structured array.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, list of int, or None, optional
+    ///     Rows to read.  ``None`` (default) reads every row in file
+    ///     order.  A slice or iterable of ints selects a subset;
+    ///     negative indices are supported.  Iterables are deduped
+    ///     with first-occurrence-wins ordering.
+    /// columns : list of str, or None, optional
+    ///     Column names to read.  ``None`` (default) reads every
+    ///     column in file order.  A list selects + reorders;
+    ///     matching is case-insensitive against the table's column
+    ///     names.
+    /// scale : bool, optional
+    ///     If ``True`` (default), apply ``TSCAL`` / ``TZERO``
+    ///     scaling: the unsigned-int trick promotes to the matching
+    ///     unsigned dtype with no precision loss, and other scaling
+    ///     produces ``f8``.  If ``False``, return raw stored values
+    ///     in the on-disk BITPIX dtype.
+    /// mask_null : bool, optional
+    ///     If ``True``, return a ``numpy.ma.MaskedArray`` with
+    ///     per-field bool masks set ``True`` where the stored
+    ///     integer equals ``TNULLn``.  The mask compare is in
+    ///     stored-int space (pre-scaling), so it composes
+    ///     correctly with the ``TSCAL`` / ``TZERO`` paths.  Only
+    ///     applies to integer fixed-width columns; variable-length
+    ///     columns with ``TNULL`` are rejected.  Default ``False``.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Structured array of shape ``(n_selected,)`` with one
+    ///     field per selected column.  Dtype reflects the
+    ///     ``scale`` choice (scaled values for ``True``, raw
+    ///     stored dtype for ``False``).
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If a row index is out of range, a column name is unknown,
+    ///     or ``mask_null=True`` is requested on a variable-length
+    ///     column carrying ``TNULL``.
+    ///
+    /// Notes
+    /// -----
+    /// Both the ``rows=`` and ``columns=`` subsets validate fully
+    /// before any file I/O happens, so an invalid selection leaves
+    /// the file untouched.
+    ///
+    /// Examples
+    /// --------
+    /// Read the whole table::
+    ///
+    ///     arr = hdu.read()
+    ///
+    /// Read three columns from rows 100..200::
+    ///
+    ///     arr = hdu.read(rows=slice(100, 200),
+    ///                    columns=["RA", "DEC", "MAG"])
+    ///
+    /// Read with masking on a column that has ``TNULL=-99``::
+    ///
+    ///     arr = hdu.read(mask_null=True)
+    ///     assert arr["FLAG"].mask.any()
     #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -326,6 +428,37 @@ impl TableHDU {
     // when a column has non-ASCII bytes that the default U decode would
     // reject.  `scale` and `mask_null` match read(); when mask_null=True
     // and this column carries TNULL, returns a numpy.ma.MaskedArray.
+    /// Read a single column into a plain (non-structured) ndarray.
+    ///
+    /// Equivalent to ``hdu.read(columns=[name])[name]`` but skips the
+    /// structured-array packaging — useful when you only want one
+    /// column's data.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name.  Case-insensitive against the table's
+    ///     ``TTYPEn`` values.
+    /// rows : slice, list of int, or None, optional
+    ///     Same semantics as :meth:`read`'s ``rows=``.
+    /// as_bytes : bool, optional
+    ///     Only meaningful for ``A`` (character) columns.  If
+    ///     ``True``, return the on-disk bytes in an ``S<n>`` field
+    ///     with no decode, no NUL-truncation, and no trailing-space
+    ///     strip — useful when a column has non-ASCII bytes that
+    ///     the default ``U`` decode would reject.  Default ``False``.
+    /// scale : bool, optional
+    ///     Same as :meth:`read`'s ``scale=``.
+    /// mask_null : bool, optional
+    ///     If ``True`` and this column carries ``TNULL``, return a
+    ///     ``numpy.ma.MaskedArray``.  Default ``False``.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Array of shape ``(n_selected,) + field_shape`` —
+    ///     ``field_shape`` is empty for scalar columns, ``(repeat,)``
+    ///     or the ``TDIM`` shape for subarray columns.
     #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true, mask_null=false))]
     fn read_column(
         slf: PyRef<'_, Self>,
