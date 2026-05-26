@@ -729,11 +729,15 @@ against `nomask`.
    Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor
    means N descriptors per row, each pointing at its own heap cell.
    Field dtype would need to be an Object array of shape `(repeat,)`
-   per row, or some other reshape — decide before coding.
+   per row, or some other reshape — decide before coding.  See
+   `docs/vla-shapes.md` for the per-shape mental-model diagram.
 2. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
    a P/Q column would mean "reshape each heap cell to these dims",
    useful for VLA-of-images.  Each cell still uses the inner element
    type; the reshape is just on the ndarray after the heap read.
+   FITS only allows ONE variable axis per cell (TDIM has exactly
+   one zero) — see `docs/vla-shapes.md` for the limitation note
+   and standard workarounds for fully-variable `(n, m)` shapes.
 3. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
    columns with TNULL in the header are rejected when `mask_null=
    True`.  Adding support means a per-row bool ndarray for each
