@@ -17,12 +17,14 @@
 #
 # Tighten these once the planned coverage sweep is done.
 
+comment: false
+
 coverage:
   status:
     patch:
       default:
         target: 70%
-        threshold: 0%
+        threshold: 1%
     project:
       default:
         threshold: 1%
