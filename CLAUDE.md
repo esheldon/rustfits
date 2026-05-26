@@ -1298,9 +1298,13 @@ the reader walks tiles and decodes them.
 **Open follow-ups (low priority):**
 
 - **Performance** — release-mode chunked-read of large GZIP_2
-  float files: ~30% FASTER than cfitsio on big chunks (50k rows),
-  ~5% slower on small chunks (1k rows).  See "Performance TODO"
-  below for the history of how the gap closed.
+  float files: **3.2× FASTER** than cfitsio on big chunks (50k
+  rows; at the decoder physics floor), **24× FASTER** on small
+  chunks (1k rows; LRU tile cache vs cfitsio's unbounded cache).
+  See "Performance — ZIMAGE chunked-read profiling history"
+  below for how the gap closed, and "Header-derived metadata
+  caching (planned)" for the next available win across all HDU
+  types.
 - **Byte-exact heap agreement with cfitsio on quantized floats**
   — decoded values are bit-exact; raw heap bytes differ by qsort
   tie-breaking quirks.  Not worth fixing absent a specific need.
@@ -3742,50 +3746,43 @@ per-user fixture, not committed — see "Performance / large
 fixture files" under "Build / dev workflow" for how to obtain or
 synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 
-**Current state (release builds; May 2026):**
+**Current state (release builds; 2026-05-26):**
 
-- **Big chunks (50k rows)**: rustfits is ~30% FASTER than
-  cfitsio.  Decode (flate2's GZIP_2 inflate + unshuffle +
-  byteswap) is already a strength.
-- **Small chunks (1k rows)**: rustfits is ~5% slower than
-  cfitsio.  Effectively at parity; the residual is
-  per-`__getitem__`-call Python interpreter dispatch overhead
-  that's hard to attack from the Rust side.
+- **Big chunks (50k rows)**: rustfits is **3.2× FASTER** than
+  cfitsio.  `decode_gzip2`'s remaining ~48% of slice time is now
+  ~100% the flate2/miniz_oxide inflate itself — the physics floor.
+- **Small chunks (1k rows)**: rustfits is **24× FASTER** than
+  cfitsio.  cfitsio caches all decoded tiles forever (memory
+  bloat); rustfits has an LRU.  The dominant cost is per-tile
+  decode and unshuffle; the remaining ~15-20% per-call header
+  re-parse is the next available win (see "Header-derived
+  metadata caching" plan below).
 
-**How the gap closed.**  The first profiling pass (with
-`OPENBLAS_NUM_THREADS=1` to silence BLAS spinner noise) found
-two per-tile micro-overhead hot spots:
+**How the gap closed.**  Three sequential profile-and-fix passes:
 
-- `place_tile_bytes_into_output::PyBytes::new` — 14% on big
-  chunks, 24% on small chunks (Python-owned bytes alloc + copy).
-- `tile_origin_and_shape` — 0.4% on big chunks, **12% on small
-  chunks** (three `vec![0u64; d]` heap allocations per tile for
-  what's pure arithmetic on 2-element arrays).
-
-Fixing the second alone closed the small-chunks gap from 1.4× to
-1.05× — the dominant cost was allocator round-trips, not the
-PyBytes copy.  The fix: stack-allocate the origin/shape arrays
-via `[u64; MAX_NAXIS]` (MAX_NAXIS=8; spec allows up to 999 but
-real images are 1-4 dims), pass them as `&mut` to the function,
-return just the active length `d`.  See
-`tile_origin_and_shape` in `hdu_image_compressed.rs`.
-
-The PyBytes copy fix was never needed for parity.  If we ever
-want to push past parity into "always faster than cfitsio", the
-remaining candidates (ranked by previously-measured impact):
-
-- **`PyBytes::new` → numpy-owned ndarray (zero-copy)** — would
-  save the 14% copy on the big-chunks path.  Requires either
-  adding the `numpy` Rust crate dep (smallest diff,
-  ~10 lines) or writing directly into the output array's
-  buffer (~50 lines for the contiguous fast path, more for
-  stepped slices).
-- **`Vec::with_capacity` + `set_len` in `unshuffle`** — kills a
-  small per-tile zero-init pass.  Trivial diff, ~2% saved.
-- **GZIP_2 unshuffle loop** — ~19% inside `decode_gzip2`.
-  Harder to attack without rewriting the codec layer; would
-  matter only for big-chunk workloads where we're already
-  winning.
+1. **`tile_origin_and_shape` stack-allocation** (commit a85583f).
+   The function did three `vec![0u64; d]` per call for what is
+   pure arithmetic on 2-element arrays.  Replaced with caller-
+   provided `[u64; MAX_NAXIS]` stack buffers (MAX_NAXIS=8).
+   Closed small-chunks 1.4× slower → 1.05× of cfitsio.
+2. **Direct-write to output buffer** (commit a85583f).  Old per-
+   tile path was `PyBytes::new + frombuffer + reshape + set_item`
+   — four Python round-trips and a full Vec→PyBytes copy per
+   tile.  New `strided_copy_c_contig_to_c_contig` helper writes
+   tile bytes directly into the output ndarray's buffer via
+   `RawBuffer::acquire_writable`.  Stepped slices and int-
+   collapse axes still take the old PyBytes path.  No new dep.
+3. **`OverlappingTileRange` iterator** (commit a85583f).  Old
+   loop walked `0..n_tiles` per chunk and skipped non-overlapping
+   tiles inside the body.  On row-stripe layouts (fpack default)
+   this is most of the work.  Pre-computes per-axis
+   `(tc_first, tc_extent)` and yields a tight iteration over
+   only overlapping tiles in BINTABLE row-major order.
+4. **Eliminate alloc_zeroed in unshuffle/shuffle** (commit
+   d7edc54).  `vec![0u8; n_pixels * bytepix]` → `Vec::with_capacity
+   + spare_capacity_mut + MaybeUninit::write + unsafe { set_len }`.
+   The zero-init pass was 17.67% of total profile on big chunks.
+   Took big-chunks 2.8× → 3.2× faster.
 
 **Profiling gotchas worth remembering.**
 
@@ -3802,7 +3799,212 @@ remaining candidates (ranked by previously-measured impact):
   Always profile with `maturin develop --release` (debug
   symbols stay via `[profile.release] debug = "line-tables-only"`
   in Cargo.toml).
+- The per-user 12 GB GZIP_2 f8 fixture isn't committed.  The
+  bench script at `bench_chunked_read.py` (outside the repo)
+  cycles `lo = (i * CHUNK_ROWS) % (n_rows - CHUNK_ROWS)` over
+  100k chunks of 1k rows for small-chunks, 1k chunks of 50k
+  rows for big-chunks.  Cycling pattern is what amortizes the
+  LRU tile cache — sequential reads wouldn't get the same
+  cache amplification.
 
-Do **not** chase this incrementally during ZIMAGE Phase 6+
-feature work — fold it in with the post-feature coverage
-sweep, since both want a quiet codebase to profile.
+## Header-derived metadata caching (planned, 2026-05-26)
+
+**Status: scoped + design captured; not yet started.**
+
+**Why.**  After the four perf fixes above, the remaining ~15-20%
+of slice-path time on small-chunks compressed reads is per-
+`__getitem__` re-parsing of the same header fields:
+`parse_compressed_image_shape`, `parse_string_keyword("ZCMPTYPE")`,
+`parse_rice_params`, `parse_tile_shape`, `parse_hcompress_smooth`,
+`find_data_columns`, `build_quant_context`, `parse_bscale_bzero`.
+That's 8+ O(N_cards) linear scans per call for what is fixed
+per-HDU metadata.  Profile shows `parse_string_keyword` at
+17.81% of total on big-chunks, similar fraction on small-chunks.
+
+The pattern recurs in EVERY HDU type, not just compressed images
+— see the "Pattern recurrence" subsection below.
+
+**Why we built it without caching originally.**  The "FITSHeader:
+cards are the single source of truth" rule (see that section
+above) deliberately rejects parsed-value caches on the public
+`FITSHeader` API to avoid sync drift.  That rule is correct for
+single-key lookups (`header["KEY"]`) where parse cost is
+invisible.  It DOESN'T account for derived structures (table
+schema, compressed-image tile layout, etc.) used in tight
+public-method loops, where parse-derive cost is orders of
+magnitude bigger than a single key lookup.
+
+The proposed cache is for **derived structures**, NOT individual
+keys.  The cards Vec stays the source of truth; the cache is a
+memoization keyed by a version counter that bumps on any
+mutation.  This is structurally simpler than the per-key cache
+the FITSHeader rule warns about — invalidation is "have the
+cards mutated since the last fill?" not per-field.
+
+**Design.**
+
+```rust
+// On the base HDU: a version counter that bumps every time
+// cards are mutated.  Lives in `Arc<AtomicU64>` so all HDU views
+// of the file share the same counter.
+struct HDU {
+    cards_version: Arc<AtomicU64>,
+    // ... existing fields
+}
+
+// Per-HDU-type meta struct holding everything currently
+// re-parsed every __getitem__.  Wrapped in Arc so cache hits
+// return a cheap clone, not a deep copy.
+struct CompressedImageMeta {
+    zbitpix: i32,
+    image_shape: Vec<u64>,
+    tile_shape: Vec<u64>,
+    algorithm: CompressionAlgorithm,
+    cols: DataColumns,
+    quant: Option<QuantContext>,
+    blocksize: u32,
+    bytepix: u32,
+    smooth: bool,
+    bscale_bzero: (Option<f64>, Option<f64>),
+    naxis1: u64,
+    naxis2: u64,
+    theap: u64,
+}
+
+// On each HDU subclass: a Mutex-protected cached
+// (version, Arc<Meta>) pair.  None on first access; populated
+// lazily.
+struct CompressedImageHDU {
+    meta_cache: Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>,
+    // ... existing fields
+}
+
+impl CompressedImageHDU {
+    fn meta(&self, py: Python) -> PyResult<Arc<CompressedImageMeta>> {
+        let cur_version = self.cards_version.load(Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock();
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version { return Ok(m.clone()); }
+            }
+        }
+        // Cold path: re-parse + cache.
+        let cards = self.header_snapshot()?;
+        let m = Arc::new(parse_compressed_image_meta(&cards)?);
+        let mut cache = self.meta_cache.lock();
+        *cache = Some((cur_version, m.clone()));
+        Ok(m)
+    }
+}
+```
+
+Hot path: one Mutex lock + integer compare + Arc clone.  Cold
+path (first call OR after mutation): the existing parse code.
+
+**Mutation discipline.**  Every code path that mutates the cards
+Vec must call `bump_cards_version()` on the HDU's
+`cards_version`.  Mutation surface (today):
+
+- `header.rs::rewrite_header_to_disk` — every FITSHeader
+  mutation goes through this.
+- `hdu_table::edit::insert_column` / `delete_column` — direct
+  card-Vec mutations + header rewrite.
+- Internal structural updates in `hdu_image.rs::ImageHDU::extend`
+  (NAXISn card update), `hdu_table::write_*` (NAXIS2/PCOUNT
+  card updates), `hdu_image_compressed.rs` (NAXIS2/PCOUNT/
+  ZNAXIS<last> card updates), `hdu_table_compressed.rs`
+  (similar).
+- `checksum.rs::compressed_table_add_*` etc.
+
+Suggested helper:
+
+```rust
+// On HDU; called by every code path that mutates cards.
+fn bump_cards_version(&self) {
+    self.cards_version.fetch_add(1, Ordering::AcqRel);
+}
+```
+
+Audit pass: grep for `set_card_for_key`, `delete_card_for_key`,
+`apply_setitem`, `append_commentary_to_cards`, direct
+`cards.clone()`/`cards.push()` patterns; ensure each followed
+by a `bump_cards_version()` call.  Debug-only safety net: a
+`debug_assert!` in the cache fill path that computes a hash
+of the cards Vec and compares to the last-cached hash; if
+they differ but version matches, panic with a clear "missing
+bump_cards_version() call" message.
+
+**Pattern recurrence — what to cache, per HDU type.**
+
+| HDU type | Per-call re-parse cost | Cached struct |
+|---|---|---|
+| `CompressedImageHDU` | ~15-20% of slice path (measured) | `CompressedImageMeta` (above) |
+| `ImageHDU` | similar pattern, single-shot reads make it less hot | `ImageMeta` (BITPIX, shape, BSCALE, BZERO, BLANK) |
+| `TableHDU` | `parse_columns` does ~6 scans × N_columns per call — likely the biggest unmeasured beneficiary | `TableMeta` (columns Vec, row_width, heap layout) |
+| `CompressedTableHDU` | both `TableHDU` overhead PLUS Z-prefix parse PLUS `synthesize_uncompressed_cards` per call | `CompressedTableMeta` (compression algos + everything `TableMeta` has) |
+| `AsciiTableHDU` | same shape as `TableHDU` | `AsciiTableMeta` |
+
+For tables especially, `parse_columns`' per-column 6 scans means
+a 100-column table does 600 O(N_cards) scans per `read()` /
+`__getitem__` / `__setitem__` / etc.  Nobody's profiled this,
+but it's almost certainly hot for any per-row workload.
+
+**Suggested phasing.**
+
+1. **Foundation** — add `cards_version` to `HDU`, add
+   `bump_cards_version()` helper, audit + add bumps to every
+   mutation path.  No caches yet.  Tests should still all pass
+   (no behavior change, just an unused counter).  This is the
+   risky part — getting all the mutation paths right.
+2. **`CompressedImageHDU` cache** — define `CompressedImageMeta`,
+   write `parse_compressed_image_meta`, wire `meta_cache` into
+   `__getitem__` / `read` / `slice_compressed_image` /
+   `extend` / `__setitem__`.  Measure: should land the
+   remaining 15-20% on small-chunks compressed reads.
+3. **`TableHDU` cache** — same shape with `TableMeta` /
+   `parse_table_meta`.  Likely the biggest unmeasured win.
+   Wire into `read`, `__getitem__`, `__setitem__`, `write`,
+   `append`, `insert_column`, `delete_column`, etc.  Profile
+   a tight per-row workload before AND after to anchor the
+   gain.
+4. **`CompressedTableHDU` cache** — extends the table meta
+   with the compression-side fields.
+5. **`ImageHDU` cache** — lowest priority (cold per-call paths
+   anyway).  Do for symmetry.
+
+Don't try to do all five in one PR — each phase is independently
+landable and testable.  Foundation (phase 1) is the only one
+that's hard to get right; the others are repeated application
+of the same pattern.
+
+**Risks.**
+
+- **Forgotten bump in a mutation path** → cache holds stale
+  metadata → reads return wrong values silently.  The debug-only
+  hash check above catches this in tests; production builds rely
+  on the audit.
+- **Mutex contention** — only the lock is per-call; the parse
+  is amortized.  Should be invisible vs the slice work.  If it
+  ever shows up, switch to `parking_lot::Mutex` or `RwLock`.
+- **Mutation of one HDU's header invalidating another HDU's
+  cache** — shouldn't happen (each HDU has its own
+  `cards_version`); FITS headers belong to one HDU.  Note: the
+  `Arc<AtomicU64>` is shared between an HDU and any
+  `FITSHeader`/`FITSHeaderEdit` views of that HDU's header
+  (those views mutate THIS HDU's cards, so they must bump THIS
+  counter).  Cross-HDU header copies via `update()` go through
+  the destination HDU's own mutation path, so they bump the
+  destination's counter naturally.
+
+**Out of scope (don't get sidetracked).**
+
+- Generic key→value parsed-cache on FITSHeader's public API
+  (the "single source of truth" rule above explicitly rejects
+  this; it's a different design and a different risk profile).
+- SIMD-vectorizing the unshuffle/shuffle loops.  Maybe later,
+  but the remaining `unshuffle` cost at 10.79% on small chunks
+  is the algorithmic loop itself, not allocator overhead.
+  Different kind of work.
+- Adding the `numpy` Rust crate dep.  We chose the direct-write
+  approach to avoid it; the header cache doesn't change that
+  decision.
