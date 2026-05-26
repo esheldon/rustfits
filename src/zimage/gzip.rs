@@ -51,13 +51,27 @@ fn gzip_decompress(compressed: &[u8], expected_len: usize) -> PyResult<Vec<u8>> 
 // for i in 0..n_pixels, j in 0..bytepix.  The shuffled layout
 // groups bytes by significance (all MSBs first, all 2nd MSBs
 // next, ...) which makes the decorrelated runs compress better.
+//
+// We allocate `out` uninitialized (via Vec::with_capacity +
+// spare_capacity_mut + MaybeUninit::write + set_len) rather than
+// `vec![0u8; n]`, because every byte is written exactly once by
+// the loop below and the `alloc_zeroed`-then-overwrite pattern
+// was ~17% of total profile time on big-chunk reads of large
+// f8 GZIP_2 images.
 fn unshuffle(shuffled: &[u8], n_pixels: usize, bytepix: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n_pixels * bytepix];
+    let n = n_pixels * bytepix;
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let uninit = out.spare_capacity_mut();
     for j in 0..bytepix {
+        let src_row = &shuffled[j * n_pixels..(j + 1) * n_pixels];
         for i in 0..n_pixels {
-            out[i * bytepix + j] = shuffled[j * n_pixels + i];
+            uninit[i * bytepix + j].write(src_row[i]);
         }
     }
+    // SAFETY: the nested loop writes every position in [0, n) of
+    // the spare capacity exactly once (j ∈ [0, bytepix), i ∈
+    // [0, n_pixels) → covers i*bytepix+j ∈ [0, n) bijectively).
+    unsafe { out.set_len(n); }
     out
 }
 
@@ -142,12 +156,21 @@ pub(crate) fn encode_gzip1(
 //   pixels[i * bytepix + j]  →  out[j * n_pixels + i]
 // for i in 0..n_pixels, j in 0..bytepix.
 fn shuffle(pixels: &[u8], n_pixels: usize, bytepix: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n_pixels * bytepix];
+    // Same alloc_zeroed-elimination as `unshuffle` above — see
+    // that function's docstring for the rationale and the
+    // bijection-proves-every-byte-written argument.
+    let n = n_pixels * bytepix;
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let uninit = out.spare_capacity_mut();
     for j in 0..bytepix {
         for i in 0..n_pixels {
-            out[j * n_pixels + i] = pixels[i * bytepix + j];
+            uninit[j * n_pixels + i].write(pixels[i * bytepix + j]);
         }
     }
+    // SAFETY: (i, j) → j*n_pixels+i is a bijection from
+    // [0,n_pixels) × [0,bytepix) onto [0, n), so every byte is
+    // written exactly once before set_len.
+    unsafe { out.set_len(n); }
     out
 }
 
