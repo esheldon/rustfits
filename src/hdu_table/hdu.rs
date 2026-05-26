@@ -2,10 +2,11 @@
 // __getitem__ classifier (TableKey) and the SingleColumnSubset /
 // ColumnSubset pyclasses used for chained subset reads.
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PySlice, PyTuple};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
 use crate::common::{
     check_not_tainted, parse_keyword, parse_string_keyword, FileHandle,
@@ -13,7 +14,7 @@ use crate::common::{
 };
 use crate::hdu::HDU;
 
-use super::columns::{parse_columns, Column};
+use super::columns::{parse_columns, parse_table_meta, Column, TableMeta};
 use super::edit::{delete_column_impl, insert_column_impl};
 use super::read::{
     build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
@@ -33,8 +34,57 @@ use super::write_vla::{
     any_var_column, append_vla_aware, repack_table_heap, write_vla_aware,
 };
 
+/// A binary-table HDU (``XTENSION='BINTABLE'``).
+///
+/// Returned by indexing a :class:`FITS` object at a position
+/// containing a binary table — e.g. ``hdu = fits[1]``.  Carries
+/// the table's schema (column names, dtypes, units, scaling) and
+/// the I/O surface for reading and modifying rows.
+///
+/// All reads return numpy structured arrays whose dtype reflects
+/// the on-disk schema after the default ``scale=True`` mapping:
+/// the unsigned-int trick (BSCALE=1 + BZERO=2**(n-1)) promotes
+/// to the matching unsigned dtype, other scaling produces ``f8``,
+/// and TNULL-bearing integer columns can be returned as
+/// ``numpy.ma.MaskedArray`` via ``mask_null=True``.
+///
+/// Indexing is symmetric for reads and writes: anything readable
+/// via ``hdu[key]`` (rows, single column, multi-column subset,
+/// ``(row, col)`` cell) is writable via ``hdu[key] = value``.
+/// See the individual methods for details.
+///
+/// Examples
+/// --------
+/// Read a whole table::
+///
+///     arr = hdu.read()
+///
+/// Read a column subset::
+///
+///     ra_dec = hdu.read(columns=["RA", "DEC"])
+///
+/// Iterate rows lazily via slicing::
+///
+///     for chunk in (hdu[i:i+1000] for i in range(0, len(hdu), 1000)):
+///         process(chunk)
+///
+/// Notes
+/// -----
+/// Compressed binary tables (``ZTABLE=T``) return the subclass
+/// :class:`CompressedTableHDU` instead, which overrides the read
+/// and write methods to handle per-tile decompression.
 #[pyclass(extends = HDU, subclass)]
-pub(crate) struct TableHDU;
+pub(crate) struct TableHDU {
+    // Lazily-populated per-HDU parsed-metadata cache.  See `meta()`
+    // for the hot-path accessor; entry is `(version, meta)` where
+    // `version` is the value of the base-HDU `cards_version` at
+    // the time of the parse.  None until the first call; auto-
+    // invalidates on any cards mutation because the next `meta()`
+    // call observes a higher version (Phase 1 atomic) and re-parses.
+    // See `CompressedImageHDU.meta_cache` for the parallel pattern
+    // on the image side.
+    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<TableMeta>)>>>,
+}
 
 impl TableHDU {
     pub(crate) fn new(
@@ -47,9 +97,51 @@ impl TableHDU {
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
-            TableHDU,
+            TableHDU::new_empty_cache(),
             HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
+    }
+
+    // Factory for the subclass-construction path: CompressedTableHDU
+    // builds its PyClassInitializer with `.add_subclass(TableHDU)`,
+    // which requires a fresh value.
+    pub(crate) fn new_empty_cache() -> Self {
+        TableHDU { meta_cache: Arc::new(Mutex::new(None)) }
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit)
+    // an Arc clone.  On miss (first call, or any cards mutation
+    // since the previous call) takes a header snapshot under the
+    // cards mutex and re-parses.  See `TableMeta` for what's cached.
+    //
+    // Callers reach this method while also needing the base HDU
+    // (for offsets / file / etc.) by going through
+    // `slf.as_super()`, which borrows up the class chain instead
+    // of consuming `slf` — keeping both alive for the call.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<TableMeta>> {
+        let cur_version = super_.cards_version.load(Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        // Miss: re-parse outside the lock so concurrent readers
+        // racing the same miss each parse once but only one wins
+        // the cache slot — same loss-of-work pattern as the
+        // ZIMAGE meta cache.
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_table_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
@@ -93,14 +185,36 @@ fn column_repr_info(col: &Column) -> (String, Option<String>) {
 
 #[pymethods]
 impl TableHDU {
-    // FITS checksum convention.  Same 4 methods as ImageHDU and
-    // same semantics; cards are CHECKSUM + DATASUM.  Manual —
-    // re-run add_checksum after write/append/__setitem__.
+    /// Compute and store the ``DATASUM`` checksum card.
+    ///
+    /// ``DATASUM`` is the unsigned-32-bit checksum of the HDU's
+    /// data section, per the FITS Checksum Convention.  Call
+    /// after any write that changes the data — :meth:`write`,
+    /// :meth:`append`, ``__setitem__``, :meth:`insert_column`,
+    /// :meth:`delete_column`, :meth:`repack`.  rustfits does NOT
+    /// auto-refresh checksums on mutation; the user opts in
+    /// explicitly because checksum computation can be expensive
+    /// on large data sections.
+    ///
+    /// See Also
+    /// --------
+    /// add_checksum : Also compute the full HDU ``CHECKSUM`` card.
+    /// verify_datasum : Compare the stored ``DATASUM`` against the
+    ///     current data bytes.
     fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super();
         crate::hdu_image::checksum_hdu_add_datasum(&super_, "DATASUM")
     }
 
+    /// Compute and store both ``DATASUM`` and ``CHECKSUM`` cards.
+    ///
+    /// ``CHECKSUM`` is the encoded complement of the running
+    /// checksum over (header + data) so that the total HDU
+    /// checksum lands on ``0xFFFFFFFF``, per the FITS Checksum
+    /// Convention.  This is the call most users want — it writes
+    /// both cards atomically.
+    ///
+    /// See :meth:`add_datasum` for the manual-refresh contract.
     fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super();
         crate::hdu_image::checksum_hdu_add_checksum(
@@ -108,11 +222,27 @@ impl TableHDU {
         )
     }
 
+    /// Verify the stored ``DATASUM`` against the current data.
+    ///
+    /// Returns
+    /// -------
+    /// bool or None
+    ///     ``True`` if the stored ``DATASUM`` matches the current
+    ///     data section; ``False`` if it doesn't; ``None`` if the
+    ///     ``DATASUM`` card is absent.
     fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_ = slf.into_super();
         crate::hdu_image::checksum_hdu_verify_datasum(&super_, "DATASUM")
     }
 
+    /// Verify the stored ``CHECKSUM`` over the full HDU.
+    ///
+    /// Returns
+    /// -------
+    /// bool or None
+    ///     ``True`` if the stored ``CHECKSUM`` matches the current
+    ///     header + data; ``False`` if it doesn't; ``None`` if the
+    ///     ``CHECKSUM`` card is absent.
     fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_ = slf.into_super();
         crate::hdu_image::checksum_hdu_verify_checksum(&super_, "CHECKSUM")
@@ -123,10 +253,19 @@ impl TableHDU {
     // annotation.  Column lines are dynamically aligned to the longest
     // column name.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
+        // Try the cached meta first; fall back to a fresh cards
+        // snapshot + tolerant parse if the file is degenerate enough
+        // that meta parsing raises — repr must never crash.
+        let cached = slf.meta(super_).ok();
         let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        let nrows = parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0);
+        let (columns, nrows): (Vec<Column>, i64) = match &cached {
+            Some(m) => (m.columns.clone(), m.nrows as i64),
+            None => (
+                parse_columns(&cards)?,
+                parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0),
+            ),
+        };
         let extname = parse_string_keyword(&cards, "EXTNAME");
 
         let mut out = String::new();
@@ -157,90 +296,168 @@ impl TableHDU {
         Ok(out)
     }
 
-    // numpy structured dtype the table would read into.  Useful for
-    // inspecting the column layout (names, per-cell shapes, types)
-    // without paying for an actual read.  Reflects the default-read
-    // (scale=True) dtype — i.e. columns with the TSCAL/TZERO unsigned
-    // trick appear as u2/u4/u8/i1, and other scaled columns as f8.
+    /// The numpy structured dtype the table reads into.
+    ///
+    /// Reflects the default-read (``scale=True``) dtype — i.e.
+    /// columns with the TSCAL/TZERO unsigned trick appear as
+    /// ``u2`` / ``u4`` / ``u8`` / ``i1``, and other scaled columns
+    /// as ``f8``.  Useful for inspecting the column layout (names,
+    /// per-cell shapes, types) without paying for an actual read.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.dtype
+    ///     Structured dtype with one field per column.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        build_numpy_dtype(py, &columns, /* scale = */ true)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        build_numpy_dtype(py, &meta.columns, /* scale = */ true)
     }
 
-    // Column-units dict: maps column name (case preserved) to the
-    // TUNITn string, or None when TUNITn is unset for that column.
-    // Informational only — nothing in the read path consumes units.
-    // Dict preserves the on-disk column order.
+    /// Per-column units (``TUNITn``), as a dict.
+    ///
+    /// Maps each column name (case preserved) to its ``TUNITn``
+    /// string, or ``None`` when ``TUNITn`` is unset for that
+    /// column.  Dict iteration follows on-disk column order.
+    ///
+    /// Informational only — nothing in the read path consumes
+    /// units.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     ``{column_name: unit_or_None}``.
     #[getter]
     fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let dict = PyDict::new(py);
-        for col in &columns {
+        for col in &meta.columns {
             dict.set_item(&col.name, col.tunit.as_deref())?;
         }
         Ok(dict.unbind())
     }
 
-    // Number of rows (NAXIS2).  Returns 0 if the keyword is absent
-    // (malformed header) or set to a negative value.
+    /// Number of rows in the table.
+    ///
+    /// Reads the ``NAXIS2`` header keyword.  Equivalent to
+    /// ``len(hdu)``; both are provided for symmetry with numpy
+    /// (``len(arr)``) and pandas (``df.nrows``) idioms.
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
     }
 
-    // Number of columns (TFIELDS).
+    /// Number of columns in the table (``TFIELDS``).
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "TFIELDS").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.columns.len())
     }
 
-    // Column names in file order (case preserved verbatim).  Returns
-    // a Python tuple so the value is immutable from the caller side.
+    /// Column names in on-disk order, as a tuple.
+    ///
+    /// Names are returned with their on-disk case preserved
+    /// verbatim.  Lookup against this list (e.g. by :meth:`read`'s
+    /// ``columns=`` argument) is case-insensitive throughout the
+    /// API.  Returned as a tuple so the value is immutable from
+    /// the caller side.
+    ///
+    /// Returns
+    /// -------
+    /// tuple of str
     #[getter]
     fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let columns = parse_columns(&cards)?;
-        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let names: Vec<&str> =
+            meta.columns.iter().map(|c| c.name.as_str()).collect();
         Ok(PyTuple::new(py, &names)?.unbind())
     }
 
     // Pythonic length: `len(table_hdu)` == row count.  Mirrors
     // `len(structured_array)` for the equivalent numpy structured
     // array a full read would return.
+    //
+    // No `///` docstring here: pyo3 installs __len__ as the C
+    // `tp_len` slot, whose canonical "Return len(self)." overrides
+    // any per-method docstring.  The semantics are covered in the
+    // class docstring instead.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
     }
 
-    // Read the table into a numpy structured array of native-endian
-    // dtype.  Returned shape is `(n_selected,)`:
-    //   - rows=None: every row in file order (n_selected == NAXIS2).
-    //   - rows=slice or iterable of int: deduped, in user-requested
-    //     order; negative indices supported.
-    //   - columns=None: every column in file order.
-    //   - columns=list of names: subset + reorder, case-insensitive.
-    //   - scale=True (default): apply TSCAL/TZERO; the unsigned-int
-    //     trick promotes to the matching unsigned dtype, other scaling
-    //     produces f8.  scale=False returns raw stored values.
-    //   - mask_null=False (default): return a plain structured ndarray;
-    //     integer columns with TNULL set return the raw sentinel.
-    //     mask_null=True: return numpy.ma.MaskedArray with per-field
-    //     bool masks set True where the stored integer equals TNULLn.
-    //     Mask compare is in stored-int space (pre-scaling).  TNULL on
-    //     variable-length columns is not yet supported and raises.
-    //
-    // Both subsets validate fully before any I/O happens.
+    /// Read rows from the table into a numpy structured array.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, list of int, or None, optional
+    ///     Rows to read.  ``None`` (default) reads every row in file
+    ///     order.  A slice or iterable of ints selects a subset;
+    ///     negative indices are supported.  Iterables are deduped
+    ///     with first-occurrence-wins ordering.
+    /// columns : list of str, or None, optional
+    ///     Column names to read.  ``None`` (default) reads every
+    ///     column in file order.  A list selects + reorders;
+    ///     matching is case-insensitive against the table's column
+    ///     names.
+    /// scale : bool, optional
+    ///     If ``True`` (default), apply ``TSCAL`` / ``TZERO``
+    ///     scaling: the unsigned-int trick promotes to the matching
+    ///     unsigned dtype with no precision loss, and other scaling
+    ///     produces ``f8``.  If ``False``, return raw stored values
+    ///     in the on-disk BITPIX dtype.
+    /// mask_null : bool, optional
+    ///     If ``True``, return a ``numpy.ma.MaskedArray`` with
+    ///     per-field bool masks set ``True`` where the stored
+    ///     integer equals ``TNULLn``.  The mask compare is in
+    ///     stored-int space (pre-scaling), so it composes
+    ///     correctly with the ``TSCAL`` / ``TZERO`` paths.  Only
+    ///     applies to integer fixed-width columns; variable-length
+    ///     columns with ``TNULL`` are rejected.  Default ``False``.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Structured array of shape ``(n_selected,)`` with one
+    ///     field per selected column.  Dtype reflects the
+    ///     ``scale`` choice (scaled values for ``True``, raw
+    ///     stored dtype for ``False``).
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If a row index is out of range, a column name is unknown,
+    ///     or ``mask_null=True`` is requested on a variable-length
+    ///     column carrying ``TNULL``.
+    ///
+    /// Notes
+    /// -----
+    /// Both the ``rows=`` and ``columns=`` subsets validate fully
+    /// before any file I/O happens, so an invalid selection leaves
+    /// the file untouched.
+    ///
+    /// Examples
+    /// --------
+    /// Read the whole table::
+    ///
+    ///     arr = hdu.read()
+    ///
+    /// Read three columns from rows 100..200::
+    ///
+    ///     arr = hdu.read(rows=slice(100, 200),
+    ///                    columns=["RA", "DEC", "MAG"])
+    ///
+    /// Read with masking on a column that has ``TNULL=-99``::
+    ///
+    ///     arr = hdu.read(mask_null=True)
+    ///     assert arr["FLAG"].mask.any()
     #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -250,11 +467,11 @@ impl TableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_table(
-            py, &cards, data_offset, &super_.file, rows, columns, scale,
+            py, &meta, data_offset, &super_.file, rows, columns, scale,
             mask_null,
         )
     }
@@ -267,6 +484,37 @@ impl TableHDU {
     // when a column has non-ASCII bytes that the default U decode would
     // reject.  `scale` and `mask_null` match read(); when mask_null=True
     // and this column carries TNULL, returns a numpy.ma.MaskedArray.
+    /// Read a single column into a plain (non-structured) ndarray.
+    ///
+    /// Equivalent to ``hdu.read(columns=[name])[name]`` but skips the
+    /// structured-array packaging — useful when you only want one
+    /// column's data.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name.  Case-insensitive against the table's
+    ///     ``TTYPEn`` values.
+    /// rows : slice, list of int, or None, optional
+    ///     Same semantics as :meth:`read`'s ``rows=``.
+    /// as_bytes : bool, optional
+    ///     Only meaningful for ``A`` (character) columns.  If
+    ///     ``True``, return the on-disk bytes in an ``S<n>`` field
+    ///     with no decode, no NUL-truncation, and no trailing-space
+    ///     strip — useful when a column has non-ASCII bytes that
+    ///     the default ``U`` decode would reject.  Default ``False``.
+    /// scale : bool, optional
+    ///     Same as :meth:`read`'s ``scale=``.
+    /// mask_null : bool, optional
+    ///     If ``True`` and this column carries ``TNULL``, return a
+    ///     ``numpy.ma.MaskedArray``.  Default ``False``.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Array of shape ``(n_selected,) + field_shape`` —
+    ///     ``field_shape`` is empty for scalar columns, ``(repeat,)``
+    ///     or the ``TDIM`` shape for subarray columns.
     #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true, mask_null=false))]
     fn read_column(
         slf: PyRef<'_, Self>,
@@ -277,11 +525,11 @@ impl TableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
-            py, &cards, data_offset, &super_.file, name, rows, as_bytes,
+            py, &meta, data_offset, &super_.file, name, rows, as_bytes,
             scale, mask_null,
         )
     }
@@ -306,25 +554,25 @@ impl TableHDU {
         match kind {
             TableKey::Rows => {
                 let pyref = slf.borrow();
-                let super_ = pyref.into_super();
-                let cards = super_.header_snapshot()?;
+                let super_ = pyref.as_super();
+                let meta = pyref.meta(super_)?;
                 let data_offset = super_.offsets.data_offset();
                 read_table(
-                    py, &cards, data_offset, &super_.file, Some(key), None,
+                    py, &meta, data_offset, &super_.file, Some(key), None,
                     /* scale = */ true, /* mask_null = */ false,
                 )
             }
             TableKey::SingleRow(idx) => {
                 let pyref = slf.borrow();
-                let super_ = pyref.into_super();
-                let cards = super_.header_snapshot()?;
+                let super_ = pyref.as_super();
+                let meta = pyref.meta(super_)?;
                 let data_offset = super_.offsets.data_offset();
                 // Wrap idx in a single-element list so resolve_rows
                 // handles negative-index normalization and range
                 // validation the same way it does for `hdu[[idx]]`.
                 let one = PyList::new(py, [idx])?;
                 let arr_py = read_table(
-                    py, &cards, data_offset, &super_.file,
+                    py, &meta, data_offset, &super_.file,
                     Some(one.as_any()), None,
                     /* scale = */ true, /* mask_null = */ false,
                 )?;
@@ -347,27 +595,46 @@ impl TableHDU {
         }
     }
 
-    // Bulk-write data into this table's data section.  Three input
-    // forms are accepted; all normalize through the same per-column
-    // strip-write kernel:
-    //
-    //   - Structured numpy ndarray.  Field names must match the HDU's
-    //     columns (extras, missing, or duplicates rejected); field
-    //     order may differ from HDU order (the slow path handles
-    //     reordering).  `len(data)` must equal NAXIS2.
-    //
-    //   - Dict of {name: ndarray}.  One entry per HDU column;
-    //     extras / missing rejected.  Each value is a per-column
-    //     ndarray with shape (NAXIS2,) + per-cell shape.
-    //
-    //   - List/tuple of ndarrays + `names=[...]` keyword.  Parallel
-    //     sequences; same per-column model as dict.
-    //
-    // The fast path (one bulk memcpy per strip + per-column in-place
-    // transform) is used when the input is a structured ndarray
-    // whose fields are in HDU order with no width / offset mismatches
-    // (no U columns, no padding).  All other cases run the slow path
-    // (per-column strided copy + per-cell transform).
+    /// Bulk-write data into the table's data section.
+    ///
+    /// Overwrites all ``NAXIS2`` rows; for appending new rows
+    /// instead, use :meth:`append`.  Accepts three input forms,
+    /// all normalizing through the same per-column strip-write
+    /// kernel:
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    ///     * **Structured ndarray** — field names must match the
+    ///       HDU's columns (extras, missing, or duplicates
+    ///       rejected); field order may differ from HDU order.
+    ///       ``len(data)`` must equal ``NAXIS2``.
+    ///     * **Dict** ``{name: ndarray}`` — one entry per HDU
+    ///       column; extras / missing rejected.  Each value is a
+    ///       per-column ndarray with shape ``(NAXIS2,) +
+    ///       per_cell_shape``.
+    ///     * **List or tuple of ndarrays** with ``names=[...]`` —
+    ///       parallel sequences; same per-column model as dict.
+    /// names : list of str, optional
+    ///     Required only when ``data`` is a list/tuple of ndarrays.
+    ///     Ignored for the structured-ndarray and dict forms.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Field name mismatch, missing/extra columns, length
+    ///     mismatch with ``NAXIS2``, or per-cell shape mismatch.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: any dtype/shape error is raised
+    /// BEFORE the file is touched, so an invalid input leaves the
+    /// table unchanged.
+    ///
+    /// See Also
+    /// --------
+    /// append : Add new rows to the table.
+    /// __setitem__ : Modify a subset of rows / columns / cells.
     #[pyo3(signature = (data, *, names=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -488,21 +755,39 @@ impl TableHDU {
         }
     }
 
-    // Append rows to the table.  Grows NAXIS2 in the header and the
-    // data section to fit the new rows; for HDUs that are not the last
-    // on disk, the file tail is shifted forward and every later HDU's
-    // offsets are bumped in lockstep (shared shift_file_tail primitive
-    // — see CLAUDE.md "Image overflow: in-place data-section grow"
-    // and "Header overflow: in-place file grow").  Accepts the same
-    // three input forms as TableHDU.write: structured ndarray, dict
-    // {name: ndarray}, or list/tuple of ndarrays with names=[...].
-    //
-    // Order of operations is validate-then-mutate: input is fully
-    // validated (columns, dtypes, shapes) before any file or header
-    // bytes are touched, so a dtype mismatch can't leave the file
-    // half-grown.  After validation: grow the file → write the new
-    // NAXIS2 card → write the new rows.  Any mid-write I/O failure
-    // taints the file (close + reopen to recover).
+    /// Append rows to the end of the table.
+    ///
+    /// Grows ``NAXIS2`` in the header and the data section to fit
+    /// the new rows.  For HDUs that are not the last on disk, the
+    /// file tail is shifted forward and every later HDU's offsets
+    /// are bumped in lockstep; previously-issued handles remain
+    /// valid.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    ///     Same three input forms as :meth:`write`: a structured
+    ///     ndarray, a ``{name: ndarray}`` dict, or a list/tuple
+    ///     of per-column ndarrays paired with ``names=``.  Length
+    ///     defines the number of new rows.
+    /// names : list of str, optional
+    ///     Required for the list/tuple form; ignored otherwise.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: input is fully validated (columns,
+    /// dtypes, shapes) before any file or header bytes are
+    /// touched, so a dtype mismatch can't leave the file
+    /// half-grown.
+    ///
+    /// Mid-write I/O failures taint the file — subsequent reads
+    /// and writes will raise until the user closes and reopens.
+    ///
+    /// See Also
+    /// --------
+    /// extend : Alias of ``append``, kept for symmetry with
+    ///     :meth:`ImageHDU.extend`.
+    /// write : Overwrite all rows in place.
     #[pyo3(signature = (data, *, names=None))]
     fn append(
         slf: PyRefMut<'_, Self>,
@@ -542,10 +827,13 @@ impl TableHDU {
         }
     }
 
-    // Alias for append().  Kept for symmetry with ImageHDU.extend so
-    // generic code that iterates HDUs and calls .extend(...) on each
-    // continues to work.  The primary table-side name is `append`
-    // because that's the natural verb for adding rows to a table.
+    /// Alias for :meth:`append`.
+    ///
+    /// Kept for symmetry with :meth:`ImageHDU.extend` so generic
+    /// code that iterates HDUs and calls ``.extend(...)`` on each
+    /// continues to work.  The primary table-side name is
+    /// :meth:`append` because that's the natural verb for adding
+    /// rows to a table.
     #[pyo3(signature = (data, *, names=None))]
     fn extend(
         slf: PyRefMut<'_, Self>,
@@ -556,42 +844,96 @@ impl TableHDU {
         Self::append(slf, py, data, names)
     }
 
-    // Rewrite the heap to drop orphaned cells left behind by VLA
-    // __setitem__ (and any future mutation that always-appends).  No-op
-    // for tables without VLA columns or with an already-compact heap.
-    // If the heap shrinks, the on-disk file shrinks too (last HDU →
-    // set_len; non-last HDU → tail shifted backward and later HDU
-    // offsets bumped down via the shared
-    // shift_file_tail_backward_and_update_offsets primitive).
+    /// Rebuild the VLA heap, reclaiming orphan cells.
+    ///
+    /// VLA writes (``__setitem__`` on a variable-length column)
+    /// always append new cell bytes to the end of the heap,
+    /// leaving the old bytes as orphans referenced by no
+    /// descriptor.  ``repack()`` walks every live descriptor,
+    /// streams the referenced bytes into a compact new heap, and
+    /// rewrites the descriptors to point at it.  If the heap
+    /// shrinks, the on-disk file shrinks too: the last HDU uses
+    /// ``set_len``, and a non-last HDU shifts the trailing HDUs
+    /// backward in lockstep.
+    ///
+    /// No-op for tables without VLA columns or with an
+    /// already-compact heap.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the file uses a non-default ``THEAP`` (heap offset
+    ///     other than ``NAXIS1 * NAXIS2``).  Rustfits never emits
+    ///     such files itself; the limitation only blocks repacking
+    ///     files written by other tools with a custom heap offset.
+    ///     Workaround: rewrite through a fresh
+    ///     :meth:`FITS.create_table_hdu` + :meth:`write`.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super();
         repack_table_heap(&super_)
     }
 
-    // Insert a new fixed-width column into the table.
-    //
-    //   hdu.insert_column(name, data, *, position=None, after=None,
-    //                     before=None, unit=None)
-    //
-    // Location: at most one of position / after / before may be
-    // specified.  position is a 0-based column index (0..=ncols; ncols
-    // appends at the end, which is also the default when all three are
-    // None).  after and before accept either a column name (str,
-    // case-insensitive) or a 0-based integer index (negative wraps).
-    //
-    // Data: a regular numpy ndarray of shape (NAXIS2,) + per-cell
-    // shape.  The dtype maps to a FITS letter via the same rules as
-    // create_table_hdu (i2/i4/i8/u1/u2/u4/u8/f4/f8/c8/c16/b1 + S/U
-    // strings; unsigned-int trick on u2/u4/u8 emits TZERO).  VLA
-    // (Object dtype) is not supported on insert — rebuild the table
-    // via create_table_hdu + write if you need to add a VLA column.
-    //
-    // The existing data section is reshuffled row-by-row in 1 MiB
-    // strips (peak memory bounded, regardless of table size).  Any
-    // existing VLA columns are preserved — the heap is relocated
-    // forward to sit after the new (larger) main rows; descriptor
-    // offsets are relative to heap start and remain valid.  Mid-write
-    // I/O failures taint the file (close + reopen to recover).
+    /// Insert a new column into the table.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name (becomes ``TTYPEn``).  Must not duplicate
+    ///     an existing column (case-insensitive check).
+    /// data : numpy.ndarray
+    ///     Column values, shape ``(NAXIS2,) + per_cell_shape``.
+    ///     For fixed columns the dtype determines the FITS letter
+    ///     (``i2`` / ``i4`` / ``i8`` / ``u1`` / ``u2`` / ``u4`` /
+    ///     ``u8`` / ``f4`` / ``f8`` / ``c8`` / ``c16`` / ``b1`` +
+    ///     ``S`` / ``U`` strings); the unsigned-int trick on
+    ///     ``u2`` / ``u4`` / ``u8`` emits ``TZERO``.  For VLA
+    ///     columns, pass Object dtype with one inner ndarray per
+    ///     row and set ``inner_dtype=``.
+    /// position : int, optional
+    ///     0-based column index in the result, ``0..=ncols``.
+    ///     ``ncols`` appends at the end (also the default when
+    ///     none of position / after / before is set).  Mutually
+    ///     exclusive with ``after`` and ``before``.
+    /// after : str or int, optional
+    ///     Insert after this column.  Accepts a name
+    ///     (case-insensitive) or a 0-based integer index
+    ///     (negative wraps).  Mutually exclusive with
+    ///     ``position`` and ``before``.
+    /// before : str or int, optional
+    ///     Insert before this column.  Same rules as ``after``.
+    ///     Mutually exclusive with ``position`` and ``after``.
+    /// unit : str, optional
+    ///     ``TUNITn`` string.
+    /// inner_dtype : str, optional
+    ///     Required when ``data`` is Object dtype (VLA insert).
+    ///     Inner element dtype as a string: ``'f4'`` / ``'i4'`` /
+    ///     ``'?'`` etc.  Maps to the FITS inner-element letter.
+    /// heap_format : {'P', 'Q'}, optional
+    ///     For VLA columns only.  ``'P'`` (default) uses 8-byte
+    ///     descriptors with a 4 GB heap ceiling; ``'Q'`` uses
+    ///     16-byte descriptors with no practical ceiling.
+    /// bit_packed : bool, optional
+    ///     For boolean columns only.  If ``True``, emit an ``X``
+    ///     (or ``PX`` / ``QX`` for VLA) bit-packed column instead
+    ///     of the default ``L`` (one byte per bool).  Default
+    ///     ``False``.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Duplicate name; multiple position kwargs set; unknown
+    ///     position; dtype mismatch; row count mismatch with
+    ///     ``NAXIS2``; ``inner_dtype`` / ``heap_format`` set on
+    ///     non-Object input; or the file uses a non-default
+    ///     ``THEAP`` (see :meth:`repack` for the same limitation).
+    ///
+    /// Notes
+    /// -----
+    /// Strip-based row shuffler bounds peak memory at ~1 MiB
+    /// regardless of table size.  Existing VLA columns are
+    /// preserved across the insert; their heap is relocated
+    /// forward to sit after the new (wider) main rows.  Mid-write
+    /// I/O failures taint the file (close + reopen to recover).
     #[pyo3(signature = (
         name, data, *, position=None, after=None, before=None, unit=None,
         inner_dtype=None, heap_format=None, bit_packed=false,
@@ -617,22 +959,27 @@ impl TableHDU {
         )
     }
 
-    // Remove a column from the table.
-    //
-    //   hdu.delete_column(name_or_index)
-    //
-    // `key` is a column name (str, case-insensitive) or a 0-based
-    // integer index (negative wraps from the end).  Works on both
-    // fixed and VLA columns: for a VLA column, the descriptor bytes
-    // are removed from each row but the heap is left as-is — the
-    // deleted column's heap cells become orphans that hdu.repack()
-    // reclaims.  Existing OTHER VLA columns are preserved — the heap
-    // is relocated backward to sit after the new (shorter) main rows;
-    // their descriptor offsets are relative to heap start and remain
-    // valid.
-    //
-    // Row shuffle runs in 1 MiB front-to-back strips so peak memory
-    // stays bounded.  Mid-write I/O failures taint the file.
+    /// Remove a column from the table.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str or int
+    ///     Column name (case-insensitive) or a 0-based integer
+    ///     index.  Negative indices wrap from the end.
+    ///
+    /// Notes
+    /// -----
+    /// Works on both fixed and VLA columns.  For a VLA column,
+    /// the descriptor bytes are removed from each row but the
+    /// heap cells the column referenced are left as-is — they
+    /// become orphans that :meth:`repack` reclaims.  Existing
+    /// other VLA columns are preserved across the delete; their
+    /// heap relocates backward to sit after the new (shorter)
+    /// main rows.
+    ///
+    /// Row shuffle runs in 1 MiB front-to-back strips so peak
+    /// memory stays bounded.  Mid-write I/O failures taint the
+    /// file (close + reopen to recover).
     fn delete_column(
         slf: PyRefMut<'_, Self>,
         key: &Bound<'_, PyAny>,
@@ -717,10 +1064,26 @@ pub(crate) fn classify_table_key(key: &Bound<'_, PyAny>) -> PyResult<TableKey> {
     }
 }
 
-// Returned by hdu[col] for a single str/bytes column name.  Holds onto
-// the parent TableHDU via Py<TableHDU> (a refcount bump) so the read
-// can re-borrow it; carries the column name verbatim (case preserved,
-// matching is case-insensitive at read time).
+/// A deferred handle for one column of a :class:`TableHDU`.
+///
+/// Returned by ``hdu["name"]`` (a single str/bytes column name).
+/// Carries a reference to the parent table and the column name;
+/// no I/O happens at construction.  Add ``[rows]`` to trigger
+/// the read::
+///
+///     col = hdu["RA"]          # no I/O, returns a subset handle
+///     all_ra  = col[:]         # read every row
+///     subset  = col[100:200]   # read 100 rows
+///     fancy   = col[[7, 3, 9]] # read three rows in that order
+///
+/// Writing to ``[rows]`` mutates only that column::
+///
+///     hdu["FLAG"][bad_rows] = -99
+///
+/// Equivalent to :meth:`TableHDU.read_column` for reads and to
+/// the cell / slice forms of ``TableHDU.__setitem__`` for writes;
+/// the subset object exists so the ``hdu["name"][...]`` idiom
+/// composes naturally.
 #[pyclass]
 pub(crate) struct SingleColumnSubset {
     hdu: Py<TableHDU>,
@@ -739,9 +1102,10 @@ impl SingleColumnSubset {
         ))
     }
 
-    // [rows] triggers the actual read.  `rows` may be a slice or any
-    // iterable of ints (negative supported), with semantics matching
-    // TableHDU.read_column(rows=...).
+    // __getitem__ / __setitem__ are pyo3 slot dunders — their
+    // docstrings would be overridden by Python's canonical slot
+    // text.  Their semantics are covered in the class docstring's
+    // "Add ``[rows]``" examples.
     fn __getitem__(
         &self,
         py: Python<'_>,
@@ -749,23 +1113,20 @@ impl SingleColumnSubset {
     ) -> PyResult<Py<PyAny>> {
         let bound = self.hdu.bind(py);
         let pyref = bound.borrow();
-        let super_ = pyref.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_one_column(
-            py, &cards, data_offset, &super_.file,
+            py, &meta, data_offset, &super_.file,
             &self.name, Some(rows), /* as_bytes = */ false,
             /* scale = */ true, /* mask_null = */ false,
         )
     }
 
-    // hdu["name"][rows] = value: row-restricted write to one column.
-    //   - [i] = v             single-cell shortcut for hdu[i, "name"] = v
-    //   - [i:j[:s]] = arr     write `count` cells in that column
-    //   - [[i,j,k]] = arr     fancy-row write, one column
-    // Per-cell loop through setitem_cell — simple and correct.  Cards
-    // are re-snapshotted between cells so VLA writes (which mutate
-    // PCOUNT) see fresh state.
+    // See the __getitem__ comment above re: slot dunders.
+    // Per-cell loop through setitem_cell — simple and correct.
+    // Cards are re-snapshotted between cells so VLA writes (which
+    // mutate PCOUNT) see fresh state.
     fn __setitem__(
         &self,
         py: Python<'_>,
@@ -788,8 +1149,27 @@ impl SingleColumnSubset {
     }
 }
 
-// Returned by hdu[[col1, col2, ...]] for an iterable of column names.
-// Same Py<TableHDU> hold-onto-parent pattern as SingleColumnSubset.
+/// A deferred handle for a column subset of a :class:`TableHDU`.
+///
+/// Returned by ``hdu[[name1, name2, ...]]`` (an iterable of
+/// str/bytes column names).  Carries a reference to the parent
+/// table and the column list; no I/O happens at construction.
+/// Add ``[rows]`` to trigger the read::
+///
+///     pos = hdu[["RA", "DEC"]]
+///     all_pos = pos[:]              # structured ndarray w/ 2 fields
+///     subset  = pos[100:200]
+///
+/// Writing to ``[rows]`` mutates only those columns; the value
+/// must be a structured ndarray with the matching field names
+/// (extras tolerated for forward compatibility)::
+///
+///     hdu[["RA", "DEC"]][bad_rows] = corrected
+///
+/// Equivalent to :meth:`TableHDU.read` with ``columns=`` for
+/// reads, and to the multi-column form of ``TableHDU.__setitem__``
+/// for writes.  The subset object exists so the
+/// ``hdu[[...]][...]`` idiom composes naturally.
 #[pyclass]
 pub(crate) struct ColumnSubset {
     hdu: Py<TableHDU>,
@@ -808,9 +1188,9 @@ impl ColumnSubset {
         ))
     }
 
-    // [rows] triggers the actual read.  `rows` may be a slice or any
-    // iterable of ints (negative supported), with semantics matching
-    // TableHDU.read(rows=..., columns=...).
+    // __getitem__ / __setitem__ are pyo3 slot dunders — see the
+    // SingleColumnSubset note for why we don't put docstrings on
+    // them.  Semantics are in the class docstring above.
     fn __getitem__(
         &self,
         py: Python<'_>,
@@ -818,22 +1198,16 @@ impl ColumnSubset {
     ) -> PyResult<Py<PyAny>> {
         let bound = self.hdu.bind(py);
         let pyref = bound.borrow();
-        let super_ = pyref.into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
         read_table(
-            py, &cards, data_offset, &super_.file,
+            py, &meta, data_offset, &super_.file,
             Some(rows), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
         )
     }
 
-    // hdu[["a","b"]][rows] = value: row-restricted write to a column
-    // subset.  Same row-key surface as SingleColumnSubset (int / slice
-    // / fancy list); value is a structured ndarray (or numpy.void for
-    // int row) carrying those columns.  Implementation walks each
-    // column and forwards to write_one_column_at_rows with the
-    // corresponding field view as the per-column data.
     fn __setitem__(
         &self,
         py: Python<'_>,

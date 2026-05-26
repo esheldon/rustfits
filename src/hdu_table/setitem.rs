@@ -566,9 +566,8 @@ fn setitem_cell_vla(
     }
 
     // PCOUNT update via disk-write-before-commit.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -589,7 +588,7 @@ fn setitem_cell_vla(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -919,9 +918,8 @@ fn setitem_rows_vla_aware_inner(
 
     // PCOUNT update — disk-write-before-commit.  No NAXIS2 change
     // (row count unchanged).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -942,7 +940,7 @@ fn setitem_rows_vla_aware_inner(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -1260,9 +1258,8 @@ pub(crate) fn setitem_single_column_vla(
     }
 
     // PCOUNT update (disk-write-before-commit).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -1283,7 +1280,7 @@ pub(crate) fn setitem_single_column_vla(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 

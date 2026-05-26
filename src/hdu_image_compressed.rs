@@ -26,7 +26,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
@@ -68,6 +68,55 @@ const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 // concurrency model.
 type TileCache = BytesBoundLruCache<u64>;
 
+/// A tile-compressed image HDU (``ZIMAGE=T`` on disk).
+///
+/// The user-facing surface mirrors :class:`ImageHDU` exactly:
+/// every accessor (:attr:`shape`, :attr:`dtype`, :attr:`bitpix`,
+/// ...) reports the **uncompressed** image properties, and every
+/// I/O method (:meth:`read`, :meth:`write`, :meth:`extend`,
+/// ``__getitem__``, ``__setitem__``) operates on the
+/// uncompressed pixels.  The tile-compressed storage is an
+/// implementation detail.
+///
+/// Subclasses :class:`ImageHDU` (so ``isinstance(hdu,
+/// ImageHDU)`` holds), but overrides every I/O method to handle
+/// per-tile (de)compression.  Returned by indexing a
+/// :class:`FITS` object at a position containing a ZIMAGE HDU.
+///
+/// Compression-specific surface beyond the inherited
+/// :class:`ImageHDU` API:
+///
+/// * :attr:`compression` — the algorithm config object (e.g.
+///   :class:`Rice1` instance) that would reproduce the on-disk
+///   layout.
+/// * :attr:`n_tiles` — number of tile chunks on disk.
+/// * :attr:`tile_cache_size`, :meth:`set_tile_cache_size`,
+///   :attr:`tile_cache_used`, :meth:`clear_tile_cache` — LRU
+///   cache controls for decoded tiles.
+/// * :meth:`repack` — drop orphaned tile bytes accumulated by
+///   ``__setitem__`` / :meth:`extend`.
+///
+/// Examples
+/// --------
+/// Read tile-compressed data the same way as uncompressed::
+///
+///     arr = hdu.read()
+///     stamp = hdu[100:200, 50:150]   # decodes only overlapping tiles
+///
+/// Inspect the compression::
+///
+///     print(hdu.compression)         # Rice1(tile_shape=[100,100], ...)
+///     print(hdu.n_tiles)
+///
+/// Tune the tile cache for a memory-constrained workflow::
+///
+///     hdu.set_tile_cache_size(0)     # disable caching
+///
+/// Notes
+/// -----
+/// Use :meth:`FITS.create_image_hdu` with ``compress=`` to
+/// create a tile-compressed image.  Direct construction from
+/// Python is not supported.
 #[pyclass(extends = ImageHDU)]
 pub(crate) struct CompressedImageHDU {
     cache: Arc<TileCache>,
@@ -93,6 +142,16 @@ pub(crate) struct CompressedImageHDU {
     pub(crate) compress_config: Arc<
         Mutex<Option<crate::zimage::compression_config::CompressionConfigKind>>,
     >,
+    // Lazily-populated cache of the parsed compressed-image
+    // metadata.  See `meta()` for the hot-path accessor; entry is
+    // `(version, meta)` where `version` is the value of the
+    // base-HDU `cards_version` at the time of the parse.  None
+    // until the first call; auto-invalidates on any cards mutation
+    // because the next `meta()` call observes a higher version and
+    // re-parses.  Wrapped in Arc<Mutex<...>> so concurrent readers
+    // briefly serialize on the lock (uncontended in the GIL-held
+    // case today, correct for future allow_threads use).
+    meta_cache: Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>,
 }
 
 impl CompressedImageHDU {
@@ -114,12 +173,51 @@ impl CompressedImageHDU {
             header, index, filename, offsets, layout, file, tainted,
         );
         PyClassInitializer::from(hdu)
-            .add_subclass(ImageHDU)
+            .add_subclass(ImageHDU::new_empty_cache())
             .add_subclass(CompressedImageHDU {
                 cache: Arc::new(TileCache::new(DEFAULT_TILE_CACHE_BYTES)),
                 quantize_config: Arc::new(Mutex::new(quantize_config)),
                 compress_config: Arc::new(Mutex::new(compress_config)),
+                meta_cache: Arc::new(Mutex::new(None)),
             })
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit)
+    // an Arc clone.  On miss (first call, or any cards mutation
+    // since the previous call) takes a header snapshot under the
+    // cards mutex and re-parses.  See `CompressedImageMeta` for
+    // what's cached and what is intentionally not.
+    //
+    // Callers reach this method while also needing the base HDU
+    // (for offsets/file/etc.) by going through `slf.as_super()
+    // .as_super()`, which borrows up the class chain instead of
+    // consuming `slf` — keeping both alive for the call.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<CompressedImageMeta>> {
+        let cur_version = super_.cards_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        // Miss: re-parse outside the lock so concurrent readers
+        // racing the same miss each parse once but only one wins
+        // the cache slot — same loss-of-work pattern as the
+        // TileCache, acceptable because parsing is cheap (10s of
+        // microseconds) compared to the lock contention savings.
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_compressed_image_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
@@ -141,9 +239,17 @@ impl CompressedImageHDU {
     //     verbatim (useful for debugging an unknown algorithm).
     //   - ZCMPTYPE missing entirely → show `None` (Python idiom).
     fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
-        let super_ = slf.into_super().into_super();
+        let super_ = slf.as_super().as_super();
+        // Try the cached meta first; fall back to a fresh cards
+        // snapshot if the file is degenerate enough that parsing
+        // raises (repr must never crash — see the
+        // "Degraded fallbacks" doc on this method).
+        let cached_meta = slf.meta(super_).ok();
         let cards = super_.header_snapshot()?;
-        let (zbitpix, shape) = parse_compressed_image_shape(&cards)?;
+        let (zbitpix, shape): (i32, Vec<u64>) = match &cached_meta {
+            Some(m) => (m.zbitpix, m.image_shape.clone()),
+            None => parse_compressed_image_shape(&cards)?,
+        };
         let dtype = zbitpix_to_native_dtype(zbitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
@@ -172,95 +278,108 @@ impl CompressedImageHDU {
     }
 
     // ----- image-side accessors (parallel to ImageHDU) -----
+    //
+    // These mirror ImageHDU's accessors exactly but report the
+    // ORIGINAL (uncompressed) image properties — `shape` is the
+    // shape pixels would have after `.read()`, NOT the on-disk
+    // BINTABLE shape.  Sources: ZBITPIX / ZNAXIS / ZNAXISn cards
+    // (the Z-prefixed substitutes the FITS Tile Compression
+    // Convention defines for the original image).
 
-    // Image dimensions in numpy axis order (slowest first).
+    /// Original image dimensions in numpy axis order (slowest
+    /// first).  Sourced from ``ZNAXISn``; the user sees what
+    /// :meth:`read` would return, not the on-disk BINTABLE
+    /// shape.
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(PyTuple::new(py, &shape)?.unbind())
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(PyTuple::new(py, &meta.image_shape)?.unbind())
     }
 
-    // numpy dtype matching ZBITPIX — what .read() will return.
+    /// The numpy dtype :meth:`read` would return.  Sourced from
+    /// ``ZBITPIX``.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
-        let dtype_str = zbitpix_to_native_dtype(zbitpix)?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        let dtype_str = zbitpix_to_native_dtype(meta.zbitpix)?;
         let np = py.import("numpy")?;
         Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
     }
 
-    // ZNAXIS — number of image axes.
+    /// Number of image axes.  Sourced from ``ZNAXIS``.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(shape.len())
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape.len())
     }
 
-    // Total pixel count (product of all ZNAXISn).  Returns 0 for
-    // an empty shape so the accessor is well-defined on degenerate
-    // headers; real compressed HDUs always have NAXIS > 0.
+    /// Total pixel count (product of all ``ZNAXISn``).
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape.iter().product())
     }
 
-    // Raw ZBITPIX — the image-side bitpix the user will read into.
+    /// Raw FITS ``ZBITPIX`` value (the image-side bitpix the
+    /// user reads into).  Distinct from ``hdu.header["BITPIX"]``
+    /// (which is 8, the BINTABLE BITPIX on disk).
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
-        Ok(zbitpix)
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.zbitpix)
     }
 
-    // numpy convention: `len(arr)` is shape[0].
+    // __len__ is a pyo3 slot dunder — no per-method docstring.
+    // numpy convention: shape[0] of the original image.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        if shape.is_empty() {
-            Ok(0)
-        } else {
-            Ok(shape[0] as usize)
-        }
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape[0] as usize)
     }
 
-    // BUNIT (informational).
+    /// ``BUNIT`` header value, or ``None`` when unset.
+    /// Informational only.
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super().into_super();
+        let super_ = slf.as_super().as_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
     }
 
     // ----- compression-specific accessors -----
 
-    // Structured compression config: returns the same Gzip1 /
-    // Gzip2 / Rice1 / Hcompress1 pyclass instance that would have
-    // been passed to `create_image_hdu(..., compress=...)` to
-    // produce a file with the same on-disk parameters.  This is
-    // the single source of truth for "how is this HDU compressed":
-    //
-    //   if isinstance(hdu.compression, rustfits.Rice1):
-    //       print(hdu.compression.blocksize)
-    //
-    // The FITS-spec ZCMPTYPE string is available as
-    // `hdu.compression.zcmptype`; tile shape as
-    // `hdu.compression.tile_shape`.  Two HDUs can be compared with
-    // `hdu_a.compression == hdu_b.compression` (field-wise __eq__).
-    //
-    // Construction cost per access is small (parses cards, builds
-    // a tiny pyclass).  No caching — keep parity with the other
-    // accessors that re-parse the header on each call.
+    /// Compression configuration of this HDU.
+    ///
+    /// Returns the same :class:`Gzip1` / :class:`Gzip2` /
+    /// :class:`Rice1` / :class:`Hcompress1` / :class:`Plio1`
+    /// pyclass instance that would have been passed to
+    /// :meth:`FITS.create_image_hdu`'s ``compress=`` argument to
+    /// reproduce the on-disk layout.  Single source of truth for
+    /// "how is this HDU compressed"::
+    ///
+    ///     if isinstance(hdu.compression, rustfits.Rice1):
+    ///         print(hdu.compression.blocksize)
+    ///
+    /// The FITS-spec ``ZCMPTYPE`` string is available as
+    /// ``hdu.compression.zcmptype``; tile shape as
+    /// ``hdu.compression.tile_shape``.  Two HDUs can be compared
+    /// with ``hdu_a.compression == hdu_b.compression``
+    /// (field-wise ``__eq__``).
+    ///
+    /// Notes
+    /// -----
+    /// For HDUs that were just created in this Python session,
+    /// the returned object is the exact config passed to
+    /// ``create_image_hdu(..., compress=...)`` — write-only
+    /// parameters (like ``Gzip1(level=9)``) round-trip.  For
+    /// reopened HDUs, the config is rebuilt from header cards;
+    /// the ``level`` field comes back as ``None`` because gzip
+    /// framing doesn't preserve the level.
     #[getter]
     fn compression(
         slf: PyRef<'_, Self>, py: Python<'_>,
@@ -284,48 +403,56 @@ impl CompressedImageHDU {
         build_compression_config(py, &cards)
     }
 
-    // Total number of tiles in the image: product of
-    // ceil(NAXISn / TILEn).  Storage-layout property (kept here
-    // rather than on .compression because it's about how the
-    // BINTABLE is laid out, not the algorithm).
+    /// Number of tile chunks the image is split into on disk.
+    ///
+    /// Product of ``ceil(ZNAXISn / ZTILEn)`` across all axes.
+    /// Storage-layout property (kept here rather than on
+    /// :attr:`compression` because it's about how the BINTABLE
+    /// is laid out, not the algorithm).
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, image_shape) = parse_compressed_image_shape(&cards)?;
-        let tile_shape = parse_tile_shape(&cards, &image_shape);
-        Ok(compute_n_tiles(&image_shape, &tile_shape))
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.n_tiles)
     }
 
     // ----- tile cache -----
 
-    // Current cache capacity in bytes.  Default 32 MiB; tune with
-    // `set_tile_cache_size`.  Reads and slicing both consult this
-    // budget — there's no per-call opt-out.
+    /// Current cache capacity in bytes.
+    ///
+    /// Default 32 MiB.  Reads and slicing both consult this
+    /// budget — there's no per-call opt-out.  Tune with
+    /// :meth:`set_tile_cache_size`.
     #[getter]
     fn tile_cache_size(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.capacity()
     }
 
-    // Configure the cache capacity in bytes.  Setting to 0
-    // disables caching entirely (every decode is one-shot —
-    // useful for memory-constrained workflows).  Shrinking the
-    // cap below current usage evicts LRU tiles to fit.
+    /// Set the cache capacity in bytes.
+    ///
+    /// Setting to ``0`` disables caching entirely — every decode
+    /// is one-shot, useful for memory-constrained workflows.
+    /// Shrinking the cap below current usage evicts LRU tiles to
+    /// fit.
     fn set_tile_cache_size(&self, bytes: u64) {
         self.cache.set_capacity(bytes);
     }
 
-    // Bytes currently held in the cache.  Useful for monitoring
-    // memory usage and for tests that assert eviction worked.
+    /// Bytes currently held in the tile cache.
+    ///
+    /// Useful for monitoring memory usage and for tests that
+    /// assert eviction worked.
     #[getter]
     fn tile_cache_used(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.used_bytes()
     }
 
-    // Drop every cached tile.  Keeps `tile_cache_size` as-is, so
-    // subsequent decodes will repopulate.  Useful right after a
-    // one-shot `read()` to release the tile copies while keeping
-    // the cache configured for later slicing.
+    /// Drop every cached tile.
+    ///
+    /// Keeps :attr:`tile_cache_size` as-is, so subsequent decodes
+    /// will repopulate.  Useful right after a one-shot
+    /// :meth:`read` to release the tile copies while keeping the
+    /// cache configured for later slicing.
     fn clear_tile_cache(&self) {
         self.cache.clear();
     }
@@ -334,22 +461,33 @@ impl CompressedImageHDU {
     //
     // Compressed HDUs use ZHECKSUM + ZDATASUM (not the BINTABLE-
     // level CHECKSUM/DATASUM) per the FITS Tile Compression
-    // Convention.  Both are computed against the *equivalent
-    // uncompressed image* — the BITPIX-native bytes the decoded
-    // data would occupy if it were stored uncompressed.  Astropy
-    // uses the same convention and reads our values bit-exact.
-    //
-    // Manual semantics — re-run add_checksum after extend /
-    // __setitem__ / write to refresh.
+    // Convention; both compute against the equivalent uncompressed
+    // image bytes (astropy uses the same convention).
 
+    /// Compute and store the ``ZDATASUM`` checksum card.
+    ///
+    /// Computed against the equivalent uncompressed image bytes,
+    /// not the on-disk BINTABLE, per the FITS Tile Compression
+    /// Convention.  Same manual-refresh contract as
+    /// :meth:`ImageHDU.add_datasum` — re-run after
+    /// :meth:`write` / :meth:`extend` / ``__setitem__``.
     fn add_datasum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
         compressed_add_datasum(slf, py)
     }
 
+    /// Compute and store both ``ZDATASUM`` and ``ZHECKSUM`` cards.
+    ///
+    /// Same convention as :meth:`add_datasum`.  This is the call
+    /// most users want.
     fn add_checksum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
         compressed_add_checksum(slf, py)
     }
 
+    /// Verify the stored ``ZDATASUM`` against the equivalent
+    /// uncompressed image bytes.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_datasum(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Option<bool>> {
@@ -365,20 +503,24 @@ impl CompressedImageHDU {
     // ----- overrides for ImageHDU's data-access methods -----
     //
     // These shadow ImageHDU's implementations so the uncompressed
-    // read/write paths never run on a compressed BINTABLE.  Only
-    // `read` does real work in Phase 2; everything else raises.
+    // read/write paths never run on a compressed BINTABLE.  User-
+    // facing semantics are identical to the ImageHDU versions;
+    // docstrings here cross-reference the parent and add the
+    // compression-specific notes (tile-cache behavior etc.).
 
-    // Whole-image read.  Walks every tile in the BINTABLE, decodes
-    // it (or pulls from the tile cache), places it in the output
-    // ndarray.  Honors `scale` and `mask_blank` for compatibility
-    // with the ImageHDU signature; `mask_blank=True` currently
-    // raises because ZBLANK isn't wired in yet.
-    //
-    // Cache behavior: every tile read/decode populates the LRU
-    // cache (subject to `tile_cache_size`).  This makes subsequent
-    // slicing into the same region cheap.  To run cache-free, set
-    // `tile_cache_size=0` before the read or call
-    // `clear_tile_cache()` afterward.
+    /// Read the (decompressed) image into a numpy array.
+    ///
+    /// Same signature and semantics as :meth:`ImageHDU.read`:
+    /// ``scale`` applies ``BSCALE``/``BZERO``; ``mask_blank``
+    /// returns a ``MaskedArray`` on ``ZBLANK`` matches.
+    ///
+    /// Notes
+    /// -----
+    /// Tile cache: every tile decoded during the read populates
+    /// the LRU cache (subject to :attr:`tile_cache_size`).  This
+    /// makes subsequent overlapping slicing reads hit warm tiles.
+    /// To run cache-free, set ``set_tile_cache_size(0)`` before
+    /// the read, or call :meth:`clear_tile_cache` afterward.
     #[pyo3(signature = (*, scale=true, mask_blank=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -386,59 +528,55 @@ impl CompressedImageHDU {
         scale: bool,
         mask_blank: bool,
     ) -> PyResult<Py<PyAny>> {
-        let cache = Arc::clone(&slf.cache);
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
         read_compressed_image_data(
-            py, &cards, super_.offsets.data_offset(),
-            &super_.file, &super_.tainted, &cache, scale, mask_blank,
+            py, &meta, super_.offsets.data_offset(),
+            &super_.file, &super_.tainted, &slf.cache, scale, mask_blank,
         )
     }
 
-    // Slicing on tile-compressed images.  Reuses the same slice-
-    // key parser as ImageHDU (slice + int + ellipsis per axis,
-    // with step support), and decodes only the tiles overlapping
-    // the requested region.  Each accessed tile is cached, so
-    // overlapping slices later hit warm tiles.
-    //
-    // Always applies BSCALE/BZERO (matches the table-side
-    // convention; use .read(scale=False) to bypass for the whole
-    // image).  All-int multi-axis (`hdu[i, j, k]`) returns a
-    // numpy scalar, matching ImageHDU semantics.
-    //
-    // Phase 3 supports the same slicing surface as ImageHDU
-    // (slice/int/ellipsis); fancy list/array indexing falls
-    // through `parse_axis_indexer` and raises the existing
-    // "unsupported index type" error.
+    // __getitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same slice surface as ImageHDU (slice / int / ellipsis per
+    // axis, stepped slices, mixed combinations), but decodes only
+    // the tiles overlapping the requested region.  Always scales
+    // (use .read(scale=False) for raw).  Tile cache populated on
+    // every access — see the read() docstring for cache control.
     fn __getitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let cache = Arc::clone(&slf.cache);
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
         slice_compressed_image(
-            py, &cards, super_.offsets.data_offset(),
-            &super_.file, &super_.tainted, &cache, key,
+            py, &meta, super_.offsets.data_offset(),
+            &super_.file, &super_.tainted, &slf.cache, key,
         )
     }
 
-    // Compressed writes are Phase 7+ territory.  Reject every
-    // path that would otherwise inherit ImageHDU's uncompressed
-    // implementation, since those would happily blast bytes into
-    // the BINTABLE data area and produce a corrupt file.
-    // Bulk-write a compressed image.  Encodes every tile in RAM
-    // first (validate-then-mutate), then grows the file as needed,
-    // writes the per-tile descriptors into the main data section
-    // and the encoded bytes into the heap, and rewrites the PCOUNT
-    // card.  `start=` is not supported on compressed images (every
-    // tile is encoded independently; partial writes would mean a
-    // partial tile, which doesn't compose with the encode-once
-    // model).  Pass the full image array as `data`.
-    //
-    // Phase 7 supports Gzip1, Gzip2, and Rice1 with integer
-    // ZBITPIX (u1/i2/i4/i8 for GZIP; u1/i2/i4 for RICE).
+    /// Write the entire image (encoding tile-by-tile).
+    ///
+    /// Same input contract as :meth:`ImageHDU.write` — data must
+    /// match the HDU shape exactly.  ``start=`` is rejected
+    /// because compressed writes are encode-once per tile;
+    /// partial writes don't compose with the tile-encoding
+    /// model.  Use ``__setitem__`` for region updates instead.
+    ///
+    /// Validate-then-mutate: every tile is encoded into RAM
+    /// first; only after all encodes succeed does the file grow
+    /// + descriptor table + heap get written.  A dtype or shape
+    /// error leaves the file untouched.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray or numpy.ma.MaskedArray
+    ///     See :meth:`ImageHDU.write` for the dtype rules
+    ///     (BITPIX-native, scaled, or f8 for general scaling;
+    ///     MaskedArray auto-fills via ``ZBLANK`` or NaN).
+    /// start : Any, optional
+    ///     Not supported.  Passing anything other than ``None``
+    ///     raises ``NotImplementedError``.
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -465,14 +603,31 @@ impl CompressedImageHDU {
             &super_.file, &super_.layout, &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
         )
     }
 
-    // No `start=` kwarg, unlike ImageHDU.extend: writing to existing
-    // tile rows is __setitem__'s job (re-encode the affected tiles
-    // in place).  extend only appends at the end of the slow axis.
+    /// Append new pixels along the slow axis.
+    ///
+    /// Same shape contract as :meth:`ImageHDU.extend`: ``data``
+    /// inner-axis shape must match ``hdu.shape[1:]``; the slow
+    /// axis can be any size.
+    ///
+    /// Unlike :meth:`ImageHDU.extend`, there is no ``start=``
+    /// argument — writes to existing tile rows are
+    /// ``__setitem__``'s job (which re-encodes the affected
+    /// tiles in place).  ``extend`` only appends at the end of
+    /// the slow axis.  Partial last tiles are handled: the
+    /// boundary tile is decoded, combined with the first portion
+    /// of new data, and re-encoded.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate; mid-write I/O failures taint the
+    /// file.  Old boundary-tile bytes become orphans; call
+    /// :meth:`repack` to reclaim them.
     fn extend(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -493,11 +648,17 @@ impl CompressedImageHDU {
             &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
         )
     }
 
+    // __setitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same slice surface as ImageHDU.__setitem__: anything
+    // hdu[key] reads, hdu[key] = value writes.  Internally
+    // re-encodes every overlapping tile + appends to the heap;
+    // old tile bytes become orphans that repack() reclaims.
     fn __setitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -518,6 +679,7 @@ impl CompressedImageHDU {
             &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
             key,
@@ -525,12 +687,22 @@ impl CompressedImageHDU {
         )
     }
 
-    // Rebuild the tile-data heap with only the bytes that live
-    // descriptors point at, dropping orphans left behind by __setitem__
-    // / extend / boundary-tile re-encoding.  Shrinks the on-disk file
-    // when the new padded extent is smaller (last HDU: set_len; non-
-    // last HDU: tail shifts backward).  Clears the tile cache (its
-    // entries were keyed against the old heap layout).
+    /// Rebuild the tile-data heap, reclaiming orphan tiles.
+    ///
+    /// :meth:`extend` (when a partial last tile is re-encoded)
+    /// and ``__setitem__`` (every affected tile is re-encoded
+    /// and appended to the heap) both leave the old compressed
+    /// bytes as orphans referenced by no descriptor.  ``repack``
+    /// walks every live descriptor, streams its referenced bytes
+    /// into a compact new heap, and rewrites the descriptors to
+    /// point at it.  If the heap shrinks, the on-disk file
+    /// shrinks too: the last HDU uses ``set_len``, a non-last
+    /// HDU shifts the trailing HDUs backward in lockstep.
+    ///
+    /// Also clears the tile cache (its entries were keyed
+    /// against the old heap layout).
+    ///
+    /// No-op for an already-compact heap.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
         let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
@@ -747,7 +919,7 @@ pub(crate) fn header_has_zimage(header: &[String]) -> bool {
 //   - mask_blank=True rejected (ZBLANK handling is a follow-up)
 fn read_compressed_image_data(
     py: Python<'_>,
-    cards: &[String],
+    meta: &CompressedImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     tainted: &TaintFlag,
@@ -756,6 +928,18 @@ fn read_compressed_image_data(
     mask_blank: bool,
 ) -> PyResult<Py<PyAny>> {
     check_not_tainted(tainted)?;
+    let zbitpix = meta.zbitpix;
+    let image_shape = meta.image_shape.as_slice();
+    let tile_shape = meta.tile_shape.as_slice();
+    let algorithm = meta.algorithm;
+    let blocksize = meta.blocksize;
+    let bytepix = meta.bytepix;
+    let smooth = meta.smooth;
+    let naxis1 = meta.naxis1;
+    let theap = meta.theap;
+    let cols = &meta.cols;
+    let quant = meta.quant.as_ref();
+    let n_tiles = meta.n_tiles;
 
     // mask_blank parallels the uncompressed ImageHDU behavior, but
     // uses ZBLANK instead of BLANK (per the FITS Tile Compression
@@ -766,29 +950,16 @@ fn read_compressed_image_data(
     // space, but that's separate from the integer-pixel mask
     // semantics; NaN is already preserved on dequantize, so float
     // mask_blank stays rejected here too.)
-    let (zbitpix_early, _) = parse_compressed_image_shape(cards)?;
-    if mask_blank && zbitpix_early < 0 {
+    if mask_blank && zbitpix < 0 {
         return Err(PyValueError::new_err(format!(
             "mask_blank=True is not valid on float ZBITPIX ({}); the \
              FITS standard forbids BLANK on floating-point arrays \
              (NaN serves that role).  Use mask_blank=False, or \
              post-process with numpy.isnan.",
-            zbitpix_early
+            zbitpix
         )));
     }
 
-    // Algorithm dispatch — RICE_1 / GZIP_1 / GZIP_2 supported.
-    // HCOMPRESS_1 / PLIO_1 fall through the per-algorithm decoder
-    // dispatch in src/zimage/mod.rs and surface its NotImplemented
-    // error.
-    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
-        .ok_or_else(|| PyValueError::new_err(
-            "compressed HDU missing ZCMPTYPE"
-        ))?;
-    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
-
-    // Image shape + bitpix (image-side).
-    let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
     if image_shape.is_empty() {
         return Err(PyValueError::new_err(
             "compressed HDU has ZNAXIS=0 (no image data)"
@@ -802,65 +973,11 @@ fn read_compressed_image_data(
     // (i32) for the quantized-float path.  Same idea for bytepix:
     // 1/2/4/8 for integer images, always 4 for quantized float.
     let stored_zbitpix: i32 = if zbitpix < 0 { 32 } else { zbitpix };
-    let default_bytepix: u32 = match stored_zbitpix {
-        8 => 1, 16 => 2, 32 => 4, 64 => 8,
-        _ => return Err(PyValueError::new_err(format!(
-            "unsupported ZBITPIX {}", zbitpix
-        ))),
-    };
-
-    // RICE parameters: BLOCKSIZE and BYTEPIX from ZNAMEn/ZVALn.
-    // Defaults: BLOCKSIZE=32, BYTEPIX = stored_zbitpix/8.
-    let (blocksize, bytepix_from_header) = parse_rice_params(cards);
-    let blocksize = blocksize.unwrap_or(32);
-    let bytepix = bytepix_from_header.unwrap_or(default_bytepix);
-
-    // HCOMPRESS smoothing flag (ZNAMEn='SMOOTH').  False for any
-    // other algorithm (the decoder dispatch ignores it).
-    let smooth = parse_hcompress_smooth(cards);
-
-    // BINTABLE layout.
-    let naxis1 = parse_keyword(cards, "NAXIS1")
-        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
-        as u64;
-    let naxis2 = parse_keyword(cards, "NAXIS2")
-        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS2"))?
-        as u64;
-    // THEAP default = NAXIS1 * NAXIS2 (heap immediately after the
-    // main data section).
-    let theap = parse_keyword(cards, "THEAP")
-        .map(|x| x.max(0) as u64)
-        .unwrap_or(naxis1 * naxis2);
-    let cols = find_data_columns(cards)?;
-
-    // Quantization context (Some when ZBITPIX is float).  Carries
-    // the dither method, ZDITHER0 seed, and the per-tile column
-    // offsets needed for dequant.
-    // For float ZBITPIX this is Some(ctx) when quantization is in
-    // play (ZSCALE/ZZERO present + ZQUANTIZ != 'NONE'); None when
-    // the file stores raw unquantized floats.  Always None for
-    // integer ZBITPIX.
-    let quant = if zbitpix < 0 {
-        build_quant_context(cards, &cols)?
-    } else {
-        None
-    };
-
-    // Tile shape + sanity-check against NAXIS2.
-    let tile_shape = parse_tile_shape(cards, &image_shape);
-    let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
-    if n_tiles != naxis2 {
-        return Err(PyValueError::new_err(format!(
-            "ZIMAGE row count NAXIS2={} disagrees with computed \
-             tile count {} (image shape {:?}, tile shape {:?})",
-            naxis2, n_tiles, image_shape, tile_shape,
-        )));
-    }
 
     // Allocate output ndarray of the right shape + native dtype.
     let np = py.import("numpy")?;
     let dtype_str = zbitpix_to_native_dtype(zbitpix)?;
-    let shape_tuple = PyTuple::new(py, &image_shape)?;
+    let shape_tuple = PyTuple::new(py, image_shape)?;
     let out_arr = np.call_method1("empty", (shape_tuple, dtype_str))?;
     // Zero the array so that any test that asserts initial state
     // (or any future code that exits early) sees a clean value.
@@ -887,9 +1004,9 @@ fn read_compressed_image_data(
         let actual_shape = &shape_buf[..d];
         let tile_bytes = get_or_decode_tile(
             py, cache, file_handle, tainted, tile_idx, data_offset,
-            naxis1, theap, &cols, algorithm, actual_shape,
+            naxis1, theap, cols, algorithm, actual_shape,
             bytepix, blocksize, stored_zbitpix,
-            zbitpix, quant.as_ref(), smooth,
+            zbitpix, quant, smooth,
         )?;
         place_tile_bytes_into_output(
             py, &out_arr, &tile_bytes, dtype_str,
@@ -902,8 +1019,8 @@ fn read_compressed_image_data(
     // For integer ZBITPIX this is a simple `arr == ZBLANK` mask;
     // the float branch was rejected at the top.
     let mask_opt = if mask_blank {
-        crate::hdu_image::compute_blank_mask_for_key(
-            cards, &out_arr, "ZBLANK",
+        crate::hdu_image::compute_blank_mask_from_value(
+            meta.zblank, &out_arr,
         )?
     } else {
         None
@@ -912,10 +1029,11 @@ fn read_compressed_image_data(
     // Apply BSCALE/BZERO (same dispatch the uncompressed path uses).
     let unbound = out_arr.unbind();
     let scaled = if scale {
-        let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
-        let kind = crate::hdu_image::image_scaling_kind(zbitpix, bscale, bzero);
+        let kind = crate::hdu_image::image_scaling_kind(
+            zbitpix, meta.bscale, meta.bzero,
+        );
         crate::hdu_image::apply_image_scaling(
-            py, unbound, zbitpix, kind, bscale, bzero,
+            py, unbound, zbitpix, kind, meta.bscale, meta.bzero,
         )?
     } else {
         unbound
@@ -937,7 +1055,7 @@ fn read_compressed_image_data(
 // GZIP_COMPRESSED_DATA always use byte inner type (B → 1);
 // UNCOMPRESSED_DATA uses whichever inner type matches ZBITPIX
 // (B/I/J/K), so the byte-count math has to consult inner_byte_width.
-struct ColumnInfo {
+pub(crate) struct ZimageColumnInfo {
     byte_offset_in_row: u64,
     is_q: bool,
     inner_byte_width: u64,
@@ -948,10 +1066,10 @@ struct ColumnInfo {
 // only used in specific code paths (fallbacks when the primary
 // tile is empty; ZSCALE/ZZERO when ZBITPIX is float).  Resolved
 // in find_data_columns by walking TTYPEn.
-struct DataColumns {
-    primary: ColumnInfo,
-    gzip_fallback: Option<ColumnInfo>,
-    uncompressed_fallback: Option<ColumnInfo>,
+pub(crate) struct ZimageDataColumns {
+    primary: ZimageColumnInfo,
+    gzip_fallback: Option<ZimageColumnInfo>,
+    uncompressed_fallback: Option<ZimageColumnInfo>,
     // Fixed-width 1D (double) columns used for per-tile
     // dequantization.  Stored as raw row-byte offsets — the
     // dequant path seeks to `data_offset + row*naxis1 + offset`
@@ -992,7 +1110,7 @@ enum TilePayload {
 // `slice_compressed_image` when ZBITPIX is negative, then carried
 // through the tile loop so `get_or_decode_tile` can read per-tile
 // ZSCALE/ZZERO and dequantize after decode.
-struct QuantContext {
+pub(crate) struct ZimageQuantContext {
     method: crate::zimage::quantize::DitherMethod,
     zdither0: i64,
     zscale_offset_in_row: u64,
@@ -1000,6 +1118,109 @@ struct QuantContext {
     // ZBITPIX of the *output* float dtype (-32 or -64).  Decoder
     // always works in i32; this picks dequantize_to_f32 vs _f64.
     output_zbitpix: i32,
+}
+
+// Parsed-once snapshot of all per-HDU compressed-image metadata
+// that the hot paths (read / slice / extend / __setitem__ / repack
+// + the inspection accessors) re-derived from the cards Vec on
+// every call before Phase 2 of header-cache landed.  Cached on the
+// HDU keyed by `cards_version` (see `meta()`), so successive calls
+// against an unchanged header pay only a single Mutex lock + integer
+// compare + Arc clone.
+//
+// What is NOT cached here: per-call inputs (slice keys, mask_blank
+// flag, scale flag) — those vary across calls and don't belong in
+// the meta.  BSCALE / BZERO are cached because they're needed every
+// read+slice path.  ZBLANK is NOT cached — only the mask_blank=True
+// path consults it, and that's a single keyword lookup.
+pub(crate) struct CompressedImageMeta {
+    pub(crate) zbitpix: i32,
+    pub(crate) image_shape: Vec<u64>,
+    pub(crate) tile_shape: Vec<u64>,
+    pub(crate) n_tiles: u64,
+    pub(crate) algorithm: CompressionAlgorithm,
+    // Decoder parameters.
+    pub(crate) blocksize: u32,
+    pub(crate) bytepix: u32,
+    pub(crate) smooth: bool,
+    // On-disk BINTABLE layout used by tile lookups.  NAXIS2 is
+    // not stored separately because it must equal `n_tiles` (the
+    // parser sanity-checks the two).
+    pub(crate) naxis1: u64,
+    pub(crate) theap: u64,
+    pub(crate) cols: ZimageDataColumns,
+    // None for integer ZBITPIX, None for unquantized-float HDUs
+    // (ZQUANTIZ='NONE' or ZSCALE/ZZERO columns missing).  Some(ctx)
+    // when per-tile dequantization needs to run after decode.
+    pub(crate) quant: Option<ZimageQuantContext>,
+    // Image-side BSCALE/BZERO for output scaling (independent of
+    // the decoder; applied by the read path on the assembled array
+    // when scale=True).  Defaults are (1.0, 0.0).
+    pub(crate) bscale: f64,
+    pub(crate) bzero: f64,
+    // ZBLANK card value (the integer sentinel for masked pixels);
+    // None when absent.  Only the `read(mask_blank=True)` path
+    // consults it.  Cached so neither hot path needs cards at all.
+    pub(crate) zblank: Option<i64>,
+}
+
+// Parse all of the above from the cards Vec.  Same validation rules
+// the inlined parsing used (in slice_compressed_image et al.) — just
+// in one place instead of every hot-path entry point.
+fn parse_compressed_image_meta(cards: &[String]) -> PyResult<CompressedImageMeta> {
+    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
+        .ok_or_else(|| PyValueError::new_err(
+            "compressed HDU missing ZCMPTYPE"
+        ))?;
+    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
+    let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
+    if image_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "compressed HDU has ZNAXIS=0 (no image data)"
+        ));
+    }
+    let stored_zbitpix: i32 = if zbitpix < 0 { 32 } else { zbitpix };
+    let default_bytepix: u32 = match stored_zbitpix {
+        8 => 1, 16 => 2, 32 => 4, 64 => 8,
+        _ => return Err(PyValueError::new_err(format!(
+            "unsupported ZBITPIX {}", zbitpix
+        ))),
+    };
+    let (blocksize, bytepix_from_header) = parse_rice_params(cards);
+    let blocksize = blocksize.unwrap_or(32);
+    let bytepix = bytepix_from_header.unwrap_or(default_bytepix);
+    let smooth = parse_hcompress_smooth(cards);
+    let naxis1 = parse_keyword(cards, "NAXIS1")
+        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
+        as u64;
+    let naxis2 = parse_keyword(cards, "NAXIS2")
+        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS2"))?
+        as u64;
+    let theap = parse_keyword(cards, "THEAP")
+        .map(|x| x.max(0) as u64)
+        .unwrap_or(naxis1 * naxis2);
+    let cols = find_data_columns(cards)?;
+    let quant = if zbitpix < 0 {
+        build_quant_context(cards, &cols)?
+    } else {
+        None
+    };
+    let tile_shape = parse_tile_shape(cards, &image_shape);
+    let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
+    if n_tiles != naxis2 {
+        return Err(PyValueError::new_err(format!(
+            "ZIMAGE row count NAXIS2={} disagrees with tile count {}",
+            naxis2, n_tiles
+        )));
+    }
+    let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
+    let zblank = parse_keyword(cards, "ZBLANK");
+    Ok(CompressedImageMeta {
+        zbitpix, image_shape, tile_shape, n_tiles, algorithm,
+        blocksize, bytepix, smooth,
+        naxis1, theap,
+        cols, quant, bscale, bzero, zblank,
+    })
 }
 
 // Parse ZQUANTIZ + ZDITHER0 + verify ZSCALE/ZZERO columns are
@@ -1016,8 +1237,8 @@ struct QuantContext {
 // (would indicate a malformed file).
 fn build_quant_context(
     cards: &[String],
-    cols: &DataColumns,
-) -> PyResult<Option<QuantContext>> {
+    cols: &ZimageDataColumns,
+) -> PyResult<Option<ZimageQuantContext>> {
     let zquantiz = parse_string_keyword(cards, "ZQUANTIZ");
     let method_opt = crate::zimage::quantize::parse_dither_method(
         zquantiz.as_deref(),
@@ -1053,7 +1274,7 @@ fn build_quant_context(
             zbitpix
         )));
     }
-    Ok(Some(QuantContext {
+    Ok(Some(ZimageQuantContext {
         method,
         zdither0,
         zscale_offset_in_row,
@@ -1066,16 +1287,16 @@ fn build_quant_context(
 // column (required) plus the optional GZIP_COMPRESSED_DATA and
 // UNCOMPRESSED_DATA fallback columns.  All preceding columns
 // contribute their byte width to the running offset.
-fn find_data_columns(header: &[String]) -> PyResult<DataColumns> {
+fn find_data_columns(header: &[String]) -> PyResult<ZimageDataColumns> {
     let tfields = parse_keyword(header, "TFIELDS").unwrap_or(0).max(0) as u64;
     if tfields == 0 {
         return Err(PyValueError::new_err(
             "ZIMAGE BINTABLE has TFIELDS=0"
         ));
     }
-    let mut primary: Option<ColumnInfo> = None;
-    let mut gzip_fallback: Option<ColumnInfo> = None;
-    let mut uncompressed_fallback: Option<ColumnInfo> = None;
+    let mut primary: Option<ZimageColumnInfo> = None;
+    let mut gzip_fallback: Option<ZimageColumnInfo> = None;
+    let mut uncompressed_fallback: Option<ZimageColumnInfo> = None;
     let mut zscale_offset_in_row: Option<u64> = None;
     let mut zzero_offset_in_row: Option<u64> = None;
 
@@ -1088,7 +1309,7 @@ fn find_data_columns(header: &[String]) -> PyResult<DataColumns> {
                 "ZIMAGE BINTABLE column {} missing TFORM", i
             )))?;
         let width = tform_byte_width(&tform)?;
-        let info = ColumnInfo {
+        let info = ZimageColumnInfo {
             byte_offset_in_row: offset,
             is_q: tform_is_q_descriptor(&tform),
             inner_byte_width: tform_vla_inner_byte_width(&tform).unwrap_or(1),
@@ -1098,7 +1319,7 @@ fn find_data_columns(header: &[String]) -> PyResult<DataColumns> {
             "GZIP_COMPRESSED_DATA" => gzip_fallback = Some(info),
             "UNCOMPRESSED_DATA" => uncompressed_fallback = Some(info),
             // ZSCALE / ZZERO are fixed-width 1D columns — the
-            // ColumnInfo's VLA fields are meaningless here, but
+            // ZimageColumnInfo's VLA fields are meaningless here, but
             // the byte_offset is what the dequant path needs.
             "ZSCALE" => zscale_offset_in_row = Some(offset),
             "ZZERO" => zzero_offset_in_row = Some(offset),
@@ -1109,7 +1330,7 @@ fn find_data_columns(header: &[String]) -> PyResult<DataColumns> {
     let primary = primary.ok_or_else(|| PyValueError::new_err(
         "ZIMAGE BINTABLE missing COMPRESSED_DATA column"
     ))?;
-    Ok(DataColumns {
+    Ok(ZimageDataColumns {
         primary,
         gzip_fallback,
         uncompressed_fallback,
@@ -1334,17 +1555,16 @@ fn read_uncompressed_image_be_bytes(
 ) -> PyResult<Vec<u8>> {
     // Get the equivalent (BITPIX-native, native-endian) data via
     // the existing read path with scaling off.
-    let cache = Arc::clone(&slf.cache);
     let super_ = slf.as_super().as_super();
-    let cards = super_.header_snapshot()?;
+    let meta = slf.meta(super_)?;
     let arr_native = read_compressed_image_data(
-        py, &cards, super_.offsets.data_offset(),
-        &super_.file, &super_.tainted, &cache,
+        py, &meta, super_.offsets.data_offset(),
+        &super_.file, &super_.tainted, &slf.cache,
         false, // scale=False — we want stored-space BITPIX-native
         false, // mask_blank=False — checksum is over raw bytes
     )?;
     let arr = arr_native.bind(py);
-    let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
+    let zbitpix = meta.zbitpix;
     let be_dtype = match zbitpix {
         8 => ">u1",
         16 => ">i2",
@@ -1709,7 +1929,7 @@ fn get_or_decode_tile(
     data_offset: u64,
     naxis1: u64,
     theap: u64,
-    cols: &DataColumns,
+    cols: &ZimageDataColumns,
     algorithm: CompressionAlgorithm,
     actual_shape: &[u64],
     bytepix: u32,
@@ -1723,7 +1943,7 @@ fn get_or_decode_tile(
     // to decide f32 vs f64 output.  Equals stored_zbitpix when
     // there's no quantization in play.
     output_zbitpix: i32,
-    quant: Option<&QuantContext>,
+    quant: Option<&ZimageQuantContext>,
     // HCOMPRESS_1 SMOOTH flag (ignored by every other algorithm).
     smooth: bool,
 ) -> PyResult<Arc<Vec<u8>>> {
@@ -1836,7 +2056,7 @@ fn get_or_decode_tile(
                 tile_row_1based, ctx.zdither0,
             ),
             other => return Err(PyValueError::new_err(format!(
-                "QuantContext.output_zbitpix={} not in {{-32,-64}}",
+                "ZimageQuantContext.output_zbitpix={} not in {{-32,-64}}",
                 other
             ))),
         }
@@ -1867,9 +2087,9 @@ fn fetch_tile_payload_and_quant(
     data_offset: u64,
     naxis1: u64,
     theap: u64,
-    cols: &DataColumns,
+    cols: &ZimageDataColumns,
     algorithm: CompressionAlgorithm,
-    quant: Option<&QuantContext>,
+    quant: Option<&ZimageQuantContext>,
 ) -> PyResult<(TilePayload, Option<(f64, f64)>)> {
     let mut guard = file_handle.lock()
         .map_err(|_| PyIOError::new_err("file lock poisoned"))?;
@@ -1904,7 +2124,7 @@ fn fetch_tile_payload(
     data_offset: u64,
     naxis1: u64,
     theap: u64,
-    cols: &DataColumns,
+    cols: &ZimageDataColumns,
     algorithm: CompressionAlgorithm,
 ) -> PyResult<TilePayload> {
     let mut guard = file_handle.lock()
@@ -1922,7 +2142,7 @@ fn fetch_tile_payload_inner(
     tile_idx: u64,
     data_offset: u64,
     theap: u64,
-    cols: &DataColumns,
+    cols: &ZimageDataColumns,
     algorithm: CompressionAlgorithm,
     row_offset: u64,
 ) -> PyResult<TilePayload> {
@@ -2308,7 +2528,7 @@ fn axis_overlap<'py>(
 // is unwrapped to a numpy scalar.
 fn slice_compressed_image(
     py: Python<'_>,
-    cards: &[String],
+    meta: &CompressedImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     tainted: &TaintFlag,
@@ -2316,62 +2536,21 @@ fn slice_compressed_image(
     key: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     check_not_tainted(tainted)?;
-
-    // Algorithm + image-side bitpix + image shape — same
-    // validation as the whole-image read path.
-    let zcmptype = parse_string_keyword(cards, "ZCMPTYPE")
-        .ok_or_else(|| PyValueError::new_err(
-            "compressed HDU missing ZCMPTYPE"
-        ))?;
-    let algorithm = crate::zimage::parse_algorithm(&zcmptype)?;
-    let (zbitpix, image_shape) = parse_compressed_image_shape(cards)?;
-    if image_shape.is_empty() {
-        return Err(PyValueError::new_err(
-            "compressed HDU has ZNAXIS=0 (no image data)"
-        ));
-    }
+    let zbitpix = meta.zbitpix;
+    let image_shape = meta.image_shape.as_slice();
+    let tile_shape = meta.tile_shape.as_slice();
+    let algorithm = meta.algorithm;
+    let blocksize = meta.blocksize;
+    let bytepix = meta.bytepix;
+    let smooth = meta.smooth;
+    let naxis1 = meta.naxis1;
+    let theap = meta.theap;
+    let cols = &meta.cols;
+    let quant = meta.quant.as_ref();
+    let n_tiles = meta.n_tiles;
     // Same stored vs output ZBITPIX split as the whole-image read
     // path; see read_compressed_image_data for the rationale.
     let stored_zbitpix: i32 = if zbitpix < 0 { 32 } else { zbitpix };
-    let default_bytepix: u32 = match stored_zbitpix {
-        8 => 1, 16 => 2, 32 => 4, 64 => 8,
-        _ => return Err(PyValueError::new_err(format!(
-            "unsupported ZBITPIX {}", zbitpix
-        ))),
-    };
-    let (blocksize, bytepix_from_header) = parse_rice_params(cards);
-    let blocksize = blocksize.unwrap_or(32);
-    let bytepix = bytepix_from_header.unwrap_or(default_bytepix);
-    let smooth = parse_hcompress_smooth(cards);
-
-    let naxis1 = parse_keyword(cards, "NAXIS1")
-        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS1"))?
-        as u64;
-    let naxis2 = parse_keyword(cards, "NAXIS2")
-        .ok_or_else(|| PyValueError::new_err("BINTABLE missing NAXIS2"))?
-        as u64;
-    let theap = parse_keyword(cards, "THEAP")
-        .map(|x| x.max(0) as u64)
-        .unwrap_or(naxis1 * naxis2);
-    let cols = find_data_columns(cards)?;
-    // For float ZBITPIX this is Some(ctx) when quantization is in
-    // play (ZSCALE/ZZERO present + ZQUANTIZ != 'NONE'); None when
-    // the file stores raw unquantized floats.  Always None for
-    // integer ZBITPIX.
-    let quant = if zbitpix < 0 {
-        build_quant_context(cards, &cols)?
-    } else {
-        None
-    };
-
-    let tile_shape = parse_tile_shape(cards, &image_shape);
-    let n_tiles = compute_n_tiles(&image_shape, &tile_shape);
-    if n_tiles != naxis2 {
-        return Err(PyValueError::new_err(format!(
-            "ZIMAGE row count NAXIS2={} disagrees with tile count {}",
-            naxis2, n_tiles
-        )));
-    }
 
     // Parse the slice key.  Fancy lists/arrays raise here via
     // parse_axis_indexer's "unsupported index type" error, matching
@@ -2443,9 +2622,9 @@ fn slice_compressed_image(
             let actual_shape = &shape_buf[..d_img];
             let tile_bytes = get_or_decode_tile(
                 py, cache, file_handle, tainted, tile_idx, data_offset,
-                naxis1, theap, &cols, algorithm, actual_shape,
+                naxis1, theap, cols, algorithm, actual_shape,
                 bytepix, blocksize, stored_zbitpix,
-                zbitpix, quant.as_ref(), smooth,
+                zbitpix, quant, smooth,
             )?;
             strided_copy_c_contig_to_c_contig(
                 dst_bytes, &output_shape, &out_start_buf[..d_img],
@@ -2492,9 +2671,9 @@ fn slice_compressed_image(
             // Fetch tile bytes (cache or decode), wrap as ndarray.
             let tile_bytes = get_or_decode_tile(
                 py, cache, file_handle, tainted, tile_idx, data_offset,
-                naxis1, theap, &cols, algorithm, actual_shape,
+                naxis1, theap, cols, algorithm, actual_shape,
                 bytepix, blocksize, stored_zbitpix,
-                zbitpix, quant.as_ref(), smooth,
+                zbitpix, quant, smooth,
             )?;
             let pybytes = PyBytes::new(py, &tile_bytes);
             let arr1d = np.call_method1(
@@ -2520,10 +2699,11 @@ fn slice_compressed_image(
     // Always scale on __getitem__ (matches the table-side
     // convention; user can read(scale=False) for the whole image).
     let unbound = out_arr.unbind();
-    let (bscale, bzero) = crate::hdu_image::parse_bscale_bzero(cards);
-    let kind = crate::hdu_image::image_scaling_kind(zbitpix, bscale, bzero);
+    let kind = crate::hdu_image::image_scaling_kind(
+        zbitpix, meta.bscale, meta.bzero,
+    );
     let scaled = crate::hdu_image::apply_image_scaling(
-        py, unbound, zbitpix, kind, bscale, bzero,
+        py, unbound, zbitpix, kind, meta.bscale, meta.bzero,
     )?;
 
     if all_int {
@@ -2886,6 +3066,7 @@ fn write_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>
     >,
@@ -3362,9 +3543,12 @@ fn write_compressed_image_data(
     }
 
     // ----- header rewrite (PCOUNT update) -----
-    let mut cards_guard = cards_arc.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, total_heap_bytes);
     {
         let mut g = lock_file(file_handle)?;
@@ -3387,7 +3571,7 @@ fn write_compressed_image_data(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Any tiles cached from earlier reads are now stale.
     cache.clear();
@@ -3454,6 +3638,7 @@ fn extend_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
@@ -4213,10 +4398,12 @@ fn extend_compressed_image_data(
     }
 
     // ----- header rewrite (PCOUNT + NAXIS2 + ZNAXIS<last>) -----
-    let mut cards_guard = cards_arc
-        .lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     update_int_card(&mut new_cards, "NAXIS2", new_n_tiles as i64);
     // numpy axis 0 = slowest = FITS NAXIS<znaxis> (highest-numbered).
@@ -4247,7 +4434,7 @@ fn extend_compressed_image_data(
             ))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Boundary tiles' content changed (and any cached new tiles
     // would be inconsistent with the new heap layout anyway).
@@ -4390,6 +4577,7 @@ fn setitem_compressed_image(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
@@ -4932,10 +5120,12 @@ fn setitem_compressed_image(
     }
 
     // ----- header rewrite (PCOUNT only — shape unchanged) -----
-    let mut cards_guard = cards_arc
-        .lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(file_handle)?;
@@ -4961,7 +5151,7 @@ fn setitem_compressed_image(
             ))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Modified tiles are now stale in the cache.
     cache.clear();
@@ -5037,7 +5227,7 @@ fn repack_compressed_heap(
 
     // Walk every row × every descriptor column; copy live cells.
     let primary_slot = Some(cols.primary);
-    let cols_list: [&Option<ColumnInfo>; 3] = [
+    let cols_list: [&Option<ZimageColumnInfo>; 3] = [
         &primary_slot,
         &cols.gzip_fallback,
         &cols.uncompressed_fallback,
@@ -5140,9 +5330,8 @@ fn repack_compressed_heap(
     }
 
     // PCOUNT update — disk-write-before-commit.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -5163,7 +5352,7 @@ fn repack_compressed_heap(
                 "repack: PCOUNT header flush: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     cache.clear();
     Ok(())
 }

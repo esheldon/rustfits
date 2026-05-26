@@ -465,6 +465,49 @@ fn append_header_and_data_to_file(
     Ok(HduOffsets::new(header_start, num_blocks, header_end))
 }
 
+/// A FITS file open for reading, writing, or both.
+///
+/// The top-level entry point of rustfits.  Open an existing file
+/// or create a new one, then index or iterate to reach individual
+/// HDUs::
+///
+///     # Read an existing file
+///     with rustfits.FITS("data.fits", "r") as fits:
+///         for hdu in fits:
+///             print(hdu.extname, hdu.has_data)
+///         sci = fits["SCI"]            # by EXTNAME
+///         hdu2 = fits[2]               # by position
+///         arr = fits[1].read()
+///
+///     # Append a new HDU to an existing file
+///     with rustfits.FITS("data.fits", "r+") as fits:
+///         fits.create_image_hdu("f4", (100, 100), extname="MODEL")
+///         fits[-1].write(model)
+///
+///     # Create a new file (or truncate an existing one)
+///     with rustfits.FITS("out.fits", "w+") as fits:
+///         fits.create_table_hdu(my_dtype, nrows=1000)
+///         fits[1].write(rows)
+///
+/// Parameters
+/// ----------
+/// filename : str
+///     Path to the FITS file.
+/// mode : {'r', 'r+', 'w+'}, optional
+///     File open mode.
+///
+///     * ``'r'`` (default) — read-only; the file must exist.
+///     * ``'r+'`` — read+write; the file must exist.  Used to
+///       modify or append HDUs to an existing file.
+///     * ``'w+'`` — read+write; creates the file if it doesn't
+///       exist, **truncates** to zero length if it does.
+///       Equivalent to fitsio's ``'rw'`` + ``clobber=True``.
+///
+/// Notes
+/// -----
+/// Use as a context manager (``with rustfits.FITS(...) as fits:``)
+/// to guarantee the file handle is closed.  ``len(fits)`` returns
+/// the HDU count; iteration yields each HDU in file order.
 #[pyclass]
 pub(crate) struct FITS {
     filename: String,
@@ -1183,17 +1226,30 @@ impl FITS {
         })
     }
 
+    /// List of HDU objects in file order.
+    ///
+    /// Equivalent to iterating the :class:`FITS` instance, but
+    /// returns a real Python list (e.g. for slicing / length
+    /// queries without consuming the iterator).
     #[getter]
     fn hdus(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let list = PyList::new(py, &self.hdus)?;
         Ok(list.unbind())
     }
 
+    /// Path passed to the constructor.
     #[getter]
     fn filename(&self) -> String {
         self.filename.clone()
     }
 
+    /// Close the file handle and sync pending writes to disk.
+    ///
+    /// Called automatically when the :class:`FITS` is used as a
+    /// context manager (``with rustfits.FITS(...) as fits:``).
+    /// Safe to call multiple times.  After closing, attempting
+    /// any read or write through the FITS object or its HDUs
+    /// raises ``IOError``.
     fn close(&mut self) -> PyResult<()> {
         let mut guard = lock_file(&self.file)?;
         if let Some(file) = guard.take() {
@@ -1202,6 +1258,8 @@ impl FITS {
         Ok(())
     }
 
+    /// ``True`` once :meth:`close` (or context-manager ``__exit__``)
+    /// has been called; ``False`` while the file is open.
     #[getter]
     fn closed(&self) -> PyResult<bool> {
         let guard = lock_file(&self.file)?;
@@ -1272,29 +1330,70 @@ impl FITS {
         Ok(list.try_iter()?.into_any().unbind())
     }
 
-    // Create a new image HDU.  `dtype` follows numpy short-code convention
-    // (e.g. 'f8', 'i4').  `dims` is the array shape in numpy (row-major)
-    // order and is reversed internally to produce FITS NAXISn.  The first
-    // HDU created becomes the primary HDU (SIMPLE=T, EXTEND=T); subsequent
-    // calls produce 'IMAGE' extensions.  The data section is allocated as
-    // zeros via sparse file extension.
-    //
-    // `compress`, when non-None, is a compression-config object (e.g.
-    // `rustfits.Gzip1(tile_shape=..., heap_format='P')`).  In that case
-    // the HDU is created as a tile-compressed image (BINTABLE+ZIMAGE on
-    // disk, `CompressedImageHDU` in Python) instead of a plain IMAGE
-    // extension.  All five integer-ZBITPIX encoders are supported
-    // (GZIP_1/2, RICE_1, HCOMPRESS_1, PLIO_1).
-    //
-    // `quantize`, when non-None, is a `Quantize` config object
-    // (`rustfits.Quantize(level=..., method='dither1', seed=0)`).
-    // Required for float-image compression (Phase 8): float values
-    // are quantized to i32 per-tile before being passed to the
-    // chosen integer compression algorithm, with per-tile ZSCALE /
-    // ZZERO columns recording the scaling.  Ignored for integer
-    // images.  When omitted on float input, a default
-    // `Quantize()` is used (cfitsio-equivalent defaults: level=4.0,
-    // method='dither1', seed=0).
+    /// Create a new image HDU and append it to the file.
+    ///
+    /// Allocates the data section as zeros via sparse-file extension
+    /// — call :meth:`ImageHDU.write` (or use the returned HDU as
+    /// ``fits[-1]``) to actually write pixel data.
+    ///
+    /// The first HDU created becomes the primary HDU (``SIMPLE=T``,
+    /// ``EXTEND=T``); subsequent calls produce ``XTENSION='IMAGE'``
+    /// extensions.
+    ///
+    /// Parameters
+    /// ----------
+    /// dtype : str
+    ///     numpy short-code for the image element type, e.g.
+    ///     ``'f8'``, ``'i4'``, ``'u2'``.  Both the BITPIX-native
+    ///     dtypes (``u1`` / ``i2`` / ``i4`` / ``i8`` / ``f4`` /
+    ///     ``f8``) and the unsigned-int trick dtypes (``i1`` /
+    ///     ``u2`` / ``u4`` / ``u8``) are accepted; the latter
+    ///     emit the corresponding ``BSCALE`` + ``BZERO`` cards.
+    /// dims : sequence of int
+    ///     Image shape in numpy (row-major) axis order — slowest
+    ///     axis first.  Reversed internally to produce FITS
+    ///     ``NAXISn``.  Every dimension must be ``> 0``.
+    /// extname : str, optional
+    ///     ``EXTNAME`` to assign.  Defaults to no EXTNAME card.
+    /// extver : int, optional
+    ///     ``EXTVER`` to assign.  Defaults to no EXTVER card.
+    /// compress : Gzip1 / Gzip2 / Rice1 / Hcompress1 / Plio1, optional
+    ///     If set, create a tile-compressed image
+    ///     (``BINTABLE`` + ``ZIMAGE`` on disk, returned in Python
+    ///     as a :class:`CompressedImageHDU`) instead of a plain
+    ///     ``IMAGE`` extension.  All five algorithms are
+    ///     supported for integer dtypes; only GZIP_1 / GZIP_2
+    ///     for unquantized floats; all-but-PLIO for quantized
+    ///     floats.
+    /// quantize : Quantize, optional
+    ///     Per-tile quantization config for float-image
+    ///     compression: ``rustfits.Quantize(level=...,
+    ///     method='dither1', seed=0)``.  Required when
+    ///     ``compress=`` is set and the dtype is ``f4``/``f8``
+    ///     and you want lossy storage.  Ignored for integer
+    ///     dtypes.  Omit on float input to write losslessly
+    ///     (raw float bytes through GZIP).
+    /// blank : int, optional
+    ///     Sentinel value for masked pixels (emits ``BLANK`` for
+    ///     uncompressed, ``ZBLANK`` for compressed integer HDUs).
+    ///     Only valid for integer dtypes; float HDUs use NaN.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Unsupported dtype, non-positive dimension, ``quantize=``
+    ///     without ``compress=``, ``blank=`` on a float dtype, or
+    ///     other algorithm/dtype incompatibilities (see
+    ///     :class:`Rice1` / :class:`Hcompress1` / :class:`Plio1`
+    ///     for per-algorithm constraints).
+    ///
+    /// See Also
+    /// --------
+    /// create_table_hdu : The table-side counterpart.
+    /// Gzip1, Gzip2, Rice1, Hcompress1, Plio1 : Compression
+    ///     config classes for the ``compress=`` argument.
+    /// Quantize : Per-tile quantization config for float-image
+    ///     compression.
     #[pyo3(signature = (
         dtype, dims, *, extname=None, extver=None,
         compress=None, quantize=None, blank=None,
@@ -1411,22 +1510,87 @@ impl FITS {
         self.finalize_hdu(py, &cards, offsets, HduKind::Image)
     }
 
-    // Create a new BINTABLE extension HDU.  `dtype` is either a
-    // numpy.dtype OR a "descr" list of tuples (any form numpy.dtype()
-    // accepts) — it is normalized internally to a structured dtype.
-    // `nrows` (default 0) is the row count to allocate in the data
-    // section; subsequent TableHDU.write(arr) currently requires
-    // len(arr) == nrows.
-    //
-    // If the file has no HDUs yet, an empty primary image
-    // (SIMPLE=T, NAXIS=0) is automatically written first so that the
-    // BINTABLE can land as an extension — the FITS standard forbids
-    // BINTABLE as the primary HDU.
-    //
-    // MVP supports scalar fields with i2/i4/i8/u1/f4/f8 dtypes.
-    // Subsequent commits add the unsigned-int trick (u2/u4/u8),
-    // bool/complex, subarray fields, strings, and dict/list+names
-    // input forms.  See the Table Write Roadmap in CLAUDE.md.
+    /// Create a new BINTABLE extension HDU and append it to the file.
+    ///
+    /// Allocates the data section as zeros — call
+    /// :meth:`TableHDU.write` (or use the returned HDU as
+    /// ``fits[-1]``) to actually write row data.
+    ///
+    /// If the file has no HDUs yet, an empty primary image
+    /// (``SIMPLE=T``, ``NAXIS=0``) is written first so the
+    /// BINTABLE can land as an extension — the FITS standard
+    /// forbids BINTABLE as the primary HDU.
+    ///
+    /// Parameters
+    /// ----------
+    /// dtype : numpy.dtype or list of tuples
+    ///     Structured dtype describing the table schema, or any
+    ///     form ``numpy.dtype()`` accepts (e.g. a "descr" list
+    ///     like ``[('x', 'f4'), ('y', 'f4'), ('name', 'S10')]``).
+    ///     For VLA columns, use Object dtype (``'O'``) for the
+    ///     field and declare its inner type via ``var_dtypes=``.
+    /// nrows : int, optional
+    ///     Initial row count.  Default ``0``; subsequent
+    ///     :meth:`TableHDU.write` requires the value to match
+    ///     this exactly, while :meth:`TableHDU.append` adds
+    ///     rows beyond it.
+    /// extname : str, optional
+    ///     ``EXTNAME`` to assign.
+    /// extver : int, optional
+    ///     ``EXTVER`` to assign.
+    /// units : dict, optional
+    ///     ``{column_name: unit_string}`` to populate ``TUNITn``
+    ///     cards.  Unspecified columns get no TUNIT.
+    /// var_dtypes : dict, optional
+    ///     For VLA columns: ``{column_name: inner_dtype_str}``,
+    ///     where ``inner_dtype_str`` is a numpy short-code for
+    ///     the per-cell element type (``'f4'`` / ``'i4'`` / etc.)
+    ///     or ``'S'`` for ASCII strings.  The column itself must
+    ///     be declared as Object dtype (``'O'``) in ``dtype``.
+    /// bit_columns : list of str or True, optional
+    ///     Opt-in to bit-packed ``X`` storage for bool columns:
+    ///     a list of column names (case-insensitive) restricts the
+    ///     opt-in to those columns; ``True`` is a soft global
+    ///     toggle for ALL ``b1`` columns.  Default is one byte
+    ///     per bool (``L``).
+    /// heap_format : {'P', 'Q'}, optional
+    ///     Descriptor format for VLA columns.  ``'P'`` (default)
+    ///     uses 8-byte descriptors with a 4 GB heap ceiling;
+    ///     ``'Q'`` uses 16-byte descriptors with no practical
+    ///     ceiling.  Ignored when no VLA columns are declared.
+    /// compress : str, bool, or per-algorithm config / dict, optional
+    ///     Create a tile-compressed table (``ZTABLE`` on disk,
+    ///     :class:`CompressedTableHDU` in Python) instead of a
+    ///     plain BINTABLE.  Accepts:
+    ///
+    ///     * ``True`` — compress every column with cfitsio's
+    ///       per-dtype defaults.
+    ///     * a string alias (``'GZIP_1'`` / ``'GZIP_2'`` /
+    ///       ``'RICE_1'``) or config-class instance
+    ///       (``Gzip1()`` / ``Gzip2()`` / ``Rice1()``) — apply
+    ///       to every column.
+    ///     * a dict ``{column_name: algo}`` — per-column
+    ///       override; unspecified columns get the default.
+    /// ztilelen : int, optional
+    ///     Rows per tile for table compression.  Defaults to
+    ///     cfitsio's ``max(1, min(nrows, 10_000_000 /
+    ///     row_width))``.  Requires ``compress=``; rejected
+    ///     otherwise.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Negative ``nrows``; unsupported per-column dtype;
+    ///     ``var_dtypes=`` declared for a non-Object field;
+    ///     ``ztilelen=`` set without ``compress=``; invalid
+    ///     ``compress=`` form; or an algorithm not legal for
+    ///     a column's dtype (e.g. ``RICE_1`` on float).
+    ///
+    /// See Also
+    /// --------
+    /// create_image_hdu : The image-side counterpart.
+    /// TableHDU.write : Write data into the created table.
+    /// TableHDU.append : Add rows beyond ``nrows``.
     #[pyo3(signature = (
         dtype, nrows=0, *,
         extname=None, extver=None, units=None,

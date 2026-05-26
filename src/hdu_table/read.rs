@@ -9,8 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::common::{lock_file, parse_keyword, FileHandle, RawBuffer};
 
 use super::columns::{
-    bytes_per_element, byteswap_unit, parse_columns, scaled_output_dtype,
-    scaling_kind, Column, ScalingKind,
+    bytes_per_element, byteswap_unit, scaled_output_dtype, scaling_kind,
+    Column, ScalingKind, TableMeta,
 };
 
 // Unsigned-trick conversion for one column-cell's worth of elements.
@@ -716,7 +716,7 @@ fn heap_pass(
     file_handle: &FileHandle,
     columns: &[Column],
     data_offset: u64,
-    cards: &[String],
+    theap: u64,
     mut var_cells: Vec<VarCell>,
     as_bytes: bool,
     single_column: bool,
@@ -725,7 +725,7 @@ fn heap_pass(
     if var_cells.is_empty() {
         return Ok(());
     }
-    let heap_base_file = data_offset + heap_base_in_data(cards);
+    let heap_base_file = data_offset + theap;
     var_cells.sort_by_key(|c| c.heap_offset);
 
     let mut guard = lock_file(file_handle)?;
@@ -1043,7 +1043,7 @@ where
 // restricted to selected columns.
 pub(crate) fn read_table(
     py: Python<'_>,
-    cards: &[String],
+    meta: &TableMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     rows_arg: Option<&Bound<'_, PyAny>>,
@@ -1051,13 +1051,11 @@ pub(crate) fn read_table(
     scale: bool,
     mask_null: bool,
 ) -> PyResult<Py<PyAny>> {
-    let n_rows = parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
-    let row_width =
-        parse_keyword(cards, "NAXIS1").unwrap_or(0).max(0) as usize;
-    let all_columns = parse_columns(cards)?;
+    let n_rows = meta.nrows as usize;
+    let row_width = meta.row_width as usize;
     let columns = match columns_requested {
-        None => all_columns,
-        Some(names) => resolve_columns(&all_columns, &names)?,
+        None => meta.columns.clone(),
+        Some(names) => resolve_columns(&meta.columns, &names)?,
     };
     if mask_null {
         reject_var_tnull(&columns)?;
@@ -1150,7 +1148,7 @@ pub(crate) fn read_table(
     }  // drop RawBuffers here, before heap pass touches arrays via Python.
 
     heap_pass(
-        py, &arr, file_handle, &columns, data_offset, cards,
+        py, &arr, file_handle, &columns, data_offset, meta.theap,
         var_cells, /* as_bytes = */ false, /* single_column = */ false,
         &scaling_kinds,
     )?;
@@ -1176,7 +1174,7 @@ pub(crate) fn read_table(
 // `rows_arg` semantics are identical to `read_table`.
 pub(crate) fn read_one_column(
     py: Python<'_>,
-    cards: &[String],
+    meta: &TableMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     name: &str,
@@ -1185,17 +1183,14 @@ pub(crate) fn read_one_column(
     scale: bool,
     mask_null: bool,
 ) -> PyResult<Py<PyAny>> {
-    let n_rows_total =
-        parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as usize;
-    let row_width =
-        parse_keyword(cards, "NAXIS1").unwrap_or(0).max(0) as usize;
-    let all_columns = parse_columns(cards)?;
+    let n_rows_total = meta.nrows as usize;
+    let row_width = meta.row_width as usize;
 
-    let col = all_columns.iter()
+    let col = meta.columns.iter()
         .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
         .ok_or_else(|| {
             let available: Vec<&str> =
-                all_columns.iter().map(|c| c.name.as_str()).collect();
+                meta.columns.iter().map(|c| c.name.as_str()).collect();
             PyValueError::new_err(format!(
                 "unknown column name: '{}'.  Available columns: {:?}",
                 name, available
@@ -1339,7 +1334,7 @@ pub(crate) fn read_one_column(
         let columns_slice = std::slice::from_ref(&col);
         let scaling_kinds = [kind];
         heap_pass(
-            py, &arr, file_handle, columns_slice, data_offset, cards,
+            py, &arr, file_handle, columns_slice, data_offset, meta.theap,
             var_cells, as_bytes, /* single_column = */ true,
             &scaling_kinds,
         )?;

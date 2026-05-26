@@ -468,3 +468,32 @@ pub(crate) fn parse_columns(cards: &[String]) -> PyResult<Vec<Column>> {
 
     Ok(columns)
 }
+
+// Parsed-once snapshot of all per-HDU table metadata that the
+// hot paths (read / read_one_column / __getitem__ / accessors /
+// write / append / setitem / repack / insert_column / delete_column)
+// re-derived from the cards Vec on every call before Phase 3 of
+// the header-meta cache landed.  Cached on the TableHDU keyed by
+// `cards_version` (see `TableHDU::meta()`), so successive calls
+// against an unchanged header pay only one Mutex lock + integer
+// compare + Arc clone instead of the 7+ linear card scans per
+// column that `parse_columns` does internally.
+pub(crate) struct TableMeta {
+    pub(crate) nrows: u64,     // NAXIS2
+    pub(crate) row_width: u64, // NAXIS1
+    pub(crate) theap: u64,     // heap offset relative to data_offset
+    pub(crate) columns: Vec<Column>,
+}
+
+pub(crate) fn parse_table_meta(cards: &[String]) -> PyResult<TableMeta> {
+    let columns = parse_columns(cards)?;
+    let nrows = parse_keyword(cards, "NAXIS2").unwrap_or(0).max(0) as u64;
+    let row_width =
+        parse_keyword(cards, "NAXIS1").unwrap_or(0).max(0) as u64;
+    // THEAP default = NAXIS1 * NAXIS2 (heap immediately after the
+    // main data section).
+    let theap = parse_keyword(cards, "THEAP")
+        .map(|x| x.max(0) as u64)
+        .unwrap_or(nrows * row_width);
+    Ok(TableMeta { nrows, row_width, theap, columns })
+}

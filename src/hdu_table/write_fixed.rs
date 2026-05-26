@@ -789,9 +789,8 @@ pub(crate) fn append_fixed_only(
     // failure, same as the header- and image-grow paths.
     let new_card = card_int(
         "NAXIS2", new_nrows as i64, "number of rows in table");
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     let card_idx = new_cards.iter()
         .position(|c| c.len() >= 6 && c[..6].trim() == "NAXIS2")
         .ok_or_else(|| PyValueError::new_err(
@@ -819,8 +818,7 @@ pub(crate) fn append_fixed_only(
                  reopen the file to recover", e))
         })?;
     }
-    *cards_guard = new_cards;
-    drop(cards_guard);
+    cards_guard.commit(new_cards);
 
     // A write failure here taints — header already advertises the
     // larger NAXIS2 but the new rows are partly or wholly stale.

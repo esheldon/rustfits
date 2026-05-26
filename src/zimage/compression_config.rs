@@ -133,6 +133,9 @@ impl Gzip1 {
         Ok(Gzip1 { tile_shape, heap_format, level })
     }
 
+    /// Tile shape in numpy axis order (slowest first), or
+    /// ``None`` when the algorithm-default tile shape should
+    /// be used at create time.
     #[getter]
     fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.tile_shape {
@@ -144,11 +147,16 @@ impl Gzip1 {
         }
     }
 
+    /// Descriptor format for the on-disk heap (``'P'`` or
+    /// ``'Q'``).
     #[getter]
     fn heap_format(&self) -> String {
         self.heap_format.to_string()
     }
 
+    /// zlib compression level (0-9), or ``None`` for the codec
+    /// default (6).  Write-only: always ``None`` on reopened
+    /// HDUs — gzip framing doesn't record the level.
     #[getter]
     fn level(&self, py: Python<'_>) -> Py<PyAny> {
         match self.level {
@@ -240,6 +248,9 @@ impl Gzip2 {
         Ok(Gzip2 { tile_shape, heap_format, level })
     }
 
+    /// Tile shape in numpy axis order (slowest first), or
+    /// ``None`` when the algorithm-default tile shape should
+    /// be used at create time.
     #[getter]
     fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.tile_shape {
@@ -251,11 +262,16 @@ impl Gzip2 {
         }
     }
 
+    /// Descriptor format for the on-disk heap (``'P'`` or
+    /// ``'Q'``).
     #[getter]
     fn heap_format(&self) -> String {
         self.heap_format.to_string()
     }
 
+    /// zlib compression level (0-9), or ``None`` for the codec
+    /// default (6).  Write-only: always ``None`` on reopened
+    /// HDUs — gzip framing doesn't record the level.
     #[getter]
     fn level(&self, py: Python<'_>) -> Py<PyAny> {
         match self.level {
@@ -333,6 +349,9 @@ impl Plio1 {
         Ok(Plio1 { tile_shape, heap_format })
     }
 
+    /// Tile shape in numpy axis order (slowest first), or
+    /// ``None`` when the algorithm-default tile shape should
+    /// be used at create time.
     #[getter]
     fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.tile_shape {
@@ -344,6 +363,8 @@ impl Plio1 {
         }
     }
 
+    /// Descriptor format for the on-disk heap (``'P'`` or
+    /// ``'Q'``).
     #[getter]
     fn heap_format(&self) -> String {
         self.heap_format.to_string()
@@ -463,6 +484,9 @@ impl Hcompress1 {
         })
     }
 
+    /// Tile shape in numpy axis order (slowest first), or
+    /// ``None`` when the algorithm-default tile shape should
+    /// be used at create time.
     #[getter]
     fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.tile_shape {
@@ -474,16 +498,23 @@ impl Hcompress1 {
         }
     }
 
+    /// Descriptor format for the on-disk heap (``'P'`` or
+    /// ``'Q'``).
     #[getter]
     fn heap_format(&self) -> String {
         self.heap_format.to_string()
     }
 
+    /// HCOMPRESS quantization scale (``0`` or ``1`` for
+    /// lossless; larger for lossy with higher compression).
     #[getter]
     fn scale(&self) -> i32 {
         self.scale
     }
 
+    /// Whether HCOMPRESS's read-time smoothing pass is enabled
+    /// (reduces block artifacts at lossy scales; no effect at
+    /// ``scale <= 1``).
     #[getter]
     fn smooth(&self) -> bool {
         self.smooth
@@ -585,6 +616,9 @@ impl Rice1 {
         })
     }
 
+    /// Tile shape in numpy axis order (slowest first), or
+    /// ``None`` when the algorithm-default tile shape should
+    /// be used at create time.
     #[getter]
     fn tile_shape(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.tile_shape {
@@ -596,11 +630,15 @@ impl Rice1 {
         }
     }
 
+    /// Descriptor format for the on-disk heap (``'P'`` or
+    /// ``'Q'``).
     #[getter]
     fn heap_format(&self) -> String {
         self.heap_format.to_string()
     }
 
+    /// RICE block size in pixels (default ``32``).  Number of
+    /// pixels the encoder groups into one Rice-coded block.
     #[getter]
     fn blocksize(&self) -> u32 {
         self.blocksize
@@ -753,16 +791,24 @@ impl Quantize {
         Ok(Quantize { level, method, seed })
     }
 
+    /// Quantization level (N sigma per quanta, or fixed bscale
+    /// when negative).  See the class docstring.
     #[getter]
     fn level(&self) -> f64 {
         self.level
     }
 
+    /// Short Pythonic name of the dither scheme
+    /// (``'no_dither'`` / ``'dither1'`` / ``'dither2'``).  See
+    /// :attr:`zquantiz` for the FITS-spec form.
     #[getter]
     fn method(&self) -> &'static str {
         self.method.short_name()
     }
 
+    /// Random seed (``ZDITHER0``).  ``0`` means "pick one
+    /// automatically at create time"; positive values pass
+    /// through verbatim for reproducible output.
     #[getter]
     fn seed(&self) -> i64 {
         self.seed

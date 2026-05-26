@@ -7,7 +7,7 @@ use pyo3::types::{PyEllipsis, PySlice, PyTuple};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::Bound;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::sync::atomic::Ordering;
 
@@ -21,8 +21,54 @@ use crate::common::{
 use crate::hdu::HDU;
 use crate::header::card_int;
 
+/// An uncompressed image HDU (primary or ``XTENSION='IMAGE'``).
+///
+/// Returned by indexing a :class:`FITS` object at a position
+/// containing an uncompressed image — e.g. ``hdu = fits[0]`` for
+/// the primary HDU.  Carries the image shape, dtype, and scaling
+/// metadata, plus the read/write/slice surface.
+///
+/// All reads return numpy arrays whose dtype reflects the on-disk
+/// ``BITPIX`` after the default ``scale=True`` mapping: the
+/// unsigned-int trick (``BSCALE=1`` + ``BZERO=2**(n-1)``) promotes
+/// to the matching unsigned dtype, other scaling produces ``f8``,
+/// and BLANK-bearing integer images can be returned as
+/// ``numpy.ma.MaskedArray`` via ``mask_blank=True``.
+///
+/// Indexing is symmetric for reads and writes: anything readable
+/// via ``img[key]`` (slice / int / mixed) is writable via
+/// ``img[key] = value``.  ``len(img)`` returns ``shape[0]`` to
+/// match numpy.
+///
+/// Examples
+/// --------
+/// Read the whole image::
+///
+///     arr = hdu.read()
+///
+/// Slice into a 2-D image (numpy semantics — row-major)::
+///
+///     subimg = hdu[100:200, 50:150]
+///     scalar = hdu[5, 6]              # 0-d → numpy scalar
+///
+/// Grow along the slow axis::
+///
+///     hdu.extend(new_rows)            # appends new_rows.shape[0] rows
+///
+/// Notes
+/// -----
+/// Tile-compressed images (``ZIMAGE=T`` on disk) return the
+/// subclass :class:`CompressedImageHDU` instead, which overrides
+/// reads and writes to handle per-tile (de)compression.
 #[pyclass(extends = HDU, subclass)]
-pub(crate) struct ImageHDU;
+pub(crate) struct ImageHDU {
+    // Phase 5 meta cache: parsed ImageMeta keyed by cards_version.
+    // Mirrors TableHDU + CompressedImageHDU + CompressedTableHDU.
+    // First hit re-parses BITPIX + NAXIS + NAXISn + BSCALE + BZERO
+    // + BLANK; subsequent hits return an Arc clone.  Invalidates on
+    // every cards mutation via the version bump in CardsWriteGuard.
+    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<ImageMeta>)>>>,
+}
 
 impl ImageHDU {
     pub(crate) fn new(
@@ -35,23 +81,58 @@ impl ImageHDU {
         tainted: TaintFlag,
     ) -> (Self, HDU) {
         (
-            ImageHDU,
+            ImageHDU::new_empty_cache(),
             HDU::new(header, index, filename, offsets, layout, file, tainted),
         )
+    }
+
+    // Factory for the subclass-construction path: CompressedImageHDU
+    // builds its PyClassInitializer with `.add_subclass(ImageHDU)`,
+    // which now requires a populated struct.
+    pub(crate) fn new_empty_cache() -> Self {
+        ImageHDU { meta_cache: Arc::new(Mutex::new(None)) }
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit) an
+    // Arc clone.  On miss takes a header snapshot and re-parses.
+    // Same shape as the other three HDU types' meta() methods;
+    // callers reach this via `slf.as_super()` to keep both `slf`
+    // and the base HDU alive for the call.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<ImageMeta>> {
+        let cur_version = super_.cards_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_image_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
 #[pymethods]
 impl ImageHDU {
-    // Multi-line, fitsio-style repr.  Shows file, extension index,
-    // type, EXTNAME (if present), and the image dtype + dims in numpy
-    // axis order (slowest first — same order the user gets back from
-    // a read).  Primary HDUs with NAXIS=0 show `dims: []`.
+    // __repr__ is a pyo3 slot dunder — see the established
+    // convention in TableHDU (no per-method docstring; class
+    // docstring covers the semantics).  Multi-line fitsio-style
+    // output: file / extension / type / extname / dtype / dims.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dtype = bitpix_to_native_dtype(meta.bitpix)?;
         let cards = super_.header_snapshot()?;
-        let (bitpix, shape) = parse_image_hdu_shape_lax(&cards)?;
-        let dtype = bitpix_to_native_dtype(bitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
 
@@ -64,85 +145,126 @@ impl ImageHDU {
         }
         out.push_str("  image info:\n");
         out.push_str(&format!("    data type: {}\n", dtype));
-        out.push_str(&format!("    dims: {:?}\n", shape));
+        out.push_str(&format!("    dims: {:?}\n", meta.shape));
         if let Some(u) = bunit {
             out.push_str(&format!("    unit: {}\n", u));
         }
         Ok(out)
     }
 
-    // BUNIT header value (e.g. "Jy", "counts/s"), or None when unset.
-    // Purely informational; nothing in the read/write path consumes
-    // it.  Mirrors TableHDU.units (per-column) at the image level.
+    /// ``BUNIT`` header value (e.g. ``'Jy'``, ``'counts/s'``), or
+    /// ``None`` when unset.  Informational only; nothing in the
+    /// read or write path consumes it.
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super();
+        let super_ = slf.as_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
     }
 
-    // Image dimensions in numpy axis order (slowest first), as a
-    // tuple.  Primary HDUs with NAXIS=0 return ().
+    /// Image dimensions in numpy axis order (slowest first).
+    ///
+    /// Returned as a tuple so the value is immutable from the
+    /// caller side.  Primary HDUs with ``NAXIS=0`` return ``()``.
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(PyTuple::new(py, &shape)?.unbind())
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(PyTuple::new(py, &meta.shape)?.unbind())
     }
 
-    // numpy dtype matching BITPIX — the type `read()` would return.
+    /// The numpy dtype :meth:`read` would return.
+    ///
+    /// Reflects the default-read (``scale=True``) dtype: BITPIX
+    /// 8/16/32/64 → ``u1`` / ``i2`` / ``i4`` / ``i8`` (or the
+    /// matching unsigned for the unsigned-int trick); BITPIX
+    /// -32 / -64 → ``f4`` / ``f8``.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
-        let dtype_str = bitpix_to_native_dtype(bitpix)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dtype_str = bitpix_to_native_dtype(meta.bitpix)?;
         let np = py.import("numpy")?;
         Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
     }
 
-    // NAXIS — number of image axes.  0 for primary HDUs with no data.
+    /// Number of image axes (``NAXIS``).
+    ///
+    /// ``0`` for primary HDUs with no data section.  Same as
+    /// ``len(hdu.shape)``.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(shape.len())
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.shape.len())
     }
 
-    // Total pixel count (product of all NAXISn).  Returns 0 for
-    // NAXIS=0 (empty shape would otherwise give the empty-product
-    // identity 1, which is wrong for "no data").
+    /// Total pixel count (product of all ``NAXISn``).
+    ///
+    /// Returns ``0`` when ``NAXIS=0`` (empty shape).  Without the
+    /// special case the empty-product identity would give ``1``,
+    /// which is wrong for "no data".
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(if meta.shape.is_empty() { 0 } else { meta.shape.iter().product() })
     }
 
-    // Raw FITS BITPIX value (e.g. 8, 16, -32, -64).  Useful for
-    // round-trip / standards-level inspection; everyday code should
-    // prefer `.dtype`.
+    /// Raw FITS ``BITPIX`` value (e.g. ``8``, ``16``, ``-32``,
+    /// ``-64``).
+    ///
+    /// Useful for round-trip / standards-level inspection;
+    /// everyday code should prefer :attr:`dtype`, which reflects
+    /// scaling.
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (bitpix, _) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(bitpix)
+        let super_ = slf.as_super();
+        Ok(slf.meta(super_)?.bitpix)
     }
 
-    // numpy convention: `len(arr)` is shape[0].  For a 2-D image
-    // that's the row count; for a 1-D image the pixel count.  Returns
-    // 0 when NAXIS=0 (no data section).
+    // __len__ is a pyo3 slot dunder — no per-method docstring.
+    // numpy convention: shape[0].  For a 2-D image that's the row
+    // count; for a 1-D image, the pixel count.  Returns 0 when
+    // NAXIS=0.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_image_hdu_shape_lax(&cards)?;
-        Ok(shape.first().copied().unwrap_or(0) as usize)
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.shape.first().copied().unwrap_or(0) as usize)
     }
 
+    /// Write pixel data to the HDU's data section.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray or numpy.ma.MaskedArray
+    ///     Image pixels.  Shape must match ``hdu.shape`` (or, when
+    ///     ``start=`` is set, fit within ``hdu.shape`` from
+    ///     ``start``).  Dtype must be the HDU's BITPIX-native
+    ///     type, the matching scaled dtype (unsigned-int trick),
+    ///     or ``f8`` (which goes through general reverse-scaling
+    ///     into the stored dtype, with rint + bounds check for
+    ///     integer BITPIX).  ``MaskedArray`` input auto-fills
+    ///     masked positions with the sentinel from ``BLANK``
+    ///     (integer dtypes) or NaN (float dtypes).
+    /// start : list of int, optional
+    ///     Per-axis starting offset (numpy order) for a partial
+    ///     write.  Must be ``len(hdu.shape)`` long and
+    ///     non-negative.  Default ``None`` writes the entire
+    ///     image starting at the origin.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Shape mismatch, dtype incompatibility, NaN/Inf on
+    ///     integer BITPIX with general scaling, out-of-range
+    ///     value on integer BITPIX, or missing BLANK on
+    ///     MaskedArray integer input.
+    ///
+    /// See Also
+    /// --------
+    /// extend : Grow the slow axis to fit larger data.
+    /// __setitem__ : Slice-style partial writes.
     #[pyo3(signature = (data, start=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -158,21 +280,38 @@ impl ImageHDU {
         )
     }
 
-    // `scale=True` (default) applies BSCALE/BZERO on read.  For files
-    // with the unsigned-int trick (BITPIX=16/32/64, BZERO=2^(n-1), or
-    // BITPIX=8, BZERO=-128), the result is returned in the matching
-    // unsigned (or i1) dtype.  For general scaling, the result is
-    // promoted to f8.  `scale=False` returns raw stored values in the
-    // BITPIX native dtype.
-    //
-    // `mask_blank=True` (opt-in, default False) returns a
-    // numpy.ma.MaskedArray with True at pixels whose stored value
-    // matches the header's `BLANK` keyword.  Comparison is in stored
-    // (pre-scaling) space per the FITS spec.  Only valid on integer
-    // BITPIX (8/16/32/64); float BITPIX rejects up-front because the
-    // spec forbids BLANK on floating-point arrays (NaN serves that
-    // role).  When BLANK is absent from the header, returns a
-    // MaskedArray with an all-False mask for consistent return type.
+    /// Read the image into a numpy array.
+    ///
+    /// Parameters
+    /// ----------
+    /// scale : bool, optional
+    ///     If ``True`` (default), apply ``BSCALE`` / ``BZERO``
+    ///     scaling.  For files with the unsigned-int trick
+    ///     (``BITPIX=16/32/64`` + ``BZERO=2**(n-1)``, or
+    ///     ``BITPIX=8`` + ``BZERO=-128``), returns the matching
+    ///     unsigned (or ``i1``) dtype with no precision loss.
+    ///     For general scaling, returns ``f8``.  If ``False``,
+    ///     returns raw stored values in the BITPIX-native dtype.
+    /// mask_blank : bool, optional
+    ///     If ``True``, return a ``numpy.ma.MaskedArray`` with
+    ///     ``True`` at pixels whose stored value matches the
+    ///     header's ``BLANK`` keyword.  Comparison is in stored
+    ///     (pre-scaling) space per the FITS spec.  Only valid
+    ///     for integer ``BITPIX``; float BITPIX rejects because
+    ///     the spec forbids BLANK on floats (NaN serves that
+    ///     role).  When ``BLANK`` is absent, returns a
+    ///     ``MaskedArray`` with an all-False mask — return type
+    ///     stays consistent.  Default ``False``.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Array of shape ``hdu.shape``.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     ``mask_blank=True`` on a float-BITPIX image.
     #[pyo3(signature = (*, scale=true, mask_blank=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -180,22 +319,44 @@ impl ImageHDU {
         scale: bool,
         mask_blank: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_: PyRef<HDU> = slf.into_super();
-        let header_cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         read_image_data(
-            py, &header_cards, super_.offsets.data_offset(),
+            py, &meta, super_.offsets.data_offset(),
             &super_.file, scale, mask_blank,
         )
     }
 
-    // Grow the HDU's slow axis (numpy axis 0 = FITS NAXISn) if needed to
-    // fit the data being written, then write it.  For HDUs that are not the
-    // last on disk, the file tail (every byte from this HDU's data-section
-    // end to EOF) is shifted forward to make room and every later HDU's
-    // offsets are bumped in lockstep, so any previously-issued handles
-    // remain valid (same shared-Arc model as the header-grow path).  See
-    // CLAUDE.md "Header overflow: in-place file grow" for the shared
-    // shift_file_tail_and_update_offsets primitive.
+    /// Grow the slow axis of the image and write new pixels into it.
+    ///
+    /// The slow axis is numpy axis 0 (FITS ``NAXISn`` where ``n``
+    /// is the highest).  Grows the on-disk data section to fit the
+    /// combined shape, writes the new pixels, and bumps the
+    /// corresponding ``NAXISn`` card in the header.
+    ///
+    /// For HDUs that are not the last on disk, the file tail is
+    /// shifted forward and every later HDU's offsets are bumped in
+    /// lockstep — previously-issued handles remain valid.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray or numpy.ma.MaskedArray
+    ///     New pixels.  Dtype and inner-axis shape must match
+    ///     ``hdu.shape[1:]``; the slow axis can be any size.
+    ///     Same dtype rules as :meth:`write` (BITPIX-native,
+    ///     scaled, or ``f8`` for general scaling; MaskedArray
+    ///     accepted).
+    /// start : list of int, optional
+    ///     Per-axis starting offset for the write.  Default
+    ///     ``None`` appends at the current slow-axis end
+    ///     (``hdu.shape[0]``); explicit ``start[0]`` can overlap
+    ///     existing rows for in-place rewrites.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: dtype/shape errors leave the file
+    /// untouched.  Mid-write I/O failures taint the file (close
+    /// + reopen to recover).
     #[pyo3(signature = (data, start=None))]
     fn extend(
         slf: PyRefMut<'_, Self>,
@@ -336,9 +497,8 @@ impl ImageHDU {
             new_hdu_shape[0] as i64,
             &format!("length of data axis {}", naxis),
         );
-        let mut cards_guard = super_.header.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = cards_guard.clone();
+        let cards_guard = super_.cards_write_lock()?;
+        let mut new_cards = cards_guard.clone_cards();
         let card_idx = new_cards.iter()
             .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
             .ok_or_else(|| PyValueError::new_err(
@@ -373,8 +533,7 @@ impl ImageHDU {
             })?;
         }
 
-        *cards_guard = new_cards.clone();
-        drop(cards_guard);
+        cards_guard.commit(new_cards.clone());
 
         // Image-data write completes the extend.  A failure here leaves
         // the on-disk header advertising the new shape but the file's
@@ -393,26 +552,31 @@ impl ImageHDU {
         })
     }
 
+    // __getitem__ is a pyo3 slot dunder — no per-method docstring.
     // Image indexing follows numpy semantics: each integer index
-    // reduces a dimension, each slice keeps one.  When EVERY axis is
-    // indexed by an integer the result has zero dimensions left — we
-    // unwrap the 0-d array to a numpy scalar (e.g. np.float64,
-    // np.int32) so `hdu[5, 6]` matches `numpy_arr[5, 6]`.  Mixed
-    // slice + int (e.g. `hdu[5, :]`) still returns an ndarray.
+    // reduces a dimension, each slice keeps one.  When EVERY axis
+    // is indexed by an integer the result is unwrapped to a numpy
+    // scalar (e.g. np.float64) so `hdu[5, 6]` matches
+    // `numpy_arr[5, 6]`.  Mixed slice + int still returns an
+    // ndarray.  Always scales (use .read(scale=False) for raw).
     fn __getitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let super_: PyRef<HDU> = slf.into_super();
-        let header_cards = super_.header_snapshot()?;
-        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
-        let slices = normalize_slice_key(key, &hdu_shape)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        if meta.shape.is_empty() {
+            return Err(PyValueError::new_err(
+                "HDU has NAXIS=0 (no data section)"
+            ));
+        }
+        let slices = normalize_slice_key(key, &meta.shape)?;
         let all_int = slices.iter().all(|s| s.is_int);
         // Always scale on __getitem__ — matches the table-side
         // convention.  Use ImageHDU.read(scale=False) to bypass.
         let arr_py = read_image_slice(
-            py, &header_cards, super_.offsets.data_offset(),
+            py, &meta, super_.offsets.data_offset(),
             &super_.file, &slices, true,
         )?;
         if all_int {
@@ -426,19 +590,14 @@ impl ImageHDU {
         }
     }
 
-    // Symmetric write surface for __getitem__.  Same slice parser, so
-    // anything `img[key]` reads, `img[key] = value` writes.
-    //
-    // RHS forms:
-    //   - Python int / float, numpy scalar, or 0-d ndarray
-    //     (`np.ndim(value) == 0`) → broadcast: every pixel in the
-    //     selection gets this value.
-    //   - numpy ndarray with `shape == img[key].shape`, dtype
-    //     matching BITPIX → write elementwise.
-    //
-    // No general numpy broadcasting (scalar-only).  Dtype is strict;
-    // convert with `.astype(...)` if you need to.  Mid-write I/O
-    // failures taint the file (close + reopen to recover).
+    // __setitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Symmetric write surface for __getitem__: anything `img[key]`
+    // reads, `img[key] = value` writes.  RHS may be a scalar
+    // (Python int/float, numpy scalar, or 0-d ndarray — broadcast
+    // across the selection) or an ndarray whose shape exactly
+    // matches the selection's output shape.  Dtype is strict; no
+    // general numpy broadcasting.  Mid-write I/O failures taint
+    // the file.
     fn __setitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -455,31 +614,38 @@ impl ImageHDU {
         )
     }
 
-    // ----- FITS checksum convention -----
-    //
-    // add_datasum: compute DATASUM from the data section, update
-    // the card on disk + in memory.  add_checksum: add_datasum
-    // first, then compute the full HDU checksum and encode it
-    // into the CHECKSUM card.  verify_datasum / verify_checksum
-    // return True/False/None (None = card absent).  Manual
-    // semantics — checksums become stale after write/__setitem__/
-    // extend; users must re-run add_checksum after mutations.
-
+    /// Compute and store the ``DATASUM`` checksum card.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_datasum`: manual
+    /// refresh, no auto-update on mutation.  Call after
+    /// :meth:`write` / :meth:`extend` / ``__setitem__``.
     fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_: PyRef<HDU> = slf.into_super();
         checksum_hdu_add_datasum(&super_, "DATASUM")
     }
 
+    /// Compute and store both ``DATASUM`` and ``CHECKSUM`` cards.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_checksum`.  This is
+    /// the call most users want — writes both cards atomically.
     fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_: PyRef<HDU> = slf.into_super();
         checksum_hdu_add_checksum(&super_, "CHECKSUM", "DATASUM")
     }
 
+    /// Verify the stored ``DATASUM`` against the current data.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_: PyRef<HDU> = slf.into_super();
         checksum_hdu_verify_datasum(&super_, "DATASUM")
     }
 
+    /// Verify the stored ``CHECKSUM`` over the full HDU.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_: PyRef<HDU> = slf.into_super();
         checksum_hdu_verify_checksum(&super_, "CHECKSUM")
@@ -632,9 +798,7 @@ pub(crate) fn checksum_hdu_verify_checksum(
 pub(crate) fn commit_header_update(
     super_: &HDU, new_cards: Vec<String>,
 ) -> PyResult<()> {
-    let mut header_guard = super_.header.lock().map_err(|_| {
-        PyIOError::new_err("header lock poisoned")
-    })?;
+    let header_guard = super_.cards_write_lock()?;
     crate::header::rewrite_header_to_disk(
         &super_.file,
         &super_.offsets,
@@ -642,7 +806,7 @@ pub(crate) fn commit_header_update(
         &new_cards,
         &super_.tainted,
     )?;
-    *header_guard = new_cards;
+    header_guard.commit(new_cards);
     Ok(())
 }
 
@@ -651,13 +815,19 @@ pub(crate) fn commit_header_update(
 // are swapped in place after read.
 fn read_image_data(
     py: Python<'_>,
-    header: &[String],
+    meta: &ImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     scale: bool,
     mask_blank: bool,
 ) -> PyResult<Py<PyAny>> {
-    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bitpix = meta.bitpix;
+    let hdu_shape = meta.shape.as_slice();
+    if hdu_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "HDU has NAXIS=0 (no data section)"
+        ));
+    }
     if mask_blank && bitpix < 0 {
         return Err(PyValueError::new_err(format!(
             "mask_blank=True is not valid on float BITPIX ({}); the \
@@ -673,7 +843,7 @@ fn read_image_data(
 
     let dtype_str = bitpix_to_native_dtype(bitpix)?;
     let np = py.import("numpy")?;
-    let arr = np.call_method1("empty", (hdu_shape.clone(), dtype_str))?;
+    let arr = np.call_method1("empty", (hdu_shape, dtype_str))?;
 
     {
         let mut buffer = RawBuffer::acquire_writable(&arr)?;
@@ -702,15 +872,16 @@ fn read_image_data(
     // Compute mask in stored (pre-scaling) space before applying any
     // scaling.  Per the FITS spec, BLANK is the raw on-disk sentinel.
     let mask_opt = if mask_blank {
-        compute_blank_mask(header, &arr)?
+        compute_blank_mask_from_value(meta.blank, &arr)?
     } else {
         None
     };
 
     let arr_unbound = if scale {
-        let (bscale, bzero) = parse_bscale_bzero(header);
-        let kind = image_scaling_kind(bitpix, bscale, bzero);
-        apply_image_scaling(py, arr.unbind(), bitpix, kind, bscale, bzero)?
+        let kind = image_scaling_kind(bitpix, meta.bscale, meta.bzero);
+        apply_image_scaling(
+            py, arr.unbind(), bitpix, kind, meta.bscale, meta.bzero,
+        )?
     } else {
         arr.unbind()
     };
@@ -722,32 +893,22 @@ fn read_image_data(
     }
 }
 
-// Compute a per-pixel bool mask of `arr == <header[key]>`.  Returns
-// None when the keyword is absent (caller wraps the data with nomask
-// for consistent return type without an unused mask allocation).
-// Used for both `BLANK` (uncompressed images) and `ZBLANK` (tile-
-// compressed images) — the spec mandates the integer sentinel
-// comparison happens in stored space (pre-scaling).
-pub(crate) fn compute_blank_mask_for_key(
-    header: &[String],
+// Compute a per-pixel bool mask of `arr == sentinel`.  Returns
+// None when the sentinel is None (caller wraps the data with
+// nomask for consistent return type without an unused mask
+// allocation).  Used for both `BLANK` (uncompressed images) and
+// `ZBLANK` (tile-compressed images) — the spec mandates the
+// integer sentinel comparison happens in stored space (pre-
+// scaling).  All callers now pull the sentinel from their cached
+// meta (ImageMeta.blank / CompressedImageMeta.zblank) rather than
+// re-parsing the card on every read.
+pub(crate) fn compute_blank_mask_from_value(
+    sentinel: Option<i64>,
     arr: &Bound<'_, PyAny>,
-    key: &str,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let Some(blank) = parse_keyword(header, key) else {
-        return Ok(None);
-    };
-    // arr == blank: numpy broadcasts the Python int against arr's
-    // dtype.  If `blank` is out of range for the dtype, no element
-    // matches and the result is all-False — harmless.
+    let Some(blank) = sentinel else { return Ok(None); };
     let mask = arr.call_method1("__eq__", (blank,))?;
     Ok(Some(mask.unbind()))
-}
-
-fn compute_blank_mask(
-    header: &[String],
-    arr: &Bound<'_, PyAny>,
-) -> PyResult<Option<Py<PyAny>>> {
-    compute_blank_mask_for_key(header, arr, "BLANK")
 }
 
 // Wrap a plain ndarray in numpy.ma.MaskedArray.  None mask → nomask
@@ -980,13 +1141,19 @@ fn compute_read_strip_layout(
 
 fn read_image_slice(
     py: Python<'_>,
-    header: &[String],
+    meta: &ImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     slices: &[AxisSlice],
     scale: bool,
 ) -> PyResult<Py<PyAny>> {
-    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bitpix = meta.bitpix;
+    let hdu_shape = meta.shape.as_slice();
+    if hdu_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "HDU has NAXIS=0 (no data section)"
+        ));
+    }
     let naxis = hdu_shape.len();
     if slices.len() != naxis {
         return Err(PyValueError::new_err(format!(
@@ -1009,8 +1176,8 @@ fn read_image_slice(
         return Ok(arr.unbind());
     }
 
-    let hdu_strides = row_major_strides(&hdu_shape);
-    let (outer_axes, strip_pixels) = compute_read_strip_layout(&hdu_shape, slices);
+    let hdu_strides = row_major_strides(hdu_shape);
+    let (outer_axes, strip_pixels) = compute_read_strip_layout(hdu_shape, slices);
     let strip_bytes = (strip_pixels * bpp) as usize;
 
     let outer_count: u64 = slices[..outer_axes].iter().map(|s| s.count).product();
@@ -1071,9 +1238,8 @@ fn read_image_slice(
     if !scale {
         return Ok(arr_unbound);
     }
-    let (bscale, bzero) = parse_bscale_bzero(header);
-    let kind = image_scaling_kind(bitpix, bscale, bzero);
-    apply_image_scaling(py, arr_unbound, bitpix, kind, bscale, bzero)
+    let kind = image_scaling_kind(bitpix, meta.bscale, meta.bzero);
+    apply_image_scaling(py, arr_unbound, bitpix, kind, meta.bscale, meta.bzero)
 }
 
 fn write_image_data(
@@ -1540,6 +1706,32 @@ pub(crate) fn parse_bscale_bzero(header: &[String]) -> (f64, f64) {
     let bscale = parse_keyword_float(header, "BSCALE").unwrap_or(1.0);
     let bzero = parse_keyword_float(header, "BZERO").unwrap_or(0.0);
     (bscale, bzero)
+}
+
+// Parsed-once snapshot of all per-HDU image metadata.  Cached on
+// the ImageHDU keyed by `cards_version` (see `ImageHDU::meta()`)
+// so a tight loop of accessor calls or `f[idx][...]` slice reads
+// pays one Mutex lock + integer compare + Arc clone instead of
+// re-parsing BITPIX + NAXIS + NAXISn + BSCALE + BZERO every time.
+//
+// Lax parsing: NAXIS=0 yields an empty shape rather than an error.
+// Read/write paths that genuinely need a data section check
+// `shape.is_empty()` themselves and raise the appropriate
+// "HDU has no data" error.  Same pattern the accessors already
+// used via `parse_image_hdu_shape_lax`.
+pub(crate) struct ImageMeta {
+    pub(crate) bitpix: i32,
+    pub(crate) shape: Vec<u64>, // numpy axis order (slowest first)
+    pub(crate) bscale: f64,
+    pub(crate) bzero: f64,
+    pub(crate) blank: Option<i64>,
+}
+
+pub(crate) fn parse_image_meta(cards: &[String]) -> PyResult<ImageMeta> {
+    let (bitpix, shape) = parse_image_hdu_shape_lax(cards)?;
+    let (bscale, bzero) = parse_bscale_bzero(cards);
+    let blank = parse_keyword(cards, "BLANK");
+    Ok(ImageMeta { bitpix, shape, bscale, bzero, blank })
 }
 
 pub(crate) fn image_scaling_kind(bitpix: i32, bscale: f64, bzero: f64) -> ScalingKind {

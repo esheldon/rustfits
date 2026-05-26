@@ -1298,13 +1298,17 @@ the reader walks tiles and decodes them.
 **Open follow-ups (low priority):**
 
 - **Performance** — release-mode chunked-read of large GZIP_2
-  float files: **3.2× FASTER** than cfitsio on big chunks (50k
-  rows; at the decoder physics floor), **24× FASTER** on small
-  chunks (1k rows; LRU tile cache vs cfitsio's unbounded cache).
+  float files: **3.2× FASTER** than fitsio on big chunks (50k
+  rows; at the decoder physics floor), **40× FASTER** on small
+  chunks (1k rows; up from 24× before the header-meta cache
+  landed — see Phase 2 in "Header-derived metadata caching"
+  below).  All numbers are vs fitsio (the Python wrapper around
+  cfitsio); fitsio carries its own per-call wrapping overhead
+  that likely inflates these ratios relative to a direct-
+  cfitsio comparison (worth measuring some day, but the
+  realistic comparison for users is fitsio anyway).
   See "Performance — ZIMAGE chunked-read profiling history"
-  below for how the gap closed, and "Header-derived metadata
-  caching (planned)" for the next available win across all HDU
-  types.
+  below for how the gap closed.
 - **Byte-exact heap agreement with cfitsio on quantized floats**
   — decoded values are bit-exact; raw heap bytes differ by qsort
   tie-breaking quirks.  Not worth fixing absent a specific need.
@@ -3749,16 +3753,25 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 **Current state (release builds; 2026-05-26):**
 
 - **Big chunks (50k rows)**: rustfits is **3.2× FASTER** than
-  cfitsio.  `decode_gzip2`'s remaining ~48% of slice time is now
+  fitsio.  `decode_gzip2`'s remaining ~48% of slice time is now
   ~100% the flate2/miniz_oxide inflate itself — the physics floor.
-- **Small chunks (1k rows)**: rustfits is **24× FASTER** than
-  cfitsio.  cfitsio caches all decoded tiles forever (memory
-  bloat); rustfits has an LRU.  The dominant cost is per-tile
-  decode and unshuffle; the remaining ~15-20% per-call header
-  re-parse is the next available win (see "Header-derived
-  metadata caching" plan below).
+- **Small chunks (1k rows)**: rustfits is **40× FASTER** than
+  fitsio (up from 24× after the Phase 2 header-meta cache
+  landed).  fitsio caches all decoded tiles forever (memory
+  bloat); rustfits has an LRU AND a per-HDU parsed-meta cache
+  that eliminates the 8+ linear card scans per slice call.
 
-**How the gap closed.**  Three sequential profile-and-fix passes:
+**Note on the comparison baseline.**  All ratios are vs **fitsio**
+(the Python wrapper around cfitsio), not direct cfitsio.  fitsio
+carries its own per-call wrapping overhead — Python-level argument
+marshalling, ndarray construction, etc. — that likely inflates
+these numbers relative to a direct-cfitsio comparison.  The
+realistic comparison for users is fitsio, so that's what the
+benchmark uses; a direct-cfitsio comparison would be worth doing
+some day to attribute the gap more precisely.
+
+**How the gap closed.**  Four sequential profile-and-fix passes
+plus the header-meta cache:
 
 1. **`tile_origin_and_shape` stack-allocation** (commit a85583f).
    The function did three `vec![0u64; d]` per call for what is
@@ -3783,6 +3796,15 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
    + spare_capacity_mut + MaybeUninit::write + unsafe { set_len }`.
    The zero-init pass was 17.67% of total profile on big chunks.
    Took big-chunks 2.8× → 3.2× faster.
+5. **Header-meta cache (Phase 2 of header-derived metadata
+   caching).**  Per-call re-parsing of ~8 header fields
+   (ZCMPTYPE, ZNAXISn, ZTILEn, ZNAMEn/ZVALn, TFORMn, TTYPEn,
+   ZBLANK, BSCALE/BZERO) collapsed to one Mutex lock + Acquire
+   load + Arc clone via the cached `CompressedImageMeta`.  Took
+   small-chunks 24× → **40× faster than fitsio** — the cache hit
+   eliminates ~40% of the per-call overhead.  See "Header-derived
+   metadata caching" section below for the design (CardsWriteGuard
+   foundation in Phase 1, parsed-meta cache in Phase 2).
 
 **Profiling gotchas worth remembering.**
 
@@ -3807,9 +3829,31 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
   LRU tile cache — sequential reads wouldn't get the same
   cache amplification.
 
-## Header-derived metadata caching (planned, 2026-05-26)
+## Header-derived metadata caching (shipped, 2026-05-26)
 
-**Status: scoped + design captured; not yet started.**
+**Status: all five phases shipped.  Some write-side paths still
+re-parse; deferred until measured to be hot.**
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Foundation: `cards_version` + `CardsWriteGuard` | ✅ Shipped |
+| 2 | `CompressedImageHDU` cache (read / slice / accessors) | ✅ Shipped |
+| 3 | `TableHDU` cache (read paths + accessors) | ✅ Shipped |
+| 4 | `CompressedTableHDU` cache (setitem + accessors) | ✅ Shipped |
+| 5 | `ImageHDU` cache (accessors + read paths) | ✅ Shipped |
+
+**Measured outcome (Phase 2):** **40× faster than fitsio on
+small-chunk compressed reads** (up from 24× before the cache),
+on the 100k chunks × 1k rows benchmark.  The cache eliminates
+~40% of per-call overhead by collapsing 8+ linear card scans per
+slice call to one Mutex lock + Acquire load + Arc clone.  See
+"Performance — ZIMAGE chunked-read profiling history" above for
+the full fix-by-fix breakdown.
+
+Other phases (3-5) were not benchmarked but follow the identical
+shape — the win scales with how much parsing happened per call.
+`TableHDU` likely benefits substantially on per-row workflows
+because `parse_columns` does ~7 linear scans × N_columns.
 
 **Why.**  After the four perf fixes above, the remaining ~15-20%
 of slice-path time on small-chunks compressed reads is per-
@@ -3949,40 +3993,84 @@ a 100-column table does 600 O(N_cards) scans per `read()` /
 `__getitem__` / `__setitem__` / etc.  Nobody's profiled this,
 but it's almost certainly hot for any per-row workload.
 
-**Suggested phasing.**
+**Phase outcomes.**
 
-1. **Foundation** — add `cards_version` to `HDU`, add
-   `bump_cards_version()` helper, audit + add bumps to every
-   mutation path.  No caches yet.  Tests should still all pass
-   (no behavior change, just an unused counter).  This is the
-   risky part — getting all the mutation paths right.
-2. **`CompressedImageHDU` cache** — define `CompressedImageMeta`,
-   write `parse_compressed_image_meta`, wire `meta_cache` into
-   `__getitem__` / `read` / `slice_compressed_image` /
-   `extend` / `__setitem__`.  Measure: should land the
-   remaining 15-20% on small-chunks compressed reads.
-3. **`TableHDU` cache** — same shape with `TableMeta` /
-   `parse_table_meta`.  Likely the biggest unmeasured win.
-   Wire into `read`, `__getitem__`, `__setitem__`, `write`,
-   `append`, `insert_column`, `delete_column`, etc.  Profile
-   a tight per-row workload before AND after to anchor the
-   gain.
-4. **`CompressedTableHDU` cache** — extends the table meta
-   with the compression-side fields.
-5. **`ImageHDU` cache** — lowest priority (cold per-call paths
-   anyway).  Do for symmetry.
+1. ✅ **Foundation** (`b36a864`).  `cards_version: Arc<AtomicU64>`
+   on `HDU`, shared with every `FITSHeader` view.
+   `CardsWriteGuard` with consuming `commit(new_cards)` and no
+   `DerefMut` → impossible to mutate without bumping the version.
+   No `bump_cards_version()` free helper was needed — the guard's
+   `commit` does it; the compile-time guarantee replaced the
+   "audit every mutation path" plan in the original design.
+2. ✅ **`CompressedImageHDU` cache** (`c021a35`, `935b9a6`).
+   `CompressedImageMeta` cached as
+   `Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>` on the
+   HDU; `meta(&self, super_)` accessor.  Wired into
+   `slice_compressed_image` + `read_compressed_image_data` (the
+   `.read()` + checksum path) + every accessor (`shape`, `dtype`,
+   `bitpix`, `ndim`, `size`, `__len__`, `n_tiles`, `__repr__`).
+   Three private structs renamed for cross-module clarity now
+   that they appear in the `pub(crate)` Meta API: `ColumnInfo` →
+   `ZimageColumnInfo`, `DataColumns` → `ZimageDataColumns`,
+   `QuantContext` → `ZimageQuantContext`.  Helper
+   `compute_blank_mask_from_value` (in `hdu_image.rs`) replaces
+   the card-parsing variants so the cached `meta.zblank` flows
+   straight through.  **Measured: 40× faster than fitsio on the
+   small-chunks slice benchmark, up from 24×.**  Write side
+   (`write_compressed_image_data`, `extend_compressed_image_data`,
+   `setitem_compressed_image`, `repack_compressed_heap`) still
+   re-parses — deferred (writes are rare; refactoring is invasive
+   because the helpers also call `unwrap_masked_input` /
+   `normalize_input_dtype` which carry their own header parsing).
+3. ✅ **`TableHDU` cache** (`ba70eb2`).  `TableMeta` (nrows /
+   row_width / theap / columns) cached on `TableHDU`.  `read_table`
+   and `read_one_column` refactored to take `&TableMeta` instead
+   of `&[String]`.  Accessors (`nrows`, `__len__`, `ncols`,
+   `dtype`, `colnames`, `units`, `__repr__`) routed through meta.
+   `TableHDU::new_empty_cache()` factory exposed for the
+   `CompressedTableHDU` PyClassInitializer chain.  Write paths
+   (`write`, `append`, `__setitem__`, `insert_column`,
+   `delete_column`, `repack`) still re-parse via `parse_columns`
+   — deferred.
+4. ✅ **`CompressedTableHDU` cache** (`0bc6c5b`).  Existing
+   `CompressedTableMeta` (created for `__setitem__` paths)
+   promoted to a cached field with the same shape as the other
+   three.  `parse_compressed_table_meta` runs
+   `synthesize_uncompressed_cards` first so `parse_columns` sees
+   the original schema instead of the on-disk
+   `TFORMn='1QB(...)'` + preserved `TDIMn` cards (which would
+   trip on TDIM-on-VLA).  `data_offset` dropped from the meta
+   (an earlier-HDU grow can shift it — caching would silently
+   regress); callers fetch it fresh.  The Phase-3-era `ncols`
+   workaround (direct TFIELDS parse, needed because
+   `TableHDU.meta()` can't handle compressed cards) gone — Phase
+   4's `meta()?.columns.len()` works naturally.
+5. ✅ **`ImageHDU` cache** (`7ce3a83`, `8bfff7d`).  `ImageMeta`
+   (bitpix / shape / bscale / bzero / blank) cached on
+   `ImageHDU` (was a unit struct).  All 7 accessors routed
+   through meta; `read_image_data` and `read_image_slice` take
+   `&ImageMeta` instead of `&[String]`.  Lax parsing (NAXIS=0
+   yields empty shape) keeps the accessor "never crash on
+   primary HDU" contract intact — the strict NAXIS=0 check
+   that `parse_image_hdu_shape` used to do is now done by the
+   read helpers explicitly.  Write paths
+   (`write_image_data`, `write_image_slice`, `extend`) still
+   re-parse — deferred for the same reason as the table side
+   (`unwrap_masked_input` + `normalize_input_dtype` carry their
+   own parsing).
 
-Don't try to do all five in one PR — each phase is independently
-landable and testable.  Foundation (phase 1) is the only one
-that's hard to get right; the others are repeated application
-of the same pattern.
+Five phases were independently landable and testable.  Foundation
+(phase 1) was the only structurally interesting one; the others
+applied the same pattern.
 
 **Risks.**
 
-- **Forgotten bump in a mutation path** → cache holds stale
-  metadata → reads return wrong values silently.  The debug-only
-  hash check above catches this in tests; production builds rely
-  on the audit.
+- ~~**Forgotten bump in a mutation path**~~ — eliminated by
+  Phase 1's `CardsWriteGuard` design: the type system makes
+  `*guard = new_cards` impossible (no `DerefMut`), and the only
+  mutation path (`commit`) always bumps.  New mutation sites
+  pick up the bump automatically by going through
+  `cards_write_lock()`.
 - **Mutex contention** — only the lock is per-call; the parse
   is amortized.  Should be invisible vs the slice work.  If it
   ever shows up, switch to `parking_lot::Mutex` or `RwLock`.
