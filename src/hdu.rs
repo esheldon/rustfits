@@ -67,6 +67,22 @@ impl CardsWriteGuard<'_> {
     }
 }
 
+/// Base class for every FITS Header-Data Unit (HDU).
+///
+/// All HDU types — :class:`ImageHDU`, :class:`TableHDU`,
+/// :class:`CompressedImageHDU`, :class:`CompressedTableHDU`,
+/// :class:`AsciiTableHDU` — inherit from this class and share the
+/// header access, identity, and "do you have data?" surface
+/// defined here.
+///
+/// HDU instances are produced by indexing a :class:`FITS` object
+/// (``hdu = fits[1]``) or iterating it (``for hdu in fits: ...``).
+/// They cannot be constructed directly from Python; the file
+/// object owns the on-disk layout.
+///
+/// The shared inherited surface is small on purpose — most of the
+/// useful methods live on the subclasses, where the data layout
+/// is known.
 #[pyclass(subclass)]
 pub(crate) struct HDU {
     // Shared with FITSHeader so mutations through the header view propagate
@@ -152,10 +168,26 @@ impl CardsWriteGuard<'_> {
 
 #[pymethods]
 impl HDU {
+    // __repr__ is a pyo3 slot dunder — see the TableHDU.__len__ note
+    // for why we don't put a docstring on it.  Default repr is the
+    // bare class name + index; subclasses override with multi-line
+    // fitsio-style output.
     fn __repr__(&self) -> String {
         format!("<HDU #{}>", self.index)
     }
 
+    /// The HDU's :class:`FITSHeader`.
+    ///
+    /// Returns a live view of this HDU's header cards.  Mutations
+    /// via the header object (``__setitem__``, ``__delitem__``,
+    /// ``update``, ``add_comment``, ``add_history``,
+    /// ``add_blank``) write through to disk immediately, following
+    /// the disk-write-before-commit ordering documented on
+    /// :class:`FITSHeader`.
+    ///
+    /// Reads are cheap; mutations may grow the reserved header
+    /// blocks in place if the new card list exceeds the current
+    /// allotment.
     #[getter]
     fn header(&self, py: Python<'_>) -> PyResult<Py<FITSHeader>> {
         Py::new(py, FITSHeader::from_state(
@@ -168,46 +200,68 @@ impl HDU {
         ))
     }
 
-    // Test-only hook: flip the taint flag without an actual disk failure.
-    // Used by tests/test_header_taint.py to verify rejection semantics
-    // without producing a real I/O failure on the host filesystem.
+    /// Test-only hook: flip the taint flag without an actual I/O
+    /// failure.  Used by ``tests/test_header_taint.py`` to verify
+    /// rejection semantics on hosts where producing a real mid-write
+    /// failure is hard.  Underscored to signal "not a public API"
+    /// — do not call from user code.
     fn _force_taint(&self) {
         self.tainted.store(true, Ordering::Release);
     }
 
+    /// The HDU's 0-based position in its file.
+    ///
+    /// Stable for the lifetime of the :class:`FITS` object — even
+    /// when an earlier HDU grows and shifts this HDU's bytes
+    /// forward, the index is unchanged because the HDU is still
+    /// at the same position in the file's HDU list.
     #[getter]
     pub(crate) fn index(&self) -> usize {
         self.index
     }
 
-    // EXTNAME header value, or None when the keyword is absent.
-    // Inherited by every HDU subclass.
+    /// ``EXTNAME`` header value, or ``None`` when the keyword is
+    /// absent.
+    ///
+    /// EXTNAME is the user-visible name of the HDU (e.g.
+    /// ``'SCI'``, ``'CATALOG'``).  Combined with :attr:`extver`
+    /// it's the standard way to identify HDUs without relying on
+    /// position-by-index.
     #[getter]
     fn extname(&self) -> PyResult<Option<String>> {
         let cards = self.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "EXTNAME"))
     }
 
-    // EXTVER header value; default 1 per the FITS standard when the
-    // keyword is absent.  Always returns a usable version number so
-    // callers can compare/select without handling Optional[int].
+    /// ``EXTVER`` header value, defaulting to ``1`` when absent.
+    ///
+    /// Per the FITS standard, multiple HDUs may share an
+    /// ``EXTNAME`` and are distinguished by ``EXTVER``.  Returns
+    /// ``1`` rather than ``None`` for the absent case so callers
+    /// can compare/select without handling ``Optional[int]``.
     #[getter]
     fn extver(&self) -> PyResult<i64> {
         let cards = self.header_snapshot()?;
         Ok(parse_keyword(&cards, "EXTVER").unwrap_or(1))
     }
 
-    // True iff this HDU has a non-empty data section: NAXIS > 0 and
-    // every NAXISn > 0.  Works uniformly for image and table HDUs
-    // (the FITS data-section formula is Π NAXISn pixels for images,
-    // and row_width × nrows = NAXIS1 × NAXIS2 bytes for tables — both
-    // collapse to "no NAXISn is zero").  Intended use: `fits.read()`-
-    // style convenience that picks the first HDU worth reading, and
-    // user code that wants a quick "is this HDU empty?" check.
-    //
-    // Heap-only edge case: a VLA table with NAXIS2=0 and PCOUNT>0
-    // returns False (no rows to interpret the heap through), which
-    // is the right call for read-convenience semantics.
+    /// ``True`` iff this HDU has a non-empty data section.
+    ///
+    /// Works uniformly across image and table HDUs: the test is
+    /// ``NAXIS > 0`` AND every ``NAXISn > 0``.  For images that
+    /// means "at least one pixel"; for tables it means "at least
+    /// one row of at least one column".
+    ///
+    /// Useful for picking the first HDU worth reading in a file
+    /// (primary HDUs are often empty stubs)::
+    ///
+    ///     hdu = next(h for h in fits if h.has_data)
+    ///     arr = hdu.read()
+    ///
+    /// Edge case: a VLA table with ``NAXIS2=0`` but ``PCOUNT>0``
+    /// (heap-only) returns ``False`` — no main rows means there's
+    /// nothing to interpret the heap through, which is the right
+    /// answer for the "is this HDU worth reading?" question.
     #[getter]
     fn has_data(&self) -> PyResult<bool> {
         let cards = self.header_snapshot()?;
