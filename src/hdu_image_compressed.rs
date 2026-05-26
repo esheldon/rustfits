@@ -26,7 +26,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
@@ -465,6 +465,7 @@ impl CompressedImageHDU {
             &super_.file, &super_.layout, &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
         )
@@ -493,6 +494,7 @@ impl CompressedImageHDU {
             &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
         )
@@ -518,6 +520,7 @@ impl CompressedImageHDU {
             &super_.tainted,
             &cache,
             &super_.header,
+            &super_.cards_version,
             &quantize_config,
             &compress_config,
             key,
@@ -2886,6 +2889,7 @@ fn write_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>
     >,
@@ -3362,9 +3366,12 @@ fn write_compressed_image_data(
     }
 
     // ----- header rewrite (PCOUNT update) -----
-    let mut cards_guard = cards_arc.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, total_heap_bytes);
     {
         let mut g = lock_file(file_handle)?;
@@ -3387,7 +3394,7 @@ fn write_compressed_image_data(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Any tiles cached from earlier reads are now stale.
     cache.clear();
@@ -3454,6 +3461,7 @@ fn extend_compressed_image_data(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
@@ -4213,10 +4221,12 @@ fn extend_compressed_image_data(
     }
 
     // ----- header rewrite (PCOUNT + NAXIS2 + ZNAXIS<last>) -----
-    let mut cards_guard = cards_arc
-        .lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     update_int_card(&mut new_cards, "NAXIS2", new_n_tiles as i64);
     // numpy axis 0 = slowest = FITS NAXIS<znaxis> (highest-numbered).
@@ -4247,7 +4257,7 @@ fn extend_compressed_image_data(
             ))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Boundary tiles' content changed (and any cached new tiles
     // would be inconsistent with the new heap layout anyway).
@@ -4390,6 +4400,7 @@ fn setitem_compressed_image(
     tainted: &TaintFlag,
     cache: &TileCache,
     cards_arc: &Arc<Mutex<Vec<String>>>,
+    cards_version: &Arc<AtomicU64>,
     quantize_config: &Arc<
         Mutex<Option<crate::zimage::compression_config::Quantize>>,
     >,
@@ -4932,10 +4943,12 @@ fn setitem_compressed_image(
     }
 
     // ----- header rewrite (PCOUNT only — shape unchanged) -----
-    let mut cards_guard = cards_arc
-        .lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = crate::hdu::CardsWriteGuard::from_parts(
+        cards_arc.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?,
+        cards_version,
+    );
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(file_handle)?;
@@ -4961,7 +4974,7 @@ fn setitem_compressed_image(
             ))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Modified tiles are now stale in the cache.
     cache.clear();
@@ -5140,9 +5153,8 @@ fn repack_compressed_heap(
     }
 
     // PCOUNT update — disk-write-before-commit.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -5163,7 +5175,7 @@ fn repack_compressed_heap(
                 "repack: PCOUNT header flush: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     cache.clear();
     Ok(())
 }

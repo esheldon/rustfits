@@ -870,9 +870,8 @@ pub(crate) fn write_vla_aware(
     // refresh the TFORMn `(maxlen)` hint for any PX/QX columns so
     // astropy's strict TFORM parser will accept the file (other
     // VLA letters round-trip fine without the hint).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, total_heap_bytes as u64);
     for (col_idx, col) in columns.iter().enumerate() {
         if col.tform_letter != 'X' { continue; }
@@ -903,7 +902,7 @@ pub(crate) fn write_vla_aware(
                 "PCOUNT header flush failed: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -1059,9 +1058,8 @@ pub(crate) fn append_vla_aware(
     }
 
     // Update NAXIS2 + PCOUNT cards (disk-write-before-commit).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     let naxis2_card = card_int(
         "NAXIS2", new_nrows as i64, "number of rows in table");
     let naxis2_idx = new_cards.iter()
@@ -1088,7 +1086,7 @@ pub(crate) fn append_vla_aware(
                 "header flush failed during VLA append: {}", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -1282,9 +1280,8 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
     }
 
     // PCOUNT update — disk-write-before-commit ordering.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    let mut new_cards = cards_guard.clone();
+    let cards_guard = super_.cards_write_lock()?;
+    let mut new_cards = cards_guard.clone_cards();
     set_pcount_in_cards(&mut new_cards, new_pcount);
     {
         let mut g = lock_file(&super_.file)?;
@@ -1307,6 +1304,6 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
                 e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }

@@ -3807,9 +3807,37 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
   LRU tile cache — sequential reads wouldn't get the same
   cache amplification.
 
-## Header-derived metadata caching (planned, 2026-05-26)
+## Header-derived metadata caching (in progress, 2026-05-26)
 
-**Status: scoped + design captured; not yet started.**
+**Status: Phase 1 (foundation) shipped; Phase 2+ pending.**
+
+Phase 1 shipped:
+- `HDU` carries `cards_version: Arc<AtomicU64>`, initialized to 0
+  in `HDU::new`, shared (via Arc clone) with every `FITSHeader`
+  view via `FITSHeader::from_state`.
+- `CardsWriteGuard` smart guard in `src/hdu.rs`.  Holds a
+  `MutexGuard<Vec<String>>` plus `&AtomicU64`; has read-only
+  accessors (`as_slice`, `clone_cards`) and exactly one mutation
+  path: the consuming `commit(new_cards)` method, which
+  atomically replaces the Vec AND bumps the version.  Does NOT
+  implement `DerefMut` — so `*guard = new_cards` no longer
+  compiles, making it impossible to mutate without bumping.
+- `HDU::cards_write_lock(&self)` returns a `CardsWriteGuard`;
+  `FITSHeader::cards_write_lock(&self)` is the same on the
+  Python-facing header.  `CardsWriteGuard::from_parts(guard,
+  version)` is the escape hatch for lower-level helpers that
+  receive an `Arc<Mutex<Vec<String>>>` plus an
+  `Arc<AtomicU64>` directly (used in
+  `hdu_image_compressed.rs`'s write / extend / setitem
+  helpers, which take `cards_arc` + `cards_version`).
+- All 26 historical mutation sites refactored to use
+  `cards_write_lock()` + `commit(new_cards)`.  Diff size:
+  +201/-107 across 9 files; all 2040 tests pass; ruff clean.
+
+The compile-time guarantee removes the "forgot to bump"
+foot-gun the original plan called out as Phase 1's risk:
+any future code path that mutates cards has to go through
+`commit`, which always bumps.
 
 **Why.**  After the four perf fixes above, the remaining ~15-20%
 of slice-path time on small-chunks compressed reads is per-
@@ -3951,11 +3979,13 @@ but it's almost certainly hot for any per-row workload.
 
 **Suggested phasing.**
 
-1. **Foundation** — add `cards_version` to `HDU`, add
-   `bump_cards_version()` helper, audit + add bumps to every
-   mutation path.  No caches yet.  Tests should still all pass
-   (no behavior change, just an unused counter).  This is the
-   risky part — getting all the mutation paths right.
+1. ~~**Foundation**~~ ✅ shipped.  See the "Status" block at
+   the top of this section: `cards_version`, `CardsWriteGuard`
+   with consuming `commit`, no `DerefMut` → impossible to
+   mutate without bumping.  No `bump_cards_version()` free
+   helper was needed — the guard's `commit` does it; the
+   compile-time guarantee replaced the "audit every mutation
+   path" plan.
 2. **`CompressedImageHDU` cache** — define `CompressedImageMeta`,
    write `parse_compressed_image_meta`, wire `meta_cache` into
    `__getitem__` / `read` / `slice_compressed_image` /
@@ -3979,10 +4009,12 @@ of the same pattern.
 
 **Risks.**
 
-- **Forgotten bump in a mutation path** → cache holds stale
-  metadata → reads return wrong values silently.  The debug-only
-  hash check above catches this in tests; production builds rely
-  on the audit.
+- ~~**Forgotten bump in a mutation path**~~ — eliminated by
+  Phase 1's `CardsWriteGuard` design: the type system makes
+  `*guard = new_cards` impossible (no `DerefMut`), and the only
+  mutation path (`commit`) always bumps.  New mutation sites
+  pick up the bump automatically by going through
+  `cards_write_lock()`.
 - **Mutex contention** — only the lock is per-call; the parse
   is amortized.  Should be invisible vs the slice work.  If it
   ever shows up, switch to `parking_lot::Mutex` or `RwLock`.

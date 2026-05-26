@@ -153,7 +153,11 @@ pub(crate) fn insert_column_impl(
     update_int_card(&mut new_cards, "NAXIS1", new_row_width as i64)?;
 
     // (1) Header rewrite first — may grow header by N blocks via the
-    //     shared shift primitive, bumping self.data_offset.
+    //     shared shift primitive, bumping self.data_offset.  Acquire
+    //     the cards write guard now so the eventual commit bumps the
+    //     version counter under the same lock that protects the cards
+    //     Vec; the lock is held through the data work below.
+    let cards_guard = super_.cards_write_lock()?;
     rewrite_header_to_disk(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,
@@ -191,9 +195,7 @@ pub(crate) fn insert_column_impl(
         &transform, &encode_col.name,
     )?;
 
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -341,7 +343,11 @@ fn insert_vla_column_impl(
         );
     }
 
-    // (1) Header rewrite first — may grow header blocks.
+    // (1) Header rewrite first — may grow header blocks.  Acquire
+    //     the cards write guard now; the lock is held through the
+    //     data work below and the eventual commit bumps the version
+    //     counter under that lock.
+    let cards_guard = super_.cards_write_lock()?;
     rewrite_header_to_disk(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,
@@ -419,9 +425,7 @@ fn insert_vla_column_impl(
         })?;
     }
 
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -546,7 +550,10 @@ pub(crate) fn delete_column_impl(
     update_int_card(&mut new_cards, "NAXIS1", new_row_width as i64)?;
 
     // (1) Header rewrite.  delete usually doesn't grow the header (drops
-    //     cards), but rewrite_header_to_disk handles both cases.
+    //     cards), but rewrite_header_to_disk handles both cases.  Acquire
+    //     the cards write guard now; lock is held through the data work
+    //     below and the eventual commit bumps the version counter.
+    let cards_guard = super_.cards_write_lock()?;
     rewrite_header_to_disk(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,
@@ -580,9 +587,7 @@ pub(crate) fn delete_column_impl(
         super_, data_offset, old_data_bytes, new_data_bytes,
     )?;
 
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 

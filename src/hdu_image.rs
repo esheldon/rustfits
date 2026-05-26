@@ -336,9 +336,8 @@ impl ImageHDU {
             new_hdu_shape[0] as i64,
             &format!("length of data axis {}", naxis),
         );
-        let mut cards_guard = super_.header.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = cards_guard.clone();
+        let cards_guard = super_.cards_write_lock()?;
+        let mut new_cards = cards_guard.clone_cards();
         let card_idx = new_cards.iter()
             .position(|c| c.len() >= 8 && c[..8].trim() == naxisn_key)
             .ok_or_else(|| PyValueError::new_err(
@@ -373,8 +372,7 @@ impl ImageHDU {
             })?;
         }
 
-        *cards_guard = new_cards.clone();
-        drop(cards_guard);
+        cards_guard.commit(new_cards.clone());
 
         // Image-data write completes the extend.  A failure here leaves
         // the on-disk header advertising the new shape but the file's
@@ -632,9 +630,7 @@ pub(crate) fn checksum_hdu_verify_checksum(
 pub(crate) fn commit_header_update(
     super_: &HDU, new_cards: Vec<String>,
 ) -> PyResult<()> {
-    let mut header_guard = super_.header.lock().map_err(|_| {
-        PyIOError::new_err("header lock poisoned")
-    })?;
+    let header_guard = super_.cards_write_lock()?;
     crate::header::rewrite_header_to_disk(
         &super_.file,
         &super_.offsets,
@@ -642,7 +638,7 @@ pub(crate) fn commit_header_update(
         &new_cards,
         &super_.tainted,
     )?;
-    *header_guard = new_cards;
+    header_guard.commit(new_cards);
     Ok(())
 }
 

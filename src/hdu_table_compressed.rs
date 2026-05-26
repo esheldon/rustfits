@@ -2601,8 +2601,7 @@ pub(crate) fn write_compressed_table_data<'py>(
     // funpack truncate the heap to zero even though the descriptors
     // point at real data.  For fixed-only tables ZPCOUNT stays 0
     // (no original heap to size).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let cards_guard = super_.cards_write_lock()?;
     let mut new_cards = cards.to_vec();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
     set_zpcount_in_cards(&mut new_cards, original_pcount);
@@ -2610,7 +2609,7 @@ pub(crate) fn write_compressed_table_data<'py>(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,
     )?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     Ok(())
 }
 
@@ -3508,8 +3507,7 @@ pub(crate) fn append_compressed_table_data(
     // when any VLA col is present — it's the original
     // (uncompressed) heap size and funpack copies it onto the
     // output PCOUNT.  For fixed-only tables ZPCOUNT stays 0.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let cards_guard = super_.cards_write_lock()?;
     let mut new_cards = cards.to_vec();
     update_int_card_in_place(
         &mut new_cards, "NAXIS2", new_n_tiles as i64,
@@ -3525,7 +3523,7 @@ pub(crate) fn append_compressed_table_data(
         &super_.file, &super_.offsets, &super_.layout,
         &new_cards, &super_.tainted,
     )?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Step 7: invalidate the cache.  The merged tile's entries
     // are stale; cheapest correct option is a full clear (cache
@@ -3996,8 +3994,7 @@ pub(crate) fn repack_compressed_table_heap(
     }
 
     // Update PCOUNT — disk-write-before-commit pattern.
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let cards_guard = super_.cards_write_lock()?;
     let mut new_cards = cards.clone();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, new_pcount);
     {
@@ -4019,7 +4016,7 @@ pub(crate) fn repack_compressed_table_heap(
                 "repack: PCOUNT header flush: {}; close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     cache.clear();
     Ok(())
 }
@@ -4367,8 +4364,7 @@ fn repack_compressed_table_heap_vla(
 
     // Update PCOUNT (ZPCOUNT stays unchanged — original-heap
     // size is invariant under repack).
-    let mut cards_guard = super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let cards_guard = super_.cards_write_lock()?;
     let mut new_cards = cards.to_vec();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, new_pcount);
     {
@@ -4392,7 +4388,7 @@ fn repack_compressed_table_heap_vla(
                  close + reopen", e))
         })?;
     }
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
     cache.clear();
     Ok(())
 }
@@ -4718,8 +4714,7 @@ pub(crate) fn setitem_compressed_cols(
 
     // Update PCOUNT (and ZPCOUNT if any VLA col was touched).
     // Standard disk-write-before-commit + taint discipline.
-    let mut cards_guard = ctx.super_.header.lock()
-        .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+    let cards_guard = ctx.super_.cards_write_lock()?;
     let mut new_cards = ctx.cards.to_vec();
     crate::hdu_table::set_pcount_in_cards(&mut new_cards, heap_cursor);
     if any_vla {
@@ -4729,7 +4724,7 @@ pub(crate) fn setitem_compressed_cols(
         &ctx.super_.file, &ctx.super_.offsets, &ctx.super_.layout,
         &new_cards, &ctx.super_.tainted,
     )?;
-    *cards_guard = new_cards;
+    cards_guard.commit(new_cards);
 
     // Invalidate the cache — every modified tile's column entry is
     // stale (descriptor points at a new heap blob, decoded bytes

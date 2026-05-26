@@ -14,7 +14,7 @@ use pyo3::conversion::IntoPyObjectExt;
 use pyo3::Bound;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::{
     check_not_tainted, lock_file, shift_file_tail_and_update_offsets,
@@ -1362,6 +1362,9 @@ pub(crate) struct FITSHeader {
     #[allow(dead_code)]
     pub(crate) layout: Arc<FileLayout>,
     pub(crate) tainted: TaintFlag,
+    // Shared with the parent HDU; bumped on every successful cards
+    // mutation so caches keyed off this counter can detect staleness.
+    pub(crate) cards_version: Arc<AtomicU64>,
 }
 
 impl FITSHeader {
@@ -1371,8 +1374,9 @@ impl FITSHeader {
         offsets: Arc<HduOffsets>,
         layout: Arc<FileLayout>,
         tainted: TaintFlag,
+        cards_version: Arc<AtomicU64>,
     ) -> Self {
-        FITSHeader { cards, file, offsets, layout, tainted }
+        FITSHeader { cards, file, offsets, layout, tainted, cards_version }
     }
 
     fn snapshot(&self) -> PyResult<Vec<String>> {
@@ -1382,12 +1386,19 @@ impl FITSHeader {
         Ok(g.clone())
     }
 
+    // Acquire the cards mutex for a mutation; see CardsWriteGuard in
+    // hdu.rs for the commit semantics and version-bump contract.
+    pub(crate) fn cards_write_lock(&self) -> PyResult<crate::hdu::CardsWriteGuard<'_>> {
+        let inner = self.cards.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        Ok(crate::hdu::CardsWriteGuard::from_parts(inner, &self.cards_version))
+    }
+
     fn append_commentary(&self, keyword: &str, text: &str) -> PyResult<()> {
         check_not_tainted(&self.tainted)?;
         validate_commentary_text(text)?;
-        let mut guard = self.cards.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = guard.clone();
+        let guard = self.cards_write_lock()?;
+        let mut new_cards = guard.clone_cards();
         append_commentary_to_cards(&mut new_cards, keyword, text);
         rewrite_header_to_disk(
             &self.file,
@@ -1396,7 +1407,7 @@ impl FITSHeader {
             &new_cards,
             &self.tainted,
         )?;
-        *guard = new_cards;
+        guard.commit(new_cards);
         Ok(())
     }
 }
@@ -1555,9 +1566,8 @@ impl FITSHeader {
             )));
         }
         let (value_obj, explicit_comment) = parse_setitem_value(value)?;
-        let mut guard = self.cards.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = guard.clone();
+        let guard = self.cards_write_lock()?;
+        let mut new_cards = guard.clone_cards();
         // Pass the RAW user key — apply_setitem decides storage spelling
         // (existing card's wins, else user's case-preserved form).
         apply_setitem(&mut new_cards, key, &value_obj, explicit_comment)?;
@@ -1568,7 +1578,7 @@ impl FITSHeader {
             &new_cards,
             &self.tainted,
         )?;
-        *guard = new_cards;
+        guard.commit(new_cards);
         Ok(())
     }
 
@@ -1583,9 +1593,8 @@ impl FITSHeader {
                 key
             )));
         }
-        let mut guard = self.cards.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = guard.clone();
+        let guard = self.cards_write_lock()?;
+        let mut new_cards = guard.clone_cards();
         let removed = if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
             delete_commentary_cards(&mut new_cards, &key) > 0
         } else {
@@ -1603,7 +1612,7 @@ impl FITSHeader {
             &new_cards,
             &self.tainted,
         )?;
-        *guard = new_cards;
+        guard.commit(new_cards);
         Ok(())
     }
 
@@ -1631,9 +1640,8 @@ impl FITSHeader {
         if actions.is_empty() {
             return Ok(());
         }
-        let mut guard = self.cards.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
-        let mut new_cards = guard.clone();
+        let guard = self.cards_write_lock()?;
+        let mut new_cards = guard.clone_cards();
         for action in &actions {
             match action {
                 UpdateAction::SetKey { key, value, explicit_comment } => {
@@ -1654,7 +1662,7 @@ impl FITSHeader {
             &new_cards,
             &self.tainted,
         )?;
-        *guard = new_cards;
+        guard.commit(new_cards);
         Ok(())
     }
 
@@ -1711,8 +1719,7 @@ impl FITSHeaderEdit {
     fn commit_internal(&self, py: Python<'_>) -> PyResult<()> {
         let parent = self.parent.bind(py).borrow();
         check_not_tainted(&parent.tainted)?;
-        let mut g = parent.cards.lock()
-            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        let guard = parent.cards_write_lock()?;
         rewrite_header_to_disk(
             &parent.file,
             &parent.offsets,
@@ -1720,7 +1727,7 @@ impl FITSHeaderEdit {
             &self.cards,
             &parent.tainted,
         )?;
-        *g = self.cards.clone();
+        guard.commit(self.cards.clone());
         Ok(())
     }
 }

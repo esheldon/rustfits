@@ -8,8 +8,8 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyIOError;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::{
     check_not_tainted, parse_keyword, parse_string_keyword,
@@ -17,11 +17,68 @@ use crate::common::{
 };
 use crate::header::FITSHeader;
 
+// Smart-guard for the cards Vec.  Holds the cards mutex AND a
+// reference to the per-HDU `cards_version` atomic counter.  The only
+// way to mutate the cards is `commit(new_cards)`, which atomically
+// replaces the Vec and bumps the version — making it impossible to
+// forget a version bump on a successful mutation.  Read-only access
+// is via `as_slice()` and `clone_cards()`; there is no `DerefMut`.
+//
+// If the caller drops the guard without calling `commit`, no version
+// bump and no cards replacement happens — correct for the "decided
+// not to mutate after all" path (e.g. a validation error before any
+// disk write).
+//
+// Memory ordering: `commit` does the version bump with Release while
+// still holding the cards mutex.  Any cache reader using Acquire on
+// the version observes the post-mutation Vec because the cards mutex
+// would have to be re-acquired (and released by us) for the reader
+// to even reach the new cards.
+pub(crate) struct CardsWriteGuard<'a> {
+    inner: MutexGuard<'a, Vec<String>>,
+    version: &'a AtomicU64,
+}
+
+impl CardsWriteGuard<'_> {
+    /// Read-only view of the current cards.  Used by future cache
+    /// readers that need to parse fresh metadata on miss without
+    /// dropping the lock.
+    #[allow(dead_code)]
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.inner
+    }
+
+    /// Clone the current cards out so the caller can stage a modified
+    /// replacement.  Typical pattern:
+    ///
+    ///   let g = super_.cards_write_lock()?;
+    ///   let mut new_cards = g.clone_cards();
+    ///   // ... mutate new_cards, do disk I/O ...
+    ///   g.commit(new_cards);
+    pub(crate) fn clone_cards(&self) -> Vec<String> {
+        self.inner.clone()
+    }
+
+    /// Atomically replace the cards Vec and bump the version counter.
+    /// Consumes the guard so a single commit closes the write window.
+    pub(crate) fn commit(mut self, new_cards: Vec<String>) {
+        *self.inner = new_cards;
+        self.version.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[pyclass(subclass)]
 pub(crate) struct HDU {
     // Shared with FITSHeader so mutations through the header view propagate
     // back to the HDU's canonical card list (and any other readers).
     pub(crate) header: Arc<Mutex<Vec<String>>>,
+    // Monotonic counter, bumped (via `bump_cards_version`, called from
+    // `rewrite_header_to_disk` on every successful disk-and-commit) every
+    // time the cards Vec mutates.  Shared with FITSHeader so mutations
+    // through the header view propagate to caches keyed off this counter
+    // on the HDU (planned per-HDU-type Meta caches read cur_version,
+    // compare against the cached version, and re-parse on miss).
+    pub(crate) cards_version: Arc<AtomicU64>,
     pub(crate) index: usize,
     // Source filename, cloned in from FITS at construction.  Used only
     // by __repr__; size is negligible compared to header storage.
@@ -45,6 +102,7 @@ impl HDU {
     ) -> Self {
         HDU {
             header: Arc::new(Mutex::new(header)),
+            cards_version: Arc::new(AtomicU64::new(0)),
             index,
             filename,
             offsets,
@@ -62,6 +120,34 @@ impl HDU {
             .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
         Ok(g.clone())
     }
+
+    // Acquire the cards mutex for a mutation.  The returned guard's
+    // ONLY mutation path is `commit(new_cards)`, which atomically
+    // replaces the cards Vec and bumps the version counter — so any
+    // metadata cache keyed off `cards_version` invalidates correctly
+    // without per-callsite vigilance.  See `CardsWriteGuard` above
+    // for the read-only accessors and the commit semantics.
+    pub(crate) fn cards_write_lock(&self) -> PyResult<CardsWriteGuard<'_>> {
+        let inner = self.header.lock()
+            .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+        Ok(CardsWriteGuard { inner, version: &self.cards_version })
+    }
+}
+
+impl CardsWriteGuard<'_> {
+    /// Construct a CardsWriteGuard from a raw MutexGuard plus the
+    /// matching version counter.  Used by `FITSHeader::cards_write_lock`
+    /// and similar helpers that can't go through `HDU::cards_write_lock`
+    /// because they sit on a different pyclass.  Keep this surface
+    /// internal: callers MUST use a `_write_lock()` accessor on the
+    /// owning type rather than constructing a guard directly, to avoid
+    /// version-counter mismatches.
+    pub(crate) fn from_parts<'a>(
+        inner: MutexGuard<'a, Vec<String>>,
+        version: &'a AtomicU64,
+    ) -> CardsWriteGuard<'a> {
+        CardsWriteGuard { inner, version }
+    }
 }
 
 #[pymethods]
@@ -78,6 +164,7 @@ impl HDU {
             Arc::clone(&self.offsets),
             Arc::clone(&self.layout),
             Arc::clone(&self.tainted),
+            Arc::clone(&self.cards_version),
         ))
     }
 
