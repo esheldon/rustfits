@@ -103,6 +103,60 @@ pub(crate) fn header_has_ztable(header: &[String]) -> bool {
 // pyclass
 // ---------------------------------------------------------------------------
 
+/// A tile-compressed binary-table HDU (``ZTABLE=T`` on disk).
+///
+/// The user-facing surface mirrors :class:`TableHDU` exactly:
+/// every accessor (:attr:`nrows`, :attr:`ncols`, :attr:`dtype`,
+/// :attr:`colnames`, :attr:`units`) reports the **uncompressed**
+/// table schema, and every I/O method (:meth:`read`,
+/// :meth:`write`, :meth:`append`, ``__setitem__``,
+/// ``__getitem__``) operates on the uncompressed rows.  The
+/// per-(tile, column) compressed storage is an implementation
+/// detail.
+///
+/// Subclasses :class:`TableHDU` (so ``isinstance(hdu, TableHDU)``
+/// holds), but overrides every I/O method to handle per-tile
+/// (de)compression.  Returned by indexing a :class:`FITS` object
+/// at a position containing a ZTABLE HDU.
+///
+/// Compression-specific surface beyond the inherited
+/// :class:`TableHDU` API:
+///
+/// * :attr:`compression` — per-column algorithm dict
+///   (``{col_name: 'GZIP_1'}`` etc.).
+/// * :attr:`n_tiles` — number of tile chunks on disk.
+/// * :attr:`ztile_rows` — rows per tile (the ``ZTILELEN``
+///   parameter the file was created with).
+/// * :attr:`tile_cache_size`, :meth:`set_tile_cache_size`,
+///   :attr:`tile_cache_used`, :meth:`clear_tile_cache` — LRU
+///   cache controls for decoded ``(tile, column)`` slabs.
+/// * :meth:`repack` — drop orphans accumulated by
+///   :meth:`append` (merge-into-partial-last-tile) and
+///   ``__setitem__`` mutations.
+///
+/// Examples
+/// --------
+/// Read just like an uncompressed table::
+///
+///     arr = hdu.read()
+///     ra_dec = hdu.read(columns=["RA", "DEC"])
+///     chunk = hdu[1000:2000]
+///
+/// Inspect compression::
+///
+///     print(hdu.compression)         # {'RA': 'GZIP_2', 'FLAG': 'RICE_1', ...}
+///     print(hdu.n_tiles, hdu.ztile_rows)
+///
+/// Notes
+/// -----
+/// Use :meth:`FITS.create_table_hdu` with ``compress=`` to
+/// create a tile-compressed table.  Direct construction from
+/// Python is not supported.
+///
+/// :meth:`insert_column` and :meth:`delete_column` are NOT
+/// supported on compressed tables; rebuild the table through
+/// a fresh :meth:`FITS.create_table_hdu` + :meth:`write` to
+/// change the schema.
 #[pyclass(extends = TableHDU)]
 pub(crate) struct CompressedTableHDU {
     cache: Arc<ColumnTileCache>,
@@ -264,38 +318,43 @@ impl CompressedTableHDU {
     // -------------------------------------------------------------------
     // Uncompressed-view accessors (override the inherited TableHDU ones)
     // -------------------------------------------------------------------
+    //
+    // All sourced from the SYNTHESIZED uncompressed schema (see
+    // synthesize_uncompressed_cards): ZNAXIS1 → row width, ZNAXIS2
+    // → row count, ZFORMn → original TFORMn.  The on-disk BINTABLE
+    // has TFORMn='1QB(...)' per column and would mislead the
+    // inherited TableHDU accessors.
 
-    // Number of rows in the ORIGINAL (uncompressed) table.  Reads
-    // ZNAXIS2 (cached) — the compressed-table NAXIS2 holds the
-    // number of tile chunks, not the user-visible row count.
+    /// Number of rows in the ORIGINAL (uncompressed) table.
+    ///
+    /// Sourced from ``ZNAXIS2``; the on-disk ``NAXIS2`` holds the
+    /// number of tile chunks, not the user-visible row count.
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
         Ok(slf.meta(super_)?.nrows)
     }
 
-    // Pythonic length: matches `len(structured_arr)` for the array
-    // a future `.read()` will return.
+    // __len__ is a pyo3 slot dunder — no per-method docstring.
+    // Same value as nrows; matches len(structured_arr) for the
+    // array a full read() returns.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
         Ok(slf.meta(super_)?.nrows)
     }
 
-    // Number of columns.  Same override reason as the rest of the
-    // uncompressed-view accessors: the inherited TableHDU.ncols
-    // would parse the on-disk schema (which trips on TDIM-on-VLA
-    // cards present in a compressed table).  The cached meta uses
-    // the synthesized cards via parse_compressed_table_meta, so
-    // columns.len() is the right answer.
+    /// Number of columns in the table (``TFIELDS``).
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
         Ok(slf.meta(super_)?.columns.len())
     }
 
-    // numpy structured dtype the original (uncompressed) table would
-    // read into.  Uses the cached meta whose columns Vec was parsed
-    // from the synthesized (uncompressed-view) cards.
+    /// The numpy structured dtype the original (uncompressed)
+    /// table reads into.
+    ///
+    /// Same scaling rules as :attr:`TableHDU.dtype`; sourced from
+    /// the synthesized uncompressed-view cards.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let super_ = slf.as_super().as_super();
@@ -303,7 +362,8 @@ impl CompressedTableHDU {
         build_numpy_dtype(py, &meta.columns, /* scale = */ true)
     }
 
-    // Column names in file order — same cached-meta source as dtype.
+    /// Column names in on-disk order, as a tuple.  Same semantics
+    /// as :attr:`TableHDU.colnames`.
     #[getter]
     fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let super_ = slf.as_super().as_super();
@@ -313,7 +373,8 @@ impl CompressedTableHDU {
         Ok(PyTuple::new(py, &names)?.unbind())
     }
 
-    // Per-column units dict (TUNITn) — same cached-meta source.
+    /// Per-column units (``TUNITn``), as a dict.  Same semantics
+    /// as :attr:`TableHDU.units`.
     #[getter]
     fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let super_ = slf.as_super().as_super();
@@ -329,12 +390,18 @@ impl CompressedTableHDU {
     // Compression-specific accessors
     // -------------------------------------------------------------------
 
-    // Per-column compression algorithm: dict {col_name: zctyp_value}
-    // preserving on-disk column order.  Column names are read from
-    // TTYPEn (preserved verbatim from the original table).  Algorithm
-    // strings are returned as the FITS-spec form found on disk
-    // (RICE_1 / GZIP_1 / GZIP_2 / NOCOMPRESS — typically one of the
-    // three algorithms cfitsio's fits_compress_table emits).
+    /// Per-column compression algorithm, as a dict.
+    ///
+    /// ``{column_name: zctyp_value}`` preserving on-disk column
+    /// order.  Column names come from ``TTYPEn`` (preserved
+    /// verbatim from the original table).  Algorithm strings
+    /// are the FITS-spec ``ZCTYPn`` values found on disk
+    /// (``'RICE_1'`` / ``'GZIP_1'`` / ``'GZIP_2'``).
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     ``{column_name: algorithm_string}``.
     #[getter]
     fn compression(
         slf: PyRef<'_, Self>, py: Python<'_>,
@@ -348,17 +415,20 @@ impl CompressedTableHDU {
         Ok(dict.unbind())
     }
 
-    // Number of tile chunks the original table was split into.
-    // Equals the compressed table's NAXIS2 — one row per tile.
+    /// Number of tile chunks the original table was split into.
+    ///
+    /// Equals the compressed table's on-disk ``NAXIS2`` — one
+    /// BINTABLE row per tile.
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
         Ok(slf.meta(super_)?.n_tiles)
     }
 
-    // Rows-per-tile setting used at compression time (ZTILELEN).
-    // The last tile may contain fewer rows if ZNAXIS2 is not a
-    // multiple of ZTILELEN.
+    /// Rows per tile used at compression time (``ZTILELEN``).
+    ///
+    /// The last tile may contain fewer rows if ``ZNAXIS2`` is
+    /// not a multiple of ``ZTILELEN``.
     #[getter]
     fn ztile_rows(slf: PyRef<'_, Self>) -> PyResult<usize> {
         let super_ = slf.as_super().as_super();
@@ -366,24 +436,28 @@ impl CompressedTableHDU {
     }
 
     // -------------------------------------------------------------------
-    // I/O surface — all stubbed; later phases will fill these in.
+    // I/O surface (overrides the inherited TableHDU versions)
     // -------------------------------------------------------------------
 
-    // Read the (decompressed) table into a numpy structured ndarray.
-    //
-    //   rows=None    every row in file order, shape (ZNAXIS2,).
-    //   rows=slice   range of rows; step!=1 supported via per-tile
-    //                row dispatch.
-    //   rows=list    arbitrary indices in user-requested order
-    //                (deduped — first occurrence wins).
-    //   columns=None all columns in file order.
-    //   columns=list subset + reorder, case-insensitive name lookup.
-    //   scale=True   apply TSCAL/TZERO (unsigned trick + general).
-    //
-    // Only fixed columns are supported in Phase 2/3; VLA columns
-    // raise NotImplementedError (Phase 4).  mask_null=True is not
-    // yet implemented (TNULL masking on compressed-table reads is a
-    // separate follow-up).
+    /// Read the (decompressed) table into a numpy structured array.
+    ///
+    /// Same signature as :meth:`TableHDU.read`: ``rows`` /
+    /// ``columns`` / ``scale`` / ``mask_null``.  Per-tile decode
+    /// runs lazily — only the tiles overlapping the requested
+    /// row range are decompressed.
+    ///
+    /// Currently unsupported:
+    ///
+    /// * ``mask_null=True`` raises ``NotImplementedError`` —
+    ///   TNULL masking on compressed-table reads is a separate
+    ///   follow-up.
+    ///
+    /// Notes
+    /// -----
+    /// Decoded (tile, column) byte slabs populate the LRU cache
+    /// (subject to :attr:`tile_cache_size`).  Subsequent reads
+    /// of the same column range, or of other columns within the
+    /// same tile range, hit warm slabs.
     #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
     fn read(
         slf: PyRef<'_, Self>,
@@ -408,15 +482,13 @@ impl CompressedTableHDU {
         )
     }
 
-    // Standard table-shaped __getitem__:
-    //   hdu[i]            → 0-d structured record (numpy.void) at row i
+    // __getitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same dispatch as TableHDU.__getitem__:
+    //   hdu[i]            → 0-d structured record at row i
     //   hdu[i:j[:s]]      → structured ndarray covering the slice
-    //   hdu[[i, j, k]]    → fancy-row structured ndarray in input order
-    //   hdu["col"]        → CompressedSingleColumnSubset (chained reads)
+    //   hdu[[i, j, k]]    → fancy-row structured ndarray
+    //   hdu["col"]        → CompressedSingleColumnSubset
     //   hdu[["a", "b"]]   → CompressedColumnSubset
-    //
-    // Dispatch mirrors TableHDU.__getitem__ exactly via the shared
-    // classify_table_key/TableKey machinery.
     fn __getitem__(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -470,39 +542,41 @@ impl CompressedTableHDU {
     }
 
     // ----- Tile cache controls (mirror CompressedImageHDU) -----
+    //
+    // Cache keys are (tile_idx, col_idx) — per-(tile, column)
+    // granularity, so reading just hdu["col"][i:j] only loads
+    // that one column's overlapping tiles.
 
-    // Current cache capacity in bytes (default 32 MiB).
+    /// Current tile-cache capacity in bytes.  Default 32 MiB.
+    /// See :meth:`CompressedImageHDU.tile_cache_size` for details.
     #[getter]
     fn tile_cache_size(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.capacity()
     }
 
-    // Set capacity in bytes; 0 disables caching.  Shrinking below
-    // current usage evicts LRU entries to fit.
+    /// Set the tile-cache capacity in bytes.  ``0`` disables.
     fn set_tile_cache_size(&self, bytes: u64) {
         self.cache.set_capacity(bytes);
     }
 
-    // Bytes currently held in the cache.
+    /// Bytes currently held in the tile cache.
     #[getter]
     fn tile_cache_used(slf: PyRef<'_, Self>) -> u64 {
         slf.cache.used_bytes()
     }
 
-    // Drop every cached (tile, column) decompressed slab.  Keeps the
-    // capacity setting in place.
+    /// Drop every cached ``(tile, column)`` decompressed slab.
+    /// Keeps :attr:`tile_cache_size` as-is.
     fn clear_tile_cache(&self) {
         self.cache.clear();
     }
 
-    // Row writes — `hdu[i] = record`, `hdu[a:b] = arr` (step=1),
-    // `hdu[[i, j, k]] = arr`.  For tables without VLA columns.  Each
-    // form touches ALL columns of the selected rows.  Modified tiles
-    // are decoded → row bytes overwritten → re-encoded + appended to
-    // the heap end (orphaning the old blobs; `repack()` reclaims).
-    //
-    // Still raising for forms that 6c-2c/d/e will add: stepped
-    // slices, single/multi column, single cell, VLA columns.
+    // __setitem__ is a pyo3 slot dunder — no per-method docstring.
+    // Same surface as TableHDU.__setitem__ (all 6 forms: row /
+    // slice / fancy-row / column / cell / multi-column / subset
+    // chained), including VLA columns.  Modified tiles are
+    // decoded → row bytes overwritten → re-encoded + appended to
+    // the heap end (orphaning the old blobs; repack() reclaims).
     fn __setitem__(
         slf: PyRef<'_, Self>,
         py: Python<'_>,
@@ -634,16 +708,20 @@ impl CompressedTableHDU {
         }
     }
 
-    // Compress and write `data` to the table.  Accepts the same
-    // three input forms as TableHDU.write:
-    //   - structured numpy ndarray with the table's field names
-    //   - dict {col_name: ndarray}
-    //   - list/tuple of ndarrays + names=[...]
-    //
-    // Encodes each (tile, column) per the per-column ZCTYPn
-    // algorithm, streams compressed blobs to the heap, fills the
-    // descriptor table, and updates PCOUNT.  Mid-write I/O failures
-    // taint the file (close + reopen to recover).
+    /// Compress and write data to the table.
+    ///
+    /// Same signature and input forms as :meth:`TableHDU.write`:
+    /// structured ndarray, ``{name: ndarray}`` dict, or list of
+    /// per-column ndarrays + ``names=``.  Encodes each
+    /// ``(tile, column)`` per the per-column ``ZCTYPn`` algorithm
+    /// the file was created with, streams compressed blobs to the
+    /// heap, fills the descriptor table, and updates ``PCOUNT``.
+    ///
+    /// Notes
+    /// -----
+    /// Mid-write I/O failures taint the file (close + reopen to
+    /// recover).  See :meth:`TableHDU.write` for the per-form
+    /// validation rules.
     #[pyo3(signature = (data, *, names=None))]
     fn write(
         slf: PyRef<'_, Self>,
@@ -696,26 +774,29 @@ impl CompressedTableHDU {
         )
     }
 
-    // Append rows to a compressed table.  Accepts the same three
-    // input forms as TableHDU.write (structured ndarray / dict /
-    // list+names).
-    //
-    // **Merge-into-last-partial semantics.**  If the existing last
-    // tile has fewer than ZTILELEN rows, append() decodes it,
-    // concatenates the first M new rows (M = ZTILELEN - last_tile_rows),
-    // re-encodes the now-fuller tile, and appends the new blobs to
-    // the heap end.  The old last-tile blobs become orphans (PCOUNT
-    // grows monotonically — `repack()` would reclaim them, not yet
-    // implemented on compressed tables).  Any rows that didn't fit
-    // are encoded as fresh full tiles.  Maintains the FITS Tile
-    // Compression Convention's "all tiles same size except the
-    // last" invariant so funpack and our own reader both work.
-    //
-    // VLA columns supported: existing per-cell compressed bytes are
-    // copied verbatim (no decode/re-encode); merge-tile new rows are
-    // encoded via the per-cell-then-fallback path; original-table
-    // heap offsets continue from current ZPCOUNT so the funpack-
-    // reconstructed file stays consistent.
+    /// Append rows to a compressed table.
+    ///
+    /// Same signature and input forms as :meth:`TableHDU.append`.
+    ///
+    /// Notes
+    /// -----
+    /// **Merge-into-last-partial semantics.**  If the existing
+    /// last tile has fewer than ``ztile_rows`` rows, ``append``
+    /// decodes it, concatenates the first ``M`` new rows (``M =
+    /// ztile_rows - last_tile_rows``), re-encodes the now-fuller
+    /// tile, and appends the new blobs to the heap end.  Old
+    /// last-tile blobs become orphans (``PCOUNT`` grows
+    /// monotonically — call :meth:`repack` to reclaim them).
+    /// Any rows that didn't fit are encoded as fresh full tiles.
+    /// Maintains the FITS Tile Compression Convention's "all
+    /// tiles same size except the last" invariant.
+    ///
+    /// VLA columns are supported: existing per-cell compressed
+    /// bytes are copied verbatim (no decode + re-encode);
+    /// merge-tile new rows are encoded via the per-cell-then-
+    /// fallback path; original-table heap offsets continue from
+    /// the current ``ZPCOUNT`` so a funpack-reconstructed file
+    /// stays consistent.
     #[pyo3(signature = (data, *, names=None))]
     fn append(
         slf: PyRef<'_, Self>,
@@ -764,9 +845,9 @@ impl CompressedTableHDU {
         )
     }
 
-    // Alias for append, mirroring TableHDU's `extend` alias which
-    // exists for parity with ImageHDU.extend (generic code that
-    // iterates HDUs and calls .extend(...) keeps working).
+    /// Alias for :meth:`append`.  Mirrors :meth:`TableHDU.extend`
+    /// for parity with :meth:`ImageHDU.extend` — generic code
+    /// iterating HDUs and calling ``.extend(...)`` keeps working.
     #[pyo3(signature = (data, *, names=None))]
     fn extend(
         slf: PyRef<'_, Self>,
@@ -777,22 +858,37 @@ impl CompressedTableHDU {
         Self::append(slf, py, data, names)
     }
 
-    // Rewrite the heap with only live blobs (those pointed at by
-    // current descriptors), dropping orphans left behind by
-    // append-with-merge (and any future mutation that always-
-    // appends).  Shrinks the on-disk file when the new heap is
-    // smaller.  No-op when the heap is already compact (PCOUNT
-    // unchanged after the rewrite).
-    //
-    // VLA columns add a level of indirection (dual-descriptor
-    // blobs contain compressed-Q descriptors pointing at per-cell
-    // bytes); not yet supported by repack().
+    /// Rebuild the heap, reclaiming orphan blobs.
+    ///
+    /// :meth:`append` (when a merge into the last partial tile
+    /// re-encodes the existing blobs) and ``__setitem__`` (every
+    /// affected tile re-encoded and appended to the heap end)
+    /// leave the old compressed bytes as orphans referenced by
+    /// no descriptor.  ``repack`` walks every live descriptor,
+    /// streams its referenced bytes into a compact new heap, and
+    /// rewrites descriptors to point at it.
+    ///
+    /// Shrinks the on-disk file when the new heap is smaller
+    /// (last HDU: ``set_len``; non-last HDU: trailing HDUs shift
+    /// backward in lockstep).  No-op for an already-compact
+    /// heap.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
         let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
         repack_compressed_table_heap(&super_, &cache)
     }
 
+    /// Not supported on compressed tables.
+    ///
+    /// Schema edits would require re-encoding every tile.
+    /// Workaround: build a fresh :class:`CompressedTableHDU` with
+    /// the new schema via :meth:`FITS.create_table_hdu`
+    /// (``compress=`` set) + :meth:`write`.
+    ///
+    /// Raises
+    /// ------
+    /// NotImplementedError
+    ///     Always.
     fn insert_column(
         _slf: PyRef<'_, Self>,
         _name: &str,
@@ -803,6 +899,8 @@ impl CompressedTableHDU {
              compressed tables are not planned for the current roadmap"))
     }
 
+    /// Not supported on compressed tables.  See
+    /// :meth:`insert_column` for the workaround.
     fn delete_column(
         _slf: PyRef<'_, Self>,
         _key: &Bound<'_, PyAny>,
@@ -813,39 +911,49 @@ impl CompressedTableHDU {
     }
 
     // Compressed tables use ZHECKSUM / ZDATASUM per the FITS Tile
-    // Compression Convention (the integrity check is against the
-    // equivalent uncompressed table, not the on-disk BINTABLE).
-    // Compressed tables use ZHECKSUM / ZDATASUM per the FITS Tile
     // Compression Convention: both are computed against the
-    // EQUIVALENT UNCOMPRESSED table (the original schema rebuilt from
-    // the Z-prefixed cards, with cell data decoded back to its
-    // BITPIX-native big-endian layout).  Astropy uses the same
-    // convention and reads our values bit-exact.
-    //
-    // Manual semantics — re-run add_checksum after write / append /
-    // __setitem__ / repack to refresh.
-    //
-    // VLA-bearing compressed tables raise NotImplementedError —
-    // reconstructing the equivalent-uncompressed heap depends on
-    // per-cell ORIGINAL offsets stored in the dual-descriptor blob,
-    // which this implementation doesn't yet thread through to the
-    // checksum path.
+    // EQUIVALENT UNCOMPRESSED table (the original schema rebuilt
+    // from the Z-prefixed cards, with cell data decoded back to
+    // its BITPIX-native big-endian layout).  Astropy uses the
+    // same convention and reads our values bit-exact.
 
+    /// Compute and store the ``ZDATASUM`` checksum card.
+    ///
+    /// Computed against the equivalent uncompressed table
+    /// (original schema rebuilt from the Z-prefixed cards with
+    /// cell data decoded back to its BITPIX-native big-endian
+    /// layout), not the on-disk BINTABLE — per the FITS Tile
+    /// Compression Convention.  Same manual-refresh contract as
+    /// :meth:`TableHDU.add_datasum` — re-run after :meth:`write`
+    /// / :meth:`append` / ``__setitem__`` / :meth:`repack`.
     fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super().into_super();
         compressed_table_add_datasum(&super_)
     }
 
+    /// Compute and store both ``ZDATASUM`` and ``ZHECKSUM`` cards.
+    ///
+    /// Same equivalent-uncompressed convention as
+    /// :meth:`add_datasum`.  This is the call most users want.
     fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
         let super_ = slf.into_super().into_super();
         compressed_table_add_checksum(&super_)
     }
 
+    /// Verify the stored ``ZDATASUM`` against the equivalent
+    /// uncompressed table bytes.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_ = slf.into_super().into_super();
         compressed_table_verify_datasum(&super_)
     }
 
+    /// Verify the stored ``ZHECKSUM`` over the full HDU.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
     fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
         let super_ = slf.into_super().into_super();
         compressed_table_verify_checksum(&super_)
@@ -1322,9 +1430,19 @@ impl RowPlan {
 // Column-subset pyclasses returned by hdu[col] / hdu[[cols]]
 // ---------------------------------------------------------------------------
 
-// Returned by CompressedTableHDU[col] for a single str/bytes column.
-// Read-only — write-side mutations on compressed tables aren't in
-// the current roadmap.
+/// A deferred handle for one column of a :class:`CompressedTableHDU`.
+///
+/// The compressed-table counterpart of
+/// :class:`SingleColumnSubset`.  Returned by ``hdu["name"]``
+/// when ``hdu`` is a :class:`CompressedTableHDU`.  Add
+/// ``[rows]`` to trigger the read::
+///
+///     col = compressed_hdu["RA"]
+///     subset = col[100:200]            # decodes only overlapping tiles
+///
+/// Writing via ``[rows] = value`` is supported and routes to
+/// the same per-tile decode → modify → re-encode path as
+/// ``CompressedTableHDU.__setitem__``.
 #[pyclass]
 pub(crate) struct CompressedSingleColumnSubset {
     hdu: Py<CompressedTableHDU>,
@@ -1435,7 +1553,17 @@ impl CompressedSingleColumnSubset {
     }
 }
 
-// Returned by CompressedTableHDU[[col1, col2, ...]].  Read-only.
+/// A deferred handle for a column subset of a
+/// :class:`CompressedTableHDU`.
+///
+/// The compressed-table counterpart of :class:`ColumnSubset`.
+/// Returned by ``hdu[[name1, name2, ...]]`` when ``hdu`` is a
+/// :class:`CompressedTableHDU`.  Add ``[rows]`` to read or
+/// assign to write::
+///
+///     pos = compressed_hdu[["RA", "DEC"]]
+///     subset = pos[100:200]
+///     compressed_hdu[["RA", "DEC"]][bad_rows] = corrected
 #[pyclass]
 pub(crate) struct CompressedColumnSubset {
     hdu: Py<CompressedTableHDU>,
