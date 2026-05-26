@@ -1298,13 +1298,17 @@ the reader walks tiles and decodes them.
 **Open follow-ups (low priority):**
 
 - **Performance** — release-mode chunked-read of large GZIP_2
-  float files: **3.2× FASTER** than cfitsio on big chunks (50k
-  rows; at the decoder physics floor), **24× FASTER** on small
-  chunks (1k rows; LRU tile cache vs cfitsio's unbounded cache).
+  float files: **3.2× FASTER** than fitsio on big chunks (50k
+  rows; at the decoder physics floor), **40× FASTER** on small
+  chunks (1k rows; up from 24× before the header-meta cache
+  landed — see Phase 2 in "Header-derived metadata caching"
+  below).  All numbers are vs fitsio (the Python wrapper around
+  cfitsio); fitsio carries its own per-call wrapping overhead
+  that likely inflates these ratios relative to a direct-
+  cfitsio comparison (worth measuring some day, but the
+  realistic comparison for users is fitsio anyway).
   See "Performance — ZIMAGE chunked-read profiling history"
-  below for how the gap closed, and "Header-derived metadata
-  caching (planned)" for the next available win across all HDU
-  types.
+  below for how the gap closed.
 - **Byte-exact heap agreement with cfitsio on quantized floats**
   — decoded values are bit-exact; raw heap bytes differ by qsort
   tie-breaking quirks.  Not worth fixing absent a specific need.
@@ -3749,16 +3753,25 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 **Current state (release builds; 2026-05-26):**
 
 - **Big chunks (50k rows)**: rustfits is **3.2× FASTER** than
-  cfitsio.  `decode_gzip2`'s remaining ~48% of slice time is now
+  fitsio.  `decode_gzip2`'s remaining ~48% of slice time is now
   ~100% the flate2/miniz_oxide inflate itself — the physics floor.
-- **Small chunks (1k rows)**: rustfits is **24× FASTER** than
-  cfitsio.  cfitsio caches all decoded tiles forever (memory
-  bloat); rustfits has an LRU.  The dominant cost is per-tile
-  decode and unshuffle; the remaining ~15-20% per-call header
-  re-parse is the next available win (see "Header-derived
-  metadata caching" plan below).
+- **Small chunks (1k rows)**: rustfits is **40× FASTER** than
+  fitsio (up from 24× after the Phase 2 header-meta cache
+  landed).  fitsio caches all decoded tiles forever (memory
+  bloat); rustfits has an LRU AND a per-HDU parsed-meta cache
+  that eliminates the 8+ linear card scans per slice call.
 
-**How the gap closed.**  Three sequential profile-and-fix passes:
+**Note on the comparison baseline.**  All ratios are vs **fitsio**
+(the Python wrapper around cfitsio), not direct cfitsio.  fitsio
+carries its own per-call wrapping overhead — Python-level argument
+marshalling, ndarray construction, etc. — that likely inflates
+these numbers relative to a direct-cfitsio comparison.  The
+realistic comparison for users is fitsio, so that's what the
+benchmark uses; a direct-cfitsio comparison would be worth doing
+some day to attribute the gap more precisely.
+
+**How the gap closed.**  Four sequential profile-and-fix passes
+plus the header-meta cache:
 
 1. **`tile_origin_and_shape` stack-allocation** (commit a85583f).
    The function did three `vec![0u64; d]` per call for what is
@@ -3783,6 +3796,15 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
    + spare_capacity_mut + MaybeUninit::write + unsafe { set_len }`.
    The zero-init pass was 17.67% of total profile on big chunks.
    Took big-chunks 2.8× → 3.2× faster.
+5. **Header-meta cache (Phase 2 of header-derived metadata
+   caching).**  Per-call re-parsing of ~8 header fields
+   (ZCMPTYPE, ZNAXISn, ZTILEn, ZNAMEn/ZVALn, TFORMn, TTYPEn,
+   ZBLANK, BSCALE/BZERO) collapsed to one Mutex lock + Acquire
+   load + Arc clone via the cached `CompressedImageMeta`.  Took
+   small-chunks 24× → **40× faster than fitsio** — the cache hit
+   eliminates ~40% of the per-call overhead.  See "Header-derived
+   metadata caching" section below for the design (CardsWriteGuard
+   foundation in Phase 1, parsed-meta cache in Phase 2).
 
 **Profiling gotchas worth remembering.**
 
@@ -3809,7 +3831,13 @@ synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 
 ## Header-derived metadata caching (in progress, 2026-05-26)
 
-**Status: Phase 1 (foundation) shipped; Phase 2+ pending.**
+**Status: Phase 1 (foundation) and Phase 2 (CompressedImageHDU
+hot paths) shipped; accessors + write side + Phase 3+ pending.**
+
+Phase 2 measured outcome: **40× faster than fitsio on small-chunk
+compressed reads** (up from 24×).  See the "Performance — ZIMAGE
+chunked-read profiling history" section above for the full
+fix-by-fix breakdown.
 
 Phase 1 shipped:
 - `HDU` carries `cards_version: Arc<AtomicU64>`, initialized to 0
@@ -3986,11 +4014,40 @@ but it's almost certainly hot for any per-row workload.
    helper was needed — the guard's `commit` does it; the
    compile-time guarantee replaced the "audit every mutation
    path" plan.
-2. **`CompressedImageHDU` cache** — define `CompressedImageMeta`,
-   write `parse_compressed_image_meta`, wire `meta_cache` into
-   `__getitem__` / `read` / `slice_compressed_image` /
-   `extend` / `__setitem__`.  Measure: should land the
-   remaining 15-20% on small-chunks compressed reads.
+2. **`CompressedImageHDU` cache** — partly shipped.
+   - ✅ `CompressedImageMeta` + `parse_compressed_image_meta`
+     defined in `src/hdu_image_compressed.rs`.  Cached as
+     `Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>` on
+     the HDU; `meta(&self, super_)` is the accessor.
+   - ✅ Wired into `slice_compressed_image` (the
+     `__getitem__` hot path) and `read_compressed_image_data`
+     (the `.read()` + checksum path).  All `cards`-based
+     parsing replaced; `cards` no longer threaded through
+     either function.
+   - ✅ Helper `compute_blank_mask_from_value` added in
+     `hdu_image.rs` so the cached `meta.zblank` flows through
+     to the mask-construction without re-parsing.
+   - ✅ Three private structs renamed for cross-module
+     clarity: `ColumnInfo` → `ZimageColumnInfo`,
+     `DataColumns` → `ZimageDataColumns`, `QuantContext` →
+     `ZimageQuantContext` (all promoted to `pub(crate)`).
+   - ⏳ Inspection accessors (`shape`, `dtype`, `bitpix`,
+     `ndim`, `size`, `__len__`, `unit`, `__repr__`,
+     `n_tiles`) still call `header_snapshot()` +
+     `parse_compressed_image_shape()`.  Cheap individually
+     but called frequently from Python; route through `meta()`
+     next.
+   - ⏳ Write side (`write_compressed_image_data`,
+     `extend_compressed_image_data`, `setitem_compressed_image`,
+     `repack_compressed_heap`) still re-parses.  Less hot than
+     reads (writes are rare); route through `meta()` for
+     symmetry.
+
+   Measured outcome (slice path only, post-shipped portions):
+   **40× faster than fitsio on small-chunk reads, up from 24×**
+   — the cache eliminated ~40% of per-call overhead on the
+   100k chunks × 1k rows benchmark.  See the perf history
+   section above for the full breakdown.
 3. **`TableHDU` cache** — same shape with `TableMeta` /
    `parse_table_meta`.  Likely the biggest unmeasured win.
    Wire into `read`, `__getitem__`, `__setitem__`, `write`,

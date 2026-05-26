@@ -729,12 +729,17 @@ pub(crate) fn compute_blank_mask_for_key(
     arr: &Bound<'_, PyAny>,
     key: &str,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let Some(blank) = parse_keyword(header, key) else {
-        return Ok(None);
-    };
-    // arr == blank: numpy broadcasts the Python int against arr's
-    // dtype.  If `blank` is out of range for the dtype, no element
-    // matches and the result is all-False — harmless.
+    compute_blank_mask_from_value(parse_keyword(header, key), arr)
+}
+
+// Same as `compute_blank_mask_for_key`, but takes the already-parsed
+// sentinel value directly so callers that hold cached metadata
+// (e.g. `CompressedImageMeta.zblank`) don't re-scan the cards.
+pub(crate) fn compute_blank_mask_from_value(
+    sentinel: Option<i64>,
+    arr: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(blank) = sentinel else { return Ok(None); };
     let mask = arr.call_method1("__eq__", (blank,))?;
     Ok(Some(mask.unbind()))
 }
