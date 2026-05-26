@@ -215,10 +215,10 @@ impl ImageHDU {
         scale: bool,
         mask_blank: bool,
     ) -> PyResult<Py<PyAny>> {
-        let super_: PyRef<HDU> = slf.into_super();
-        let header_cards = super_.header_snapshot()?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
         read_image_data(
-            py, &header_cards, super_.offsets.data_offset(),
+            py, &meta, super_.offsets.data_offset(),
             &super_.file, scale, mask_blank,
         )
     }
@@ -437,15 +437,19 @@ impl ImageHDU {
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let super_: PyRef<HDU> = slf.into_super();
-        let header_cards = super_.header_snapshot()?;
-        let (_bitpix, hdu_shape) = parse_image_hdu_shape(&header_cards)?;
-        let slices = normalize_slice_key(key, &hdu_shape)?;
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        if meta.shape.is_empty() {
+            return Err(PyValueError::new_err(
+                "HDU has NAXIS=0 (no data section)"
+            ));
+        }
+        let slices = normalize_slice_key(key, &meta.shape)?;
         let all_int = slices.iter().all(|s| s.is_int);
         // Always scale on __getitem__ — matches the table-side
         // convention.  Use ImageHDU.read(scale=False) to bypass.
         let arr_py = read_image_slice(
-            py, &header_cards, super_.offsets.data_offset(),
+            py, &meta, super_.offsets.data_offset(),
             &super_.file, &slices, true,
         )?;
         if all_int {
@@ -682,13 +686,19 @@ pub(crate) fn commit_header_update(
 // are swapped in place after read.
 fn read_image_data(
     py: Python<'_>,
-    header: &[String],
+    meta: &ImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     scale: bool,
     mask_blank: bool,
 ) -> PyResult<Py<PyAny>> {
-    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bitpix = meta.bitpix;
+    let hdu_shape = meta.shape.as_slice();
+    if hdu_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "HDU has NAXIS=0 (no data section)"
+        ));
+    }
     if mask_blank && bitpix < 0 {
         return Err(PyValueError::new_err(format!(
             "mask_blank=True is not valid on float BITPIX ({}); the \
@@ -704,7 +714,7 @@ fn read_image_data(
 
     let dtype_str = bitpix_to_native_dtype(bitpix)?;
     let np = py.import("numpy")?;
-    let arr = np.call_method1("empty", (hdu_shape.clone(), dtype_str))?;
+    let arr = np.call_method1("empty", (hdu_shape, dtype_str))?;
 
     {
         let mut buffer = RawBuffer::acquire_writable(&arr)?;
@@ -733,15 +743,16 @@ fn read_image_data(
     // Compute mask in stored (pre-scaling) space before applying any
     // scaling.  Per the FITS spec, BLANK is the raw on-disk sentinel.
     let mask_opt = if mask_blank {
-        compute_blank_mask(header, &arr)?
+        compute_blank_mask_from_value(meta.blank, &arr)?
     } else {
         None
     };
 
     let arr_unbound = if scale {
-        let (bscale, bzero) = parse_bscale_bzero(header);
-        let kind = image_scaling_kind(bitpix, bscale, bzero);
-        apply_image_scaling(py, arr.unbind(), bitpix, kind, bscale, bzero)?
+        let kind = image_scaling_kind(bitpix, meta.bscale, meta.bzero);
+        apply_image_scaling(
+            py, arr.unbind(), bitpix, kind, meta.bscale, meta.bzero,
+        )?
     } else {
         arr.unbind()
     };
@@ -753,23 +764,15 @@ fn read_image_data(
     }
 }
 
-// Compute a per-pixel bool mask of `arr == <header[key]>`.  Returns
-// None when the keyword is absent (caller wraps the data with nomask
-// for consistent return type without an unused mask allocation).
-// Used for both `BLANK` (uncompressed images) and `ZBLANK` (tile-
-// compressed images) — the spec mandates the integer sentinel
-// comparison happens in stored space (pre-scaling).
-pub(crate) fn compute_blank_mask_for_key(
-    header: &[String],
-    arr: &Bound<'_, PyAny>,
-    key: &str,
-) -> PyResult<Option<Py<PyAny>>> {
-    compute_blank_mask_from_value(parse_keyword(header, key), arr)
-}
-
-// Same as `compute_blank_mask_for_key`, but takes the already-parsed
-// sentinel value directly so callers that hold cached metadata
-// (e.g. `CompressedImageMeta.zblank`) don't re-scan the cards.
+// Compute a per-pixel bool mask of `arr == sentinel`.  Returns
+// None when the sentinel is None (caller wraps the data with
+// nomask for consistent return type without an unused mask
+// allocation).  Used for both `BLANK` (uncompressed images) and
+// `ZBLANK` (tile-compressed images) — the spec mandates the
+// integer sentinel comparison happens in stored space (pre-
+// scaling).  All callers now pull the sentinel from their cached
+// meta (ImageMeta.blank / CompressedImageMeta.zblank) rather than
+// re-parsing the card on every read.
 pub(crate) fn compute_blank_mask_from_value(
     sentinel: Option<i64>,
     arr: &Bound<'_, PyAny>,
@@ -777,13 +780,6 @@ pub(crate) fn compute_blank_mask_from_value(
     let Some(blank) = sentinel else { return Ok(None); };
     let mask = arr.call_method1("__eq__", (blank,))?;
     Ok(Some(mask.unbind()))
-}
-
-fn compute_blank_mask(
-    header: &[String],
-    arr: &Bound<'_, PyAny>,
-) -> PyResult<Option<Py<PyAny>>> {
-    compute_blank_mask_for_key(header, arr, "BLANK")
 }
 
 // Wrap a plain ndarray in numpy.ma.MaskedArray.  None mask → nomask
@@ -1016,13 +1012,19 @@ fn compute_read_strip_layout(
 
 fn read_image_slice(
     py: Python<'_>,
-    header: &[String],
+    meta: &ImageMeta,
     data_offset: u64,
     file_handle: &FileHandle,
     slices: &[AxisSlice],
     scale: bool,
 ) -> PyResult<Py<PyAny>> {
-    let (bitpix, hdu_shape) = parse_image_hdu_shape(header)?;
+    let bitpix = meta.bitpix;
+    let hdu_shape = meta.shape.as_slice();
+    if hdu_shape.is_empty() {
+        return Err(PyValueError::new_err(
+            "HDU has NAXIS=0 (no data section)"
+        ));
+    }
     let naxis = hdu_shape.len();
     if slices.len() != naxis {
         return Err(PyValueError::new_err(format!(
@@ -1045,8 +1047,8 @@ fn read_image_slice(
         return Ok(arr.unbind());
     }
 
-    let hdu_strides = row_major_strides(&hdu_shape);
-    let (outer_axes, strip_pixels) = compute_read_strip_layout(&hdu_shape, slices);
+    let hdu_strides = row_major_strides(hdu_shape);
+    let (outer_axes, strip_pixels) = compute_read_strip_layout(hdu_shape, slices);
     let strip_bytes = (strip_pixels * bpp) as usize;
 
     let outer_count: u64 = slices[..outer_axes].iter().map(|s| s.count).product();
@@ -1107,9 +1109,8 @@ fn read_image_slice(
     if !scale {
         return Ok(arr_unbound);
     }
-    let (bscale, bzero) = parse_bscale_bzero(header);
-    let kind = image_scaling_kind(bitpix, bscale, bzero);
-    apply_image_scaling(py, arr_unbound, bitpix, kind, bscale, bzero)
+    let kind = image_scaling_kind(bitpix, meta.bscale, meta.bzero);
+    apply_image_scaling(py, arr_unbound, bitpix, kind, meta.bscale, meta.bzero)
 }
 
 fn write_image_data(
