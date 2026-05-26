@@ -116,6 +116,13 @@ pub(crate) struct CompressedTableHDU {
     pub(crate) compress_configs: Arc<
         Mutex<Option<Vec<CompressionConfigKind>>>,
     >,
+    // Phase 4 meta cache: parsed CompressedTableMeta keyed by
+    // cards_version.  Mirrors the TableHDU + CompressedImageHDU
+    // pattern — first hit re-parses the synthesized uncompressed
+    // schema plus per-column ZCTYPn algorithms; subsequent hits on
+    // the same version return an Arc clone.  Invalidates on every
+    // cards mutation via the version bump in CardsWriteGuard.
+    meta_cache: Arc<Mutex<Option<(u64, Arc<CompressedTableMeta>)>>>,
 }
 
 impl CompressedTableHDU {
@@ -139,7 +146,39 @@ impl CompressedTableHDU {
                     DEFAULT_TILE_CACHE_BYTES,
                 )),
                 compress_configs: Arc::new(Mutex::new(compress_configs)),
+                meta_cache: Arc::new(Mutex::new(None)),
             })
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path
+    // accessor: one Mutex lock + Acquire version load + (on hit)
+    // an Arc clone.  On miss takes a header snapshot and re-parses.
+    // Same shape as TableHDU::meta and CompressedImageHDU::meta;
+    // callers reach this via `slf.as_super()` to keep both `slf`
+    // and the base HDU alive for the call.  Note: data_offset is
+    // NOT in the returned meta (offsets can change when earlier
+    // HDUs grow); callers fetch it fresh from `super_.offsets`.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<CompressedTableMeta>> {
+        crate::common::check_not_tainted(&super_.tainted)?;
+        let cur_version = super_.cards_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_compressed_table_meta(cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
     }
 }
 
@@ -150,15 +189,33 @@ impl CompressedTableHDU {
     // would see after .read()), plus a compression-info line listing
     // the per-column algorithm.
     fn __repr__(slf: PyRef<'_, Self>, _py: Python<'_>) -> PyResult<String> {
-        let super_ = slf.into_super().into_super();
+        let super_ = slf.as_super().as_super();
+        // Try the cached meta first; fall back to a fresh cards
+        // snapshot if the file is degenerate — repr must never crash.
+        let cached = slf.meta(super_).ok();
         let cards = super_.header_snapshot()?;
-        let virtual_cards = synthesize_uncompressed_cards(&cards);
-        let nrows = parse_keyword(&cards, "ZNAXIS2")
-            .unwrap_or(0).max(0);
-        let n_tiles = parse_keyword(&cards, "NAXIS2")
-            .unwrap_or(0).max(0);
+        let (columns, nrows, n_tiles, ztilelen): (Vec<Column>, i64, i64, Option<i64>) =
+            match &cached {
+                Some(m) => (
+                    m.columns.clone(),
+                    m.nrows as i64,
+                    m.n_tiles as i64,
+                    Some(m.ztilelen as i64),
+                ),
+                None => {
+                    let virtual_cards =
+                        synthesize_uncompressed_cards(&cards);
+                    (
+                        parse_columns(&virtual_cards).unwrap_or_default(),
+                        parse_keyword(&cards, "ZNAXIS2")
+                            .unwrap_or(0).max(0),
+                        parse_keyword(&cards, "NAXIS2")
+                            .unwrap_or(0).max(0),
+                        parse_keyword(&cards, "ZTILELEN"),
+                    )
+                }
+            };
         let extname = parse_string_keyword(&cards, "EXTNAME");
-        let columns = parse_columns(&virtual_cards).unwrap_or_default();
 
         let mut out = String::new();
         out.push_str(&format!("  file: {}\n", super_.filename));
@@ -169,9 +226,15 @@ impl CompressedTableHDU {
         }
         out.push_str(&format!("  rows: {}\n", nrows));
         out.push_str(&format!("  tiles: {}\n", n_tiles));
-        if let Some(ztilelen) = parse_keyword(&cards, "ZTILELEN") {
-            out.push_str(&format!("  rows per tile: {}\n", ztilelen));
+        if let Some(z) = ztilelen {
+            if z > 0 {
+                out.push_str(&format!("  rows per tile: {}\n", z));
+            }
         }
+        // compression_algorithms is a cheap walk (one TFIELDS lookup
+        // + per-column TTYPE/ZCTYP lookups) and returns raw strings
+        // rather than the enum form the meta cache holds — leave
+        // it as a direct card walk.
         let algos = compression_algorithms(&cards);
         if !algos.is_empty() {
             let summary: Vec<String> = algos.iter()
@@ -203,76 +266,60 @@ impl CompressedTableHDU {
     // -------------------------------------------------------------------
 
     // Number of rows in the ORIGINAL (uncompressed) table.  Reads
-    // ZNAXIS2 — the compressed-table NAXIS2 holds the number of tile
-    // chunks, not the user-visible row count.
+    // ZNAXIS2 (cached) — the compressed-table NAXIS2 holds the
+    // number of tile chunks, not the user-visible row count.
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "ZNAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super().as_super();
+        Ok(slf.meta(super_)?.nrows)
     }
 
     // Pythonic length: matches `len(structured_arr)` for the array
     // a future `.read()` will return.
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "ZNAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super().as_super();
+        Ok(slf.meta(super_)?.nrows)
     }
 
-    // Number of columns (TFIELDS).  Same value on both the
-    // compressed and uncompressed views, but the inherited
-    // TableHDU.ncols routes through the meta cache, which parses
-    // the full schema and trips on the ZIMAGE TDIM-on-VLA cards
-    // present in a compressed table's on-disk header.  Override
-    // to do a direct keyword lookup on the raw cards instead.
+    // Number of columns.  Same override reason as the rest of the
+    // uncompressed-view accessors: the inherited TableHDU.ncols
+    // would parse the on-disk schema (which trips on TDIM-on-VLA
+    // cards present in a compressed table).  The cached meta uses
+    // the synthesized cards via parse_compressed_table_meta, so
+    // columns.len() is the right answer.
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "TFIELDS").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super().as_super();
+        Ok(slf.meta(super_)?.columns.len())
     }
 
     // numpy structured dtype the original (uncompressed) table would
-    // read into.  Synthesized from the Z-prefixed cards (ZFORMn carries
-    // the original TFORMn, ZNAXIS1 the original row width, ZNAXIS2 the
-    // original row count, ZPCOUNT the original heap size).  TDIM /
-    // TTYPE / TUNIT are preserved on disk and don't need
-    // substitution.
+    // read into.  Uses the cached meta whose columns Vec was parsed
+    // from the synthesized (uncompressed-view) cards.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let virtual_cards = synthesize_uncompressed_cards(&cards);
-        let columns = parse_columns(&virtual_cards)?;
-        build_numpy_dtype(py, &columns, /* scale = */ true)
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        build_numpy_dtype(py, &meta.columns, /* scale = */ true)
     }
 
-    // Column names in file order.  Overrides TableHDU.colnames so the
-    // parser walks the SYNTHESIZED cards (the on-disk TFORMn are all
-    // 1QB descriptors and may carry TDIMn that parse_columns rejects
-    // on a variable-length column).
+    // Column names in file order — same cached-meta source as dtype.
     #[getter]
     fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let virtual_cards = synthesize_uncompressed_cards(&cards);
-        let columns = parse_columns(&virtual_cards)?;
-        let names: Vec<&str> = columns.iter()
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        let names: Vec<&str> = meta.columns.iter()
             .map(|c| c.name.as_str()).collect();
         Ok(PyTuple::new(py, &names)?.unbind())
     }
 
-    // Per-column units dict (TUNITn).  Same override reason as
-    // colnames — parser must see the original schema.
+    // Per-column units dict (TUNITn) — same cached-meta source.
     #[getter]
     fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let virtual_cards = synthesize_uncompressed_cards(&cards);
-        let columns = parse_columns(&virtual_cards)?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
         let dict = PyDict::new(py);
-        for col in &columns {
+        for col in &meta.columns {
             dict.set_item(&col.name, col.tunit.as_deref())?;
         }
         Ok(dict.unbind())
@@ -305,19 +352,17 @@ impl CompressedTableHDU {
     // Equals the compressed table's NAXIS2 — one row per tile.
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "NAXIS2").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super().as_super();
+        Ok(slf.meta(super_)?.n_tiles)
     }
 
-    // Rows-per-tile setting used at compression time.  Reads
-    // ZTILELEN.  The last tile may contain fewer rows if
-    // ZNAXIS2 is not a multiple of ZTILELEN.
+    // Rows-per-tile setting used at compression time (ZTILELEN).
+    // The last tile may contain fewer rows if ZNAXIS2 is not a
+    // multiple of ZTILELEN.
     #[getter]
     fn ztile_rows(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        Ok(parse_keyword(&cards, "ZTILELEN").unwrap_or(0).max(0) as usize)
+        let super_ = slf.as_super().as_super();
+        Ok(slf.meta(super_)?.ztilelen)
     }
 
     // -------------------------------------------------------------------
@@ -468,11 +513,11 @@ impl CompressedTableHDU {
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
             .clone();
-        let cache = Arc::clone(&slf.cache);
-        let super_ = slf.into_super().into_super();
-        let meta = read_compressed_table_meta(&super_)?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
         let ctx = SetItemCtx {
-            super_: &super_,
+            super_,
             cards: &meta.cards,
             columns: &meta.columns,
             algorithms: &meta.algorithms,
@@ -481,9 +526,9 @@ impl CompressedTableHDU {
             ztilelen: meta.ztilelen,
             n_tiles: meta.n_tiles,
             descriptor_row_width: meta.descriptor_row_width,
-            data_offset: meta.data_offset,
+            data_offset,
             current_pcount: meta.current_pcount,
-            cache: &cache,
+            cache: &slf.cache,
         };
         let all_cols: Vec<usize> = (0..meta.columns.len()).collect();
 
@@ -1340,11 +1385,11 @@ impl CompressedSingleColumnSubset {
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
             .clone();
-        let cache = Arc::clone(&pyref.cache);
-        let super_ = pyref.into_super().into_super();
-        let meta = read_compressed_table_meta(&super_)?;
+        let super_ = pyref.as_super().as_super();
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
         let ctx = SetItemCtx {
-            super_: &super_,
+            super_,
             cards: &meta.cards,
             columns: &meta.columns,
             algorithms: &meta.algorithms,
@@ -1353,9 +1398,9 @@ impl CompressedSingleColumnSubset {
             ztilelen: meta.ztilelen,
             n_tiles: meta.n_tiles,
             descriptor_row_width: meta.descriptor_row_width,
-            data_offset: meta.data_offset,
+            data_offset,
             current_pcount: meta.current_pcount,
-            cache: &cache,
+            cache: &pyref.cache,
         };
         let col_idx = find_compressed_column_index(&meta.columns, &self.name)?;
         let col = &meta.columns[col_idx];
@@ -1452,11 +1497,11 @@ impl CompressedColumnSubset {
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
             .clone();
-        let cache = Arc::clone(&pyref.cache);
-        let super_ = pyref.into_super().into_super();
-        let meta = read_compressed_table_meta(&super_)?;
+        let super_ = pyref.as_super().as_super();
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
         let ctx = SetItemCtx {
-            super_: &super_,
+            super_,
             cards: &meta.cards,
             columns: &meta.columns,
             algorithms: &meta.algorithms,
@@ -1465,9 +1510,9 @@ impl CompressedColumnSubset {
             ztilelen: meta.ztilelen,
             n_tiles: meta.n_tiles,
             descriptor_row_width: meta.descriptor_row_width,
-            data_offset: meta.data_offset,
+            data_offset,
             current_pcount: meta.current_pcount,
-            cache: &cache,
+            cache: &pyref.cache,
         };
         let (disk_rows, was_single) =
             resolve_compressed_rows_key(rows, meta.nrows)?;
@@ -5062,10 +5107,18 @@ fn coerce_vla_cell_value_to_len1<'py>(
 }
 
 // Snapshot of the compressed-table metadata needed by every
-// __setitem__ dispatch path (main HDU + the subset pyclasses).
-// Owning the Vecs lets the caller assemble `SetItemCtx` with
-// references into it; the struct itself is short-lived (one
-// __setitem__ call) and never crosses an await/Python re-entry.
+// __setitem__ dispatch path (main HDU + the subset pyclasses)
+// AND by every accessor + I/O entry point (read, write, append,
+// repack, ...).  Cached per-HDU keyed by `cards_version` (see
+// `CompressedTableHDU::meta()`), so a hot inner loop of accessor
+// calls pays one Mutex lock + integer compare + Arc clone instead
+// of re-parsing the synthesized cards every time.
+//
+// Notably absent: `data_offset`.  It's *not* a header-derived
+// value — it can change when an earlier HDU grows (the shared
+// Arc<HduOffsets> takes care of the propagation, but caching the
+// old value here would defeat that).  Callers fetch it fresh
+// from `super_.offsets.data_offset()` alongside the meta.
 pub(crate) struct CompressedTableMeta {
     pub(crate) cards: Vec<String>,
     pub(crate) columns: Vec<Column>,
@@ -5074,21 +5127,15 @@ pub(crate) struct CompressedTableMeta {
     pub(crate) ztilelen: usize,
     pub(crate) n_tiles: usize,
     pub(crate) descriptor_row_width: usize,
-    pub(crate) data_offset: u64,
     pub(crate) current_pcount: u64,
 }
 
-// Read + parse all the per-table state a __setitem__ call needs:
-// the header card snapshot, the "virtual uncompressed" column
-// list, per-column ZCTYPn algorithms, and the on-disk shape
-// keywords.  Also honors the taint flag so a poisoned file
-// rejects fast.  Shared between main __setitem__ and the subset
-// pyclasses so the prelude doesn't drift between call sites.
-pub(crate) fn read_compressed_table_meta(
-    super_: &HDU,
+// Parse all of the above from the cards Vec.  Same shape as
+// `parse_table_meta` and `parse_compressed_image_meta` — a
+// pure function the meta accessor calls on cache miss.
+fn parse_compressed_table_meta(
+    cards: Vec<String>,
 ) -> PyResult<CompressedTableMeta> {
-    crate::common::check_not_tainted(&super_.tainted)?;
-    let cards = super_.header_snapshot()?;
     let virtual_cards = synthesize_uncompressed_cards(&cards);
     let columns = parse_columns(&virtual_cards)?;
     let nrows = parse_keyword(&cards, "ZNAXIS2")
@@ -5101,7 +5148,6 @@ pub(crate) fn read_compressed_table_meta(
         .unwrap_or(0).max(0) as usize;
     let current_pcount = parse_keyword(&cards, "PCOUNT")
         .unwrap_or(0).max(0) as u64;
-    let data_offset = super_.offsets.data_offset();
     let mut algorithms: Vec<CompressionAlgorithm> =
         Vec::with_capacity(columns.len());
     for i in 0..columns.len() {
@@ -5113,7 +5159,7 @@ pub(crate) fn read_compressed_table_meta(
     }
     Ok(CompressedTableMeta {
         cards, columns, algorithms, nrows, ztilelen, n_tiles,
-        descriptor_row_width, data_offset, current_pcount,
+        descriptor_row_width, current_pcount,
     })
 }
 
