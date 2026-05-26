@@ -1350,6 +1350,79 @@ fn build_string_value_cards(key: &str, value: &str, comment: &str) -> PyResult<V
 
 // ===== FITSHeader pyclass =====
 
+/// Live view of an HDU's FITS header.
+///
+/// Returned by ``hdu.header`` (see :attr:`HDU.header`).  Behaves
+/// like a mapping for lookup (``header["KEY"]`` /
+/// ``"KEY" in header`` / ``header.get("KEY", default)``) and for
+/// mutation (``header["KEY"] = value`` / ``del header["KEY"]``).
+/// Mutations write through to disk immediately — no flush
+/// required, no two-step commit.
+///
+/// **Reading:** ``header[key]`` returns the value directly
+/// (astropy-style), not a ``{value, comment}`` dict.  Per-key
+/// comments come from :meth:`comment_of`.  ``header.to_dict()``
+/// returns the legacy shape for serialization or tests.
+///
+/// **Writing:** every mutation follows disk-write-before-commit:
+/// the file is updated first, and only on success is the
+/// in-memory card list replaced.  Pre-I/O errors (e.g. a header
+/// that would overflow its reserved blocks AND the grow path is
+/// disabled — currently rare; in-place file grow is supported)
+/// leave the header unchanged.  Mid-write I/O failures taint
+/// the file (close + reopen to recover).
+///
+/// **Protected keys.**  Some keywords represent state rustfits
+/// manages on the user's behalf — file structure (``SIMPLE``,
+/// ``BITPIX``, ``NAXIS*``, ``XTENSION``, ``PCOUNT``, ``GCOUNT``,
+/// ``TFIELDS``, ``TFORMn``, ...), integrity (``CHECKSUM``,
+/// ``DATASUM``), or compression layout
+/// (``ZIMAGE``, ``ZCMPTYPE``, ``ZBITPIX``, ``ZNAXIS*``, ...).
+/// ``__setitem__`` and ``__delitem__`` raise ``ValueError`` on
+/// these keys.  Use the dedicated HDU APIs for structural
+/// changes (e.g. :meth:`ImageHDU.extend`,
+/// :meth:`TableHDU.insert_column`).
+///
+/// **Batched edits.**  For multiple mutations, prefer
+/// :meth:`edit` (returns a :class:`FITSHeaderEdit` context
+/// manager) so the file is rewritten once at the end rather
+/// than per mutation.
+///
+/// Examples
+/// --------
+/// Lookup and iteration::
+///
+///     value = header["EXPTIME"]
+///     for k in header:
+///         print(k, header[k])
+///     if "FILTER" in header:
+///         ...
+///
+/// Single mutation::
+///
+///     header["EXPTIME"] = 30.0
+///     header["COMMENT"] = "calibration frame"  # via add_comment
+///     del header["JUNK"]
+///
+/// Batched mutation::
+///
+///     with header.edit() as h:
+///         h["A"] = 1
+///         h["B"] = 2
+///         h["C"] = 3
+///     # exactly one disk rewrite at the end
+///
+/// Bulk copy from another header or a dict via :meth:`update`::
+///
+///     # Copy metadata from one HDU's header to another.
+///     # Protected (structural / integrity / compression) keys
+///     # in the source are skipped silently; commentary cards
+///     # are skipped unless copy_commentary=True.
+///     fits[2].header.update(fits[1].header)
+///
+///     # From a dict (every key must be non-protected; whole
+///     # update is rejected if any key is protected).
+///     fits[1].header.update({"OBSERVER": "Hubble", "EXPTIME": 30.0})
 #[pyclass]
 pub(crate) struct FITSHeader {
     cards: Arc<Mutex<Vec<String>>>,
@@ -1414,6 +1487,10 @@ impl FITSHeader {
 
 #[pymethods]
 impl FITSHeader {
+    // __getitem__, __contains__, __len__, __iter__, __setitem__,
+    // __delitem__, __repr__, __str__ are all pyo3 slot dunders —
+    // their per-method docstrings would be overridden by Python's
+    // canonical slot text.  Semantics are in the class docstring.
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         let key = normalize_keyword(key);
         let cards = self.snapshot()?;
@@ -1472,12 +1549,22 @@ impl FITSHeader {
         Ok(list.call_method0("__iter__")?.unbind())
     }
 
+    /// List of unique keyword names in on-disk order.
+    ///
+    /// Commentary keywords (``COMMENT``, ``HISTORY``, blank)
+    /// appear at most once each, even if there are multiple
+    /// commentary cards.
     fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let cards = self.snapshot()?;
         let keys = unique_keys_in_order(&cards);
         Ok(PyList::new(py, &keys)?.unbind())
     }
 
+    /// List of values, in :meth:`keys` order.
+    ///
+    /// Each value is what ``header[key]`` would return —
+    /// scalar for regular keys, list of strings for commentary
+    /// keys.
     fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let cards = self.snapshot()?;
         let keys = unique_keys_in_order(&cards);
@@ -1488,6 +1575,7 @@ impl FITSHeader {
         Ok(PyList::new(py, &values)?.unbind())
     }
 
+    /// List of ``(key, value)`` tuples, in :meth:`keys` order.
     fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let cards = self.snapshot()?;
         let keys = unique_keys_in_order(&cards);
@@ -1500,6 +1588,19 @@ impl FITSHeader {
         Ok(PyList::new(py, &items)?.unbind())
     }
 
+    /// Get the value of ``key``, or ``default`` if absent.
+    ///
+    /// Mapping-style accessor — same shape as Python's
+    /// ``dict.get``.  Useful when you don't want a ``KeyError``
+    /// on missing keys.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str
+    ///     Keyword name.  Case-insensitive.
+    /// default : Any, optional
+    ///     Value to return when ``key`` is absent.  Defaults to
+    ///     ``None``.
     #[pyo3(signature = (key, default=None))]
     fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.__getitem__(py, key) {
@@ -1511,6 +1612,27 @@ impl FITSHeader {
         }
     }
 
+    /// Return the comment text attached to a header card.
+    ///
+    /// FITS cards have an optional ``/ comment`` field after
+    /// the value.  This accessor returns that text (empty
+    /// string when no comment is present).  Use this rather
+    /// than parsing card text yourself.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str
+    ///     Keyword name.  Case-insensitive.  Not valid for
+    ///     commentary keys (``COMMENT`` / ``HISTORY`` / blank);
+    ///     for those, ``header[key]`` returns the list of
+    ///     commentary texts directly.
+    ///
+    /// Raises
+    /// ------
+    /// KeyError
+    ///     ``key`` is absent from the header.
+    /// ValueError
+    ///     ``key`` is a commentary keyword.
     fn comment_of(&self, py: Python<'_>, key: &str) -> PyResult<String> {
         let key = normalize_keyword(key);
         if matches!(key.as_str(), "COMMENT" | "HISTORY" | "") {
@@ -1531,11 +1653,44 @@ impl FITSHeader {
         }
     }
 
+    /// The raw 80-character header card strings.
+    ///
+    /// Useful for low-level inspection or for tools that need
+    /// to write the bytes themselves.  Returns a snapshot — the
+    /// list is a copy, mutations to it don't write back.
+    ///
+    /// Returns
+    /// -------
+    /// list of str
+    ///     Each entry is one 80-character FITS card (with the
+    ///     standard padding included).
     #[getter]
     fn cards(&self) -> PyResult<Vec<String>> {
         self.snapshot()
     }
 
+    /// Snapshot the header as a ``{key: {value, comment}}`` dict.
+    ///
+    /// Legacy shape, useful for serialization and tests.
+    /// Everyday code should prefer ``header[key]`` (returns the
+    /// value directly) and :meth:`comment_of` (returns the
+    /// per-key comment string).
+    ///
+    /// Parameters
+    /// ----------
+    /// skip_protected : bool, optional
+    ///     If ``True``, omit protected keywords (structural,
+    ///     integrity, compression) from the output — produces a
+    ///     dict suitable for passing back into :meth:`update`
+    ///     on another header.  Default ``False`` (everything
+    ///     included).
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     ``{key: {"value": ..., "comment": ...}}`` for regular
+    ///     keys, and ``{key: [text, text, ...]}`` for the
+    ///     commentary keys ``COMMENT`` / ``HISTORY`` / blank.
     #[pyo3(signature = (skip_protected=false))]
     fn to_dict(&self, py: Python<'_>, skip_protected: bool) -> PyResult<Py<PyDict>> {
         let cards = self.snapshot()?;
@@ -1616,18 +1771,71 @@ impl FITSHeader {
         Ok(())
     }
 
+    /// Append a ``COMMENT`` card to the header.
+    ///
+    /// Long text auto-splits across multiple commentary cards
+    /// (FITS commentary cards hold ~72 chars each).  Always
+    /// appends; the ``COMMENT`` keyword is not a single-valued
+    /// card.  Use ``del header["COMMENT"]`` to remove every
+    /// COMMENT card at once.
     fn add_comment(&self, text: &str) -> PyResult<()> {
         self.append_commentary("COMMENT", text)
     }
 
+    /// Append a ``HISTORY`` card to the header.
+    ///
+    /// HISTORY is FITS's audit-trail keyword — each
+    /// pipeline-processing step typically appends one card.
+    /// Same append-only semantics as :meth:`add_comment`.
     fn add_history(&self, text: &str) -> PyResult<()> {
         self.append_commentary("HISTORY", text)
     }
 
+    /// Append a blank-keyword commentary card to the header.
+    ///
+    /// "Blank" cards have an all-spaces keyword; FITS uses them
+    /// for visual section separators and unstructured notes.
+    /// Same append-only semantics as :meth:`add_comment`.
     fn add_blank(&self, text: &str) -> PyResult<()> {
         self.append_commentary("", text)
     }
 
+    /// Bulk-copy entries from another header or a dict.
+    ///
+    /// Parameters
+    /// ----------
+    /// other : FITSHeader or dict
+    ///     Source of the new entries.  When a
+    ///     :class:`FITSHeader`, protected keywords are silently
+    ///     skipped (the destination already has its own correct
+    ///     structural / integrity / compression keys, and they
+    ///     must not be clobbered).  When a dict, protected
+    ///     keywords raise — an explicit hand-written
+    ///     ``{"BITPIX": 32}`` in user code is almost certainly
+    ///     a mistake.
+    /// copy_commentary : bool, optional, keyword-only
+    ///     Only meaningful for :class:`FITSHeader` sources.  If
+    ///     ``True``, commentary cards (``COMMENT`` / ``HISTORY``
+    ///     / blank) are appended verbatim; one append per
+    ///     source card, no deduplication.  Default ``False``
+    ///     (commentary skipped — the common case is
+    ///     "copy structured metadata from this other header").
+    ///     For dict sources, the flag is ignored and commentary
+    ///     keywords always raise.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     dict source contains a protected key, or (regardless
+    ///     of ``copy_commentary``) a dict source contains a
+    ///     commentary key.  The whole update is rejected — no
+    ///     partial commit.
+    ///
+    /// Notes
+    /// -----
+    /// All entries are written to disk in a single header
+    /// rewrite (one I/O), not per-key.  Validate-then-mutate:
+    /// validation errors leave the file untouched.
     #[pyo3(signature = (other, *, copy_commentary=false))]
     fn update(
         &self,
@@ -1666,6 +1874,23 @@ impl FITSHeader {
         Ok(())
     }
 
+    /// Open a batched-edit context.
+    ///
+    /// Returns a :class:`FITSHeaderEdit` context manager.
+    /// Mutations inside the ``with`` block accumulate in memory;
+    /// at ``__exit__`` (with no exception) they're committed to
+    /// disk in a single header rewrite.  This is the right
+    /// shape for multiple mutations: ``header.edit()`` does one
+    /// I/O instead of one per mutation.
+    ///
+    /// Example
+    /// -------
+    /// ::
+    ///
+    ///     with header.edit() as h:
+    ///         h["EXPTIME"] = 30.0
+    ///         h["FILTER"] = "g"
+    ///         h["GAIN"] = 1.5
     fn edit(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<FITSHeaderEdit>> {
         let snapshot = slf.bind(py).borrow().snapshot()?;
         Py::new(py, FITSHeaderEdit {
@@ -1693,6 +1918,43 @@ impl FITSHeader {
 
 // ===== FITSHeaderEdit: transactional header edits =====
 
+/// A transactional batch of header mutations.
+///
+/// Returned by :meth:`FITSHeader.edit` — meant to be used as a
+/// context manager.  Mutations inside the ``with`` block
+/// accumulate in memory; on clean exit, the accumulated card
+/// list is written to disk in a single header rewrite.  If the
+/// block exits with an exception, no commit happens — the
+/// header on disk is unchanged.
+///
+/// This is the right shape for multiple mutations in a row.
+/// Each mutation through :class:`FITSHeader` directly does its
+/// own disk write; with :class:`FITSHeaderEdit`, you pay one
+/// I/O for the whole batch.
+///
+/// The mutation surface (``__setitem__`` / ``__delitem__`` /
+/// :meth:`add_comment` / :meth:`add_history` / :meth:`add_blank`
+/// / :meth:`update`) mirrors :class:`FITSHeader`'s exactly.
+/// Read accessors (``__getitem__`` / ``__contains__`` /
+/// ``__repr__``) reflect the in-progress staged state, not the
+/// on-disk header.
+///
+/// Examples
+/// --------
+/// ::
+///
+///     with header.edit() as h:
+///         h["A"] = 1
+///         h["B"] = 2
+///         del h["JUNK"]
+///         h.add_history("Reprocessed with pipeline v2.3")
+///     # exactly one disk rewrite happens here, at __exit__
+///
+/// Notes
+/// -----
+/// Calling mutation methods outside a ``with`` block raises.
+/// Re-using a :class:`FITSHeaderEdit` after commit raises;
+/// open a new one with another :meth:`FITSHeader.edit` call.
 #[pyclass]
 pub(crate) struct FITSHeaderEdit {
     parent: Py<FITSHeader>,
@@ -1734,6 +1996,11 @@ impl FITSHeaderEdit {
 
 #[pymethods]
 impl FITSHeaderEdit {
+    // __enter__ / __exit__ / __setitem__ / __delitem__ /
+    // __getitem__ / __contains__ / __repr__ are all pyo3 slot
+    // dunders — their per-method docstrings would be overridden
+    // by Python's canonical slot text.  Semantics are in the
+    // class docstring.
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
         slf.entered = true;
         slf
@@ -1801,6 +2068,11 @@ impl FITSHeaderEdit {
         Ok(())
     }
 
+    /// Append a ``COMMENT`` card to the staged edits.
+    ///
+    /// Same semantics as :meth:`FITSHeader.add_comment`; the
+    /// commentary is held in memory until the surrounding
+    /// ``with`` block exits.
     fn add_comment(&mut self, text: &str) -> PyResult<()> {
         self.ensure_active()?;
         validate_commentary_text(text)?;
@@ -1808,6 +2080,8 @@ impl FITSHeaderEdit {
         Ok(())
     }
 
+    /// Append a ``HISTORY`` card to the staged edits.  See
+    /// :meth:`FITSHeader.add_history`.
     fn add_history(&mut self, text: &str) -> PyResult<()> {
         self.ensure_active()?;
         validate_commentary_text(text)?;
@@ -1815,6 +2089,8 @@ impl FITSHeaderEdit {
         Ok(())
     }
 
+    /// Append a blank-keyword commentary card to the staged
+    /// edits.  See :meth:`FITSHeader.add_blank`.
     fn add_blank(&mut self, text: &str) -> PyResult<()> {
         self.ensure_active()?;
         validate_commentary_text(text)?;
@@ -1822,6 +2098,13 @@ impl FITSHeaderEdit {
         Ok(())
     }
 
+    /// Bulk-copy entries from another header or a dict into
+    /// the staged edits.
+    ///
+    /// Same shape, source rules, and ``copy_commentary``
+    /// semantics as :meth:`FITSHeader.update`; the difference
+    /// is that the entries go into the staged-but-uncommitted
+    /// card list and write to disk at ``__exit__``.
     #[pyo3(signature = (other, *, copy_commentary=false))]
     fn update(
         &mut self,
