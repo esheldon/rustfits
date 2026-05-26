@@ -3829,43 +3829,31 @@ plus the header-meta cache:
   LRU tile cache — sequential reads wouldn't get the same
   cache amplification.
 
-## Header-derived metadata caching (in progress, 2026-05-26)
+## Header-derived metadata caching (shipped, 2026-05-26)
 
-**Status: Phase 1 (foundation) and Phase 2 (CompressedImageHDU
-hot paths) shipped; accessors + write side + Phase 3+ pending.**
+**Status: all five phases shipped.  Some write-side paths still
+re-parse; deferred until measured to be hot.**
 
-Phase 2 measured outcome: **40× faster than fitsio on small-chunk
-compressed reads** (up from 24×).  See the "Performance — ZIMAGE
-chunked-read profiling history" section above for the full
-fix-by-fix breakdown.
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Foundation: `cards_version` + `CardsWriteGuard` | ✅ Shipped |
+| 2 | `CompressedImageHDU` cache (read / slice / accessors) | ✅ Shipped |
+| 3 | `TableHDU` cache (read paths + accessors) | ✅ Shipped |
+| 4 | `CompressedTableHDU` cache (setitem + accessors) | ✅ Shipped |
+| 5 | `ImageHDU` cache (accessors + read paths) | ✅ Shipped |
 
-Phase 1 shipped:
-- `HDU` carries `cards_version: Arc<AtomicU64>`, initialized to 0
-  in `HDU::new`, shared (via Arc clone) with every `FITSHeader`
-  view via `FITSHeader::from_state`.
-- `CardsWriteGuard` smart guard in `src/hdu.rs`.  Holds a
-  `MutexGuard<Vec<String>>` plus `&AtomicU64`; has read-only
-  accessors (`as_slice`, `clone_cards`) and exactly one mutation
-  path: the consuming `commit(new_cards)` method, which
-  atomically replaces the Vec AND bumps the version.  Does NOT
-  implement `DerefMut` — so `*guard = new_cards` no longer
-  compiles, making it impossible to mutate without bumping.
-- `HDU::cards_write_lock(&self)` returns a `CardsWriteGuard`;
-  `FITSHeader::cards_write_lock(&self)` is the same on the
-  Python-facing header.  `CardsWriteGuard::from_parts(guard,
-  version)` is the escape hatch for lower-level helpers that
-  receive an `Arc<Mutex<Vec<String>>>` plus an
-  `Arc<AtomicU64>` directly (used in
-  `hdu_image_compressed.rs`'s write / extend / setitem
-  helpers, which take `cards_arc` + `cards_version`).
-- All 26 historical mutation sites refactored to use
-  `cards_write_lock()` + `commit(new_cards)`.  Diff size:
-  +201/-107 across 9 files; all 2040 tests pass; ruff clean.
+**Measured outcome (Phase 2):** **40× faster than fitsio on
+small-chunk compressed reads** (up from 24× before the cache),
+on the 100k chunks × 1k rows benchmark.  The cache eliminates
+~40% of per-call overhead by collapsing 8+ linear card scans per
+slice call to one Mutex lock + Acquire load + Arc clone.  See
+"Performance — ZIMAGE chunked-read profiling history" above for
+the full fix-by-fix breakdown.
 
-The compile-time guarantee removes the "forgot to bump"
-foot-gun the original plan called out as Phase 1's risk:
-any future code path that mutates cards has to go through
-`commit`, which always bumps.
+Other phases (3-5) were not benchmarked but follow the identical
+shape — the win scales with how much parsing happened per call.
+`TableHDU` likely benefits substantially on per-row workflows
+because `parse_columns` does ~7 linear scans × N_columns.
 
 **Why.**  After the four perf fixes above, the remaining ~15-20%
 of slice-path time on small-chunks compressed reads is per-
@@ -4005,64 +3993,75 @@ a 100-column table does 600 O(N_cards) scans per `read()` /
 `__getitem__` / `__setitem__` / etc.  Nobody's profiled this,
 but it's almost certainly hot for any per-row workload.
 
-**Suggested phasing.**
+**Phase outcomes.**
 
-1. ~~**Foundation**~~ ✅ shipped.  See the "Status" block at
-   the top of this section: `cards_version`, `CardsWriteGuard`
-   with consuming `commit`, no `DerefMut` → impossible to
-   mutate without bumping.  No `bump_cards_version()` free
-   helper was needed — the guard's `commit` does it; the
-   compile-time guarantee replaced the "audit every mutation
-   path" plan.
-2. **`CompressedImageHDU` cache** — partly shipped.
-   - ✅ `CompressedImageMeta` + `parse_compressed_image_meta`
-     defined in `src/hdu_image_compressed.rs`.  Cached as
-     `Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>` on
-     the HDU; `meta(&self, super_)` is the accessor.
-   - ✅ Wired into `slice_compressed_image` (the
-     `__getitem__` hot path) and `read_compressed_image_data`
-     (the `.read()` + checksum path).  All `cards`-based
-     parsing replaced; `cards` no longer threaded through
-     either function.
-   - ✅ Helper `compute_blank_mask_from_value` added in
-     `hdu_image.rs` so the cached `meta.zblank` flows through
-     to the mask-construction without re-parsing.
-   - ✅ Three private structs renamed for cross-module
-     clarity: `ColumnInfo` → `ZimageColumnInfo`,
-     `DataColumns` → `ZimageDataColumns`, `QuantContext` →
-     `ZimageQuantContext` (all promoted to `pub(crate)`).
-   - ⏳ Inspection accessors (`shape`, `dtype`, `bitpix`,
-     `ndim`, `size`, `__len__`, `unit`, `__repr__`,
-     `n_tiles`) still call `header_snapshot()` +
-     `parse_compressed_image_shape()`.  Cheap individually
-     but called frequently from Python; route through `meta()`
-     next.
-   - ⏳ Write side (`write_compressed_image_data`,
-     `extend_compressed_image_data`, `setitem_compressed_image`,
-     `repack_compressed_heap`) still re-parses.  Less hot than
-     reads (writes are rare); route through `meta()` for
-     symmetry.
+1. ✅ **Foundation** (`b36a864`).  `cards_version: Arc<AtomicU64>`
+   on `HDU`, shared with every `FITSHeader` view.
+   `CardsWriteGuard` with consuming `commit(new_cards)` and no
+   `DerefMut` → impossible to mutate without bumping the version.
+   No `bump_cards_version()` free helper was needed — the guard's
+   `commit` does it; the compile-time guarantee replaced the
+   "audit every mutation path" plan in the original design.
+2. ✅ **`CompressedImageHDU` cache** (`c021a35`, `935b9a6`).
+   `CompressedImageMeta` cached as
+   `Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>` on the
+   HDU; `meta(&self, super_)` accessor.  Wired into
+   `slice_compressed_image` + `read_compressed_image_data` (the
+   `.read()` + checksum path) + every accessor (`shape`, `dtype`,
+   `bitpix`, `ndim`, `size`, `__len__`, `n_tiles`, `__repr__`).
+   Three private structs renamed for cross-module clarity now
+   that they appear in the `pub(crate)` Meta API: `ColumnInfo` →
+   `ZimageColumnInfo`, `DataColumns` → `ZimageDataColumns`,
+   `QuantContext` → `ZimageQuantContext`.  Helper
+   `compute_blank_mask_from_value` (in `hdu_image.rs`) replaces
+   the card-parsing variants so the cached `meta.zblank` flows
+   straight through.  **Measured: 40× faster than fitsio on the
+   small-chunks slice benchmark, up from 24×.**  Write side
+   (`write_compressed_image_data`, `extend_compressed_image_data`,
+   `setitem_compressed_image`, `repack_compressed_heap`) still
+   re-parses — deferred (writes are rare; refactoring is invasive
+   because the helpers also call `unwrap_masked_input` /
+   `normalize_input_dtype` which carry their own header parsing).
+3. ✅ **`TableHDU` cache** (`ba70eb2`).  `TableMeta` (nrows /
+   row_width / theap / columns) cached on `TableHDU`.  `read_table`
+   and `read_one_column` refactored to take `&TableMeta` instead
+   of `&[String]`.  Accessors (`nrows`, `__len__`, `ncols`,
+   `dtype`, `colnames`, `units`, `__repr__`) routed through meta.
+   `TableHDU::new_empty_cache()` factory exposed for the
+   `CompressedTableHDU` PyClassInitializer chain.  Write paths
+   (`write`, `append`, `__setitem__`, `insert_column`,
+   `delete_column`, `repack`) still re-parse via `parse_columns`
+   — deferred.
+4. ✅ **`CompressedTableHDU` cache** (`0bc6c5b`).  Existing
+   `CompressedTableMeta` (created for `__setitem__` paths)
+   promoted to a cached field with the same shape as the other
+   three.  `parse_compressed_table_meta` runs
+   `synthesize_uncompressed_cards` first so `parse_columns` sees
+   the original schema instead of the on-disk
+   `TFORMn='1QB(...)'` + preserved `TDIMn` cards (which would
+   trip on TDIM-on-VLA).  `data_offset` dropped from the meta
+   (an earlier-HDU grow can shift it — caching would silently
+   regress); callers fetch it fresh.  The Phase-3-era `ncols`
+   workaround (direct TFIELDS parse, needed because
+   `TableHDU.meta()` can't handle compressed cards) gone — Phase
+   4's `meta()?.columns.len()` works naturally.
+5. ✅ **`ImageHDU` cache** (`7ce3a83`, `8bfff7d`).  `ImageMeta`
+   (bitpix / shape / bscale / bzero / blank) cached on
+   `ImageHDU` (was a unit struct).  All 7 accessors routed
+   through meta; `read_image_data` and `read_image_slice` take
+   `&ImageMeta` instead of `&[String]`.  Lax parsing (NAXIS=0
+   yields empty shape) keeps the accessor "never crash on
+   primary HDU" contract intact — the strict NAXIS=0 check
+   that `parse_image_hdu_shape` used to do is now done by the
+   read helpers explicitly.  Write paths
+   (`write_image_data`, `write_image_slice`, `extend`) still
+   re-parse — deferred for the same reason as the table side
+   (`unwrap_masked_input` + `normalize_input_dtype` carry their
+   own parsing).
 
-   Measured outcome (slice path only, post-shipped portions):
-   **40× faster than fitsio on small-chunk reads, up from 24×**
-   — the cache eliminated ~40% of per-call overhead on the
-   100k chunks × 1k rows benchmark.  See the perf history
-   section above for the full breakdown.
-3. **`TableHDU` cache** — same shape with `TableMeta` /
-   `parse_table_meta`.  Likely the biggest unmeasured win.
-   Wire into `read`, `__getitem__`, `__setitem__`, `write`,
-   `append`, `insert_column`, `delete_column`, etc.  Profile
-   a tight per-row workload before AND after to anchor the
-   gain.
-4. **`CompressedTableHDU` cache** — extends the table meta
-   with the compression-side fields.
-5. **`ImageHDU` cache** — lowest priority (cold per-call paths
-   anyway).  Do for symmetry.
-
-Don't try to do all five in one PR — each phase is independently
-landable and testable.  Foundation (phase 1) is the only one
-that's hard to get right; the others are repeated application
-of the same pattern.
+Five phases were independently landable and testable.  Foundation
+(phase 1) was the only structurally interesting one; the others
+applied the same pattern.
 
 **Risks.**
 
