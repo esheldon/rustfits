@@ -190,9 +190,17 @@ impl CompressedImageHDU {
     //     verbatim (useful for debugging an unknown algorithm).
     //   - ZCMPTYPE missing entirely → show `None` (Python idiom).
     fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
-        let super_ = slf.into_super().into_super();
+        let super_ = slf.as_super().as_super();
+        // Try the cached meta first; fall back to a fresh cards
+        // snapshot if the file is degenerate enough that parsing
+        // raises (repr must never crash — see the
+        // "Degraded fallbacks" doc on this method).
+        let cached_meta = slf.meta(super_).ok();
         let cards = super_.header_snapshot()?;
-        let (zbitpix, shape) = parse_compressed_image_shape(&cards)?;
+        let (zbitpix, shape): (i32, Vec<u64>) = match &cached_meta {
+            Some(m) => (m.zbitpix, m.image_shape.clone()),
+            None => parse_compressed_image_shape(&cards)?,
+        };
         let dtype = zbitpix_to_native_dtype(zbitpix)?;
         let extname = parse_string_keyword(&cards, "EXTNAME");
         let bunit = parse_string_keyword(&cards, "BUNIT");
@@ -221,23 +229,27 @@ impl CompressedImageHDU {
     }
 
     // ----- image-side accessors (parallel to ImageHDU) -----
+    //
+    // All of these go through `meta()` so a tight Python loop
+    // calling `hdu.shape` / `hdu.dtype` / etc. pays one Mutex
+    // lock + Acquire load + Arc clone per call, not a full
+    // re-parse of the cards Vec.  See Phase 2 in
+    // "Header-derived metadata caching" for the cache contract.
 
     // Image dimensions in numpy axis order (slowest first).
     #[getter]
     fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(PyTuple::new(py, &shape)?.unbind())
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(PyTuple::new(py, &meta.image_shape)?.unbind())
     }
 
     // numpy dtype matching ZBITPIX — what .read() will return.
     #[getter]
     fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
-        let dtype_str = zbitpix_to_native_dtype(zbitpix)?;
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        let dtype_str = zbitpix_to_native_dtype(meta.zbitpix)?;
         let np = py.import("numpy")?;
         Ok(np.call_method1("dtype", (dtype_str,))?.unbind())
     }
@@ -245,48 +257,39 @@ impl CompressedImageHDU {
     // ZNAXIS — number of image axes.
     #[getter]
     fn ndim(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(shape.len())
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape.len())
     }
 
-    // Total pixel count (product of all ZNAXISn).  Returns 0 for
-    // an empty shape so the accessor is well-defined on degenerate
-    // headers; real compressed HDUs always have NAXIS > 0.
+    // Total pixel count (product of all ZNAXISn).
     #[getter]
     fn size(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        Ok(if shape.is_empty() { 0 } else { shape.iter().product() })
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape.iter().product())
     }
 
     // Raw ZBITPIX — the image-side bitpix the user will read into.
     #[getter]
     fn bitpix(slf: PyRef<'_, Self>) -> PyResult<i32> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (zbitpix, _) = parse_compressed_image_shape(&cards)?;
-        Ok(zbitpix)
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.zbitpix)
     }
 
     // numpy convention: `len(arr)` is shape[0].
     fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, shape) = parse_compressed_image_shape(&cards)?;
-        if shape.is_empty() {
-            Ok(0)
-        } else {
-            Ok(shape[0] as usize)
-        }
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.image_shape[0] as usize)
     }
 
-    // BUNIT (informational).
+    // BUNIT (informational).  Not in the meta — single keyword
+    // lookup, called only when the user asks; not worth caching.
     #[getter]
     fn unit(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
-        let super_ = slf.into_super().into_super();
+        let super_ = slf.as_super().as_super();
         let cards = super_.header_snapshot()?;
         Ok(parse_string_keyword(&cards, "BUNIT"))
     }
@@ -339,11 +342,9 @@ impl CompressedImageHDU {
     // BINTABLE is laid out, not the algorithm).
     #[getter]
     fn n_tiles(slf: PyRef<'_, Self>) -> PyResult<u64> {
-        let super_ = slf.into_super().into_super();
-        let cards = super_.header_snapshot()?;
-        let (_, image_shape) = parse_compressed_image_shape(&cards)?;
-        let tile_shape = parse_tile_shape(&cards, &image_shape);
-        Ok(compute_n_tiles(&image_shape, &tile_shape))
+        let super_ = slf.as_super().as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.n_tiles)
     }
 
     // ----- tile cache -----
