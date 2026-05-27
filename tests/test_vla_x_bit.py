@@ -345,7 +345,7 @@ def test_vla_x_setitem_cell():
             f[1].write(data)
         new_cell = np.array([True, True, False, True, False] * 5, dtype=bool)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][2, "flags"] = new_cell
+            f[1]["flags"][2] = new_cell
         expected = data.copy()
         expected["flags"] = data["flags"].copy()
         expected["flags"][2] = new_cell
@@ -424,7 +424,7 @@ def test_vla_x_repack_reclaims_orphans():
             )
             f[1].write(data)
             for k in range(4):
-                f[1][1, "flags"] = np.array([True] * (k + 5), dtype=bool)
+                f[1]["flags"][1] = np.array([True] * (k + 5), dtype=bool)
             pcount_before = int(f[1].header["PCOUNT"])
             f[1].repack()
             pcount_after = int(f[1].header["PCOUNT"])

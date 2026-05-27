@@ -4,7 +4,7 @@ TableHDU.__setitem__:
 
 - hdu[[name1, name2]] = arr        # multi-column subset write
 - hdu[[i, j, k]] = arr             # fancy-row write (non-contiguous)
-- hdu[row, "name"] = value         # single-cell write
+- hdu["name"][row] = value         # single-cell write (subset form)
 
 These complement the existing single-row / slice / whole-column forms.
 """
@@ -247,16 +247,16 @@ def test_multi_columns_unknown_name_raises():
 
 
 # ---------------------------------------------------------------------------
-# Single cell: hdu[row, "name"] = value
+# Single cell via subset form: hdu["name"][row] = value
 # ---------------------------------------------------------------------------
 
 
 def test_cell_scalar_int_column():
-    """hdu[i, 'id'] = 42 writes a single cell in a scalar i4 column."""
+    """hdu['id'][i] = 42 writes a single cell in a scalar i4 column."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=4)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][1, "id"] = 999
+            f[1]["id"][1] = 999
         with rustfits.FITS(fname) as f:
             got = f[1].read()
             assert got["id"][1] == 999
@@ -264,11 +264,11 @@ def test_cell_scalar_int_column():
 
 
 def test_cell_scalar_float_column():
-    """hdu[i, 'flux'] = 3.14 writes a single cell."""
+    """hdu['flux'][i] = 3.14 writes a single cell."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=4)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][2, "flux"] = 3.14
+            f[1]["flux"][2] = 3.14
         with rustfits.FITS(fname) as f:
             assert f[1].read()["flux"][2] == 3.14
 
@@ -278,7 +278,7 @@ def test_cell_negative_row():
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=4)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][-1, "id"] = 555
+            f[1]["id"][-1] = 555
         with rustfits.FITS(fname) as f:
             assert f[1].read()["id"][3] == 555
 
@@ -292,7 +292,7 @@ def test_cell_subarray_column():
         fname, _ = _make_table(tmp, nrows=3)
         patch = np.full((3, 2), 99.0, dtype="f4")
         with rustfits.FITS(fname, "r+") as f:
-            f[1][1, "img"] = patch
+            f[1]["img"][1] = patch
         with rustfits.FITS(fname) as f:
             got = f[1].read()
             np.testing.assert_array_equal(got["img"][1], patch)
@@ -308,7 +308,7 @@ def test_cell_case_insensitive_name():
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=3)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][0, "ID"] = 777
+            f[1]["ID"][0] = 777
         with rustfits.FITS(fname) as f:
             assert f[1].read()["id"][0] == 777
 
@@ -327,7 +327,7 @@ def test_cell_vla_column():
             pre_pc = int(f[1].header["PCOUNT"])
         new_cell = np.array([100.0, 101.0, 102.0, 103.0], dtype="f4")
         with rustfits.FITS(fname, "r+") as f:
-            f[1][1, "v"] = new_cell
+            f[1]["v"][1] = new_cell
         with rustfits.FITS(fname) as f:
             assert int(f[1].header["PCOUNT"]) == pre_pc + 4 * 4
             got = f[1].read()
@@ -350,7 +350,7 @@ def test_cell_vla_string_column():
             f.create_table_hdu(dt, nrows=3, var_dtypes={"name": "S"})
             f[1].write(arr)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][1, "name"] = "modified_long"
+            f[1]["name"][1] = "modified_long"
         with rustfits.FITS(fname) as f:
             got = f[1].read()
             assert got["name"][0] == "alpha"
@@ -364,7 +364,7 @@ def test_cell_unknown_column_raises():
         fname, _ = _make_table(tmp, nrows=3)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises(ValueError, match="no column"):
-                f[1][0, "nope"] = 1
+                f[1]["nope"][0] = 1
 
 
 def test_cell_out_of_range_row_raises():
@@ -373,7 +373,7 @@ def test_cell_out_of_range_row_raises():
         fname, _ = _make_table(tmp, nrows=3)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises((IndexError, ValueError)):
-                f[1][10, "id"] = 1
+                f[1]["id"][10] = 1
 
 
 def test_cell_subarray_wrong_shape_raises():
@@ -383,7 +383,7 @@ def test_cell_subarray_wrong_shape_raises():
         bad = np.zeros((2, 2), dtype="f4")  # img wants (3, 2)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises((ValueError, Exception)):
-                f[1][0, "img"] = bad
+                f[1]["img"][0] = bad
 
 
 # ---------------------------------------------------------------------------
@@ -392,21 +392,34 @@ def test_cell_subarray_wrong_shape_raises():
 
 
 def test_tuple_with_slice_row_rejected():
-    """(slice, str) tuple is deferred; raises clearly."""
+    """(slice, str) tuple is not a supported key shape."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=4)
         with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(ValueError, match="tuple shapes"):
+            with pytest.raises(ValueError):
                 f[1][1:3, "id"] = np.zeros(2)
 
 
 def test_tuple_with_col_list_rejected():
-    """(int, [str, str]) tuple is deferred."""
+    """(int, [str, str]) tuple is not a supported key shape."""
     with tempfile.TemporaryDirectory() as tmp:
         fname, _ = _make_table(tmp, nrows=3)
         with rustfits.FITS(fname, "r+") as f:
-            with pytest.raises(ValueError, match="tuple shapes"):
+            with pytest.raises(ValueError):
                 f[1][0, ["id", "flux"]] = (1, 1.0)
+
+
+def test_tuple_row_col_rejected():
+    """
+    (int, str) tuple is no longer a supported key shape — use the
+    symmetric subset form ``hdu["col"][row] = v`` instead.  Same
+    rejection as the read side, which never accepted the tuple form.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        fname, _ = _make_table(tmp, nrows=4)
+        with rustfits.FITS(fname, "r+") as f:
+            with pytest.raises(ValueError):
+                f[1][0, "id"] = 42
 
 
 def test_mixed_int_str_iterable_rejected():

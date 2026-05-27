@@ -20,7 +20,7 @@ use super::read::{
     build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
 };
 use super::setitem::{
-    classify_setitem_key, setitem_cell, setitem_fancy_rows,
+    classify_setitem_key, setitem_fancy_rows,
     setitem_fancy_rows_vla_aware, setitem_multi_columns, setitem_row_slice,
     setitem_row_slice_vla_aware, setitem_single_column,
     setitem_single_column_vla, setitem_single_row,
@@ -782,9 +782,6 @@ impl TableHDU {
             SetItemKey::MultiColumns(names) => setitem_multi_columns(
                 py, &super_, &cards, &columns, nrows, row_width,
                 &names, value, data_offset),
-            SetItemKey::Cell(i, name) => setitem_cell(
-                py, &super_, &cards, &columns, nrows, row_width,
-                i, &name, value, data_offset),
         }
     }
 

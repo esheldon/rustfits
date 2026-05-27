@@ -130,16 +130,19 @@ else stays private to its file.
   modify affected tiles by decode → row-bytes replace →
   re-encode + append to heap, with orphans reclaimed by
   `repack()`), 6c-2c (column-targeted `__setitem__`
-  forms — `hdu["col"]=arr`, `hdu[r,"col"]=v`,
-  `hdu[[c1,c2]]=arr` — sharing the same per-tile primitive
-  but narrowing the column selection per call), 6c-2d
-  (stepped-slice row writes + subset-object writes —
-  `hdu[a:b:s]=arr`, `hdu["col"][rows]=v`,
-  `hdu[[a,b]][rows]=v`), and 6c-2e (VLA `__setitem__` for
-  every dispatch form — `hdu[r,"vla_col"]=v`,
-  `hdu["vla_col"]=arr`, `hdu[i]=record` with mixed
-  fixed+VLA cols, mixed multi-column subsets — completing
-  the full `__setitem__` surface on compressed tables.
+  forms — `hdu["col"]=arr` and `hdu[[c1,c2]]=arr` — sharing
+  the same per-tile primitive but narrowing the column
+  selection per call), 6c-2d (stepped-slice row writes +
+  subset-object writes — `hdu[a:b:s]=arr`,
+  `hdu["col"][rows]=v`, `hdu[[a,b]][rows]=v`), and 6c-2e
+  (VLA `__setitem__` for every dispatch form —
+  `hdu["vla_col"][r]=v`, `hdu["vla_col"]=arr`,
+  `hdu[i]=record` with mixed fixed+VLA cols, mixed
+  multi-column subsets — completing the full `__setitem__`
+  surface on compressed tables.  Single-cell writes go
+  through the symmetric subset form `hdu["col"][row]=v`;
+  the tuple form `hdu[row,"col"]` is rejected for symmetry
+  with the read side.
   Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
@@ -834,8 +837,8 @@ astropy reads our PA columns as per-cell chararrays of single chars;
 we read astropy's PA columns as Python str (the natural mapping).
 Tests in `tests/test_vla_string_write.py` (24 cases).
 
-**Multi-column / fancy / `(row, col)` `__setitem__`.**  Shipped.
-Three new forms complete the table `__setitem__` surface:
+**Multi-column / fancy-row `__setitem__`.**  Shipped.  Two
+additional forms complete the table `__setitem__` surface:
 
 - `hdu[[c1, c2]] = arr` — multi-column subset write.  Value is a
   structured ndarray with the named fields (extras tolerated for
@@ -849,20 +852,19 @@ Three new forms complete the table `__setitem__` surface:
   (the existing stepped-slice writer).  VLA tables are rejected
   with a clear error pointing at the per-row / whole-column
   workarounds (strided VLA writes would need per-row heap layouts).
-- `hdu[row, "col"] = value` — single-cell write.  Fixed cells:
-  promote value to a length-1 ndarray of the column's expected
-  dtype via `np.asarray(..., dtype=...) + np.broadcast_to`,
-  encode, write `byte_width` bytes at the row+column offset.
-  Subarray columns accept an ndarray matching the per-cell shape.
-  VLA cells: append cell bytes to heap end, rewrite descriptor,
-  update PCOUNT (same orphan-and-append model as
-  `setitem_single_column_vla` but for one row).  Other tuple
-  shapes — `(slice, str)`, `(int, [str, str])` — rejected with a
-  clear "tuple shapes" message.
 
-`SetItemKey` now has six variants (was three); `classify_setitem_key`
-mirrors `classify_table_key`'s iterable/tuple inspection.  Tests in
-`tests/test_setitem_multi.py` (25 cases).
+Single-cell writes go through the symmetric subset form
+`hdu["col"][row] = v` — see "Subset `__setitem__`" below.  The
+tuple form `hdu[row, "col"] = v` is NOT supported: the read side's
+`classify_table_key` has no `Cell` variant (a `(int, str)` tuple
+falls through to the iterator branch and raises "sequence must be
+all int or all str"), and `__setitem__` matches that exact
+behavior.  Anything readable via `hdu[key]` is writable via
+`hdu[key] = value`, nothing more.
+
+`SetItemKey` has five variants (mirrors the read-side `TableKey`);
+`classify_setitem_key` mirrors `classify_table_key`'s iterable
+inspection.  Tests in `tests/test_setitem_multi.py`.
 
 **Subset `__setitem__`.**  Shipped.  Both subset objects returned by
 `hdu["name"]` and `hdu[["a","b"]]` are now writable, so anything the
@@ -1247,13 +1249,14 @@ dispatch.  Forms supported:
   full-table` to modify a thin column slice (pathological when
   `byte_width << row_width`, which is the common case).
 
-All of multi-column subset writes (`hdu[[c1,c2]] = ...`), fancy
-row-list writes (`hdu[[1,3,5]] = ...`), single-cell tuple writes
-(`hdu[r, c] = ...`), and the subset-then-rows forms
+Multi-column subset writes (`hdu[[c1,c2]] = ...`), fancy row-list
+writes (`hdu[[1,3,5]] = ...`), and the subset-then-rows forms
 (`hdu["name"][rows] = ...`, `hdu[[c1,c2]][rows] = ...`) have since
-shipped — see the "Multi-column / fancy / `(row, col)`
-`__setitem__`" and "Subset `__setitem__`" sections under "Table
-write Supported" above.
+shipped — see the "Multi-column / fancy-row `__setitem__`" and
+"Subset `__setitem__`" sections under "Table write Supported"
+above.  Single-cell writes go through the symmetric subset form
+`hdu["col"][row] = v`; the tuple form `hdu[row, "col"]` was
+removed for symmetry with the read side (which never accepted it).
 
 **Phase 3 — `TableHDU.append()` (with `extend` alias).**  Done.
 Primary method name is `append` because that's the natural verb
@@ -2684,7 +2687,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6c-1b | VLA `append()` (existing-cell copy + per-cell re-encode for new rows) | ✅ Shipped |
 | 6c-2a | VLA `repack()` (streaming staging + dual-descriptor blob re-gzip) | ✅ Shipped |
 | 6c-2b | Fixed-col row writes: `hdu[i]=record`, `hdu[a:b]=arr`, `hdu[[i,j,k]]=arr` | ✅ Shipped |
-| 6c-2c | Fixed-col col/cell/multi writes: `hdu["col"]=arr`, `hdu[r,"col"]=v`, `hdu[[c1,c2]]=arr` | ✅ Shipped |
+| 6c-2c | Fixed-col col/multi writes: `hdu["col"]=arr`, `hdu[[c1,c2]]=arr` | ✅ Shipped |
 | 6c-2d | Stepped slices + subset-object writes (`hdu[a:b:s]=arr`, `hdu["name"][rows]=v`, `hdu[[a,b]][rows]=v`) | ✅ Shipped |
 | 6c-2e | VLA `__setitem__` (all forms, decode → modify → re-encode dual-descriptor blob) | ✅ Shipped |
 
@@ -3454,12 +3457,6 @@ with uncompressed-side `TableHDU.__setitem__`):
     Object-dtype ndarray of length `nrows` with per-row inner
     ndarrays.  Touches all tiles; other columns' descriptors
     stay unchanged.
-  - `hdu[r, "col"] = v` — single-cell write.  For a fixed
-    column: RHS is a scalar (Python int/float, numpy scalar, or
-    0-d ndarray — broadcast to the per-cell shape) or an ndarray
-    matching per-cell shape.  For a VLA column: RHS is the
-    cell value directly (inner-element ndarray, or str/bytes for
-    `PA`).  Touches one tile, one column.
   - `hdu[[c1, c2]] = arr` — multi-column subset write.  RHS is
     a structured ndarray of length = nrows with the named
     fields (extras tolerated; missing rejected; duplicates in
@@ -3534,7 +3531,6 @@ dispatcher dispatch table:
 | `hdu[[i,j,k]]=arr` (6c-2b) | all columns | row list |
 | `hdu[a:b:s]=arr` (6c-2d) | all columns | stepped range |
 | `hdu["col"]=arr` (6c-2c) | `[col_idx]` | `0..nrows` |
-| `hdu[r,"col"]=v` (6c-2c) | `[col_idx]` | `[r]` |
 | `hdu[[c1,c2]]=arr` (6c-2c) | `[c1_idx, c2_idx]` | `0..nrows` |
 | `hdu["col"][rows]=v` (6c-2d) | `[col_idx]` | rows |
 | `hdu[[c1,c2]][rows]=v` (6c-2d) | `[c1_idx, c2_idx]` | rows |

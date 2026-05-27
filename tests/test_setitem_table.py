@@ -402,14 +402,14 @@ def test_whole_column_wrong_dtype_rejected():
 
 
 def test_unsupported_key_rejected():
-    """Tuple shapes other than (int row, str col) still raise."""
+    """Tuple key shapes are not supported on __setitem__."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         _create_table(fname, 3)
         with rustfits.FITS(fname, "r+") as fits:
-            with pytest.raises(ValueError, match="tuple shapes"):
+            with pytest.raises(ValueError):
                 fits[1][(slice(0, 2), "id")] = np.zeros(2)
-            with pytest.raises(ValueError, match="tuple shapes"):
+            with pytest.raises(ValueError):
                 fits[1][(0, ["id", "flag"])] = (1, True)
 
 

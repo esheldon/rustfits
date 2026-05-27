@@ -4,7 +4,7 @@
 
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PySlice, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PySlice, PyString};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::Ordering;
 
@@ -370,11 +370,12 @@ pub(crate) fn setitem_multi_columns(
     Ok(())
 }
 
-// hdu[row, "col"] = value: single-cell write.  For a fixed-width
-// column: convert the value to the column's expected per-cell shape,
-// encode to bytes, write byte_width bytes at row_offset +
-// col.byte_offset.  For a VLA column: append cell bytes to the heap
-// end, rewrite the row's descriptor, update PCOUNT.
+// Write one cell at (row, col).  Called by the subset paths
+// (`hdu["col"][row] = v` and similar).  For a fixed-width column:
+// convert the value to the column's expected per-cell shape, encode
+// to bytes, write byte_width bytes at row_offset + col.byte_offset.
+// For a VLA column: append cell bytes to the heap end, rewrite the
+// row's descriptor, update PCOUNT.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn setitem_cell(
     py: Python<'_>,
@@ -455,10 +456,10 @@ pub(crate) fn setitem_cell(
     Ok(())
 }
 
-// hdu[row, "vla_col"] = value: append the new cell bytes at the heap
-// end, rewrite the row's descriptor in place, update PCOUNT.  Same
-// orphan-and-append model as setitem_single_column_vla but for one
-// row.
+// Write one VLA cell at (row, col): append the new cell bytes at the
+// heap end, rewrite the row's descriptor in place, update PCOUNT.
+// Same orphan-and-append model as setitem_single_column_vla but for
+// one row.  Called from setitem_cell when the targeted column is VLA.
 #[allow(clippy::too_many_arguments)]
 fn setitem_cell_vla(
     py: Python<'_>,
@@ -1285,16 +1286,14 @@ pub(crate) fn setitem_single_column_vla(
 }
 
 // What kind of selection the user passed to TableHDU.__setitem__.
-// Mirrors the read-side TableKey plus an extra `Cell` variant for the
-// (row, column) tuple form.  Mixed-tuple keys like (slice, [names])
-// are rejected — those are deferable surface extensions.
+// Mirrors the read-side TableKey exactly — anything readable via
+// `hdu[key]` is writable via `hdu[key] = value`, nothing more.
 pub(crate) enum SetItemKey {
     SingleRow(i64),
     RowSlice,
     SingleColumn(String),
     FancyRows(Vec<i64>),
     MultiColumns(Vec<String>),
-    Cell(i64, String),
 }
 
 pub(crate) fn classify_setitem_key(key: &Bound<'_, PyAny>) -> PyResult<SetItemKey> {
@@ -1309,32 +1308,15 @@ pub(crate) fn classify_setitem_key(key: &Bound<'_, PyAny>) -> PyResult<SetItemKe
             return Ok(SetItemKey::SingleRow(idx));
         }
     }
-    // Two-element tuple `(row, col)` — single cell write.  Other tuple
-    // shapes (slice/list rows × list of cols, etc.) are rejected for
-    // now; users can chain the existing forms instead.
-    if let Ok(tup) = key.cast::<PyTuple>() {
-        if tup.len() == 2 {
-            let row_obj = tup.get_item(0)?;
-            let col_obj = tup.get_item(1)?;
-            let row_is_int = !row_obj.is_instance_of::<PyBool>()
-                && row_obj.extract::<i64>().is_ok();
-            let col_name = try_extract_column_name(&col_obj)?;
-            if row_is_int && col_name.is_some() {
-                let idx: i64 = row_obj.extract()?;
-                return Ok(SetItemKey::Cell(idx, col_name.unwrap()));
-            }
-            return Err(PyValueError::new_err(
-                "TableHDU[(row, col)] = value requires (int row, \
-                 str column name); other tuple shapes are not \
-                 supported"));
-        }
-    }
     // Iterable: classify by first element (matches __getitem__'s
-    // classify_table_key shape).
+    // classify_table_key shape).  Tuples like `(int, str)` land here
+    // too and fall through to the all-int-or-all-str rejection — same
+    // behavior as the read side.  For a single-cell write, use the
+    // symmetric subset form `hdu["col"][row] = value`.
     let iter = key.try_iter().map_err(|_| PyValueError::new_err(
         "TableHDU[key] = value: key must be an int, slice, column \
-         name, two-tuple (row, col), iterable of ints (fancy rows), \
-         or iterable of str (column subset)"
+         name, iterable of ints (fancy rows), or iterable of str \
+         (column subset)"
     ))?;
     let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
     if items.is_empty() {
