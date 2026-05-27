@@ -1,0 +1,4 @@
+# Sphinx doc-build dependencies.  Pinned conservatively so RTD's
+# build is reproducible across the lifetime of a tag.
+sphinx>=7,<9
+furo>=2024.5

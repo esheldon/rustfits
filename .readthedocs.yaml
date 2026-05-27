@@ -1,0 +1,24 @@
+# Read the Docs build configuration.
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+    rust: "1.82"
+  jobs:
+    # Build + install the maturin-backed extension into the build
+    # venv before Sphinx starts, so autodoc can `import rustfits`.
+    # `pip install .` honors pyproject.toml's [build-system] block
+    # (maturin), so this builds and installs the wheel in one step.
+    post_install:
+      - pip install .
+
+sphinx:
+  configuration: docs/conf.py
+  fail_on_warning: false
+
+python:
+  install:
+    - requirements: docs/requirements.txt

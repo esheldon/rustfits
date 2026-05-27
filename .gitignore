@@ -46,5 +46,8 @@ env/
 .DS_Store
 Thumbs.db
 
+# Sphinx build output
+docs/_build/
+
 # Local stray files
 /log

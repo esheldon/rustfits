@@ -675,7 +675,7 @@ impl Rice1 {
 /// values with one of the integer compression algorithms
 /// (`Rice1`, `Gzip1`, `Hcompress1`, etc.).  This pyclass carries
 /// the quantization parameters separately from the algorithm
-/// config:
+/// config::
 ///
 ///     fits.create_image_hdu(
 ///         "f4", shape,
