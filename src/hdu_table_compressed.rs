@@ -1485,6 +1485,90 @@ impl CompressedSingleColumnSubset {
         Ok(arr.bind(py).get_item(self.name.as_str())?.unbind())
     }
 
+    /// Read this column.
+    ///
+    /// Returns a plain (non-structured) ndarray of the column's
+    /// values — same shape as ``self[rows]`` with the rows key.
+    /// All kwargs map to the matching
+    /// :meth:`CompressedTableHDU.read` arguments.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  None (default) reads every row.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` scaling on the way out.
+    /// mask_null : bool, default False
+    ///     Currently raises ``NotImplementedError`` on compressed
+    ///     tables (parity with :meth:`CompressedTableHDU.read`).
+    ///
+    /// Returns
+    /// -------
+    /// data : ndarray
+    ///     The column's values.
+    #[pyo3(signature = (*, rows=None, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if mask_null {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU[name].read(mask_null=True): \
+                 TNULL masking on compressed-table reads is not \
+                 yet implemented"));
+        }
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let cache = Arc::clone(&pyref.cache);
+        let super_ = pyref.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        let arr = read_compressed_table(
+            py, &cards, data_offset, &super_.file,
+            rows, Some(vec![self.name.clone()]),
+            scale, &cache,
+        )?;
+        Ok(arr.bind(py).get_item(self.name.as_str())?.unbind())
+    }
+
+    /// Write this column.
+    ///
+    /// With ``rows=None`` (default) writes all ``NAXIS2`` rows
+    /// — equivalent to ``hdu[name] = data``.  With
+    /// ``rows=<spec>`` writes only the named rows — equivalent
+    /// to ``self[rows] = data`` (the ``__setitem__`` form).
+    /// Re-encodes every affected tile and appends the new
+    /// compressed bytes to the heap; old tile bytes become
+    /// orphans (reclaim with
+    /// :meth:`CompressedTableHDU.repack`).
+    ///
+    /// Parameters
+    /// ----------
+    /// data : ndarray
+    ///     For ``rows=None``, a length-``NAXIS2`` ndarray of
+    ///     the column's expected dtype and per-cell shape (for
+    ///     VLA columns, an Object-dtype ndarray).  For
+    ///     ``rows=<spec>``, the shape must match what
+    ///     ``self[rows] = data`` would accept.
+    /// rows : slice, int, or iterable of int, optional
+    ///     Restrict the write to these rows.  None (default)
+    ///     writes every row.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => self.hdu.bind(py).set_item(&self.name, data),
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
     // [rows] = value writes to this one column at the selected rows.
     // For a bare-int `rows`, `value` is a scalar / 0-d / per-cell
     // ndarray (broadcast over the column's per-cell shape).  For a
@@ -1598,6 +1682,94 @@ impl CompressedColumnSubset {
             Some(rows), Some(self.columns.clone()),
             /* scale = */ true, &cache,
         )
+    }
+
+    /// Read these columns.
+    ///
+    /// Returns a structured ndarray with the subset's named
+    /// fields — same shape as ``self[rows]`` with the rows key.
+    /// All kwargs map to the matching
+    /// :meth:`CompressedTableHDU.read` arguments.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  None (default) reads every row.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` scaling on the way out.
+    /// mask_null : bool, default False
+    ///     Currently raises ``NotImplementedError`` on compressed
+    ///     tables (parity with :meth:`CompressedTableHDU.read`).
+    ///
+    /// Returns
+    /// -------
+    /// data : structured ndarray
+    ///     One row per selected source row; one field per column
+    ///     in the subset.
+    #[pyo3(signature = (*, rows=None, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        if mask_null {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU[[names]].read(mask_null=True): \
+                 TNULL masking on compressed-table reads is not \
+                 yet implemented"));
+        }
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let cache = Arc::clone(&pyref.cache);
+        let super_ = pyref.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        read_compressed_table(
+            py, &cards, data_offset, &super_.file,
+            rows, Some(self.columns.clone()),
+            scale, &cache,
+        )
+    }
+
+    /// Write this subset.
+    ///
+    /// With ``rows=None`` (default) writes all ``NAXIS2`` rows
+    /// — equivalent to ``hdu[[names...]] = data``.  With
+    /// ``rows=<spec>`` writes only the named rows — equivalent
+    /// to ``self[rows] = data`` (the ``__setitem__`` form).
+    /// Each named column is re-encoded per affected tile; the
+    /// other columns' stored bytes are untouched.  Old tile
+    /// bytes for modified columns become orphans (reclaim with
+    /// :meth:`CompressedTableHDU.repack`).
+    ///
+    /// Parameters
+    /// ----------
+    /// data : structured ndarray
+    ///     For ``rows=None``, a length-``NAXIS2`` structured
+    ///     ndarray with the subset's named fields.  For
+    ///     ``rows=<spec>``, the shape must match what
+    ///     ``self[rows] = data`` would accept.  Extra fields
+    ///     are tolerated (matched by name); missing fields
+    ///     raise.
+    /// rows : slice, int, or iterable of int, optional
+    ///     Restrict the write to these rows.  None (default)
+    ///     writes every row.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => {
+                let key = PyList::new(py, &self.columns)?;
+                self.hdu.bind(py).set_item(&key, data)
+            }
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
     }
 
     // [rows] = value writes a column-subset at the selected rows.

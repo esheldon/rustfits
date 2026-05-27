@@ -887,6 +887,37 @@ Tests in `tests/test_setitem_subset.py` (20 cases) — single-column
 + multi-column subset across cell / slice / fancy / full-slice /
 negative-index / VLA-numeric / VLA-string / round-trip read+write.
 
+**Subset `read()` / `write()` methods.**  Shipped.  Both subset
+objects (`SingleColumnSubset` / `ColumnSubset` on uncompressed,
+`CompressedSingleColumnSubset` / `CompressedColumnSubset` on
+compressed) gained named `read()` and `write()` methods so the
+surface is symmetric with `TableHDU.read()` / `TableHDU.write()`
+and self-documenting (rather than requiring users to discover
+`subset[:]` / `subset[:] = data` from the slicing surface).
+
+Read: `subset.read(*, rows=None, scale=True, mask_null=False)`.
+SingleColumn returns a plain ndarray (matches `__getitem__`'s
+contract); ColumnSubset returns a structured ndarray with the
+named fields.  Forwards `rows=` / `scale=` / `mask_null=` to the
+underlying `read_one_column` / `read_table` call (uncompressed)
+or `read_compressed_table` (compressed; `mask_null=True` raises
+`NotImplementedError` matching `CompressedTableHDU.read`).
+
+Write: `subset.write(data, *, rows=None)`.  With `rows=None`
+(default) dispatches to the parent HDU's `set_item(key, data)` —
+the efficient strip-based whole-column writer on uncompressed,
+the per-tile writer on compressed.  With `rows=<spec>` dispatches
+to the subset's own `__setitem__(rows, data)`, equivalent to
+`subset[rows] = data`.  Same value-shape contract as the matching
+`__setitem__` form.
+
+Tests in `tests/test_subset_read_write.py` (29 cases) — read
+returns expected shape, matches `subset[:]`, kwargs forward
+correctly; write round-trips both wholesale (`rows=None`) and
+row-restricted (`rows=` slice / int / fancy) across all four
+subset classes, plus unsigned-int trick and the
+`mask_null=True` rejection on compressed.
+
 **Add / remove columns (`insert_column` + `delete_column`).**
 Shipped.  Schema-edit methods on `TableHDU`:
 

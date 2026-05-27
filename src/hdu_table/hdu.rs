@@ -1156,6 +1156,87 @@ impl SingleColumnSubset {
         )
     }
 
+    /// Read this column.
+    ///
+    /// Returns a plain (non-structured) ndarray of the column's
+    /// values — same shape as ``self[rows]`` with the rows key.
+    /// All kwargs map to the matching :meth:`TableHDU.read`
+    /// arguments; see that method for the full semantics.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  None (default) reads every row.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` (unsigned-int trick and
+    ///     general linear scaling) on the way out.
+    /// mask_null : bool, default False
+    ///     Mask integer cells matching ``TNULLn`` and return a
+    ///     :class:`numpy.ma.MaskedArray`.  Rejected for VLA
+    ///     columns.
+    ///
+    /// Returns
+    /// -------
+    /// data : ndarray or MaskedArray
+    ///     The column's values.
+    #[pyo3(signature = (*, rows=None, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_one_column(
+            py, &meta, data_offset, &super_.file,
+            &self.name, rows, /* as_bytes = */ false,
+            scale, mask_null,
+        )
+    }
+
+    /// Write this column.
+    ///
+    /// With ``rows=None`` (default) writes all ``NAXIS2`` rows
+    /// — equivalent to ``hdu[name] = data`` — using the
+    /// efficient strip-based whole-column writer.  With
+    /// ``rows=<spec>`` writes only the named rows — equivalent
+    /// to ``self[rows] = data`` (the ``__setitem__`` form).
+    /// Other columns' bytes are untouched in both cases.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : ndarray
+    ///     For ``rows=None``, a length-``NAXIS2`` ndarray of
+    ///     the column's expected dtype and per-cell shape (for
+    ///     VLA columns, an Object-dtype ndarray of per-row inner
+    ///     ndarrays).  For ``rows=<spec>``, the shape must match
+    ///     what ``self[rows] = data`` would accept.
+    /// rows : slice, int, or iterable of int, optional
+    ///     Restrict the write to these rows.  None (default)
+    ///     writes every row.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            // Whole-column path: delegate to TableHDU.__setitem__
+            // with the column name as the key.  Uses the
+            // efficient strip-based writer (and the existing
+            // fixed/VLA dispatch).
+            None => self.hdu.bind(py).set_item(&self.name, data),
+            // Row-restricted path: same as ``self[rows] = data``.
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
     // See the __getitem__ comment above re: slot dunders.
     // Per-cell loop through setitem_cell — simple and correct.
     // Cards are re-snapshotted between cells so VLA writes (which
@@ -1239,6 +1320,87 @@ impl ColumnSubset {
             Some(rows), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
         )
+    }
+
+    /// Read these columns.
+    ///
+    /// Returns a structured ndarray with the subset's named
+    /// fields — same shape as ``self[rows]`` with the rows key.
+    /// All kwargs map to the matching :meth:`TableHDU.read`
+    /// arguments; see that method for the full semantics.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  None (default) reads every row.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` (unsigned-int trick and
+    ///     general linear scaling) on the way out.
+    /// mask_null : bool, default False
+    ///     Mask integer cells matching ``TNULLn`` and return a
+    ///     :class:`numpy.ma.MaskedArray` with a structured bool
+    ///     mask.  Rejected for VLA columns.
+    ///
+    /// Returns
+    /// -------
+    /// data : structured ndarray or MaskedArray
+    ///     One row per selected source row; one field per column
+    ///     in the subset.
+    #[pyo3(signature = (*, rows=None, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_table(
+            py, &meta, data_offset, &super_.file,
+            rows, Some(self.columns.clone()),
+            scale, mask_null,
+        )
+    }
+
+    /// Write this subset.
+    ///
+    /// With ``rows=None`` (default) writes all ``NAXIS2`` rows
+    /// — equivalent to ``hdu[[names...]] = data`` — using the
+    /// per-column whole-table writer.  With ``rows=<spec>``
+    /// writes only the named rows — equivalent to ``self[rows]
+    /// = data`` (the ``__setitem__`` form).  Other columns'
+    /// bytes are untouched in both cases.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : structured ndarray
+    ///     For ``rows=None``, a length-``NAXIS2`` structured
+    ///     ndarray with the subset's named fields.  For
+    ///     ``rows=<spec>``, the shape must match what
+    ///     ``self[rows] = data`` would accept.  Extra fields
+    ///     are tolerated (matched by name); missing fields
+    ///     raise.
+    /// rows : slice, int, or iterable of int, optional
+    ///     Restrict the write to these rows.  None (default)
+    ///     writes every row.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => {
+                let key = PyList::new(py, &self.columns)?;
+                self.hdu.bind(py).set_item(&key, data)
+            }
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
     }
 
     fn __setitem__(
