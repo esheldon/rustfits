@@ -2,9 +2,11 @@
 Top-level convenience functions.
 
 Thin wrappers around the FITS / HDU API for the most common
-"just give me the data" patterns.  Currently:
+one-liner patterns.  Currently:
 
     read(filename, ext=..., header=...) → data [, header]
+    write_image(filename, data, ...) → None
+    write_table(filename, data, ...) → None
 
 Future additions (read_header, write, ...) belong here too so the
 top-level surface stays organized in one place.
@@ -91,3 +93,114 @@ def read(
         if header:
             return data, chosen.header
         return data
+
+
+def write_image(
+    filename,
+    data,
+    *,
+    mode="w+",
+    extname=None,
+    extver=None,
+    compress=None,
+    quantize=None,
+    blank=None,
+    header=None,
+):
+    """
+    Open `filename`, create an image HDU from `data`, close.
+
+    Thin wrapper around :meth:`FITS.write_image` that handles
+    the open / close cycle.  Returns None — the new HDU is not
+    accessible after the file is closed; reopen if you need it.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the FITS file.
+    data : array_like
+        Pixel data — same shapes accepted as
+        :meth:`FITS.write_image`.
+    mode : str, default 'w+'
+        Open mode forwarded to :class:`FITS`.  Default 'w+'
+        creates the file (truncating if it exists); pass 'r+'
+        to append to an existing file without truncating.
+    extname, extver, compress, quantize, blank, header
+        Forwarded to :meth:`FITS.write_image`; see that method
+        for the full semantics.
+
+    See Also
+    --------
+    FITS.write_image : The underlying method.
+    write_table : The table-side counterpart.
+    """
+    with FITS(filename, mode) as fits:
+        fits.write_image(
+            data,
+            extname=extname,
+            extver=extver,
+            compress=compress,
+            quantize=quantize,
+            blank=blank,
+            header=header,
+        )
+
+
+def write_table(
+    filename,
+    data,
+    *,
+    mode="w+",
+    names=None,
+    extname=None,
+    extver=None,
+    units=None,
+    var_dtypes=None,
+    bit_columns=None,
+    heap_format=None,
+    compress=None,
+    ztilelen=None,
+    header=None,
+):
+    """
+    Open `filename`, create a BINTABLE HDU from `data`, close.
+
+    Thin wrapper around :meth:`FITS.write_table` that handles
+    the open / close cycle.  Returns None — the new HDU is not
+    accessible after the file is closed; reopen if you need it.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the FITS file.
+    data : structured ndarray, dict, or list/tuple of arrays
+        Row data — same three shapes accepted as
+        :meth:`FITS.write_table`.
+    mode : str, default 'w+'
+        Open mode forwarded to :class:`FITS`.  Default 'w+'
+        creates the file (truncating if it exists); pass 'r+'
+        to append to an existing file without truncating.
+    names, extname, extver, units, var_dtypes, bit_columns, \
+heap_format, compress, ztilelen, header
+        Forwarded to :meth:`FITS.write_table`; see that method
+        for the full semantics.
+
+    See Also
+    --------
+    FITS.write_table : The underlying method.
+    write_image : The image-side counterpart.
+    """
+    with FITS(filename, mode) as fits:
+        fits.write_table(
+            data,
+            names=names,
+            extname=extname,
+            extver=extver,
+            units=units,
+            var_dtypes=var_dtypes,
+            bit_columns=bit_columns,
+            heap_format=heap_format,
+            compress=compress,
+            ztilelen=ztilelen,
+            header=header,
+        )

@@ -23,4 +23,4 @@ from ._rust import (
 # User-facing convenience wrappers (read, future read_header, write, ...).
 # Definitions live in convenience.py; we re-export at the top level so
 # users can write `rustfits.read(...)` directly.
-from .convenience import read
+from .convenience import read, write_image, write_table

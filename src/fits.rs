@@ -551,6 +551,130 @@ fn hcompress_default_slow_tile(naxis2: u64) -> u64 {
     17
 }
 
+// Derive a structured numpy dtype and row count from one of the three
+// `write_table` input forms.  This is the table-side counterpart of
+// numpy.asanyarray's dtype-extraction; `create_table_hdu` is kept
+// schema-only (first arg = dtype), and this helper handles the
+// data-shaped inputs in one place.
+//
+// Accepted shapes:
+//   - structured ndarray (dtype.names is not None) -> use data.dtype,
+//     len(data) as nrows
+//   - dict {name: ndarray} -> compose np.dtype([(name, arr.dtype) for
+//     ...]); nrows is the (validated-equal) length of each column
+//   - list/tuple of ndarrays + names= -> same as dict, names supplied
+//     as the second arg
+fn derive_table_schema_from_data<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    names: Option<&Bound<'py, PyAny>>,
+) -> PyResult<(Bound<'py, PyAny>, i64)> {
+    let np = py.import("numpy")?;
+
+    // Dict input: {name: ndarray}.  names= is meaningless (the dict
+    // keys ARE the names) and rejected so a user typo doesn't silently
+    // get ignored.
+    if let Ok(d) = data.cast::<PyDict>() {
+        if names.is_some() {
+            return Err(PyValueError::new_err(
+                "write_table: names= is not valid with dict input \
+                 (the dict keys are the column names)"));
+        }
+        if d.is_empty() {
+            return Err(PyValueError::new_err(
+                "write_table: dict input is empty (no columns)"));
+        }
+        let descr = PyList::empty(py);
+        let mut nrows: Option<i64> = None;
+        for (key, val) in d.iter() {
+            let name: String = key.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "write_table: dict keys must be strings (column names)")
+            })?;
+            let arr = np.call_method1("asanyarray", (val,))?;
+            let n: i64 = arr.len()? as i64;
+            match nrows {
+                Some(prev) if prev != n => {
+                    return Err(PyValueError::new_err(format!(
+                        "write_table: column lengths disagree \
+                         (column '{}' has {} rows, previous columns had {})",
+                        name, n, prev)));
+                }
+                None => nrows = Some(n),
+                _ => {}
+            }
+            let dtype = arr.getattr("dtype")?;
+            descr.append((name, dtype))?;
+        }
+        let composed = np.call_method1("dtype", (descr,))?;
+        return Ok((composed, nrows.unwrap_or(0)));
+    }
+
+    // List / tuple of ndarrays — requires names= alongside.
+    let is_list = data.is_instance_of::<PyList>();
+    let is_tuple = data.is_instance_of::<pyo3::types::PyTuple>();
+    if is_list || is_tuple {
+        let names = names.ok_or_else(|| PyValueError::new_err(
+            "write_table: list/tuple input requires names= \
+             (one column name per array)"))?;
+        let name_list: Vec<String> = names.extract().map_err(|_| {
+            PyValueError::new_err(
+                "write_table: names= must be a list/tuple of strings")
+        })?;
+        let data_seq: Vec<Bound<PyAny>> = data.extract()?;
+        if data_seq.len() != name_list.len() {
+            return Err(PyValueError::new_err(format!(
+                "write_table: names= length {} does not match \
+                 data length {}",
+                name_list.len(), data_seq.len())));
+        }
+        if data_seq.is_empty() {
+            return Err(PyValueError::new_err(
+                "write_table: empty list/tuple input (no columns)"));
+        }
+        let descr = PyList::empty(py);
+        let mut nrows: Option<i64> = None;
+        for (name, val) in name_list.iter().zip(data_seq.iter()) {
+            let arr = np.call_method1("asanyarray", (val,))?;
+            let n: i64 = arr.len()? as i64;
+            match nrows {
+                Some(prev) if prev != n => {
+                    return Err(PyValueError::new_err(format!(
+                        "write_table: column lengths disagree \
+                         (column '{}' has {} rows, previous columns had {})",
+                        name, n, prev)));
+                }
+                None => nrows = Some(n),
+                _ => {}
+            }
+            let dtype = arr.getattr("dtype")?;
+            descr.append((name.as_str(), dtype))?;
+        }
+        let composed = np.call_method1("dtype", (descr,))?;
+        return Ok((composed, nrows.unwrap_or(0)));
+    }
+
+    // Structured ndarray — already has a named dtype.
+    let dtype = data.getattr("dtype").map_err(|_| {
+        PyValueError::new_err(
+            "write_table: data must be a structured ndarray, dict, \
+             or list/tuple of ndarrays + names=")
+    })?;
+    let dnames = dtype.getattr("names")?;
+    if dnames.is_none() {
+        return Err(PyValueError::new_err(
+            "write_table: ndarray must have a structured dtype \
+             (with named fields); got a plain dtype"));
+    }
+    if names.is_some() {
+        return Err(PyValueError::new_err(
+            "write_table: names= is not valid with structured ndarray \
+             input (the dtype already names the columns)"));
+    }
+    let nrows: i64 = data.len()? as i64;
+    Ok((dtype, nrows))
+}
+
 // Rust-only helpers on FITS — not exposed to Python.  Used by the
 // create_image_hdu / create_table_hdu / ensure_primary code paths to
 // avoid duplicating the "register HduOffsets + construct Py<HDU> +
@@ -1665,6 +1789,171 @@ impl FITS {
         let offsets = append_header_and_data_to_file(
             &self.file, &table_cards, data_padded)?;
         self.finalize_hdu(py, &table_cards, offsets, HduKind::Table)
+    }
+
+    /// Create an image HDU from ``data`` and write the pixels.
+    ///
+    /// One-call convenience that combines
+    /// :meth:`create_image_hdu` and :meth:`ImageHDU.write`.  The
+    /// HDU's dtype and shape are taken from ``data``; everything
+    /// else is forwarded to :meth:`create_image_hdu`.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : array_like
+    ///     The pixel data to write.  Anything ``numpy.asanyarray``
+    ///     accepts: an ndarray, a MaskedArray (mask is preserved
+    ///     through the write — see :class:`ImageHDU.write`), or a
+    ///     nested Python sequence.  Must have a supported numpy
+    ///     dtype (``u1`` / ``i1`` / ``i2`` / ``u2`` / ``i4`` /
+    ///     ``u4`` / ``i8`` / ``u8`` / ``f4`` / ``f8``).
+    /// extname, extver, compress, quantize, blank
+    ///     Forwarded to :meth:`create_image_hdu`; see that method
+    ///     for the full kwarg semantics.
+    /// header : FITSHeader or dict, optional
+    ///     Cards to copy into the new HDU after the write.  Routed
+    ///     through :meth:`FITSHeader.update`, which silently skips
+    ///     protected/structural cards when copying from another
+    ///     FITSHeader and raises on protected cards in a dict.
+    ///
+    /// Returns
+    /// -------
+    /// hdu : ImageHDU or CompressedImageHDU
+    ///     The newly created HDU, ready for further reads/writes
+    ///     while the FITS handle is open.
+    ///
+    /// See Also
+    /// --------
+    /// create_image_hdu : Schema-only create (no data write).
+    /// write_table : The table-side counterpart.
+    #[pyo3(signature = (
+        data, *, extname=None, extver=None,
+        compress=None, quantize=None, blank=None, header=None,
+    ))]
+    fn write_image(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        extname: Option<String>,
+        extver: Option<i64>,
+        compress: Option<Py<PyAny>>,
+        quantize: Option<Py<PyAny>>,
+        blank: Option<i64>,
+        header: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        // asanyarray preserves MaskedArray (so write() can unwrap
+        // the mask) but coerces plain lists/tuples to ndarrays.
+        let np = py.import("numpy")?;
+        let arr = np.call_method1("asanyarray", (data,))?;
+        let dtype_str: String =
+            arr.getattr("dtype")?.getattr("str")?.extract()?;
+        let shape: Vec<i64> = arr.getattr("shape")?.extract()?;
+
+        self.create_image_hdu(
+            py, dtype_str, shape, extname, extver,
+            compress, quantize, blank,
+        )?;
+
+        let hdu = self.hdus.last()
+            .ok_or_else(|| PyIOError::new_err(
+                "write_image: create_image_hdu did not append an HDU"))?
+            .clone_ref(py);
+        let bound = hdu.bind(py);
+        bound.call_method1("write", (&arr,))?;
+        if let Some(hdr) = header {
+            bound.getattr("header")?.call_method1("update", (hdr,))?;
+        }
+        Ok(hdu)
+    }
+
+    /// Create a BINTABLE HDU from ``data`` and write the rows.
+    ///
+    /// One-call convenience that combines
+    /// :meth:`create_table_hdu` and :meth:`TableHDU.write`.  The
+    /// table schema (dtype + nrows) is derived from ``data``;
+    /// everything else is forwarded to :meth:`create_table_hdu`.
+    ///
+    /// If the file has no HDUs yet, an empty primary image is
+    /// written first (the FITS standard forbids BINTABLE as the
+    /// primary HDU).
+    ///
+    /// Parameters
+    /// ----------
+    /// data : structured ndarray, dict, or list/tuple of arrays
+    ///     The rows to write.  Three accepted shapes:
+    ///
+    ///     * **structured ndarray** — dtype is taken from
+    ///       ``data.dtype``, nrows from ``len(data)``.
+    ///     * **dict** ``{name: array}`` — dtype is composed
+    ///       field-by-field from each column's ndarray dtype;
+    ///       all arrays must have the same length.
+    ///     * **list / tuple of arrays + names=** — same as dict,
+    ///       with names supplied as a separate argument.
+    /// names : sequence of str, optional
+    ///     Column names for the list/tuple input form.  Required
+    ///     when ``data`` is a list or tuple; rejected for the
+    ///     other two forms (the names are already implied).
+    /// extname, extver, units, var_dtypes, bit_columns, heap_format, compress, ztilelen
+    ///     Forwarded to :meth:`create_table_hdu`; see that method
+    ///     for the full kwarg semantics.
+    /// header : FITSHeader or dict, optional
+    ///     Cards to copy into the new HDU after the write.  Same
+    ///     semantics as ``write_image``'s ``header=``.
+    ///
+    /// Returns
+    /// -------
+    /// hdu : TableHDU or CompressedTableHDU
+    ///     The newly created HDU, ready for further reads/writes
+    ///     while the FITS handle is open.
+    ///
+    /// See Also
+    /// --------
+    /// create_table_hdu : Schema-only create (no data write).
+    /// write_image : The image-side counterpart.
+    #[pyo3(signature = (
+        data, *, names=None,
+        extname=None, extver=None, units=None,
+        var_dtypes=None, bit_columns=None, heap_format=None,
+        compress=None, ztilelen=None, header=None,
+    ))]
+    fn write_table(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+        extname: Option<String>,
+        extver: Option<i64>,
+        units: Option<&Bound<'_, PyDict>>,
+        var_dtypes: Option<&Bound<'_, PyDict>>,
+        bit_columns: Option<&Bound<'_, PyAny>>,
+        heap_format: Option<String>,
+        compress: Option<&Bound<'_, PyAny>>,
+        ztilelen: Option<i64>,
+        header: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (dtype, nrows) = derive_table_schema_from_data(py, data, names)?;
+        self.create_table_hdu(
+            py, &dtype, nrows, extname, extver, units,
+            var_dtypes, bit_columns, heap_format, compress, ztilelen,
+        )?;
+
+        let hdu = self.hdus.last()
+            .ok_or_else(|| PyIOError::new_err(
+                "write_table: create_table_hdu did not append an HDU"))?
+            .clone_ref(py);
+        let bound = hdu.bind(py);
+        // hdu.write(data, names=names) — forward the original input
+        // (TableHDU.write already dispatches on structured/dict/
+        // list+names).
+        let kwargs = PyDict::new(py);
+        if let Some(n) = names {
+            kwargs.set_item("names", n)?;
+        }
+        bound.call_method("write", (data,), Some(&kwargs))?;
+        if let Some(hdr) = header {
+            bound.getattr("header")?.call_method1("update", (hdr,))?;
+        }
+        Ok(hdu)
     }
 
     // Accept either an integer (positional, with Python-style negative
