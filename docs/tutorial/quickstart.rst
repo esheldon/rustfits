@@ -17,9 +17,10 @@ manager so the file is closed and flushed when the block exits.
    import rustfits
 
    with rustfits.FITS("data.fits") as fits:
-       print(len(fits))           # number of HDUs
+       print(fits)  # gives a pretty-printed list of HDUs
        for hdu in fits:
-           print(hdu.extname, type(hdu).__name__)
+           # gives a pretty-printed view of the HDU
+           print(hdu)
 
 Each HDU is accessed by integer position (``fits[0]`` is the
 primary HDU) or by EXTNAME (``fits["sci"]``; lookup is case-
@@ -67,6 +68,8 @@ Reading an image
 Whole-array read:
 
 .. code-block:: python
+
+   arr = rustfits.read("image.fits")
 
    with rustfits.FITS("image.fits") as fits:
        arr = fits[1].read()

@@ -26,7 +26,10 @@ def read(
     header=False,
 ):
     """
-    Open `filename`, read data from one HDU, and return it.
+    Open `filename`, read from the first HDU with data, and return it.
+
+    This function is intentionally minimal.  For more read options, open a FITS
+    object and use the rich HDU interface.
 
     Parameters
     ----------
