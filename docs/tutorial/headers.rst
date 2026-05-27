@@ -12,6 +12,12 @@ This page covers reading, mutating, batched updates with
 :class:`~rustfits.FITSHeaderEdit`, the protected-key rules,
 CONTINUE chains, HIERARCH conventions, and checksums.
 
+The ``CHECKSUM`` / ``DATASUM`` (and ``ZHECKSUM`` / ``ZDATASUM``
+for compressed HDUs) are byte-exact with cfitsio's encoder.
+Headers written by rustfits — including CONTINUE chains and
+HIERARCH long keys — read back through astropy and fitsio
+unchanged.  See :doc:`limitations` for the interop caveats.
+
 Reading
 -------
 

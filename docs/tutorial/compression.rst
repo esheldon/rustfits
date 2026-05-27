@@ -11,6 +11,14 @@ This page covers turning compression on at write time, the
 algorithm config objects, the ``Quantize`` config for float
 images, the tile cache, and the ``repack()`` operation.
 
+Compressed files written by rustfits are byte-exactly equivalent
+to fitsio / cfitsio output on the same input (anchored by
+heap-comparison tests across every algorithm), and ``funpack``
+decompresses rustfits-written files to bit-exact uncompressed
+form.  In the other direction, rustfits reads files written by
+``fpack``, astropy, and fitsio.  See :doc:`limitations` for the
+narrow caveats.
+
 Compressed images
 -----------------
 

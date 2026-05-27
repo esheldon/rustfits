@@ -3816,6 +3816,53 @@ Worth keeping an eye on the failing test
 `test_other_compression_types_dispatched` was the first to
 abort) when the time comes.
 
+## Documentation TODO — tutorial gap audit
+
+The Sphinx tutorial under `docs/tutorial/` covers the main
+surface but a 2026-05 audit identified gaps users would expect.
+Listed in rough priority order (1–5 are clearly missing; 6–8 are
+nice-to-have).  Cross items off as they land; revisit ordering
+when a real user request flags something.
+
+1. **File modes table** — `"r"` / `"r+"` / `"w+"` are sprinkled
+   throughout the tutorial but never enumerated in one place.
+   Add a short table to `quickstart.rst` covering each mode's
+   semantics (read-only vs read-write, truncates vs preserves,
+   creates vs requires-exists).
+2. **Walking HDUs / picking the right one** — the quickstart's
+   one-liner `for hdu in fits` doesn't show the realistic pattern
+   of `if hdu.has_data and isinstance(hdu, ImageHDU): ...` to
+   find the first image-with-data.  Add a couple of lines.
+3. **`AsciiTableHDU` note** — completely absent from the
+   tutorial.  Users who open a file with an ASCII table get an
+   `AsciiTableHDU` whose `read()` returns header only.  One
+   paragraph in `tables.rst` documenting it as a read-stub.
+4. **Known limitations** — small terminal page (or section in
+   `tables.rst`) listing things rustfits doesn't do: VLA with
+   `repeat > 1`, ASCII table writes, `max_size=` for VLA,
+   `mask_blank=True` on quantized compressed reads, `TDISPn`
+   on write.  Users hit these and need to know "not yet" vs
+   "by design."
+5. **Cross-tool interop** — one sentence near the top of each
+   topic page asserting "rustfits-written files are bit-exactly
+   readable by astropy and fitsio."  Major value prop that the
+   docs currently don't mention.
+6. **Subset object semantics** — explicit "subset objects are
+   lazy selectors, not snapshots; `subset[:]` triggers a read."
+   Goes into `tables.rst`.
+7. **Error/recovery model** — taint-flag + close+reopen story
+   for mid-write failures (mostly relevant on real ENOSPC).  One
+   paragraph in `headers.rst` (or a separate `errors.rst`).
+8. **Performance / chunked reads** — the big-chunk and small-
+   chunk wins vs fitsio (see "Performance — ZIMAGE chunked-read
+   profiling history" elsewhere in this file) are unmatched and
+   currently undocumented user-facing.  Worth a short page if
+   we want users to know.
+
+Out of scope (don't write these without a specific ask):
+migration guide from astropy / fitsio; WCS handling (rustfits
+doesn't parse WCS — users hand the header to `astropy.wcs`).
+
 ## Coverage TODO — sweep once feature-complete
 
 First codecov run (commit `cf619a2`, May 2026) reported

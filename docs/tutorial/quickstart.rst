@@ -27,6 +27,40 @@ insensitive).  HDUs come back typed: :class:`~rustfits.ImageHDU`,
 :class:`~rustfits.TableHDU`, :class:`~rustfits.CompressedImageHDU`,
 etc.
 
+File modes
+----------
+
+:class:`rustfits.FITS` accepts three modes:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 22 35 33
+
+   * - Mode
+     - Access
+     - If the file exists
+     - If the file is missing
+   * - ``"r"`` (default)
+     - read-only
+     - opens it
+     - raises
+   * - ``"r+"``
+     - read + write
+     - opens it (contents preserved)
+     - raises
+   * - ``"w+"``
+     - read + write
+     - **truncates** to zero length
+     - creates it
+
+Use ``"r+"`` to modify or append HDUs to an existing file without
+losing anything.  Use ``"w+"`` when you want to start fresh — it
+is equivalent to fitsio's ``"rw"`` plus ``clobber=True``.  ``"w+"``
+is the default for the top-level convenience writers
+(:func:`rustfits.write_image`, :func:`rustfits.write_table`); pass
+``mode="r+"`` to those to append to an existing file instead of
+truncating it.
+
 Reading an image
 ----------------
 
@@ -196,6 +230,42 @@ Mutation is straightforward in ``"r+"`` mode:
    with rustfits.FITS("data.fits", "r+") as fits:
        fits[1].header["object"] = "M31"
        fits[1].header.add_comment("Processed by pipeline v2")
+
+Walking the HDUs
+----------------
+
+Iterate to see what's in a file:
+
+.. code-block:: python
+
+   with rustfits.FITS("data.fits") as fits:
+       for i, hdu in enumerate(fits):
+           print(i, hdu.extname, hdu.has_data)
+
+Two HDU properties are useful for filtering without reading any
+data:
+
+* ``hdu.has_data`` — True iff the HDU has actual data
+  (``NAXIS > 0`` and every ``NAXISn > 0``).  The primary HDU is
+  often empty (header-only) and ``has_data`` is False there.
+* ``isinstance(hdu, ImageHDU)`` / ``TableHDU`` — pick by HDU
+  type.  :class:`~rustfits.CompressedImageHDU` is a subclass of
+  :class:`~rustfits.ImageHDU` and
+  :class:`~rustfits.CompressedTableHDU` is a subclass of
+  :class:`~rustfits.TableHDU`, so an ``isinstance`` check on the
+  base class matches both compressed and uncompressed.
+
+A realistic "find the first image worth reading" pattern:
+
+.. code-block:: python
+
+   with rustfits.FITS("data.fits") as fits:
+       for hdu in fits:
+           if hdu.has_data and isinstance(hdu, rustfits.ImageHDU):
+               img = hdu.read()
+               break
+
+The matching pattern for tables uses ``rustfits.TableHDU``.
 
 Where to next
 -------------

@@ -10,6 +10,11 @@ For tile-compressed images, see :doc:`compression`.  The Python
 surface is the same (``read`` / ``__getitem__`` / ``__setitem__``
 / ``extend``); the difference is the on-disk encoding.
 
+Images written by rustfits — including those that use the
+unsigned-int trick or BLANK masking — are bit-exactly readable
+by astropy and fitsio, and vice versa.  See :doc:`limitations`
+for the rare interop caveats.
+
 Writing an image
 ----------------
 

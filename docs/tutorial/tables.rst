@@ -9,6 +9,12 @@ operations, and variable-length (VLA) columns.
 For tile-compressed tables, see :doc:`compression`.  The Python
 surface is the same; the on-disk encoding differs.
 
+Tables written by rustfits — fixed columns, variable-length
+columns (numeric and string ``PA``), and bit-packed ``X`` /
+``PX`` columns — round-trip bit-exactly through astropy and
+fitsio (one astropy parser limitation on ``PX``/``QX`` is noted
+in :doc:`limitations`).
+
 Writing a table
 ---------------
 
@@ -257,3 +263,37 @@ Lightweight metadata without reading any rows:
    hdu.units           # dict, informational
    hdu.extname         # EXTNAME or None
    len(hdu)            # == nrows
+
+ASCII tables (read-stub)
+------------------------
+
+FITS also defines an older ASCII-table extension
+(``XTENSION='TABLE'``, distinct from the binary
+``XTENSION='BINTABLE'`` that everything above uses).  ASCII tables
+store row data as fixed-width text and are rare in modern files —
+nearly every pipeline uses binary tables instead.
+
+rustfits surfaces an ASCII table as :class:`~rustfits.AsciiTableHDU`
+but the read/write surface isn't yet implemented.  Inspection
+accessors work:
+
+.. code-block:: python
+
+   with rustfits.FITS("legacy.fits") as fits:
+       for hdu in fits:
+           if isinstance(hdu, rustfits.AsciiTableHDU):
+               print(hdu.nrows, hdu.extname, hdu.header.keys())
+
+Calling ``hdu.read()`` on an :class:`~rustfits.AsciiTableHDU`
+raises ``NotImplementedError``.  Until the read path lands, fall
+back to astropy or fitsio for the specific ASCII-table HDU:
+
+.. code-block:: python
+
+   import astropy.io.fits as afits
+   with afits.open("legacy.fits") as f:
+       ascii_data = f[i].data        # i = the ASCII table's index
+
+The rest of the file (primary HDU, image extensions, binary
+tables) is unaffected — rustfits opens and reads those normally
+in the same session.

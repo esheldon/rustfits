@@ -22,3 +22,4 @@ every access rather than caching parsed values.
    tables
    compression
    headers
+   limitations
