@@ -59,9 +59,42 @@ use super::write_vla::{
 ///
 ///     arr = hdu.read()
 ///
+/// Read a row subset::
+///
+///     rows = np.arange(20, 30)
+///     ra_dec = hdu.read(rows=rows)
+///
 /// Read a column subset::
 ///
-///     ra_dec = hdu.read(columns=["RA", "DEC"])
+///     columns = ['ra', 'dec']
+///     ra_dec = hdu.read(columns=columns)
+///     ra_dec = hdu.read(rows=rows, columns=columns)
+///
+/// Slicing and column subsets::
+///
+///     arr = hdu[35:100]
+///     arr = hdu[rows]
+///     single = hdu[35]
+///
+///     # a column subset.  The read does not occur until
+///     # rows are specified or .read() is called
+///     ra_dec = hdu[columns].read()
+///     ra_dec = hdu[columns][rows]
+///
+/// Writing is symmetric::
+///
+///     hdu[35:100] = data
+///     hdu[rows] = data
+///     hdu[columns][rows] = sub_data
+///
+/// Overwrite the whole table::
+///
+///    hdu[:] = new_data
+///    hdu.write(new_data)
+///
+/// Appending::
+///
+///     hdu.append(new_data)
 ///
 /// Iterate rows lazily via slicing::
 ///
