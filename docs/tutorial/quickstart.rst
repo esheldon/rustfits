@@ -185,8 +185,8 @@ Append rows with :meth:`~rustfits.TableHDU.append`:
 Creating a new file
 -------------------
 
-The shortest path is the top-level convenience functions, which
-open the file, write the HDU, and close in one call:
+The shortest path is :func:`rustfits.write`, which auto-detects
+image vs table from the value you pass it:
 
 .. code-block:: python
 
@@ -194,10 +194,23 @@ open the file, write the HDU, and close in one call:
    import rustfits
 
    img = np.arange(10000, dtype="f4").reshape(100, 100)
-   rustfits.write_image("out.fits", img)
+   rustfits.write("out.fits", img)                          # → image HDU
 
    cat = np.zeros(100, dtype=[("ra", "f8"), ("dec", "f8"), ("flag", "i4")])
-   rustfits.write_table("cat.fits", cat)
+   rustfits.write("cat.fits", cat)                          # → table HDU
+
+   rustfits.write(
+       "named.fits",
+       {"x": np.arange(3), "y": np.arange(3) * 2.0},
+       extname="sci",
+   )
+
+:func:`rustfits.write` accepts only the universal kwargs
+(``mode``, ``extname``, ``header``).  For type-specific knobs
+(``compress=``, ``quantize=``, ``blank=``, ``var_dtypes=``,
+``units=``, ``bit_columns=``, ...), call
+:func:`rustfits.write_image` or :func:`rustfits.write_table`
+directly — the data argument is the same in either case.
 
 For more control — multiple HDUs in one file, appending to an
 existing file, custom headers — use :class:`~rustfits.FITS`
@@ -225,6 +238,18 @@ a dict-like view:
        exptime = hdr["exptime"]
        comment = hdr.comment_of("exptime")
        print(hdr.keys())
+
+For "just the header, no data" workflows there's a top-level
+:func:`rustfits.read_header` shortcut (default ``ext=0`` picks
+the primary HDU):
+
+.. code-block:: python
+
+   hdr = rustfits.read_header("data.fits")           # primary
+   sci_hdr = rustfits.read_header("data.fits", ext="sci")
+
+The returned :class:`~rustfits.FITSHeader` outlives the file
+close — read-only access works after the function returns.
 
 Mutation is straightforward in ``"r+"`` mode:
 

@@ -393,6 +393,134 @@ def test_top_level_write_table_append_with_rplus_mode():
             assert f[2].extname == "T2"
 
 
+# ---------------------------------------------------------------------------
+# rustfits.write — minimal auto-dispatch convenience
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_write_dispatches_image_from_plain_ndarray():
+    """A plain (non-structured) ndarray routes to write_image."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "img.fits")
+        data = np.arange(12, dtype="f4").reshape(3, 4)
+        rustfits.write(path, data)
+        with rustfits.FITS(path) as f:
+            # Image lands in the primary HDU when the file is fresh.
+            assert isinstance(f[0], rustfits.ImageHDU)
+        back = rustfits.read(path)
+        np.testing.assert_array_equal(back, data)
+
+
+def test_top_level_write_dispatches_table_from_structured_ndarray():
+    """A structured ndarray (dtype.fields is not None) routes to write_table."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tab.fits")
+        dt = np.dtype([("a", "i4"), ("b", "f8")])
+        data = np.zeros(5, dtype=dt)
+        data["a"] = np.arange(5)
+        data["b"] = np.linspace(0, 1, 5)
+        rustfits.write(path, data)
+        with rustfits.FITS(path) as f:
+            assert isinstance(f[1], rustfits.TableHDU)
+        back = rustfits.read(path)
+        np.testing.assert_array_equal(back["a"], data["a"])
+        np.testing.assert_allclose(back["b"], data["b"])
+
+
+def test_top_level_write_dispatches_table_from_dict():
+    """A {name: array} dict routes to write_table."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dtab.fits")
+        rustfits.write(
+            path,
+            {"x": np.arange(3, dtype="i4"), "y": np.arange(3, dtype="f4")},
+        )
+        with rustfits.FITS(path) as f:
+            assert isinstance(f[1], rustfits.TableHDU)
+        back = rustfits.read(path)
+        assert back.dtype.names == ("x", "y")
+        np.testing.assert_array_equal(back["x"], [0, 1, 2])
+
+
+def test_top_level_write_rejects_list_of_arrays():
+    """list/tuple-of-arrays needs write_table directly (for names=)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rej.fits")
+        arrays = [np.arange(3, dtype="i4"), np.arange(3, dtype="f4")]
+        with pytest.raises(ValueError, match="write_image|write_table"):
+            rustfits.write(path, arrays)
+
+
+def test_top_level_write_rejects_unsupported_type():
+    """A plain string isn't writable."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rej.fits")
+        with pytest.raises(ValueError):
+            rustfits.write(path, "not data")
+
+
+def test_top_level_write_truncates_then_overwrites():
+    """Default mode='w+' truncates an existing file."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "trunc.fits")
+        rustfits.write(path, np.arange(100, dtype="i4"))
+        rustfits.write(path, np.arange(4, dtype="i4"))
+        back = rustfits.read(path)
+        assert back.tolist() == [0, 1, 2, 3]
+
+
+def test_top_level_write_appends_with_rplus_mode():
+    """mode='r+' appends to an existing file without truncating."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "app.fits")
+        rustfits.write(path, np.zeros(3, dtype="i4"))
+        rustfits.write(path, {"y": np.ones(2, dtype="f4")}, mode="r+")
+        with rustfits.FITS(path) as f:
+            # Primary (with image data) + table.
+            assert len(f) == 2
+            assert isinstance(f[0], rustfits.ImageHDU)
+            assert isinstance(f[1], rustfits.TableHDU)
+
+
+def test_top_level_write_forwards_header():
+    """`header=` is passed through to the underlying write_* call."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "hdr.fits")
+        data = np.arange(4, dtype="i4")
+        rustfits.write(path, data, header={"object": "ngc1"})
+        _, hdr = rustfits.read(path, header=True)
+        assert hdr["object"] == "ngc1"
+
+
+def test_top_level_write_forwards_extname_image():
+    """`extname=` sets EXTNAME on an image HDU; FITS["name"] looks
+    it up case-insensitively."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ext_img.fits")
+        rustfits.write(path, np.arange(4, dtype="i4"), extname="sci")
+        with rustfits.FITS(path) as f:
+            # Case is preserved on disk for EXTNAME string values.
+            assert f[0].extname == "sci"
+            # And case-insensitive lookup works.
+            assert isinstance(f["SCI"], rustfits.ImageHDU)
+
+
+def test_top_level_write_forwards_extname_table():
+    """`extname=` sets EXTNAME on a table HDU built from a dict."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ext_tab.fits")
+        rustfits.write(
+            path,
+            {"a": np.arange(3, dtype="i4")},
+            extname="cat",
+        )
+        with rustfits.FITS(path) as f:
+            assert f[1].extname == "cat"
+            assert isinstance(f[1], rustfits.TableHDU)
+            # Case-insensitive EXTNAME lookup matches.
+            assert isinstance(f["CAT"], rustfits.TableHDU)
+
+
 if __name__ == "__main__":
     import sys
 

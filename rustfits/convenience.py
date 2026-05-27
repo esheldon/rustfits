@@ -4,32 +4,36 @@ Top-level convenience functions.
 Thin wrappers around the FITS / HDU API for the most common
 one-liner patterns.  Currently:
 
-    read(filename, ext=..., header=...) → data [, header]
-    write_image(filename, data, ...) → None
-    write_table(filename, data, ...) → None
+    read(filename, ext=..., header=...)    → data [, header]
+    read_header(filename, ext=...)         → FITSHeader
+    write(filename, data, ...)             → None
+    write_image(filename, data, ...)       → None
+    write_table(filename, data, ...)       → None
 
-Future additions (read_header, write, ...) belong here too so the
-top-level surface stays organized in one place.
+`read`, `read_header`, and `write` are intentionally minimal —
+they cover the "just read / write the data" case and dispatch
+on HDU / data type.  For knobs like `scale=`, `rows=`,
+`columns=`, `compress=`, `var_dtypes=`, etc., use the
+type-specific `write_image` / `write_table` (or open the file
+with FITS() for read-side nuance).
 """
+
+import numpy as np
 
 from ._rust import FITS, ImageHDU, TableHDU
 
 
-def read(
-    filename,
-    ext=None,
-    *,
-    rows=None,
-    columns=None,
-    scale=True,
-    mask_null=False,
-    header=False,
-):
+def read(filename, ext=None, *, header=False):
     """
     Open `filename`, read from the first HDU with data, and return it.
 
-    This function is intentionally minimal.  For more read options, open a FITS
-    object and use the rich HDU interface.
+    This function is intentionally minimal — it accepts only the
+    universal kwargs (`ext` and `header`).  For finer control —
+    `scale=`, `rows=`, `columns=`, `mask_null=`, `mask_blank=` —
+    open the file explicitly::
+
+        with rustfits.FITS(filename) as fits:
+            data = fits[1].read(scale=False)
 
     Parameters
     ----------
@@ -41,8 +45,6 @@ def read(
         the primary HDU is empty.  An int selects by HDU index; a
         str selects by EXTNAME (case-insensitive).  When ext is set
         explicitly, the HDU is read even if it has no data.
-    rows, columns, scale, mask_null
-        Forwarded to `TableHDU.read()`.  Ignored for ImageHDU.
     header : bool, default False
         If True, return `(data, header)`; the header is a FITSHeader
         whose card list is independent of the file handle (safe to
@@ -77,14 +79,7 @@ def read(
         else:
             chosen = fits[ext]
 
-        if isinstance(chosen, TableHDU):
-            data = chosen.read(
-                rows=rows,
-                columns=columns,
-                scale=scale,
-                mask_null=mask_null,
-            )
-        elif isinstance(chosen, ImageHDU):
+        if isinstance(chosen, (ImageHDU, TableHDU)):
             data = chosen.read()
         else:
             raise ValueError(
@@ -96,6 +91,108 @@ def read(
         if header:
             return data, chosen.header
         return data
+
+
+def read_header(filename, ext=0):
+    """
+    Open `filename`, return the chosen HDU's header.
+
+    No data is read.  The returned :class:`FITSHeader` holds a
+    snapshot of the cards and is safe to inspect after the file
+    is closed (read-only — mutation requires an open handle in
+    ``"r+"`` mode, not this function).
+
+    Parameters
+    ----------
+    filename : str
+        Path to the FITS file (read-only mode is used).
+    ext : int or str, default 0
+        HDU selector.  Default ``0`` reads the primary HDU's
+        header, which is where file-level metadata typically
+        lives.  An int selects by HDU index; a str selects by
+        ``EXTNAME`` (case-insensitive).
+
+    Returns
+    -------
+    FITSHeader
+
+    Raises
+    ------
+    IndexError
+        When ``ext`` is an int outside ``[0, len(fits))``.
+    ValueError
+        When ``ext`` is a string and no HDU has a matching
+        ``EXTNAME``.
+    """
+    with FITS(filename, "r") as fits:
+        return fits[ext].header
+
+
+def write(filename, data, *, mode="w+", extname=None, header=None):
+    """
+    Open `filename`, write `data` (auto-detecting image vs table), close.
+
+    This function is intentionally minimal — it accepts only the
+    universal kwargs (`mode`, `extname`, `header`).  For knobs
+    like `compress=`, `quantize=`, `blank=`, `var_dtypes=`,
+    `units=`, etc., use the type-specific
+    :func:`write_image` / :func:`write_table` directly,
+    or open the file explicitly:::
+
+        with rustfits.FITS(filename, 'r+') as fits:
+            fits.write_image(data, compress=True)
+
+    Parameters
+    ----------
+    filename : str
+        Path to the FITS file.
+    data : numpy.ndarray or dict
+        Image: a numpy ndarray with a plain (non-structured) dtype.
+        Table: a structured ndarray (``dtype.fields is not None``)
+        or a ``{name: ndarray}`` dict.  The list-of-arrays +
+        ``names=[...]`` form supported by :func:`write_table` is
+        NOT accepted here — call :func:`write_table` for that.
+    mode : str, default 'w+'
+        Open mode.  Default ``'w+'`` creates or truncates the file;
+        pass ``'r+'`` to append to an existing file without
+        truncating.
+    extname : str, optional
+        ``EXTNAME`` to set on the new HDU.  Mirrors :func:`read`'s
+        ``ext=`` selector.
+    header : FITSHeader, dict, or None, optional
+        Header to attach to the new HDU.  Forwarded to the
+        underlying ``write_image`` / ``write_table``.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        When `data` is neither an ndarray nor a dict.
+    """
+    if isinstance(data, np.ndarray):
+        if data.dtype.fields is None:
+            with FITS(filename, mode) as fits:
+                fits.write_image(data, extname=extname, header=header)
+            return
+        # Structured ndarray → table.
+        with FITS(filename, mode) as fits:
+            fits.write_table(data, extname=extname, header=header)
+        return
+    if isinstance(data, dict):
+        with FITS(filename, mode) as fits:
+            fits.write_table(data, extname=extname, header=header)
+        return
+    raise ValueError(
+        f"rustfits.write() accepts a numpy ndarray (image or "
+        f"structured) or a {{name: array}} dict (table); got "
+        f"{type(data).__name__}.  For lists of arrays with names=, "
+        "or any of the type-specific kwargs (compress=, blank=, "
+        "var_dtypes=, ...), use rustfits.write_image() / "
+        "rustfits.write_table()."
+    )
 
 
 def write_image(
