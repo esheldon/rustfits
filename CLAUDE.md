@@ -1073,6 +1073,87 @@ and `tests/test_vla_x_bit.py` (16 cases, VLA PX/QX).
 - **Streaming / row-iterator API** — for tables that don't fit in
   RAM.  No user has asked yet; add when one does.
 
+## Top-level convenience functions
+
+One-call wrappers for the most common patterns.  The architecture
+is the same for all three: real `#[pymethods]` on `FITS` in
+`src/fits.rs` do the work; a thin Python wrapper in
+`rustfits/convenience.py` adds the open / close cycle for users
+who don't want to manage a `FITS` handle.  Top-level wrappers are
+re-exported from `rustfits/__init__.py` so users write
+`rustfits.read(...)` / `rustfits.write_image(...)` /
+`rustfits.write_table(...)`.
+
+### `read` (read-only)
+
+`rustfits.read(filename, ext=None, *, rows=None, columns=None,
+scale=True, mask_null=False, header=False)` — opens in `'r'`,
+picks the first HDU with data (`ext=None`) or the requested
+ext, dispatches on HDU type, returns the array (and optionally
+the `FITSHeader`).  See `rustfits/convenience.py` for the
+docstring.
+
+### `write_image` / `write_table` (method form)
+
+`FITS.write_image(data, *, extname, extver, compress, quantize,
+blank, header)` and `FITS.write_table(data, *, names, extname,
+extver, units, var_dtypes, bit_columns, heap_format, compress,
+ztilelen, header)` combine `create_*_hdu` + `write` into one
+call.  Both return the new HDU (`ImageHDU` /
+`CompressedImageHDU` / `TableHDU` / `CompressedTableHDU`) so
+callers can continue operating on it within the same `FITS`
+handle.
+
+Schema derivation: `create_table_hdu` stays schema-only (first
+arg = dtype).  A small free helper
+`derive_table_schema_from_data` in `src/fits.rs` handles the
+three data-shaped inputs the user-facing `write_table` accepts:
+
+  - **structured ndarray** — `(data.dtype, len(data))`.
+  - **dict `{name: array}`** — composes
+    `np.dtype([(name, arr.dtype) for name, arr in data.items()])`,
+    validates equal lengths.  Empty dict + length mismatch
+    rejected; `names=` rejected (the dict keys ARE the names).
+  - **list/tuple of arrays + names=`** — same as dict, names
+    supplied separately.  Missing `names=` rejected; length
+    mismatch between `names=` and the data sequence rejected.
+
+`header=` accepts a `FITSHeader` or a `dict` and routes through
+`new_hdu.header.update(header)`, inheriting that method's
+protected-key and commentary policies (FITSHeader source silently
+skips protected; dict source raises on protected).
+
+`write_table` on an empty file auto-creates the primary HDU via
+the existing `ensure_primary` path inside `create_table_hdu` —
+no special-casing needed in `write_table` itself.
+
+### Top-level wrappers (filename-takers)
+
+`rustfits.write_image(filename, data, *, mode='w+', ...kwargs)`
+and `rustfits.write_table(filename, data, *, mode='w+',
+...kwargs)` open the file, delegate to the method form, close.
+**They return None** — returning the HDU from inside a
+closed-file `with` block would be a sharp edge (the HDU's
+methods would fail with "file is closed"); users who need the
+HDU should reopen.
+
+Default `mode='w+'` truncates-or-creates (equivalent to
+fitsio's `'rw'` + `clobber=True`).  Pass `mode='r+'` to append
+HDUs to an existing file without truncating.  Supported modes
+are `'r'`, `'r+'`, `'w+'`.
+
+**Explicit kwargs, not `**kwargs`.**  The top-level wrappers
+list every forwarded keyword by name in their signature.  Costs
+a few lines of boilerplate when create_/write signatures grow;
+buys self-documenting signatures and protection against typo
+bugs that `**kwargs` would silently swallow.
+
+Tests: `tests/test_write_convenience.py` (38 cases) covers all
+four entry points across the dtype matrix, unsigned-int trick,
+compress=, blank/mask, MaskedArray input, header= (dict +
+FITSHeader source), all four reject paths, auto-primary,
+mode='w+' truncates vs mode='r+' appends.
+
 ## Table write roadmap
 
 Plan for getting table creation + writing on par with the image side.
