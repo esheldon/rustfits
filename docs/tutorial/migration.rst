@@ -160,12 +160,12 @@ Write an image to a fresh file
    with fitsio.FITS(path, "rw", clobber=True) as f:
        f.write(data, extname="SCI")
 
-   # rustfits
+   # rustfits — explicit handle for type-specific kwargs
    with rustfits.FITS(path, "w+") as fits:
        fits.write_image(data, extname="sci")
 
-   # Or via the top-level convenience.
-   rustfits.write_image(path, data, extname="sci")
+   # rustfits — minimal one-liner, auto-dispatches by data type
+   rustfits.write(path, data, extname="sci")
 
 Note ``"w+"`` is the rustfits equivalent of fitsio's
 ``"rw" + clobber=True``.  Use ``"r+"`` to append to an
@@ -197,10 +197,11 @@ Compressed image
        f.write(data, compress="RICE_1", tile_dims=(100, 100))
 
    # rustfits
-   rustfits.write_image(
-       path, data,
-       compress=rustfits.Rice1(tile_shape=(100, 100)),
-   )
+   with rustfits.FITS(path, "w+") as fits:
+       fits.write_image(
+           data,
+           compress=rustfits.Rice1(tile_shape=(100, 100)),
+       )
 
 Lossy float compression
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -212,11 +213,12 @@ Lossy float compression
        f.write(data, compress="GZIP_2", qlevel=4.0)
 
    # rustfits — quantize MUST be explicit; default is lossless
-   rustfits.write_image(
-       path, data,
-       compress=rustfits.Gzip2(),
-       quantize=rustfits.Quantize(level=4.0),
-   )
+   with rustfits.FITS(path, "w+") as fits:
+       fits.write_image(
+           data,
+           compress=rustfits.Gzip2(),
+           quantize=rustfits.Quantize(level=4.0),
+       )
 
 Read header only
 ~~~~~~~~~~~~~~~~
@@ -349,8 +351,8 @@ quick translations:
   different surface — see :doc:`headers`)
 * ``Table.read(path)`` → ``rustfits.read(path)`` for the
   simple case; open the file for finer control
-* ``CompImageHDU(...)`` → :func:`rustfits.write_image` with
-  the ``compress=`` config object
+* ``CompImageHDU(...)`` → :meth:`FITS.write_image` with the
+  ``compress=`` config object
 
 The biggest mental shift coming from astropy: rustfits doesn't
 build Python objects for every card.  The header is a

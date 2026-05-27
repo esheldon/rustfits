@@ -2,20 +2,19 @@
 Top-level convenience functions.
 
 Thin wrappers around the FITS / HDU API for the most common
-one-liner patterns.  Currently:
+one-liner patterns:
 
     read(filename, ext=..., header=...)    → data [, header]
     read_header(filename, ext=...)         → FITSHeader
     write(filename, data, ...)             → None
-    write_image(filename, data, ...)       → None
-    write_table(filename, data, ...)       → None
 
-`read`, `read_header`, and `write` are intentionally minimal —
-they cover the "just read / write the data" case and dispatch
-on HDU / data type.  For knobs like `scale=`, `rows=`,
-`columns=`, `compress=`, `var_dtypes=`, etc., use the
-type-specific `write_image` / `write_table` (or open the file
-with FITS() for read-side nuance).
+This surface is intentionally minimal — universal kwargs only,
+auto-dispatch on HDU / data type.  For type-specific knobs
+(``compress=``, ``quantize=``, ``blank=``, ``var_dtypes=``,
+``units=``, ``bit_columns=``, ``scale=``, ``rows=``,
+``columns=``, etc.), open the file explicitly with
+:class:`rustfits.FITS` and call the appropriate HDU /
+``FITS.write_image`` / ``FITS.write_table`` method.
 """
 
 from ._rust import FITS, ImageHDU, TableHDU
@@ -131,14 +130,13 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
     Open `filename`, write `data` (auto-detecting image vs table), close.
 
     This function is intentionally minimal — it accepts only the
-    universal kwargs (`mode`, `extname`, `header`).  For knobs
-    like `compress=`, `quantize=`, `blank=`, `var_dtypes=`,
-    `units=`, etc., use the type-specific
-    :func:`write_image` / :func:`write_table` directly,
-    or open the file explicitly:::
+    universal kwargs (`mode`, `extname`, `header`).  For knobs like
+    ``compress=``, ``quantize=``, ``blank=``, ``var_dtypes=``,
+    ``units=``, ``bit_columns=``, etc., open the file explicitly
+    and call the type-specific method::
 
-        with rustfits.FITS(filename, 'r+') as fits:
-            fits.write_image(data, compress=True)
+        with rustfits.FITS(filename, "w+") as fits:
+            fits.write_image(data, compress="GZIP_1")
 
     Parameters
     ----------
@@ -148,8 +146,8 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
         Image: a numpy ndarray with a plain (non-structured) dtype.
         Table: a structured ndarray (``dtype.fields is not None``)
         or a ``{name: ndarray}`` dict.  The list-of-arrays +
-        ``names=[...]`` form supported by :func:`write_table` is
-        NOT accepted here — call :func:`write_table` for that.
+        ``names=[...]`` form supported by :meth:`FITS.write_table`
+        is NOT accepted here — open the file explicitly for that.
     mode : str, default 'w+'
         Open mode.  Default ``'w+'`` creates or truncates the file;
         pass ``'r+'`` to append to an existing file without
@@ -158,8 +156,7 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
         ``EXTNAME`` to set on the new HDU.  Mirrors :func:`read`'s
         ``ext=`` selector.
     header : FITSHeader, dict, or None, optional
-        Header to attach to the new HDU.  Forwarded to the
-        underlying ``write_image`` / ``write_table``.
+        Header to attach to the new HDU.
 
     Returns
     -------
@@ -172,114 +169,3 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
     """
     with FITS(filename, mode) as fits:
         fits.write(data, extname=extname, header=header)
-
-
-def write_image(
-    filename,
-    data,
-    *,
-    mode="w+",
-    extname=None,
-    extver=None,
-    compress=None,
-    quantize=None,
-    blank=None,
-    header=None,
-):
-    """
-    Open `filename`, create an image HDU from `data`, close.
-
-    Thin wrapper around :meth:`FITS.write_image` that handles
-    the open / close cycle.  Returns None — the new HDU is not
-    accessible after the file is closed; reopen if you need it.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the FITS file.
-    data : array_like
-        Pixel data — same shapes accepted as
-        :meth:`FITS.write_image`.
-    mode : str, default 'w+'
-        Open mode forwarded to :class:`FITS`.  Default 'w+'
-        creates the file (truncating if it exists); pass 'r+'
-        to append to an existing file without truncating.
-    extname, extver, compress, quantize, blank, header
-        Forwarded to :meth:`FITS.write_image`; see that method
-        for the full semantics.
-
-    See Also
-    --------
-    FITS.write_image : The underlying method.
-    write_table : The table-side counterpart.
-    """
-    with FITS(filename, mode) as fits:
-        fits.write_image(
-            data,
-            extname=extname,
-            extver=extver,
-            compress=compress,
-            quantize=quantize,
-            blank=blank,
-            header=header,
-        )
-
-
-def write_table(
-    filename,
-    data,
-    *,
-    mode="w+",
-    names=None,
-    extname=None,
-    extver=None,
-    units=None,
-    var_dtypes=None,
-    bit_columns=None,
-    heap_format=None,
-    compress=None,
-    ztilelen=None,
-    header=None,
-):
-    """
-    Open `filename`, create a BINTABLE HDU from `data`, close.
-
-    Thin wrapper around :meth:`FITS.write_table` that handles
-    the open / close cycle.  Returns None — the new HDU is not
-    accessible after the file is closed; reopen if you need it.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the FITS file.
-    data : structured ndarray, dict, or list/tuple of arrays
-        Row data — same three shapes accepted as
-        :meth:`FITS.write_table`.
-    mode : str, default 'w+'
-        Open mode forwarded to :class:`FITS`.  Default 'w+'
-        creates the file (truncating if it exists); pass 'r+'
-        to append to an existing file without truncating.
-    names, extname, extver, units, var_dtypes, bit_columns, \
-heap_format, compress, ztilelen, header
-        Forwarded to :meth:`FITS.write_table`; see that method
-        for the full semantics.
-
-    See Also
-    --------
-    FITS.write_table : The underlying method.
-    write_image : The image-side counterpart.
-    """
-    with FITS(filename, mode) as fits:
-        fits.write_table(
-            data,
-            names=names,
-            extname=extname,
-            extver=extver,
-            units=units,
-            var_dtypes=var_dtypes,
-            bit_columns=bit_columns,
-            heap_format=heap_format,
-            compress=compress,
-            ztilelen=ztilelen,
-            header=header,
-        )

@@ -57,10 +57,9 @@ File modes
 Use ``"r+"`` to modify or append HDUs to an existing file without
 losing anything.  Use ``"w+"`` when you want to start fresh — it
 is equivalent to fitsio's ``"rw"`` plus ``clobber=True``.  ``"w+"``
-is the default for the top-level convenience writers
-(:func:`rustfits.write_image`, :func:`rustfits.write_table`); pass
-``mode="r+"`` to those to append to an existing file instead of
-truncating it.
+is also the default for the top-level :func:`rustfits.write`
+convenience; pass ``mode="r+"`` to append to an existing file
+instead of truncating it.
 
 Reading an image
 ----------------
@@ -208,13 +207,10 @@ image vs table from the value you pass it:
 :func:`rustfits.write` accepts only the universal kwargs
 (``mode``, ``extname``, ``header``).  For type-specific knobs
 (``compress=``, ``quantize=``, ``blank=``, ``var_dtypes=``,
-``units=``, ``bit_columns=``, ...), call
-:func:`rustfits.write_image` or :func:`rustfits.write_table`
-directly — the data argument is the same in either case.
-
-For more control — multiple HDUs in one file, appending to an
-existing file, custom headers — use :class:`~rustfits.FITS`
-directly:
+``units=``, ``bit_columns=``, ...), or for multiple HDUs in
+one file, open :class:`~rustfits.FITS` directly and call
+:meth:`~rustfits.FITS.write_image` /
+:meth:`~rustfits.FITS.write_table`:
 
 .. code-block:: python
 

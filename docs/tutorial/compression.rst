@@ -35,18 +35,19 @@ time.  The five algorithm classes are
 
    img = np.random.randn(1024, 1024).astype("f4")
 
-   rustfits.write_image(
-       "out.fits", img,
-       compress=rustfits.Gzip2(tile_shape=(128, 128)),
-   )
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write_image(
+           img, compress=rustfits.Gzip2(tile_shape=(128, 128)),
+       )
 
 The string alias form works too — case-insensitive, with
 cfitsio synonyms accepted:
 
 .. code-block:: python
 
-   rustfits.write_image("out.fits", img, compress="RICE_1")
-   rustfits.write_image("out.fits", img, compress="gzip_2")
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write_image(img, compress="RICE_1")
+       fits.write_image(img, compress="gzip_2")
 
 Each algorithm class carries the parameters relevant to that
 codec (``tile_shape`` everywhere; ``blocksize`` on RICE; ``scale``
@@ -56,7 +57,8 @@ equality is field-wise, so a round-trip pattern works:
 .. code-block:: python
 
    cfg = rustfits.Rice1(tile_shape=(16, 16), blocksize=64)
-   rustfits.write_image("out.fits", img.astype("i4"), compress=cfg)
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write_image(img.astype("i4"), compress=cfg)
    with rustfits.FITS("out.fits") as fits:
        assert fits[1].compression == cfg
 
@@ -78,16 +80,18 @@ the default is lossless.  Choose with the ``quantize=`` kwarg:
 .. code-block:: python
 
    # Default: lossless raw float bytes through GZIP.
-   rustfits.write_image("loss.fits", img, compress=rustfits.Gzip2())
+   with rustfits.FITS("loss.fits", "w+") as fits:
+       fits.write_image(img, compress=rustfits.Gzip2())
 
    # Lossy: quantize floats to i32 with N-sigma per quantum, then
    # compress.  Much better compression (4-10x); precision loss
    # is controlled by `level`.
-   rustfits.write_image(
-       "lossy.fits", img,
-       compress=rustfits.Rice1(),
-       quantize=rustfits.Quantize(level=4.0, method="dither1"),
-   )
+   with rustfits.FITS("lossy.fits", "w+") as fits:
+       fits.write_image(
+           img,
+           compress=rustfits.Rice1(),
+           quantize=rustfits.Quantize(level=4.0, method="dither1"),
+       )
 
 ``Quantize`` parameters:
 
@@ -150,18 +154,21 @@ dict overrides per column:
    ])
 
    # cfitsio's per-dtype defaults — fine for most cases.
-   rustfits.write_table("cat.fits.fz", cat, compress=True)
+   with rustfits.FITS("cat.fits.fz", "w+") as fits:
+       fits.write_table(cat, compress=True)
 
    # One algorithm everywhere.
-   rustfits.write_table("cat.fits.fz", cat, compress="GZIP_2")
+   with rustfits.FITS("cat.fits.fz", "w+") as fits:
+       fits.write_table(cat, compress="GZIP_2")
 
    # Per-column overrides.
-   rustfits.write_table(
-       "cat.fits.fz", cat,
-       compress={"ra": rustfits.Gzip2(),
-                 "dec": rustfits.Gzip2(),
-                 "flag": rustfits.Rice1()},
-   )
+   with rustfits.FITS("cat.fits.fz", "w+") as fits:
+       fits.write_table(
+           cat,
+           compress={"ra": rustfits.Gzip2(),
+                     "dec": rustfits.Gzip2(),
+                     "flag": rustfits.Rice1()},
+       )
 
 The tile size (``ztilelen``) defaults to roughly 10 MB worth of
 rows per tile.  Pass ``ztilelen=N`` to override.

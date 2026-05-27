@@ -18,8 +18,9 @@ for the rare interop caveats.
 Writing an image
 ----------------
 
-The shortest path is :func:`rustfits.write_image`, which opens
-the file, writes the HDU, and closes:
+The shortest path is :func:`rustfits.write`, which opens the
+file, auto-detects an image from the plain ndarray, writes the
+HDU, and closes:
 
 .. code-block:: python
 
@@ -27,10 +28,11 @@ the file, writes the HDU, and closes:
    import rustfits
 
    img = np.arange(1024 * 1024, dtype="f4").reshape(1024, 1024)
-   rustfits.write_image("out.fits", img)
+   rustfits.write("out.fits", img)
 
-For multi-HDU files use :class:`~rustfits.FITS` with the method
-form, which leaves the file open so you can keep adding HDUs:
+For multi-HDU files, or any type-specific knobs (``compress=``,
+``blank=``, etc.), open :class:`~rustfits.FITS` directly and use
+:meth:`~rustfits.FITS.write_image`:
 
 .. code-block:: python
 
@@ -165,10 +167,12 @@ card to mark missing pixels.  rustfits supports this end-to-end:
    masked = np.ma.MaskedArray(data, mask=False)
    masked[0, 0] = np.ma.masked
 
-   rustfits.write_image("out.fits", masked, blank=-1)
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write_image(masked, blank=-1)
    # ↑ records BLANK=-1; masked cells land on disk as -1
 
-   arr = rustfits.read("out.fits", mask_blank=True)
+   with rustfits.FITS("out.fits") as fits:
+       arr = fits[0].read(mask_blank=True)
    assert arr.mask[0, 0]
 
 ``mask_blank=True`` is rejected on float HDUs — the FITS spec

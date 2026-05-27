@@ -18,9 +18,8 @@ in :doc:`limitations`).
 Writing a table
 ---------------
 
-The shortest path is :func:`rustfits.write_table`, which accepts
-a structured ndarray, a dict ``{name: array}``, or a
-list/tuple of arrays with ``names=[...]``:
+The shortest path is :func:`rustfits.write`, which auto-detects
+a table from a structured ndarray or ``{name: array}`` dict:
 
 .. code-block:: python
 
@@ -33,10 +32,13 @@ list/tuple of arrays with ``names=[...]``:
    cat["ra"] = np.random.uniform(0, 360, size=1000)
    cat["dec"] = np.random.uniform(-90, 90, size=1000)
 
-   rustfits.write_table("cat.fits", cat)
+   rustfits.write("cat.fits", cat)
 
-For multi-HDU files, the method form on
-:class:`~rustfits.FITS` is the same shape:
+For multi-HDU files, or for the list-of-arrays form with a
+separate ``names=[...]`` argument, or for any type-specific
+knobs (``compress=``, ``units=``, ``var_dtypes=``,
+``bit_columns=``, ...), open :class:`~rustfits.FITS` directly
+and use :meth:`~rustfits.FITS.write_table`:
 
 .. code-block:: python
 
@@ -259,10 +261,8 @@ Object dtype):
    data["samples"][1] = np.array([0.5], dtype="f4")
    data["samples"][2] = np.array([], dtype="f4")
 
-   rustfits.write_table(
-       "vla.fits", data,
-       var_dtypes={"samples": "f4"},
-   )
+   with rustfits.FITS("vla.fits", "w+") as fits:
+       fits.write_table(data, var_dtypes={"samples": "f4"})
 
 Reading returns Object-dtype cells (one ndarray per row):
 

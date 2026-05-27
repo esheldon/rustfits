@@ -50,12 +50,12 @@ with rustfits.FITS("image.fits") as fits:
 with rustfits.FITS("catalog.fits") as fits:
     tab = fits[1].read(columns=["ra", "dec"], rows=slice(0, 100))
 
-# Write an image and a table to a new file.
+# Write an image or table to a new file (auto-detects).
 import numpy as np
-rustfits.write_image("out.fits", np.zeros((1024, 1024), dtype="f4"))
+rustfits.write("out.fits", np.zeros((1024, 1024), dtype="f4"))
 
 cat = np.zeros(100, dtype=[("ra", "f8"), ("dec", "f8")])
-rustfits.write_table("cat.fits", cat)
+rustfits.write("cat.fits", cat)
 ```
 
 See the [tutorial](docs/tutorial/index.rst) for a guided tour

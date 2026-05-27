@@ -1,9 +1,9 @@
 """
-Top-level + FITS-method write convenience: write_image / write_table.
+FITS-method + minimal-tier write convenience.
 
 Covers FITS.write_image / FITS.write_table (the one-call combinations
-of create_*_hdu + write) and the rustfits.write_image /
-rustfits.write_table top-level wrappers that open a file, write, close.
+of create_*_hdu + write on a FITS handle) and the minimal-tier
+auto-dispatching FITS.write / rustfits.write surface.
 
 Each test verifies the result through both same-handle and post-reopen
 reads where applicable.
@@ -40,7 +40,8 @@ def test_write_image_dtype_matrix(dtype):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, f"dt_{dtype}.fits")
         data = np.arange(20, dtype=dtype).reshape(4, 5)
-        rustfits.write_image(path, data, extname="X")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image(data, extname="X")
         back = rustfits.read(path, "X")
         assert back.dtype == np.dtype(dtype)
         assert np.array_equal(back, data)
@@ -51,7 +52,8 @@ def test_write_image_unsigned_trick(dtype):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, f"u_{dtype}.fits")
         data = np.arange(24, dtype=dtype).reshape(4, 6)
-        rustfits.write_image(path, data)
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image(data)
         back = rustfits.read(path)
         assert back.dtype == np.dtype(dtype)
         assert np.array_equal(back, data)
@@ -82,7 +84,8 @@ def test_write_image_with_blank_and_mask_blank_read():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "blank.fits")
         data = np.array([1, 2, -999, 4, 5], dtype="i4")
-        rustfits.write_image(path, data, blank=-999)
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image(data, blank=-999)
         with rustfits.FITS(path) as f:
             arr = f[0].read(mask_blank=True)
             assert arr.mask.tolist() == [False, False, True, False, False]
@@ -96,7 +99,8 @@ def test_write_image_with_masked_array_input():
             mask=[False, True, False, True],
             dtype="i4",
         )
-        rustfits.write_image(path, data, blank=-9999)
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image(data, blank=-9999)
         with rustfits.FITS(path) as f:
             arr = f[0].read(mask_blank=True)
             assert arr.mask.tolist() == [False, True, False, True]
@@ -107,9 +111,8 @@ def test_write_image_with_header_from_dict():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "hdr.fits")
         hdr = {"OBJECT": "NGC 1234", "RA": 12.3456, "DEC": -45.6}
-        rustfits.write_image(
-            path, np.zeros(3, dtype="i4"), extname="X", header=hdr
-        )
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image(np.zeros(3, dtype="i4"), extname="X", header=hdr)
         with rustfits.FITS(path) as f:
             assert f[0].header["OBJECT"] == "NGC 1234"
             assert f[0].header["RA"] == 12.3456
@@ -141,7 +144,8 @@ def test_write_image_accepts_list_input():
     """asanyarray promotes Python lists to ndarray."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "lst.fits")
-        rustfits.write_image(path, [[1, 2, 3], [4, 5, 6]])
+        with rustfits.FITS(path, "w+") as f:
+            f.write_image([[1, 2, 3], [4, 5, 6]])
         back = rustfits.read(path)
         assert back.shape == (2, 3)
 
@@ -183,7 +187,8 @@ def test_write_table_struct_roundtrip():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "struct.fits")
         rows = _example_struct()
-        rustfits.write_table(path, rows, extname="DATA")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(rows, extname="DATA")
         back = rustfits.read(path, "DATA")
         assert back.dtype.names == rows.dtype.names
         assert back["x"].tolist() == [1.0, 2.0, 3.0]
@@ -197,7 +202,8 @@ def test_write_table_dict_roundtrip():
             "a": np.array([1, 2, 3], dtype="i4"),
             "b": np.array([0.1, 0.2, 0.3], dtype="f4"),
         }
-        rustfits.write_table(path, data, extname="D")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(data, extname="D")
         back = rustfits.read(path, "D")
         assert back.dtype.names == ("a", "b")
         assert back["a"].tolist() == [1, 2, 3]
@@ -211,7 +217,8 @@ def test_write_table_list_plus_names_roundtrip():
             np.array([1.5, 2.5], dtype="f8"),
             np.array([10, 20], dtype="i2"),
         ]
-        rustfits.write_table(path, arrs, names=["x", "y"], extname="L")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(arrs, names=["x", "y"], extname="L")
         back = rustfits.read(path, "L")
         assert back.dtype.names == ("x", "y")
 
@@ -320,77 +327,14 @@ def test_write_table_auto_creates_primary():
 def test_write_table_with_header_dict():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "hdr.fits")
-        rustfits.write_table(
-            path,
-            {"x": np.arange(3, dtype="i4")},
-            extname="T",
-            header={"OBSERVER": "Hubble"},
-        )
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(
+                {"x": np.arange(3, dtype="i4")},
+                extname="T",
+                header={"OBSERVER": "Hubble"},
+            )
         with rustfits.FITS(path) as f:
             assert f[1].header["OBSERVER"] == "Hubble"
-
-
-# ---------------------------------------------------------------------------
-# Top-level rustfits.write_image / rustfits.write_table
-# ---------------------------------------------------------------------------
-
-
-def test_top_level_write_image_returns_none():
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "top.fits")
-        result = rustfits.write_image(path, np.arange(4, dtype="i4"))
-        assert result is None
-
-
-def test_top_level_write_table_returns_none():
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "top.fits")
-        result = rustfits.write_table(path, {"x": np.arange(3, dtype="i4")})
-        assert result is None
-
-
-def test_top_level_write_image_truncates_existing_file():
-    """Default mode='w+' must truncate (matches fitsio 'rw' + clobber)."""
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "trunc.fits")
-        rustfits.write_image(path, np.arange(100, dtype="i4"))
-        # Overwrite with smaller data.
-        rustfits.write_image(path, np.arange(4, dtype="i4"))
-        back = rustfits.read(path)
-        assert back.tolist() == [0, 1, 2, 3]
-
-
-def test_top_level_write_image_append_with_rplus_mode():
-    """mode='r+' should append to an existing file, not truncate."""
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "app.fits")
-        rustfits.write_image(path, np.zeros(3, dtype="i4"), extname="FIRST")
-        rustfits.write_image(
-            path, np.ones(3, dtype="i4"), extname="SECOND", mode="r+"
-        )
-        with rustfits.FITS(path) as f:
-            assert len(f) == 2
-            assert f[0].extname == "FIRST"
-            assert f[1].extname == "SECOND"
-
-
-def test_top_level_write_table_append_with_rplus_mode():
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "tabapp.fits")
-        rustfits.write_table(
-            path, {"a": np.arange(3, dtype="i4")}, extname="T1"
-        )
-        rustfits.write_table(
-            path,
-            {"b": np.arange(2, dtype="f4")},
-            extname="T2",
-            mode="r+",
-        )
-        with rustfits.FITS(path) as f:
-            # Auto-primary + T1 + T2.
-            assert len(f) == 3
-            assert f[1].extname == "T1"
-            assert f[2].extname == "T2"
 
 
 # ---------------------------------------------------------------------------
