@@ -5,6 +5,11 @@ captures architectural decisions and conventions that aren't obvious from
 reading the code.  Claude Code loads this automatically into every session
 in this directory; humans should read it before making structural changes.
 
+For the project-level distribution plan (how rustfits relates to fitsio,
+the freeze-and-shim handoff strategy, the migration doc location), see
+[STRATEGY.md](STRATEGY.md) at the repo root.  This file (`CLAUDE.md`) is
+for code architecture; `STRATEGY.md` is for project management.
+
 ## Project structure
 
 The Rust extension is split into single-responsibility modules.  Each only
@@ -1108,25 +1113,77 @@ and `tests/test_vla_x_bit.py` (16 cases, VLA PX/QX).
 
 ## Top-level convenience functions
 
-One-call wrappers for the most common patterns.  The architecture
-is the same for all three: real `#[pymethods]` on `FITS` in
-`src/fits.rs` do the work; a thin Python wrapper in
-`rustfits/convenience.py` adds the open / close cycle for users
-who don't want to manage a `FITS` handle.  Top-level wrappers are
-re-exported from `rustfits/__init__.py` so users write
-`rustfits.read(...)` / `rustfits.write_image(...)` /
+One-call wrappers for the most common patterns.  Surface is split
+into two tiers:
+
+- **Minimal** (universal kwargs only, dispatch on HDU / data
+  type): `read`, `read_header`, `write`.  These cover "give me
+  the data / give me the header / save this" and intentionally
+  do not expose type-specific knobs.
+- **Rich** (per-type knobs): `write_image`, `write_table`.
+  Both come in two flavors — `FITS.write_image(...)` /
+  `FITS.write_table(...)` methods for callers managing a `FITS`
+  handle, and top-level filename-taking versions in
+  `rustfits/convenience.py`.
+
+Real `#[pymethods]` on `FITS` in `src/fits.rs` do the work; a
+thin Python wrapper in `rustfits/convenience.py` adds the open /
+close cycle for users who don't want to manage a handle.  All
+top-level functions are re-exported from `rustfits/__init__.py`
+so users write `rustfits.read(...)` / `rustfits.write(...)` /
+`rustfits.read_header(...)` / `rustfits.write_image(...)` /
 `rustfits.write_table(...)`.
 
-### `read` (read-only)
+### Minimal tier (`read`, `read_header`, `write`)
 
-`rustfits.read(filename, ext=None, *, rows=None, columns=None,
-scale=True, mask_null=False, header=False)` — opens in `'r'`,
-picks the first HDU with data (`ext=None`) or the requested
-ext, dispatches on HDU type, returns the array (and optionally
-the `FITSHeader`).  See `rustfits/convenience.py` for the
-docstring.
+`rustfits.read(filename, ext=None, *, header=False)` — opens in
+`'r'`, picks the first HDU with data (`ext=None`) or the
+requested ext, dispatches on HDU type, returns the array (and
+optionally the `FITSHeader`).  Intentionally drops the
+`rows=` / `columns=` / `scale=` / `mask_null=` kwargs that
+older versions exposed — those were misleading on the image
+branch (`scale=False` was silently ignored) and only useful on
+tables anyway.  Callers needing those open the file with
+`rustfits.FITS()` and use the rich HDU API.
 
-### `write_image` / `write_table` (method form)
+`rustfits.read_header(filename, ext=0)` — opens in `'r'`, returns
+the chosen HDU's `FITSHeader`.  Default `ext=0` reads the
+primary HDU (where file-level metadata typically lives —
+matches astropy / fitsio convention).  The returned header
+outlives the file close because `FITSHeader` holds the cards
+`Arc` independently of the file handle (read-only access only;
+mutation requires an open `r+` handle).
+
+`rustfits.write(filename, data, *, mode='w+', extname=None,
+header=None)` — auto-detects image vs table from `data`:
+  - plain (non-structured) `numpy.ndarray` → `write_image`
+  - structured `numpy.ndarray` (`dtype.fields is not None`) or
+    `{name: ndarray}` dict → `write_table`
+  - list-of-arrays + names=  → rejected (use `write_table`
+    directly)
+  - anything else → `ValueError`
+
+Mirror of the read tier: just the universal kwargs (`mode`,
+`extname`, `header`).  Type-specific knobs (`compress=`,
+`quantize=`, `blank=`, `var_dtypes=`, etc.) live on the rich
+tier.  See `rustfits/convenience.py` for the canonical
+docstrings.
+
+**TODO — `FITS.write()` method form.**  The current
+auto-dispatch lives only in the filename-taking
+`rustfits.write()` top-level wrapper.  fitsio users heavily use
+the equivalent method-style call (`fits.write(data, ...)`),
+so we should add a matching `FITS.write(data, ...)` method
+that dispatches the same way (and returns the new HDU, like
+`FITS.write_image` / `FITS.write_table` do).  Adding this lets
+the existing top-level wrapper just delegate to the method,
+removing duplication.  Not strictly needed for the modern API
+but important for the `rustfits.fitsio` migration shim (see
+[STRATEGY.md](STRATEGY.md)).
+
+### Rich tier (`write_image` / `write_table`, method form)
+
+### `write_image` / `write_table` (method form, full kwargs)
 
 `FITS.write_image(data, *, extname, extver, compress, quantize,
 blank, header)` and `FITS.write_table(data, *, names, extname,
@@ -3852,6 +3909,21 @@ request flags something.
    currently undocumented user-facing.  Worth a short page if
    we want users to know; deferred because benchmark numbers age
    fast and invite arguments about methodology.
+9. ✅ **Migration guide** — ``docs/tutorial/migration.rst``,
+   wired into the toctree between ``headers.rst`` and
+   ``errors.rst``.  Frames rustfits as the modern successor to
+   fitsio (matches the [STRATEGY.md](STRATEGY.md) freeze-and-
+   shim plan), walks through the behavior differences (headers,
+   compression kwargs), shows side-by-side porting recipes for
+   the common patterns (open+read, table subset, write image /
+   table to fresh file, compressed image, lossy float
+   compression, read header only), lists what rustfits doesn't
+   have (``vstorage=fixed``, ``case_sensitive=True``, ASCII
+   table writes), and lists what fitsio doesn't have that
+   rustfits does (full ``__getitem__`` / ``__setitem__`` on
+   every HDU, ZTABLE writes, faster compressed reads).
+   Includes a short "from astropy.io.fits" section for users
+   coming from there instead.
 
 Out of scope (don't write these without a specific ask):
 migration guide from astropy / fitsio; WCS handling (rustfits

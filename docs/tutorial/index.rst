@@ -22,5 +22,6 @@ every access rather than caching parsed values.
    tables
    compression
    headers
+   migration
    errors
    limitations
