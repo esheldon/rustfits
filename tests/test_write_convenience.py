@@ -412,7 +412,9 @@ def test_top_level_write_dispatches_image_from_plain_ndarray():
 
 
 def test_top_level_write_dispatches_table_from_structured_ndarray():
-    """A structured ndarray (dtype.fields is not None) routes to write_table."""
+    """
+    A structured ndarray (dtype.fields is not None) routes to write_table.
+    """
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "tab.fits")
         dt = np.dtype([("a", "i4"), ("b", "f8")])
