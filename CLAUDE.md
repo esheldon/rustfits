@@ -1181,9 +1181,7 @@ removing duplication.  Not strictly needed for the modern API
 but important for the `rustfits.fitsio` migration shim (see
 [STRATEGY.md](STRATEGY.md)).
 
-### Rich tier (`write_image` / `write_table`, method form)
-
-### `write_image` / `write_table` (method form, full kwargs)
+### Rich tier — `write_image` / `write_table` (method form, full kwargs)
 
 `FITS.write_image(data, *, extname, extver, compress, quantize,
 blank, header)` and `FITS.write_table(data, *, names, extname,
@@ -1238,11 +1236,22 @@ a few lines of boilerplate when create_/write signatures grow;
 buys self-documenting signatures and protection against typo
 bugs that `**kwargs` would silently swallow.
 
-Tests: `tests/test_write_convenience.py` (38 cases) covers all
-four entry points across the dtype matrix, unsigned-int trick,
-compress=, blank/mask, MaskedArray input, header= (dict +
-FITSHeader source), all four reject paths, auto-primary,
-mode='w+' truncates vs mode='r+' appends.
+Tests: `tests/test_write_convenience.py` (40 cases) covers all
+four type-specific entry points (`FITS.write_image` /
+`FITS.write_table` / `rustfits.write_image` /
+`rustfits.write_table`) across the dtype matrix, unsigned-int
+trick, compress=, blank/mask, MaskedArray input, header=
+(dict + FITSHeader source), all four reject paths,
+auto-primary, mode='w+' truncates vs mode='r+' appends, AND
+the minimal-tier `rustfits.write` dispatch matrix (image vs
+structured-ndarray vs dict, list-of-arrays rejected,
+extname= and header= forwarding).  Plus the minimal `read`
++ `read_header` surface in `tests/test_convenience_read.py`
+(15 cases): default-picks-first-with-data, ext by int / by
+extname, removed-kwargs (rows / columns / scale / mask_null)
+rejected with TypeError, header=True returns tuple,
+read_header default-is-primary / int / extname /
+outlives-close / bad-ext rejection.
 
 ## Table write roadmap
 
