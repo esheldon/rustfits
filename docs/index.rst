@@ -18,6 +18,14 @@ Quick example
        arr = fits[1].read()                  # whole HDU
        stamp = fits["SCI"][100:200, 50:150]  # slice by EXTNAME
 
+Tutorial
+--------
+
+.. toctree::
+   :maxdepth: 2
+
+   tutorial/index
+
 API reference
 -------------
 
