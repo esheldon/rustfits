@@ -523,6 +523,176 @@ def test_top_level_write_forwards_extname_table():
             assert isinstance(f["CAT"], rustfits.TableHDU)
 
 
+# ---------------------------------------------------------------------------
+# FITS.write — minimal auto-dispatch convenience (method form)
+# ---------------------------------------------------------------------------
+
+
+def test_fits_write_dispatches_image_from_plain_ndarray():
+    """A plain (non-structured) ndarray routes to write_image."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "img.fits")
+        data = np.arange(12, dtype="f4").reshape(3, 4)
+        with rustfits.FITS(path, "w+") as f:
+            hdu = f.write(data)
+            assert isinstance(hdu, rustfits.ImageHDU)
+            np.testing.assert_array_equal(hdu.read(), data)
+        with rustfits.FITS(path) as f:
+            np.testing.assert_array_equal(f[0].read(), data)
+
+
+def test_fits_write_dispatches_table_from_structured_ndarray():
+    """A structured ndarray routes to write_table."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "tab.fits")
+        dt = np.dtype([("a", "i4"), ("b", "f8")])
+        rows = np.zeros(5, dtype=dt)
+        rows["a"] = np.arange(5)
+        rows["b"] = np.linspace(0, 1, 5)
+        with rustfits.FITS(path, "w+") as f:
+            hdu = f.write(rows)
+            assert isinstance(hdu, rustfits.TableHDU)
+        with rustfits.FITS(path) as f:
+            back = f[1].read()
+            np.testing.assert_array_equal(back["a"], rows["a"])
+            np.testing.assert_allclose(back["b"], rows["b"])
+
+
+def test_fits_write_dispatches_table_from_dict():
+    """A {name: array} dict routes to write_table."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dtab.fits")
+        with rustfits.FITS(path, "w+") as f:
+            hdu = f.write(
+                {"x": np.arange(3, dtype="i4"), "y": np.arange(3, dtype="f4")}
+            )
+            assert isinstance(hdu, rustfits.TableHDU)
+        with rustfits.FITS(path) as f:
+            back = f[1].read()
+            assert back.dtype.names == ("x", "y")
+            np.testing.assert_array_equal(back["x"], [0, 1, 2])
+
+
+def test_fits_write_returns_hdu_usable_within_handle():
+    """The returned HDU is live and supports further ops."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "live.fits")
+        with rustfits.FITS(path, "w+") as f:
+            hdu = f.write(np.arange(6, dtype="i4").reshape(2, 3))
+            # The returned HDU can be re-read while the handle is open.
+            back = hdu.read()
+            assert back.shape == (2, 3)
+
+
+def test_fits_write_multiple_hdus_in_one_handle():
+    """Sequential writes append HDUs of mixed types in one handle."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "multi.fits")
+        img = np.arange(8, dtype="i4").reshape(2, 4)
+        rows = np.zeros(3, dtype=[("x", "i4"), ("y", "f8")])
+        rows["x"] = [1, 2, 3]
+        with rustfits.FITS(path, "w+") as f:
+            f.write(img, extname="IMG")
+            f.write(rows, extname="TAB")
+            f.write({"a": np.arange(2, dtype="f4")}, extname="DCT")
+        with rustfits.FITS(path) as f:
+            assert isinstance(f["IMG"], rustfits.ImageHDU)
+            assert isinstance(f["TAB"], rustfits.TableHDU)
+            assert isinstance(f["DCT"], rustfits.TableHDU)
+            np.testing.assert_array_equal(f["IMG"].read(), img)
+            np.testing.assert_array_equal(f["TAB"].read()["x"], rows["x"])
+
+
+def test_fits_write_copy_loop_pattern():
+    """
+    The intended fitsio-style copy pattern works: iterate the source
+    HDUs and pass each .read() to dst.write() without checking type.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src_path = os.path.join(d, "src.fits")
+        dst_path = os.path.join(d, "dst.fits")
+        with rustfits.FITS(src_path, "w+") as src:
+            src.write_image(
+                np.arange(12, dtype="f4").reshape(3, 4),
+                extname="IMG",
+            )
+            src.write_table(
+                np.array(
+                    [(1, 2.0), (3, 4.0)],
+                    dtype=[("a", "i4"), ("b", "f8")],
+                ),
+                extname="TAB",
+            )
+
+        with rustfits.FITS(src_path) as src:
+            with rustfits.FITS(dst_path, "w+") as dst:
+                for hdu in src:
+                    if hdu.has_data:
+                        dst.write(hdu.read())
+
+        with rustfits.FITS(dst_path) as dst:
+            assert isinstance(dst[0], rustfits.ImageHDU)
+            assert isinstance(dst[1], rustfits.TableHDU)
+            np.testing.assert_array_equal(
+                dst[0].read(),
+                np.arange(12, dtype="f4").reshape(3, 4),
+            )
+
+
+def test_fits_write_forwards_extname():
+    """`extname=` is passed through to the underlying write_* call."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ext.fits")
+        with rustfits.FITS(path, "w+") as f:
+            f.write(np.arange(4, dtype="i4"), extname="sci")
+        with rustfits.FITS(path) as f:
+            assert f[0].extname == "sci"
+
+
+def test_fits_write_forwards_header():
+    """`header=` is passed through to the underlying write_* call."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "hdr.fits")
+        with rustfits.FITS(path, "w+") as f:
+            f.write(np.arange(4, dtype="i4"), header={"object": "ngc1"})
+        with rustfits.FITS(path) as f:
+            assert f[0].header["object"] == "ngc1"
+
+
+def test_fits_write_rejects_list_of_arrays():
+    """list/tuple-of-arrays needs write_table directly (for names=)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rej.fits")
+        with rustfits.FITS(path, "w+") as f:
+            with pytest.raises(ValueError, match="write_image|write_table"):
+                f.write([np.arange(3, dtype="i4"), np.arange(3, dtype="f4")])
+
+
+def test_fits_write_rejects_unsupported_type():
+    """A plain string isn't writable."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rej.fits")
+        with rustfits.FITS(path, "w+") as f:
+            with pytest.raises(ValueError):
+                f.write("not data")
+
+
+def test_top_level_write_delegates_to_method():
+    """
+    The top-level rustfits.write() and FITS.write() produce
+    bit-identical files for the same input.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        top_path = os.path.join(d, "top.fits")
+        method_path = os.path.join(d, "method.fits")
+        data = np.arange(12, dtype="f4").reshape(3, 4)
+        rustfits.write(top_path, data)
+        with rustfits.FITS(method_path, "w+") as f:
+            f.write(data)
+        with open(top_path, "rb") as t, open(method_path, "rb") as m:
+            assert t.read() == m.read()
+
+
 if __name__ == "__main__":
     import sys
 

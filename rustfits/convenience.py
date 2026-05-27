@@ -18,8 +18,6 @@ type-specific `write_image` / `write_table` (or open the file
 with FITS() for read-side nuance).
 """
 
-import numpy as np
-
 from ._rust import FITS, ImageHDU, TableHDU
 
 
@@ -172,27 +170,8 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
     ValueError
         When `data` is neither an ndarray nor a dict.
     """
-    if isinstance(data, np.ndarray):
-        if data.dtype.fields is None:
-            with FITS(filename, mode) as fits:
-                fits.write_image(data, extname=extname, header=header)
-            return
-        # Structured ndarray → table.
-        with FITS(filename, mode) as fits:
-            fits.write_table(data, extname=extname, header=header)
-        return
-    if isinstance(data, dict):
-        with FITS(filename, mode) as fits:
-            fits.write_table(data, extname=extname, header=header)
-        return
-    raise ValueError(
-        f"rustfits.write() accepts a numpy ndarray (image or "
-        f"structured) or a {{name: array}} dict (table); got "
-        f"{type(data).__name__}.  For lists of arrays with names=, "
-        "or any of the type-specific kwargs (compress=, blank=, "
-        "var_dtypes=, ...), use rustfits.write_image() / "
-        "rustfits.write_table()."
-    )
+    with FITS(filename, mode) as fits:
+        fits.write(data, extname=extname, header=header)
 
 
 def write_image(

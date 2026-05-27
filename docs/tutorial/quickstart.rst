@@ -225,6 +225,20 @@ directly:
 The ``"w+"`` mode truncates or creates; ``"r+"`` opens an
 existing file for read-write without truncating.
 
+For code that processes HDUs without knowing their type ahead
+of time — copying HDUs from one file to another, for instance
+— :meth:`~rustfits.FITS.write` is the method-form counterpart
+to :func:`rustfits.write` and auto-detects image vs table from
+its argument:
+
+.. code-block:: python
+
+   with rustfits.FITS("in.fits") as src:
+       with rustfits.FITS("out.fits", "w+") as dst:
+           for hdu in src:
+               if hdu.has_data:
+                   dst.write(hdu.read())
+
 Headers
 -------
 

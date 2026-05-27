@@ -1169,17 +1169,22 @@ Mirror of the read tier: just the universal kwargs (`mode`,
 tier.  See `rustfits/convenience.py` for the canonical
 docstrings.
 
-**TODO — `FITS.write()` method form.**  The current
-auto-dispatch lives only in the filename-taking
-`rustfits.write()` top-level wrapper.  fitsio users heavily use
-the equivalent method-style call (`fits.write(data, ...)`),
-so we should add a matching `FITS.write(data, ...)` method
-that dispatches the same way (and returns the new HDU, like
-`FITS.write_image` / `FITS.write_table` do).  Adding this lets
-the existing top-level wrapper just delegate to the method,
-removing duplication.  Not strictly needed for the modern API
-but important for the `rustfits.fitsio` migration shim (see
-[STRATEGY.md](STRATEGY.md)).
+`FITS.write(data, *, extname=None, header=None)` is the
+method-form counterpart with the same dispatch rules and the
+same restrictions (no list-of-arrays, no type-specific knobs).
+Returns the new HDU like `write_image` / `write_table` do.
+The top-level `rustfits.write()` is a thin
+`with FITS(filename, mode) as f: f.write(data, ...)` wrapper
+around it.  This is the form fitsio users reach for when
+copying HDUs between files without caring about type:
+
+```python
+with rustfits.FITS(infile) as src:
+    with rustfits.FITS(outfile, "w+") as dst:
+        for hdu in src:
+            if hdu.has_data:
+                dst.write(hdu.read())
+```
 
 ### Rich tier — `write_image` / `write_table` (method form, full kwargs)
 
