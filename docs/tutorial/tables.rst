@@ -129,6 +129,42 @@ record (``numpy.void``):
 
    first_row = hdu[0:1]      # structured ndarray of length 1
 
+How subsets relate to the parent table
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A subset is a *lazy selector*, not a snapshot.  Constructing
+``hdu["ra"]`` does no I/O — it just remembers the parent HDU and
+the column name.  The actual read happens when you slice or
+iterate the subset:
+
+.. code-block:: python
+
+   col = hdu["ra"]              # no I/O — returns a subset handle
+   first = col[0]               # READ: scalar from row 0
+   batch = col[100:200]         # READ: ndarray of 100 values
+   col[0] = 123.4               # WRITE: one cell
+
+Two consequences worth knowing:
+
+* **Subsets share the parent's open file handle.**  If the
+  parent ``FITS`` handle closes (its ``with`` block exits, or
+  you call ``fits.close()``), subsequent accesses on a subset
+  object you kept around raise ``IOError`` — the file isn't
+  open any more.  Keep the subset's use inside the same
+  ``with`` block as the parent.
+* **Each access is a fresh read.**  Subsets don't cache.  Two
+  calls to ``col[:]`` on the same subset re-read from disk
+  each time, so if another writer mutated the file in between
+  you'd see the new bytes on the second call.  (Not a concern
+  in single-process workflows; just a property of "view, not
+  snapshot.")
+
+The slicing surface (``subset[i]``, ``subset[a:b]``,
+``subset[[i,j,k]]``) is the shorthand; ``subset.read(rows=...)``
+and ``subset.write(data, rows=...)`` are the discoverable
+named forms, and both take the same kwargs as
+``HDU.read()`` / ``HDU.write()``.
+
 Writing into a table
 --------------------
 
