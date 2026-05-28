@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 3: slicing on CompressedImageHDU + LRU tile cache.
+ZIMAGE slicing on CompressedImageHDU + LRU tile cache.
 
 Covers:
     - __getitem__ with slice/int/ellipsis matches numpy semantics

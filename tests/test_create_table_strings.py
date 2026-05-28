@@ -1,5 +1,5 @@
 """
-Phase 1d tests: string columns (S/U → A).
+Tests: string columns (S/U → A).
 
 Numpy structured-dtype fields with kind 'S' (bytes) or 'U' (unicode)
 map to FITS A columns:

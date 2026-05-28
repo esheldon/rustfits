@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 5: quantized-float read.
+ZIMAGE quantized-float read.
 
 Floating-point ZBITPIX (-32 / -64) reads go through a per-tile
 dequantization step: ZSCALE and ZZERO from adjacent BINTABLE

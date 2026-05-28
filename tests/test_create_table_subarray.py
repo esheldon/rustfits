@@ -1,5 +1,5 @@
 """
-Phase 1c tests: subarray fields + TDIM.
+Tests: subarray fields + TDIM.
 
 Numpy structured-dtype fields can carry a subarray shape:
   np.dtype([('flux', 'f4', (3, 4))])

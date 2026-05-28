@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 7 follow-up: Rice1 compressed image writes.
+ZIMAGE Rice1 compressed image writes.
 
 Bit-exact port of cfitsio's `fits_rcomp` / `_short` / `_byte`
 encoder family.  Tests cover:
@@ -453,7 +453,7 @@ def test_i8_rice_rejected():
 # test_float_compress_rejected: removed in Phase 8 commit 2 —
 # float-compressed writes are now supported via the new
 # quantize= parameter.  See
-# tests/test_compressed_image_phase8_quantize_write.py for the
+# tests/test_compressed_image_write_quantize.py for the
 # float round-trip coverage.
 
 

@@ -1,5 +1,5 @@
 """
-ZTABLE Phase 4 — VLA (variable-length array) column read.
+ZTABLE VLA (variable-length array) column read.
 
 ZTABLE encodes each VLA column per tile as a single GZIP_1-compressed
 "dual-descriptor" blob: the original P/Q descriptors followed by the

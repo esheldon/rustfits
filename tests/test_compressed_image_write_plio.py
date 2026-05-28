@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 7 follow-up: Plio1 compressed image writes.
+ZIMAGE Plio1 compressed image writes.
 
 Bit-exact port of cfitsio's `pl_p2li` from `<cfitsio>/pliocomp.c`.
 The SPP/f2c goto soup is replaced by a single linear loop in

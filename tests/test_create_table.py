@@ -1,5 +1,5 @@
 """
-Phase 1 MVP tests for create_table_hdu + TableHDU.write.
+Tests for create_table_hdu + TableHDU.write.
 
 Scope:
   - Round-trip write + read for the MVP scalar dtypes

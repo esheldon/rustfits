@@ -1,5 +1,5 @@
 """
-ZTABLE Phase 5 — table-side compressed create + write.
+ZTABLE table-side compressed create + write.
 
 create_table_hdu(dtype, nrows, compress=...) routes to the ZTABLE
 write path when compress is non-None.  Accepted compress shapes:
@@ -209,7 +209,7 @@ def test_ztilelen_requires_compress():
 
 
 # VLA + compress shipped in Phase 6a; round-trip coverage lives in
-# tests/test_compressed_table_phase6a.py.
+# tests/test_compressed_table_write_vla.py.
 
 
 # ---------------------------------------------------------------------

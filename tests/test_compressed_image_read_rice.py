@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 2: RICE_1 whole-image read.
+ZIMAGE RICE_1 whole-image read.
 
 Round-trip tests use fitsio to write RICE_1-compressed fixtures
 and rustfits to read them back, checking byte-exactness of the
@@ -275,9 +275,9 @@ def test_scaled_compressed_hdu():
 # -------------------- NotImplementedError stubs --------------------
 
 
-# __getitem__ shipped in Phase 3 — see test_compressed_image_phase3_slice.py.
+# __getitem__ shipped in Phase 3 — see test_compressed_image_read_slice.py.
 # write() for Rice1 shipped in the Phase 7 follow-up — see
-# test_compressed_image_phase7_rice_write.py.
+# test_compressed_image_write_rice.py.
 
 
 # test_extend_raises_not_implemented: removed — CompressedImageHDU.extend

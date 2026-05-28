@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 8: quantized float compressed image writes.
+ZIMAGE quantized float compressed image writes.
 
 Float images are encoded by quantizing each tile to i32 (per-tile
 bscale/bzero from a noise estimate), then compressing the i32

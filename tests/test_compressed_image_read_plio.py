@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 6: PLIO_1 read.
+ZIMAGE PLIO_1 read.
 
 Round-trip tests use fitsio to write PLIO_1-compressed fixtures
 (mask-style images: mostly zero, with runs of non-zero values)

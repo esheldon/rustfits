@@ -1,5 +1,5 @@
 """
-ZTABLE Phase 3 — slicing, __getitem__, column-subset reads, and
+ZTABLE slicing, __getitem__, column-subset reads, and
 the per-(tile, column) decompressed-bytes cache.
 
 Phase 3 builds on Phase 2 (whole-table read).  New surface:

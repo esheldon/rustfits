@@ -1626,7 +1626,7 @@ specific implementations:
 
 Phase 2 follow-ups (not blocking):
 - **Add CompressedImageHDU cases to tests/test_repr.py** —
-  the Phase 1 smoke test in test_compressed_image_phase1.py
+  the Phase 1 smoke test in test_compressed_image_accessors.py
   exists, but the full _show-instrumented visual-inspection
   suite in test_repr.py doesn't include compressed images
   yet.  Add alongside the ImageHDU/TableHDU cases.
@@ -1706,7 +1706,7 @@ GZIP_COMPRESSED_DATA are always `1PB` so inner_byte_width=1.
 *Test fixtures.*  Normal-path GZIP_1 / GZIP_2 round-trips
 use fitsio.  Fitsio's high-level write API doesn't expose
 fallback-column knobs, so the three fallback tests in
-`tests/test_compressed_image_phase4_gzip.py` build minimal
+`tests/test_compressed_image_read_gzip.py` build minimal
 FITS files by hand (`_build_fallback_fixture` and friends):
 empty primary descriptor + populated fallback column + a
 hand-built BINTABLE header.  This pattern is reusable for
@@ -1892,7 +1892,7 @@ is "divide by 2^n truncating toward zero", which Rust's signed
 `/` does directly — translated as `s / 8` / `s / 64` for
 readability.
 
-*Tests.*  `tests/test_compressed_image_phase6_hcompress.py`
+*Tests.*  `tests/test_compressed_image_read_hcompress.py`
 covers accessors, lossless round-trip on u8/i16/i32, non-square
 edge tiles, default tiles, slicing parity, bit-exact agreement
 with cfitsio on a lossy hcomp_scale=4 fixture, and SMOOTH=1
@@ -1930,7 +1930,7 @@ layer — `tform_vla_inner_byte_width` returns 2 for 'I' so
 `fetch_tile_payload_inner` correctly reads `nelements * 2`
 bytes from the heap.
 
-*Tests.*  `tests/test_compressed_image_phase6_plio.py` covers
+*Tests.*  `tests/test_compressed_image_read_plio.py` covers
 the compression_type accessor, bit-exact agreement with cfitsio
 on u8/i16/i32 mask-style fixtures (mostly zero with random
 runs), all-zero tiles (header-only encoded stream), solid-value
@@ -2113,9 +2113,9 @@ Gzip2 lands within ~5% of where i64 RICE would compress, and is
 universally readable.  The encoder itself also rejects bytepix=8
 as a defensive check.
 
-*Tests.*  `tests/test_compressed_image_phase7_gzip_write.py` (GZIP_1),
-`tests/test_compressed_image_phase7_gzip2_write.py` (GZIP_2), and
-`tests/test_compressed_image_phase7_rice_write.py` (RICE_1) —
+*Tests.*  `tests/test_compressed_image_write_gzip.py` (GZIP_1),
+`tests/test_compressed_image_write_gzip2.py` (GZIP_2), and
+`tests/test_compressed_image_write_rice.py` (RICE_1) —
 each covers accessors after create, dtype matrix (u1/i2/i4 +
 i8 for GZIP only), shape matrix (1-D / 2-D square / 2-D non-square
 with edge tiles / 3-D / whole-image single tile), default-tile-shape
@@ -2168,7 +2168,7 @@ stripes are what HST/DECam/HSC files in the wild use (cfitsio
 is the dominant writer of these), so the default matches.
 
 *HCOMPRESS_1 tests.*
-`tests/test_compressed_image_phase7_hcompress_write.py` covers
+`tests/test_compressed_image_write_hcompress.py` covers
 accessors after create, dtype matrix (u1/i2/i4), shape matrix
 (divisible 2-D cases), default-tile-shape (small-image,
 large-image stripe, and fallback-when-16-doesn't-work cases),
@@ -2217,7 +2217,7 @@ inner type, not bytes — so on the write side
 filling descriptors.  The read side already worked correctly
 because `tform_vla_inner_byte_width` returns the right value.
 
-*PLIO_1 tests.*  `tests/test_compressed_image_phase7_plio_write.py`
+*PLIO_1 tests.*  `tests/test_compressed_image_write_plio.py`
 covers accessors after create (including TFORM1='1PI'
 verification), dtype matrix (u1/i2/i4), shape matrix, default
 tile shape, degenerate cases (all-zeros, all-solid, large-pv,
@@ -2326,7 +2326,7 @@ commit 3 added the missing checks to both branches.  No
 existing tests caught the gap because no Phase 5 fixture had
 NULL_VALUE_I32 in the stored stream under NoDither or DITHER_1.
 
-*Tests (`test_compressed_image_phase8_quantize_write.py`).*  29
+*Tests (`test_compressed_image_write_quantize.py`).*  29
 cases covering: schema (TFORM / TTYPE / ZQUANTIZ / ZDITHER0 /
 ZBLANK cards), round-trip across f4/f8 + (NO_DITHER, DITHER_1,
 DITHER_2), default Quantize defaults, fitsio cross-read agreement
@@ -2431,7 +2431,7 @@ unchanged from Phase 5: `build_quant_context` returns None
 float bytepix, no dequantization applied.
 
 Tests in
-`tests/test_compressed_image_phase8_unquantized_write.py`:
+`tests/test_compressed_image_write_unquantized.py`:
 schema validation, round-trip f4/f8 × Gzip1/Gzip2, astropy +
 fitsio cross-read agreement (both directions), non-last HDU
 growth, omit-kwarg semantics, rejections (Rice1/Hcompress1
@@ -2859,7 +2859,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
   number so contributors can grep `Phase N` to find what's
   pending.
 
-Tests: `tests/test_compressed_table_phase1.py` (21 cases) —
+Tests: `tests/test_compressed_table_accessors.py` (21 cases) —
 detection, isinstance chain, all accessors, remaining stubs,
 plain table unaffected, raw header cards still visible.
 
@@ -2928,7 +2928,7 @@ before fpack runs.  To set `ZTILELEN`, write `FZTILELN` on the
 source HDU (fpack has no CLI flag for it — surprising and
 worth noting in the test helper).
 
-Tests: `tests/test_compressed_table_phase2.py` (17 cases) —
+Tests: `tests/test_compressed_table_read.py` (17 cases) —
 mixed-dtype round trip; per-algorithm coverage (RICE_1 on i4 +
 the GZIP defaults for u1/i2/f4/f8/A); multi-tile + partial last
 tile; unsigned-int trick round trip; `scale=False` returns raw
@@ -3003,7 +3003,7 @@ also promotes `hdu_table::read::resolve_rows`,
 `pub(crate)` so the compressed-table dispatch reuses the same
 key-classification logic as the uncompressed path.
 
-Tests: `tests/test_compressed_table_phase3.py` (27 cases) —
+Tests: `tests/test_compressed_table_read_slice.py` (27 cases) —
 `read(rows=...)` for slice / stepped slice / iterable / negative
 indices / duplicates / dedup / combined with `columns=`;
 `__getitem__` for int / negative int / slice / stepped /
@@ -3073,7 +3073,7 @@ descriptors that the per-cell loop feeds straight to
 inline in `hdu_table_compressed.rs` using `flate2::read::GzDecoder`
 directly.
 
-Tests: `tests/test_compressed_table_phase4.py` (16 cases) —
+Tests: `tests/test_compressed_table_read_vla.py` (16 cases) —
 whole-table VLA round trip across u1 / i2 / i4 / i8 / f4 / f8
 inner dtypes (covers all three algorithms fpack picks
 per-dtype); empty cells; multiple VLA columns in one table;
@@ -3176,7 +3176,7 @@ write-only params like `Gzip1(level=9)` survive within a session
 through `.compression`.  Reopened HDUs have `None` here and
 `.compression` falls back to the dict-of-strings from ZCTYPn.
 
-Tests: `tests/test_compressed_table_phase5.py` (27 cases) —
+Tests: `tests/test_compressed_table_write.py` (27 cases) —
 every `compress=` shape (True / False / string / class / dict),
 default per-dtype matrix, invalid-algorithm rejection,
 image-only-algorithm rejection, three input forms (structured
@@ -3186,7 +3186,7 @@ string columns, default vs explicit ztilelen, **byte-exact
 funpack interop** (cfitsio decompresses our files and we get
 the original BINTABLE bit-exactly).
 
-Plus `tests/test_compressed_image_phase7_gzip_write.py`
+Plus `tests/test_compressed_image_write_gzip.py`
 (11 new cases) covering image-side string aliases including
 cfitsio synonyms and the case-insensitive match.
 
@@ -3238,7 +3238,7 @@ and `VlaCellPlan` from `hdu_table::write_vla` — shared with the
 uncompressed VLA write path so per-cell semantics evolve in one
 place.
 
-Tests: `tests/test_compressed_table_phase6a.py` (14 cases) —
+Tests: `tests/test_compressed_table_write_vla.py` (14 cases) —
 inner dtype matrix (u1/i2/i4/i8/f4/f8) covering all three
 per-dtype default algorithms; empty cells; multiple VLA columns;
 mixed VLA + fixed columns; multi-tile VLA writes; PA (string
@@ -3300,7 +3300,7 @@ and is selected by `columns.iter().any(|c| c.var_kind.is_some())`.
 than per-tile invalidation; append is rare-vs-read in any
 realistic workflow).
 
-Tests: `tests/test_compressed_table_phase6b.py` (14 cases) —
+Tests: `tests/test_compressed_table_append.py` (14 cases) —
 merge-only, exact-fill, merge + new tile, no-merge (full last
 tile), multiple appends accumulating, three input forms,
 `extend()` alias, zero-row no-op, **non-last-HDU preserves
@@ -3858,7 +3858,7 @@ matches byte-for-byte, but the encoder is a single function
 (`encode_rice`) rather than three separate functions and uses a
 clean `BitWriter` rather than cfitsio's `Buffer` struct.  Byte-
 exactness is verified by the heap-comparison tests in
-`tests/test_compressed_image_phase7_rice_write.py`.
+`tests/test_compressed_image_write_rice.py`.
 
 ### Performance / large fixture files
 
@@ -3936,7 +3936,7 @@ macOS build there.  Once a fixed fitsio is released on
 conda-forge, re-add `macos-latest` to the `test.matrix.os`
 list in `.github/workflows/ci.yml` and delete this note.
 Worth keeping an eye on the failing test
-(`tests/test_compressed_image_phase1.py`'s
+(`tests/test_compressed_image_accessors.py`'s
 `test_other_compression_types_dispatched` was the first to
 abort) when the time comes.
 
@@ -4038,7 +4038,7 @@ janitorial, not feature work — none changes behavior.  **Suggested
 ordering: do the structural splits (1 + 2) first, then the cleanup
 passes (3 + 4) on the settled structure so you don't clean code
 you're about to move; 5 is independent and can happen anytime.**
-Items 1–4 shipped 2026-05-28; only 5 remains.
+Items 1–5 all shipped 2026-05-28; this backlog is complete.
 
 1. ✅ **Split the two giant `.rs` files into directory modules.**
    Done 2026-05-28.  `src/hdu_table_compressed.rs` (5970 lines) →
@@ -4095,16 +4095,19 @@ Items 1–4 shipped 2026-05-28; only 5 remains.
    test-only `decode_checksum_ascii`.  CI does not yet gate on
    clippy; re-running `cargo clippy --lib` should stay at zero.
 
-5. **Reorganize tests by feature, not dev phase.**  The
-   `tests/test_compressed_table_phase1.py` … `_phase6*.py` files
-   (and any other phase-numbered suites) are ordered by the
-   development phase that introduced them.  Regroup by what they
-   exercise (read / write / append / repack / setitem / checksum /
-   vla / accessors).  Independent of #1–#4.  **Caveat:** CLAUDE.md
-   references many of these suites by filename AND by phase number
-   throughout the ZTABLE / ZIMAGE roadmaps — those references move
-   with the files, so budget a doc-update pass alongside the test
-   shuffle.
+5. ✅ **Reorganize tests by feature, not dev phase.**  Done
+   2026-05-28.  The 25 phase-numbered suites were `git mv`-renamed to
+   feature names (flat layout, history preserved): compressed-image
+   `phaseN_*` → `accessors` / `read_{rice,slice,gzip,quantize,hcompress,plio}`
+   / `write_{gzip,gzip2,rice,hcompress,plio,quantize,unquantized}`;
+   compressed-table `phaseN` → `accessors` / `read` / `read_slice` /
+   `read_vla` / `write` / `write_vla` / `append`; `create_table_1{b,c,d,e}`
+   → `dtypes` / `subarray` / `strings` / `input_forms`.  Module-docstring
+   "Phase N" summary tokens were dropped; all filename references in the
+   roadmaps below and across the test suite were swept to the new names.
+   (Subdirectory layout was considered and declined — flat + descriptive
+   names was preferred for `ls`-browsability.)  Deeper "Phase N" narrative
+   in roadmap prose and in body comments is kept as dev history.
 
 ## Performance — ZIMAGE chunked-read profiling history
 

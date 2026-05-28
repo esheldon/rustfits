@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 7 follow-up: Hcompress1 compressed image writes.
+ZIMAGE Hcompress1 compressed image writes.
 
 Bit-exact port of cfitsio's `fits_hcompress` family (htrans, digitize,
 encode, doencode, qtree_encode, qtree_onebit, qtree_reduce, bufcopy,
@@ -557,7 +557,7 @@ def test_i8_hcompress_rejected():
 
 # test_float_compress_rejected: removed in Phase 8 commit 2 —
 # float-compressed writes are now supported via quantize=.  See
-# tests/test_compressed_image_phase8_quantize_write.py.
+# tests/test_compressed_image_write_quantize.py.
 
 
 # test_unsigned_trick_dtype_rejected: removed — u2/u4/u8/i1 are

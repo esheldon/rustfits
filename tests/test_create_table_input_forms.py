@@ -1,5 +1,5 @@
 """
-Phase 1e tests: dict + list+names input forms for TableHDU.write,
+Tests: dict + list+names input forms for TableHDU.write,
 plus structured-array field-order normalization.
 
 Three input forms are accepted:

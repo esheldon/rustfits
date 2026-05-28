@@ -1,5 +1,5 @@
 """
-Phase 1b tests: unsigned-int trick (u2/u4/u8), bool, and complex.
+Tests: unsigned-int trick (u2/u4/u8), bool, and complex.
 
 These dtypes were rejected in the 1a MVP and added in 1b:
   - u2/u4/u8 → I/J/K + TZERO=2^(n-1)  (unsigned-int trick)

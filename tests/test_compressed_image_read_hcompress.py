@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 6: HCOMPRESS_1 read.
+ZIMAGE HCOMPRESS_1 read.
 
 Round-trip tests use fitsio to write HCOMPRESS_1-compressed fixtures
 and rustfits to read them back, checking byte-exactness of the

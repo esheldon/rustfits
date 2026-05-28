@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 1: detection, dispatch, accessors.
+ZIMAGE detection, dispatch, accessors.
 
 Confirms that a tile-compressed image HDU is parsed as a
 CompressedImageHDU (not TableHDU), and that the image-side and

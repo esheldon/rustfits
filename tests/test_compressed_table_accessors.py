@@ -1,5 +1,5 @@
 """
-Tests for ZTABLE Phase 1 — detection + accessors + stubbed I/O.
+Tests for ZTABLE detection + accessors + stubbed I/O.
 
 Phase 1 ships only the detection plumbing and accessors that report
 the original (uncompressed) table's schema.  read/write/etc. raise

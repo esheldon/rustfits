@@ -1,5 +1,5 @@
 """
-ZTABLE Phase 6a — VLA-column write (dual-descriptor heap).
+ZTABLE VLA-column write (dual-descriptor heap).
 
 Extends Phase 5 to handle variable-length columns.  Per VLA column
 per tile, the writer produces:

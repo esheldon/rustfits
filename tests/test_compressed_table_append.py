@@ -1,5 +1,5 @@
 """
-ZTABLE Phase 6b — append on compressed tables.
+ZTABLE append on compressed tables.
 
 `CompressedTableHDU.append(data, *, names=None)` extends the table
 with new rows.  The new rows merge into the existing partial last

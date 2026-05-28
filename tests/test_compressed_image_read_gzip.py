@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 4: GZIP_1 / GZIP_2 whole-image read + slicing,
+ZIMAGE GZIP_1 / GZIP_2 whole-image read + slicing,
 plus the fallback-column dispatch (GZIP_COMPRESSED_DATA and
 UNCOMPRESSED_DATA used when the primary column is empty).
 

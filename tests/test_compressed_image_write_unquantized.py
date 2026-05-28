@@ -1,5 +1,5 @@
 """
-ZIMAGE Phase 8: unquantized-float compressed image writes
+ZIMAGE unquantized-float compressed image writes
 (quantize=None or omitted kwarg).
 
 When a float HDU is created without a Quantize config (or with
