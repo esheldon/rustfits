@@ -3843,7 +3843,13 @@ downloaded (and, for a `.gz` URL, decompressed) bytes.
 - *HTTP crate: `ureq` 3.x* (blocking-native, rustls TLS, no tokio) —
   the right fit for the synchronous PyO3 path.  `download_remote`
   does `ureq::get(url).call()?.into_body().into_reader()` →
-  `read_to_end`.
+  `read_to_end`.  **Kept default-on, NOT behind a Cargo feature.**
+  Footprint is moderate: ~30 transitive crates (≈29 net new;
+  `flate2` was already ours) on `ring` + `rustls` — the leanest real
+  HTTPS stack (`reqwest` would add tokio + hyper + far more).
+  One-time `ring` `cc` build; minor `.so` size.  Not worth the
+  cfg-gating complexity; revisit only if the build weight becomes a
+  real complaint.
 - *Whole file in RAM*, not streamed to a temp file.  The original
   sketch favored a temp file for bounded memory; the `Mem` backend
   makes the in-RAM path trivial and consistent with `mem://` /
