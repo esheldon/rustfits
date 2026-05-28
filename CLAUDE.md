@@ -758,6 +758,43 @@ for full-table reads (structured) — even when no row was actually
 masked.  Tests assert "no element is masked" rather than identity
 against `nomask`.
 
+**Row / chunk iteration.**  `for row in hdu:` (i.e.
+`TableHDU.__iter__`) yields one `np.void` record per row — the same
+0-d scalar `hdu[i]` returns.  `hdu.iter(*, chunksize=None,
+columns=None, scale=True)` is the explicit form: `chunksize=None`
+(default) yields rows, `chunksize=N` (>0; 0/negative rejected) yields
+structured ndarrays of ≤N rows (last chunk short).  `columns=` and
+`scale=` are forwarded to `read`, so `hdu.iter(columns=["x"])` is the
+supported way to iterate a column subset (a single-column iter still
+yields 1-field records — use `row["x"]`; there is no iterable
+column-subset object by design).
+
+Implementation in `src/hdu_table/iter.rs`: a `TableIter` pyclass
+(no Rust generator — Python drives `__next__`, `Ok(None)` ⇒
+StopIteration) holding the current buffer + cursor.  Row mode reads
+`buffersize` rows into a buffer and yields `buf[k]` out of it,
+refilling when spent; chunk mode reads exactly `chunksize` rows per
+`__next__`.  **The refill calls the HDU's own polymorphic
+`read(rows=slice, columns=, scale=)`** via `call_method`, so
+`CompressedTableHDU` (which overrides `read` + `__len__` + `dtype`)
+iterates correctly with zero compressed-specific code — `__iter__` /
+`iter` are defined once on `TableHDU` and inherited.  `nrows` +
+`itemsize` are snapshotted POLYMORPHICALLY (`slf.len()` /
+`slf.getattr("dtype")`) at construction so the compressed subclass
+reports its uncompressed-view schema, not the on-disk `1QB` layout.
+Row-mode buffer is auto-sized to an ~8 MiB byte budget
+(`rows = 8 MiB / itemsize`); not user-configurable yet (documented in
+the `iter` docstring — for a huge-row table, drive a manual
+`hdu[lo:hi]` loop).  Contract: `nrows` is frozen at iterator creation
+(appends mid-iteration aren't seen); closing the file mid-iteration
+makes the next batch read raise the usual closed-file error.  Tests
+in `tests/test_table_iter.py` (33 cases, parametrized over plain +
+compressed): row/chunk content + sizes, `iter()`==`__iter__`,
+independent cursors, `chunksize=1` → shape-(1,) arrays, chunk >
+table, `columns=`/`scale=` forwarding, single-column 1-field quirk,
+empty table, `chunksize=0`/negative rejection, nrows snapshot,
+multi-refill via wide rows, VLA columns.
+
 **Missing (ordered by likely value).**
 1. **Variable-length P/Q with `repeat > 1`** — currently rejected.
    Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor

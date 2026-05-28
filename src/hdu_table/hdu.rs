@@ -96,9 +96,12 @@ use super::write_vla::{
 ///
 ///     hdu.append(new_data)
 ///
-/// Iterate rows lazily via slicing::
+/// Iterate rows lazily (internally buffered)::
 ///
-///     for chunk in (hdu[i:i+1000] for i in range(0, len(hdu), 1000)):
+///     for row in hdu:                     # one scalar record per row
+///         process(row)
+///
+///     for chunk in hdu.iter(chunksize=1000):   # ndarray per chunk
 ///         process(chunk)
 ///
 /// Notes
@@ -1022,6 +1025,73 @@ impl TableHDU {
     ) -> PyResult<()> {
         let super_: PyRefMut<HDU> = slf.into_super();
         delete_column_impl(&super_, key)
+    }
+
+    // `for row in hdu:` — yields one row per iteration as a numpy
+    // scalar record, the same single-element value `hdu[i]` returns.
+    // Rows are read in internally-buffered batches (not one disk read
+    // per row), so iterating a large table stays memory-bounded.
+    // Equivalent to `hdu.iter()`; see `iter` for the chunked and
+    // column-subset forms.  No `///` docstring: pyo3 installs this as
+    // the `tp_iter` slot, whose canonical text overrides any per-
+    // method docstring (same as `__len__` / `__getitem__` above).
+    fn __iter__(slf: Bound<'_, Self>) -> PyResult<super::iter::TableIter> {
+        super::iter::make_table_iter(slf, None, None, true)
+    }
+
+    /// Iterate over table rows or row-chunks.
+    ///
+    /// ``hdu.iter()`` is equivalent to ``for row in hdu`` — one row
+    /// per iteration as a numpy scalar record.  Passing ``chunksize``
+    /// switches to yielding structured arrays instead.
+    ///
+    /// Parameters
+    /// ----------
+    /// chunksize : int, optional
+    ///     ``None`` (default) yields one row per iteration as a numpy
+    ///     scalar record (the same single-element value ``hdu[i]``
+    ///     returns).  A positive integer yields a structured
+    ///     :class:`numpy.ndarray` of up to ``chunksize`` rows per
+    ///     iteration; the final chunk may be shorter.  ``0`` is
+    ///     rejected.
+    /// columns : list of str, optional
+    ///     Restrict iteration to these columns (case-insensitive),
+    ///     forwarded to :meth:`read`.  Each yielded record / chunk
+    ///     then carries only the named fields.  This is the
+    ///     supported way to iterate a column subset — a single
+    ///     ``iter(columns=["x"])`` still yields 1-field records, so
+    ///     use ``row["x"]`` to get the value.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` scaling, forwarded to
+    ///     :meth:`read`.
+    ///
+    /// Returns
+    /// -------
+    /// iterator
+    ///     Yields numpy scalar records (``chunksize=None``) or
+    ///     structured :class:`numpy.ndarray` chunks
+    ///     (``chunksize=N``).
+    ///
+    /// Notes
+    /// -----
+    /// The row count is snapshotted when the iterator is created;
+    /// rows added via :meth:`append` mid-iteration are not seen.
+    /// Closing the file mid-iteration makes the next batch read
+    /// raise the usual closed-file error.  The internal read buffer
+    /// is auto-sized to an ~8 MiB byte budget (rows = budget /
+    /// row_width) and is not currently user-configurable — for a
+    /// huge-row table, drive a manual ``hdu[lo:hi]`` loop instead.
+    ///
+    /// Works identically on :class:`CompressedTableHDU`, decoding
+    /// only the tiles each batch touches.
+    #[pyo3(signature = (*, chunksize=None, columns=None, scale=true))]
+    fn iter(
+        slf: Bound<'_, Self>,
+        chunksize: Option<usize>,
+        columns: Option<Py<PyAny>>,
+        scale: bool,
+    ) -> PyResult<super::iter::TableIter> {
+        super::iter::make_table_iter(slf, chunksize, columns, scale)
     }
 }
 

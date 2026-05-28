@@ -30,7 +30,7 @@ use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
 use crate::hdu_image_compressed::CompressedImageHDU;
-use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU};
+use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU, TableIter};
 use crate::hdu_table_compressed::{
     CompressedColumnSubset, CompressedSingleColumnSubset, CompressedTableHDU,
 };
@@ -52,6 +52,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompressedColumnSubset>()?;
     m.add_class::<ColumnSubset>()?;
     m.add_class::<SingleColumnSubset>()?;
+    m.add_class::<TableIter>()?;
     m.add_class::<AsciiTableHDU>()?;
     m.add_class::<FITSHeader>()?;
     m.add_class::<FITSHeaderEdit>()?;

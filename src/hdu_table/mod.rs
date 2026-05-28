@@ -10,6 +10,7 @@
 mod columns;
 mod edit;
 mod hdu;
+mod iter;
 mod read;
 mod setitem;
 mod write_fixed;
@@ -23,6 +24,7 @@ pub(crate) use columns::{
 pub(crate) use hdu::{
     classify_table_key, ColumnSubset, SingleColumnSubset, TableHDU, TableKey,
 };
+pub(crate) use iter::TableIter;
 pub(crate) use setitem::{
     classify_setitem_key, coerce_to_len1_record, SetItemKey,
 };
