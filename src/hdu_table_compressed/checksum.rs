@@ -48,6 +48,7 @@ struct VlaCellMeta {
 // byte_offset slot for each row, and push per-cell metadata
 // (orig_offset, vlalen, cvlalen, cvlastart) for non-empty cells to
 // `vla_cells` so the heap pass can walk them in offset order.
+#[allow(clippy::too_many_arguments)]
 fn collect_vla_tile_descriptors_and_meta(
     file: &FileHandle,
     data_offset: u64,
@@ -120,6 +121,7 @@ fn collect_vla_tile_descriptors_and_meta(
 // are legal), each cell's decompressed BE bytes (or its raw bytes
 // when cfitsio's uncompressed-fallback applies), and trailing
 // zeros to reach ZPCOUNT.  Holds the file lock for the whole pass.
+#[allow(clippy::too_many_arguments)]
 fn feed_vla_synthetic_heap(
     file: &FileHandle,
     data_offset: u64,
@@ -127,7 +129,7 @@ fn feed_vla_synthetic_heap(
     descriptor_row_width: usize,
     columns: &[Column],
     algorithms: &[CompressionAlgorithm],
-    vla_cells: &mut Vec<VlaCellMeta>,
+    vla_cells: &mut [VlaCellMeta],
     zpcount: u64,
     stream: &mut crate::checksum::ChecksumStream,
 ) -> PyResult<()> {

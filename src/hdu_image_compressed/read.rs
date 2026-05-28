@@ -35,6 +35,7 @@ use super::meta::{
 //     Phase 6
 //   - Integer ZBITPIX only (Phase 5 adds quantized floats)
 //   - mask_blank=True rejected (ZBLANK handling is a follow-up)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_compressed_image_data(
     py: Python<'_>,
     meta: &CompressedImageMeta,
@@ -115,7 +116,7 @@ pub(crate) fn read_compressed_image_data(
     let mut shape_buf = [0u64; MAX_NAXIS];
     for tile_idx in 0..n_tiles {
         let d = tile_origin_and_shape(
-            tile_idx, &image_shape, &tile_shape,
+            tile_idx, image_shape, tile_shape,
             &mut origin_buf, &mut shape_buf,
         );
         let origin = &origin_buf[..d];
@@ -229,9 +230,7 @@ pub(crate) fn tile_origin_and_shape(
     // Unfold from numpy-last (= FITS-fastest = varies fastest in
     // the BINTABLE row ordering) to numpy-first.
     for axis_numpy in (0..d).rev() {
-        let n_along = (image_shape_numpy[axis_numpy]
-            + nominal_tile_shape_numpy[axis_numpy] - 1)
-            / nominal_tile_shape_numpy[axis_numpy];
+        let n_along = image_shape_numpy[axis_numpy].div_ceil(nominal_tile_shape_numpy[axis_numpy]);
         tile_coord[axis_numpy] = idx % n_along;
         idx /= n_along;
     }
@@ -255,7 +254,6 @@ pub(crate) fn tile_origin_and_shape(
 // lock; the lock is released before decode.  The cache lock is
 // taken twice (once for `get`, once for `put`) and held only
 // across in-memory ops.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_or_decode_tile(
     _py: Python<'_>,
@@ -418,6 +416,7 @@ pub(crate) fn get_or_decode_tile(
 // `(payload, Some((scale, zero)))` when `quant` is Some, else
 // `(payload, None)`.  Pairing the reads avoids a second lock cycle
 // in the hot tile loop.
+#[allow(clippy::too_many_arguments)]
 fn fetch_tile_payload_and_quant(
     file_handle: &FileHandle,
     tile_idx: u64,
@@ -665,8 +664,7 @@ impl OverlappingTileRange {
         let mut tc_extent = [0u64; MAX_NAXIS];
         let mut total = 1u64;
         for ax in 0..d_img {
-            n_along[ax] = (image_shape[ax] + tile_shape[ax] - 1)
-                / tile_shape[ax];
+            n_along[ax] = image_shape[ax].div_ceil(tile_shape[ax]);
             let s = &slices[ax];
             debug_assert!(!s.is_int && s.step == 1 && s.count > 0);
             tc_first[ax] = s.start / tile_shape[ax];
@@ -701,8 +699,10 @@ impl OverlappingTileRange {
             idx /= self.tc_extent[ax];
         }
         let mut tile_idx: u64 = 0;
-        for ax in 0..self.d_img {
-            tile_idx = tile_idx * self.n_along[ax] + tile_coord_out[ax];
+        for (&n, &coord) in
+            self.n_along.iter().zip(tile_coord_out.iter()).take(self.d_img)
+        {
+            tile_idx = tile_idx * n + coord;
         }
         tile_idx
     }
@@ -718,6 +718,7 @@ impl OverlappingTileRange {
 // of `itemsize` bytes per element.  The innermost axis becomes
 // one memcpy per outer-axis coordinate; for d == 1 it's a single
 // memcpy.  Stack-only — no heap allocations regardless of d.
+#[allow(clippy::too_many_arguments)]
 fn strided_copy_c_contig_to_c_contig(
     dst: &mut [u8],
     dst_shape: &[u64],
@@ -733,7 +734,7 @@ fn strided_copy_c_contig_to_c_contig(
     debug_assert_eq!(d, copy_shape.len());
     debug_assert_eq!(d, dst_start.len());
     debug_assert_eq!(d, src_start.len());
-    debug_assert!(d >= 1 && d <= MAX_NAXIS);
+    debug_assert!((1..=MAX_NAXIS).contains(&d));
 
     let last = d - 1;
     let row_bytes = (copy_shape[last] as usize) * itemsize;
@@ -828,7 +829,7 @@ pub(crate) fn axis_overlap<'py>(
             0u64
         } else {
             let diff = tile_origin - axis.start;
-            (diff + axis.step - 1) / axis.step
+            diff.div_ceil(axis.step)
         };
         if k_first >= axis.count {
             return Ok(None);
@@ -892,7 +893,7 @@ pub(crate) fn slice_compressed_image(
     // Parse the slice key.  Fancy lists/arrays raise here via
     // parse_axis_indexer's "unsupported index type" error, matching
     // the ImageHDU surface.
-    let slices = normalize_slice_key(key, &image_shape)?;
+    let slices = normalize_slice_key(key, image_shape)?;
     let all_int = slices.iter().all(|s| s.is_int);
 
     // Output shape: drop is_int axes.  All-int → empty shape (0-d
@@ -927,7 +928,7 @@ pub(crate) fn slice_compressed_image(
         let dst_bytes = out_buf.as_mut_slice();
         let d_img = image_shape.len();
         let range = OverlappingTileRange::new(
-            &image_shape, &tile_shape, &slices,
+            image_shape, tile_shape, &slices,
         );
         let mut tile_coord = [0u64; MAX_NAXIS];
         let mut origin_buf = [0u64; MAX_NAXIS];
@@ -974,7 +975,7 @@ pub(crate) fn slice_compressed_image(
         let mut shape_buf = [0u64; MAX_NAXIS];
         for tile_idx in 0..n_tiles {
             let d = tile_origin_and_shape(
-                tile_idx, &image_shape, &tile_shape,
+                tile_idx, image_shape, tile_shape,
                 &mut origin_buf, &mut shape_buf,
             );
             let origin = &origin_buf[..d];

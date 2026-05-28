@@ -60,6 +60,10 @@ use crate::header::card_int;
 /// Tile-compressed images (``ZIMAGE=T`` on disk) return the
 /// subclass :class:`CompressedImageHDU` instead, which overrides
 /// reads and writes to handle per-tile (de)compression.
+// Version-stamped parsed-metadata cache (see `meta()`); the u64 is the
+// `cards_version` at parse time.
+type MetaCache = Arc<Mutex<Option<(u64, Arc<ImageMeta>)>>>;
+
 #[pyclass(extends = HDU, subclass)]
 pub(crate) struct ImageHDU {
     // Phase 5 meta cache: parsed ImageMeta keyed by cards_version.
@@ -67,7 +71,7 @@ pub(crate) struct ImageHDU {
     // First hit re-parses BITPIX + NAXIS + NAXISn + BSCALE + BZERO
     // + BLANK; subsequent hits return an Arc clone.  Invalidates on
     // every cards mutation via the version bump in CardsWriteGuard.
-    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<ImageMeta>)>>>,
+    pub(crate) meta_cache: MetaCache,
 }
 
 impl ImageHDU {
@@ -551,9 +555,8 @@ impl ImageHDU {
             &super_.file,
             data,
             Some(start_for_write),
-        ).map_err(|e| {
+        ).inspect_err(|_e| {
             super_.tainted.store(true, Ordering::Release);
-            e
         })
     }
 
@@ -714,7 +717,7 @@ fn data_section_padded_size_for(super_: &HDU) -> PyResult<u64> {
     let bitpix: i64 = parse_keyword(&cards, "BITPIX").ok_or_else(|| {
         PyValueError::new_err("HDU header missing BITPIX")
     })?;
-    let bytes_per_pixel = (bitpix.unsigned_abs() / 8) as u64;
+    let bytes_per_pixel = bitpix.unsigned_abs() / 8;
     let mut nelements: u64 = 1;
     for i in 1..=naxis {
         let n: i64 = parse_keyword(&cards, &format!("NAXIS{}", i))
@@ -1589,7 +1592,7 @@ fn write_image_slice(
                 ))),
             }
         };
-        let buffer = RawBuffer::acquire(&rhs).map_err(|e| {
+        let buffer = RawBuffer::acquire(rhs).map_err(|e| {
             PyValueError::new_err(format!(
                 "RHS must be a C-contiguous numpy array \
                  (try np.ascontiguousarray): {}", e
@@ -2127,11 +2130,11 @@ fn parse_image_hdu_shape(header: &[String]) -> PyResult<(i32, Vec<u64>)> {
 
 pub(crate) fn round_up_to_block(n: u64) -> u64 {
     let block = BLOCK_SIZE as u64;
-    ((n + block - 1) / block) * block
+    n.div_ceil(block) * block
 }
 
 pub(crate) fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
-    let num_blocks = (header.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK;
+    let num_blocks = header.len().div_ceil(CARDS_PER_BLOCK);
     let total_size = num_blocks * BLOCK_SIZE;
     let mut out = Vec::with_capacity(total_size);
     for card in header {
@@ -2165,7 +2168,7 @@ pub(crate) fn serialize_header_to_disk_bytes(header: &[String]) -> Vec<u8> {
 // place.
 pub(crate) fn dtype_to_bitpix(dtype: &str) -> PyResult<(i32, Option<f64>)> {
     let s = dtype.trim_start_matches(
-        |c| c == '<' || c == '>' || c == '|' || c == '=');
+        ['<', '>', '|', '=']);
     let normalized = s.to_lowercase();
     match normalized.as_str() {
         "u1" | "uint8"   => Ok((8,   None)),

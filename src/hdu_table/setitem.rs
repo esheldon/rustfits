@@ -143,7 +143,7 @@ pub(crate) fn setitem_row_slice(
         return Err(PyValueError::new_err(
             "TableHDU[slice] = value: negative or zero step is not supported"));
     }
-    let count = indices.slicelength as usize;
+    let count = indices.slicelength;
     let start = indices.start as i64;
     let step = indices.step as i64;
 
@@ -616,7 +616,7 @@ fn resolve_rows_key(
         let mut out = Vec::with_capacity(count as usize);
         for k in 0..count {
             let r = start + k * step;
-            if r < 0 || r as i64 >= nrows as i64 {
+            if r < 0 || r >= nrows as i64 {
                 return Err(PyIndexError::new_err(format!(
                     "row index {} out of bounds for {} rows", r, nrows)));
             }
@@ -816,6 +816,7 @@ impl<'a> VlaRowSpec<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setitem_rows_vla_aware_inner(
     py: Python<'_>,
     super_: &HDU,
@@ -992,7 +993,7 @@ pub(crate) fn setitem_row_slice_vla_aware(
             "TableHDU[slice] = value: negative or zero step is not \
              supported"));
     }
-    let count = indices.slicelength as usize;
+    let count = indices.slicelength;
     let start = indices.start as usize;
     let step = indices.step as usize;
     if count == 0 {

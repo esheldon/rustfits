@@ -222,7 +222,7 @@ fn extract_string_vla_cell_bytes(
 ) -> PyResult<Vec<u8>> {
     // Python `bytes` / numpy.bytes_ scalar — take verbatim.
     if cell.is_instance_of::<PyBytes>() {
-        return Ok(cell.extract::<Vec<u8>>()?);
+        return cell.extract::<Vec<u8>>();
     }
     // Python `str` / numpy.str_ scalar — ASCII-encode.
     if cell.is_instance_of::<PyString>() {
@@ -644,6 +644,7 @@ fn write_heap_and_flush(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_vla_data_range(
     columns: &[Column],
     fixed: &[Option<FixedColInfo>],

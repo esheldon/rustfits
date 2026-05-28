@@ -45,6 +45,7 @@ pub(crate) struct VlaMergeOldBlob {
 // Read + decompress one (tile, col) dual-descriptor blob from the
 // CURRENT (pre-mutation) heap.  Called only when merging rows into
 // the existing last partial tile.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_vla_merge_old_blob(
     file: &FileHandle,
     data_offset: u64,
@@ -766,6 +767,7 @@ fn relocate_region_forward_local(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_existing_tile_to_be_bytes(
     file: &FileHandle,
     cards: &[String],

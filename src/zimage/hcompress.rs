@@ -1,3 +1,8 @@
+// clippy: the index-based loops in this file mirror the cfitsio C
+// source line-for-line, keeping the port diffable against upstream;
+// don't rewrite them into iterator form.
+#![allow(clippy::needless_range_loop)]
+
 // HCOMPRESS_1 tile decompression for the FITS Tile Compression
 // Convention.  Port of cfitsio's `fits_hdecompress.c` (and its i64
 // sibling `fits_hdecompress64`).  Function names mirror the C source
@@ -244,8 +249,8 @@ const CODE_MAGIC: [u8; 2] = [0xDD, 0x99];
 fn qtree_copy(
     a: &mut [u8], nx: usize, ny: usize, n: usize,
 ) {
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     // First copy 4-bit values from start-of-a (input) into b
     // positions [2*i, 2*j], walking back-to-front so we don't
     // overwrite source data.
@@ -426,7 +431,7 @@ fn read_bdirect<T: HBit>(
     state: &mut HState<'_>, a: &mut [T], n: usize,
     nqx: usize, nqy: usize, scratch: &mut [u8], bit: u32,
 ) -> PyResult<()> {
-    let count = ((nqx + 1) / 2) * ((nqy + 1) / 2);
+    let count = nqx.div_ceil(2) * nqy.div_ceil(2);
     state.input_nnybble(count, &mut scratch[..count])?;
     qtree_bitins(&scratch[..count], nqx, nqy, a, n, bit);
     Ok(())
@@ -451,8 +456,8 @@ fn qtree_decode<T: HBit>(
     if nqmax > (1usize << log2n) {
         log2n += 1;
     }
-    let nqx2 = (nqx + 1) / 2;
-    let nqy2 = (nqy + 1) / 2;
+    let nqx2 = nqx.div_ceil(2);
+    let nqy2 = nqy.div_ceil(2);
     let mut scratch = vec![0u8; nqx2 * nqy2];
 
     for bit_idx in (0..nbitplanes).rev() {
@@ -498,8 +503,8 @@ fn dodecode<T: HBit + std::ops::Neg<Output = T> + std::cmp::PartialEq>(
     nbitplanes: [u8; 3],
 ) -> PyResult<()> {
     let nel = nx * ny;
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     // Caller must have zero-filled a.
     for v in a.iter_mut() { *v = T::default(); }
 
@@ -529,11 +534,10 @@ fn dodecode<T: HBit + std::ops::Neg<Output = T> + std::cmp::PartialEq>(
     // Sign bits.
     state.start_inputing_bits();
     for v in a.iter_mut() {
-        if *v != T::default() {
-            if state.input_bit()? != 0 {
+        if *v != T::default()
+            && state.input_bit()? != 0 {
                 *v = -*v;
             }
-        }
     }
     let _ = nel;
     Ok(())
@@ -894,7 +898,7 @@ fn hinv_i32(
     if nmax > (1usize << log2n) {
         log2n += 1;
     }
-    let scratch_len = (nmax + 1) / 2;
+    let scratch_len = nmax.div_ceil(2);
     let mut tmp = vec![0i32; scratch_len];
 
     let mut shift: u32 = 1;
@@ -1041,7 +1045,7 @@ fn hinv_i64(
     if nmax > (1usize << log2n) {
         log2n += 1;
     }
-    let scratch_len = (nmax + 1) / 2;
+    let scratch_len = nmax.div_ceil(2);
     let mut tmp = vec![0i64; scratch_len];
 
     let mut shift: u32 = 1;
@@ -1399,7 +1403,7 @@ fn htrans_i32(a: &mut [i32], nx: usize, ny: usize) {
     if nmax > (1usize << log2n) {
         log2n += 1;
     }
-    let mut tmp = vec![0i32; (nmax + 1) / 2];
+    let mut tmp = vec![0i32; nmax.div_ceil(2)];
 
     let mut shift: u32 = 0;
     let mut mask: i32 = -2;
@@ -1489,7 +1493,7 @@ fn htrans_i64(a: &mut [i64], nx: usize, ny: usize) {
     if nmax > (1usize << log2n) {
         log2n += 1;
     }
-    let mut tmp = vec![0i64; (nmax + 1) / 2];
+    let mut tmp = vec![0i64; nmax.div_ceil(2)];
 
     let mut shift: u32 = 0;
     let mut mask: i64 = -2;
@@ -1944,7 +1948,7 @@ fn write_bdirect_i32(
 ) {
     writer.output_nybble(0x0);
     qtree_onebit_i32(a, n, nqx, nqy, scratch, bit);
-    let count = ((nqx + 1) / 2) * ((nqy + 1) / 2);
+    let count = nqx.div_ceil(2) * nqy.div_ceil(2);
     writer.output_nnybble(&scratch[..count]);
 }
 
@@ -1954,7 +1958,7 @@ fn write_bdirect_i64(
 ) {
     writer.output_nybble(0x0);
     qtree_onebit_i64(a, n, nqx, nqy, scratch, bit);
-    let count = ((nqx + 1) / 2) * ((nqy + 1) / 2);
+    let count = nqx.div_ceil(2) * nqy.div_ceil(2);
     writer.output_nnybble(&scratch[..count]);
 }
 
@@ -1977,9 +1981,9 @@ fn qtree_encode_i32(
     if nqmax > (1usize << log2n) {
         log2n += 1;
     }
-    let nqx2 = (nqx + 1) / 2;
-    let nqy2 = (nqy + 1) / 2;
-    let bmax = (nqx2 * nqy2 + 1) / 2;
+    let nqx2 = nqx.div_ceil(2);
+    let nqy2 = nqy.div_ceil(2);
+    let bmax = (nqx2 * nqy2).div_ceil(2);
     let mut scratch = vec![0u8; 2 * bmax];
     let mut buffer = vec![0u8; bmax];
 
@@ -2054,9 +2058,9 @@ fn qtree_encode_i64(
     if nqmax > (1usize << log2n) {
         log2n += 1;
     }
-    let nqx2 = (nqx + 1) / 2;
-    let nqy2 = (nqy + 1) / 2;
-    let bmax = (nqx2 * nqy2 + 1) / 2;
+    let nqx2 = nqx.div_ceil(2);
+    let nqy2 = nqy.div_ceil(2);
+    let bmax = (nqx2 * nqy2).div_ceil(2);
     let mut scratch = vec![0u8; 2 * bmax];
     let mut buffer = vec![0u8; bmax];
 
@@ -2122,8 +2126,8 @@ fn doencode_i32(
     writer: &mut HWriter, a: &[i32], nx: usize, ny: usize,
     nbitplanes: [u8; 3],
 ) {
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     writer.start_outputing_bits();
     qtree_encode_i32(writer, &a[0..], ny, nx2, ny2, nbitplanes[0] as u32);
     qtree_encode_i32(writer, &a[ny2..], ny, nx2, ny / 2, nbitplanes[1] as u32);
@@ -2140,8 +2144,8 @@ fn doencode_i64(
     writer: &mut HWriter, a: &[i64], nx: usize, ny: usize,
     nbitplanes: [u8; 3],
 ) {
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     writer.start_outputing_bits();
     qtree_encode_i64(writer, &a[0..], ny, nx2, ny2, nbitplanes[0] as u32);
     qtree_encode_i64(writer, &a[ny2..], ny, nx2, ny / 2, nbitplanes[1] as u32);
@@ -2173,7 +2177,7 @@ fn encode_i32(
     // Pack sign bits, 8 per byte.  Same packing order as cfitsio's
     // encode: left-shift the byte each step, OR in 1 for negative,
     // increment to next byte when 8 bits accumulated.
-    let mut signbits = vec![0u8; (nel + 7) / 8];
+    let mut signbits = vec![0u8; nel.div_ceil(8)];
     let mut nsign: usize = 0;
     let mut bits_to_go: i32 = 8;
     for i in 0..nel {
@@ -2196,8 +2200,8 @@ fn encode_i32(
     }
     // Compute per-quadrant max absolute value, then nbitplanes per
     // quadrant.
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     let mut vmax: [i32; 3] = [0; 3];
     let mut j: usize = 0;
     let mut k: usize = 0;
@@ -2237,7 +2241,7 @@ fn encode_i64(
     writer.writeint(scale);
     writer.writelonglong(a[0]);
     a[0] = 0;
-    let mut signbits = vec![0u8; (nel + 7) / 8];
+    let mut signbits = vec![0u8; nel.div_ceil(8)];
     let mut nsign: usize = 0;
     let mut bits_to_go: i32 = 8;
     for i in 0..nel {
@@ -2258,8 +2262,8 @@ fn encode_i64(
         signbits[nsign] <<= bits_to_go as u32;
         nsign += 1;
     }
-    let nx2 = (nx + 1) / 2;
-    let ny2 = (ny + 1) / 2;
+    let nx2 = nx.div_ceil(2);
+    let ny2 = ny.div_ceil(2);
     let mut vmax: [i64; 3] = [0; 3];
     let mut j: usize = 0;
     let mut k: usize = 0;

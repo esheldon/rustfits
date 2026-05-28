@@ -253,8 +253,8 @@ fn parse_variable_inner_letter(
         )));
     }
     let after = t[inner.len_utf8()..].trim();
-    if !after.is_empty()
-        && !(after.starts_with('(') && after.ends_with(')'))
+    if !(after.is_empty()
+        || after.starts_with('(') && after.ends_with(')'))
     {
         return Err(PyValueError::new_err(format!(
             "column {}: variable-length TFORM='{}' has invalid trailer \

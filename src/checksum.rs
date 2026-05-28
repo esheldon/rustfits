@@ -1,3 +1,8 @@
+// clippy: the index-based loops in this file mirror the cfitsio C
+// source line-for-line, keeping the port diffable against upstream;
+// don't rewrite them into iterator form.
+#![allow(clippy::needless_range_loop)]
+
 // FITS Checksum Convention (Pence & Seaman 2010 / ADASS 1994).
 //
 // Two header cards record HDU integrity:
@@ -131,6 +136,9 @@ pub(crate) fn encode_checksum_ascii(sum: u32, complement: bool) -> [u8; 16] {
 // sum.  When `complement = true`, returns the un-complemented
 // value (i.e., the original sum the card encodes).  Direct port
 // of cfitsio's `ffdsum`.
+// Inverse of `encode_checksum_ascii`; exercised by this module's unit
+// tests and kept for symmetry with the encoder (no non-test caller yet).
+#[allow(dead_code)]
 pub(crate) fn decode_checksum_ascii(ascii: &[u8], complement: bool) -> u32 {
     debug_assert!(ascii.len() >= 16);
     let mut cbuf = [0i32; 16];

@@ -1,3 +1,8 @@
+// clippy: the index-based loops in this file mirror the cfitsio C
+// source line-for-line, keeping the port diffable against upstream;
+// don't rewrite them into iterator form.
+#![allow(clippy::needless_range_loop)]
+
 // Quantized-float dequantization for the FITS Tile Compression
 // Convention.  When ZBITPIX is negative (-32 / -64) the on-disk
 // payload is a stream of i32 *quantized* integers; to recover the
@@ -281,7 +286,7 @@ pub(crate) fn dequantize_to_f64(
 // order (the decoder already byteswapped); this just walks them in
 // 4-byte chunks.
 pub(crate) fn i32_bytes_to_values(bytes: &[u8]) -> PyResult<Vec<i32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(PyValueError::new_err(format!(
             "quantized-int byte count {} not divisible by 4",
             bytes.len()
@@ -836,6 +841,7 @@ fn min_max_f64(
 // `row_1based` is the FITS tile-row number used to seed the
 // per-tile dither sequence; pass 0 to disable dithering.
 // `dither_seed` is the ZDITHER0 offset (1 = cfitsio default).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_float(
     fdata: &[f32],
     nxpix: usize,
@@ -969,6 +975,7 @@ pub(crate) fn quantize_float(
 // f64 sibling of `quantize_float`.  Direct port of cfitsio's
 // `fits_quantize_double` — same algorithm, double-precision
 // arithmetic throughout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_double(
     fdata: &[f64],
     nxpix: usize,

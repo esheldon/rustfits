@@ -1,3 +1,8 @@
+// clippy: the index-based loops in this file mirror the cfitsio C
+// source line-for-line, keeping the port diffable against upstream;
+// don't rewrite them into iterator form.
+#![allow(clippy::needless_range_loop)]
+
 // PLIO_1 tile decompression for the FITS Tile Compression
 // Convention.  Port of cfitsio's `pl_l2pi` from
 // `/home/esheldon/git/fitsio/cfitsio-4.6.4/pliocomp.c` (which is
@@ -67,7 +72,7 @@ pub(crate) fn decode_plio(
             bytepix
         )));
     }
-    if compressed.len() % 2 != 0 {
+    if !compressed.len().is_multiple_of(2) {
         return Err(PyValueError::new_err(format!(
             "PLIO_1: compressed payload is {} bytes (must be even — \
              stream is i16 shorts)",

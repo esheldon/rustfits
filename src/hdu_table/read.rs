@@ -460,10 +460,10 @@ pub(crate) fn convert_column_cell(
 // transposed by the standard "reversed(tdim) on the numpy side" rule.
 fn convert_x_cell(col: &Column, src: &[u8], dst: &mut [u8]) {
     let n_bits = col.repeat;
-    for i in 0..n_bits {
+    for (i, d) in dst.iter_mut().take(n_bits).enumerate() {
         let byte_idx = i / 8;
         let bit_idx = 7 - (i % 8);
-        dst[i] = (src[byte_idx] >> bit_idx) & 1;
+        *d = (src[byte_idx] >> bit_idx) & 1;
     }
 }
 
@@ -710,6 +710,7 @@ pub(crate) fn build_var_cell_value(
 // single-column 1-D Object case use `arr[row]`.  Empty cells (nelements
 // == 0) are still assigned so they overwrite numpy's default None with
 // an explicit empty ndarray / "" / b"".
+#[allow(clippy::too_many_arguments)]
 fn heap_pass(
     py: Python<'_>,
     arr: &Bound<'_, PyAny>,
@@ -1041,6 +1042,7 @@ where
 // passing a list selects + reorders to the user's request.  The full
 // on-disk row is still read; only the per-row conversion loop is
 // restricted to selected columns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_table(
     py: Python<'_>,
     meta: &TableMeta,
@@ -1172,6 +1174,7 @@ pub(crate) fn read_table(
 // with a clear error on any non-A column.
 //
 // `rows_arg` semantics are identical to `read_table`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_one_column(
     py: Python<'_>,
     meta: &TableMeta,

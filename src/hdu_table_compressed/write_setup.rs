@@ -233,9 +233,7 @@ pub(crate) fn encode_table_column_slab(
         CompressionAlgorithm::Rice1 => encode_rice(
             bytes_be, n_pixels, elem_size as u32, rice_blocksize,
         ),
-        _ => Err(PyValueError::new_err(format!(
-            "internal: non-table algorithm reached encode_table_column_slab",
-        ))),
+        _ => Err(PyValueError::new_err("internal: non-table algorithm reached encode_table_column_slab".to_string())),
     }
 }
 
@@ -568,8 +566,7 @@ pub(crate) fn build_compressed_table_header(
             CompressionAlgorithm::Gzip1 => "GZIP_1",
             CompressionAlgorithm::Gzip2 => "GZIP_2",
             CompressionAlgorithm::Rice1 => "RICE_1",
-            _ => return Err(PyValueError::new_err(format!(
-                "internal: non-table algorithm in build_compressed_table_header"))),
+            _ => return Err(PyValueError::new_err("internal: non-table algorithm in build_compressed_table_header".to_string())),
         };
         out.push(card_string(
             &format!("ZCTYP{}", n), name,

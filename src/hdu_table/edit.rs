@@ -59,7 +59,6 @@ const STRIP_TARGET_BYTES: usize = 1 << 20;
 // --------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_column_impl(
     py: Python<'_>,
     super_: &HDU,
@@ -394,8 +393,7 @@ fn insert_vla_column_impl(
         let mut g = lock_file(&super_.file)?;
         let f = g.as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        for r in 0..nrows {
-            let plan = plans[r];
+        for (r, &plan) in plans.iter().enumerate() {
             if plan.nelements == 0 {
                 continue;
             }

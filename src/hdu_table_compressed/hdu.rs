@@ -133,6 +133,10 @@ pub(crate) fn header_has_ztable(header: &[String]) -> bool {
 /// supported on compressed tables; rebuild the table through
 /// a fresh :meth:`FITS.create_table_hdu` + :meth:`write` to
 /// change the schema.
+// Version-stamped parsed-metadata cache (see `meta()`); the u64 is the
+// `cards_version` at parse time.
+type MetaCache = Arc<Mutex<Option<(u64, Arc<CompressedTableMeta>)>>>;
+
 #[pyclass(extends = TableHDU)]
 pub(crate) struct CompressedTableHDU {
     pub(crate) cache: Arc<ColumnTileCache>,
@@ -152,10 +156,11 @@ pub(crate) struct CompressedTableHDU {
     // schema plus per-column ZCTYPn algorithms; subsequent hits on
     // the same version return an Arc clone.  Invalidates on every
     // cards mutation via the version bump in CardsWriteGuard.
-    meta_cache: Arc<Mutex<Option<(u64, Arc<CompressedTableMeta>)>>>,
+    meta_cache: MetaCache,
 }
 
 impl CompressedTableHDU {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,
@@ -601,7 +606,7 @@ impl CompressedTableHDU {
                         "CompressedTableHDU[slice] = value: negative or \
                          zero step is not supported"));
                 }
-                let count = indices.slicelength as usize;
+                let count = indices.slicelength;
                 require_ndarray_with_length(
                     py, value, count, "CompressedTableHDU[slice]",
                 )?;

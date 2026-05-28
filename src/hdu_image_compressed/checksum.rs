@@ -56,7 +56,7 @@ fn read_uncompressed_image_be_bytes(
     let mut padded = raw_bytes;
     let pad = crate::hdu_image::round_up_to_block(padded.len() as u64)
         - padded.len() as u64;
-    padded.extend(std::iter::repeat(0u8).take(pad as usize));
+    padded.extend(std::iter::repeat_n(0u8, pad as usize));
     Ok(padded)
 }
 

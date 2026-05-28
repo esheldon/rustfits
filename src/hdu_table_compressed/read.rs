@@ -306,7 +306,7 @@ impl RowPlan {
             = std::collections::HashMap::new();
         let n_out = indices.len();
         for (output_row, disk_row) in indices.into_iter().enumerate() {
-            let tile_idx = if ztilelen > 0 { disk_row / ztilelen } else { 0 };
+            let tile_idx = disk_row.checked_div(ztilelen).unwrap_or(0);
             let in_tile = if ztilelen > 0 { disk_row % ztilelen } else { 0 };
             by_tile.entry(tile_idx).or_default().push(TileRowRequest {
                 in_tile_offset: in_tile,

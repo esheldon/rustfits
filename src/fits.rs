@@ -113,7 +113,7 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
     if raw_size == 0 {
         0
     } else {
-        ((raw_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) * BLOCK_SIZE as u64
+        raw_size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
     }
 }
 
@@ -187,7 +187,7 @@ fn parse_hdus_from_file(
         validate_header(&header_cards, hdus.is_empty())?;
 
         let num_header_blocks =
-            ((header_cards.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK) as u64;
+            header_cards.len().div_ceil(CARDS_PER_BLOCK) as u64;
         let header_size = num_header_blocks * BLOCK_SIZE as u64;
         let header_offset = offset;
         let data_offset = offset + header_size;
@@ -350,7 +350,7 @@ fn data_section_padded(data_size: u64) -> u64 {
     if data_size == 0 {
         0
     } else {
-        ((data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        data_size.div_ceil(BLOCK_SIZE as u64)
             * BLOCK_SIZE as u64
     }
 }
@@ -508,6 +508,9 @@ fn append_header_and_data_to_file(
 /// Use as a context manager (``with rustfits.FITS(...) as fits:``)
 /// to guarantee the file handle is closed.  ``len(fits)`` returns
 /// the HDU count; iteration yields each HDU in file order.
+// `FITS` is the public Python class name (rustfits.FITS); the acronym
+// can't be lowercased without breaking the API.
+#[allow(clippy::upper_case_acronyms)]
 #[pyclass]
 pub(crate) struct FITS {
     filename: String,
@@ -763,6 +766,7 @@ impl FITS {
     // columns (COMPRESSED_DATA + ZSCALE + ZZERO), plus an optional
     // GZIP_COMPRESSED_DATA fallback for tiles that can't be
     // quantized.  ZQUANTIZ + ZDITHER0 header cards are emitted.
+    #[allow(clippy::too_many_arguments)]
     fn create_compressed_image_hdu_impl(
         &mut self,
         py: Python<'_>,
@@ -1013,7 +1017,7 @@ impl FITS {
                     // ndiv >= 1 here because dim >= 4 and remain < 4
                     // implies tile <= dim - 4 < dim, so dim / tile >= 1.
                     let ndiv = dim / tile;
-                    let add = (remain + ndiv - 1) / ndiv;
+                    let add = remain.div_ceil(ndiv);
                     let suggested = tile + add;
                     return Err(PyValueError::new_err(format!(
                         "Hcompress1: image axis {} (size {}) with \
@@ -1085,9 +1089,9 @@ impl FITS {
         let tile_shape_fits: Vec<u64> =
             tile_shape_numpy.iter().rev().copied().collect();
 
-        let mut cards: Vec<String> = Vec::new();
-        cards.push(card_string("XTENSION", "BINTABLE",
-                               "binary table extension"));
+        let mut cards: Vec<String> = vec![card_string(
+            "XTENSION", "BINTABLE", "binary table extension",
+        )];
         cards.push(card_int("BITPIX", 8, "8-bit bytes"));
         cards.push(card_int("NAXIS", 2, "2-dimensional binary table"));
         cards.push(card_int("NAXIS1", naxis1 as i64,
@@ -1544,6 +1548,7 @@ impl FITS {
         dtype, dims, *, extname=None, extver=None,
         compress=None, quantize=None, blank=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn create_image_hdu(
         &mut self,
         py: Python<'_>,
@@ -1762,6 +1767,7 @@ impl FITS {
         var_dtypes=None, bit_columns=None, heap_format=None,
         compress=None, ztilelen=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn create_table_hdu(
         &mut self,
         py: Python<'_>,
@@ -1871,6 +1877,7 @@ impl FITS {
         data, *, extname=None, extver=None,
         compress=None, quantize=None, blank=None, header=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn write_image(
         &mut self,
         py: Python<'_>,
@@ -1956,6 +1963,7 @@ impl FITS {
         var_dtypes=None, bit_columns=None, heap_format=None,
         compress=None, ztilelen=None, header=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn write_table(
         &mut self,
         py: Python<'_>,

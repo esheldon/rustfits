@@ -716,8 +716,10 @@ fn build_hierarch_string_cards(
 
 fn card_value_ends_with_amp(card: &str) -> bool {
     let trimmed = card.trim_end();
-    let value_part: &str = if trimmed.starts_with("CONTINUE") {
-        if trimmed.len() > 8 { &trimmed[8..] } else { return false; }
+    let value_part: &str = if let Some(rest) =
+        trimmed.strip_prefix("CONTINUE")
+    {
+        rest
     } else if let Some(eq_pos) = trimmed.find('=') {
         &trimmed[eq_pos + 1..]
     } else {
@@ -751,8 +753,8 @@ fn set_card_for_key(cards: &mut Vec<String>, key: &str, new_cards: Vec<String>) 
         .collect();
 
     let mut existing_start: Option<usize> = None;
-    for i in 0..cards.len() {
-        let card_key = match keyword_of(&cards[i]) {
+    for (i, card) in cards.iter().enumerate() {
+        let card_key = match keyword_of(card) {
             Some(k) => k,
             None => continue,
         };
@@ -1032,7 +1034,7 @@ pub(crate) fn rewrite_header_to_disk(
     // valid (they share Arc<HduOffsets> with the layout entry).
     if cards.len() > max_cards {
         let needed_blocks =
-            ((cards.len() + CARDS_PER_BLOCK - 1) / CARDS_PER_BLOCK) as u64;
+            cards.len().div_ceil(CARDS_PER_BLOCK) as u64;
         let delta_blocks = needed_blocks - header_block_count;
         let delta_bytes = delta_blocks * BLOCK_SIZE as u64;
         let data_offset = offsets.data_offset();

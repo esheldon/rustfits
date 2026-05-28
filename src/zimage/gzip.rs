@@ -188,7 +188,7 @@ pub(crate) fn encode_gzip2(
             bytepix
         )));
     }
-    if pixel_bytes_be.len() % bytepix as usize != 0 {
+    if !pixel_bytes_be.len().is_multiple_of(bytepix as usize) {
         return Err(PyValueError::new_err(format!(
             "GZIP_2 encode: input length {} not a multiple of bytepix {}",
             pixel_bytes_be.len(), bytepix

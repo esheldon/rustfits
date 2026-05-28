@@ -83,6 +83,9 @@ impl CardsWriteGuard<'_> {
 /// The shared inherited surface is small on purpose — most of the
 /// useful methods live on the subclasses, where the data layout
 /// is known.
+// `HDU` is the public Python base-class name; the acronym can't be
+// lowercased without breaking the API.
+#[allow(clippy::upper_case_acronyms)]
 #[pyclass(subclass)]
 pub(crate) struct HDU {
     // Shared with FITSHeader so mutations through the header view propagate

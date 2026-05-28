@@ -461,8 +461,7 @@ fn repack_compressed_table_heap_vla(
     let desc_bytes_u64 = (n_tiles * descriptor_row_width) as u64;
 
     for tile_idx in 0..n_tiles {
-        for col_idx in 0..ncols {
-            let col = &columns[col_idx];
+        for (col_idx, col) in columns.iter().enumerate() {
             let desc_off = tile_idx * descriptor_row_width + col_idx * 16;
             let nelems_s = i64::from_be_bytes(
                 desc_table[desc_off..desc_off + 8].try_into().unwrap(),

@@ -178,7 +178,7 @@ fn encode_tile_int(
         ctx.algorithm, tile_bytes, ctx.bytepix, n_pixels,
         ctx.zbitpix, encode_params,
     )?;
-    if encoded.len() as u64 % ctx.inner_byte_width != 0 {
+    if !(encoded.len() as u64).is_multiple_of(ctx.inner_byte_width) {
         return Err(PyValueError::new_err(format!(
             "internal: encoded tile {} bytes={} not a multiple \
              of inner_byte_width={}",
@@ -219,7 +219,7 @@ fn encode_tile_float(
     // Quantize.  nxpix = numpy-last (fast) axis; nypix = the rest.
     // 1-based tile index drives the dither seed.
     let nxpix = actual_shape[actual_shape.len() - 1] as usize;
-    let nypix = if nxpix == 0 { 0 } else { n_pixels / nxpix };
+    let nypix = n_pixels.checked_div(nxpix).unwrap_or(0);
     let row_1based = tile_idx + 1;
     let qt_opt = if ctx.zbitpix == -32 {
         let mut tile_f32: Vec<f32> = Vec::with_capacity(n_pixels);
@@ -259,7 +259,7 @@ fn encode_tile_float(
             ctx.algorithm, &i32_be, 4, n_pixels, 32,
             encode_params,
         )?;
-        if encoded.len() as u64 % ctx.inner_byte_width != 0 {
+        if !(encoded.len() as u64).is_multiple_of(ctx.inner_byte_width) {
             return Err(PyValueError::new_err(format!(
                 "internal: encoded tile {} bytes={} not a multiple \
                  of inner_byte_width={}",
@@ -763,7 +763,7 @@ pub(crate) fn write_compressed_image_data(
     let new_padded = if new_data_size == 0 {
         0
     } else {
-        ((new_data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        new_data_size.div_ceil(BLOCK_SIZE as u64)
             * BLOCK_SIZE as u64
     };
     // Current data extent = file size between data_offset and the next
@@ -967,7 +967,7 @@ pub(crate) fn write_compressed_image_data(
 // No-op if the card isn't present — caller must guarantee it
 // exists, which holds for the cards we update at extend time
 // (NAXIS2 / PCOUNT / ZNAXISn are all mandatory).
-fn update_int_card(cards: &mut Vec<String>, key: &str, value: i64) {
+fn update_int_card(cards: &mut [String], key: &str, value: i64) {
     let key_uc = key.to_uppercase();
     if let Some(idx) = cards.iter().position(|c| {
         c.len() >= 8 && c[..8].trim().to_uppercase() == key_uc
@@ -1196,12 +1196,11 @@ pub(crate) fn extend_compressed_image_data(
     let new_n_tiles = compute_n_tiles(&new_image_shape, &tile_shape);
 
     let t_r = tile_shape[0];
-    let n_old_tile_rows_slow = (old_naxis0 + t_r - 1) / t_r;
+    let n_old_tile_rows_slow = old_naxis0.div_ceil(t_r);
     let n_tiles_per_row_slow: u64 = {
         let mut prod = 1u64;
         for ax in 1..naxis {
-            let n_along = (old_image_shape[ax] + tile_shape[ax] - 1)
-                / tile_shape[ax];
+            let n_along = old_image_shape[ax].div_ceil(tile_shape[ax]);
             prod *= n_along;
         }
         prod
@@ -1519,7 +1518,7 @@ pub(crate) fn extend_compressed_image_data(
     // by primary size so descriptors point at the right slot.  No-op
     // for integer/unquantized-float (fallback heap is empty).
     let appended_primary_size = appended_heap.len() as u64;
-    appended_heap.extend(appended_fallback_heap.drain(..));
+    appended_heap.append(&mut appended_fallback_heap);
     for (_, row) in boundary_updates.iter_mut() {
         if row.fallback_nelem > 0 {
             row.fallback_off += appended_primary_size;
@@ -1559,7 +1558,7 @@ pub(crate) fn extend_compressed_image_data(
     let new_padded = if new_data_size == 0 {
         0
     } else {
-        ((new_data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        new_data_size.div_ceil(BLOCK_SIZE as u64)
             * BLOCK_SIZE as u64
     };
     let current_hdu_end = {
@@ -1879,6 +1878,7 @@ pub(crate) fn read_descriptor_from_buf(
 // descriptor + ZSCALE (1D) + ZZERO (1D) + GZIP fallback descriptor.
 // This helper writes one such row into `buf` at `at` (the start of
 // the row).  `descriptor_size` is 8 for P-format, 16 for Q-format.
+#[allow(clippy::too_many_arguments)]
 fn write_quant_descriptor_row(
     buf: &mut [u8],
     at: usize,
@@ -2325,7 +2325,7 @@ pub(crate) fn setitem_compressed_image(
     // (No-op for integer/unquantized-float — fallback_heap is
     // empty.  Quantized-float may have both.)
     let appended_primary_size = appended_heap.len() as u64;
-    appended_heap.extend(appended_fallback_heap.drain(..));
+    appended_heap.append(&mut appended_fallback_heap);
     for (_, row) in tile_updates.iter_mut() {
         if row.fallback_nelem > 0 {
             row.fallback_off += appended_primary_size;
@@ -2375,7 +2375,7 @@ pub(crate) fn setitem_compressed_image(
     let new_padded = if new_data_size == 0 {
         0
     } else {
-        ((new_data_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        new_data_size.div_ceil(BLOCK_SIZE as u64)
             * BLOCK_SIZE as u64
     };
     let current_hdu_end = {

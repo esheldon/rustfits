@@ -143,7 +143,7 @@ fn classify_var_numpy_field(
     let err = |reason: &str| PyValueError::new_err(format!(
         "var_dtypes['{}'] = '{}': {}", col_name, inner_dtype, reason));
     let s = inner_dtype
-        .trim_start_matches(|c| c == '<' || c == '>' || c == '|' || c == '=');
+        .trim_start_matches(['<', '>', '|', '=']);
     // String VLA aliases (FITS letter 'A').  Check BEFORE the numeric
     // lowercase match below — numpy's uppercase 'S' / 'U' string-kind
     // characters lowercase to 'u' / 's', which would collide with the
@@ -440,8 +440,8 @@ fn build_bintable_header_cards(
     extver: Option<i64>,
 ) -> Vec<String> {
     let row_width: usize = write_columns.iter().map(|c| c.byte_width).sum();
-    let mut cards: Vec<String> = Vec::new();
-    cards.push(card_string("XTENSION", "BINTABLE", "binary table extension"));
+    let mut cards: Vec<String> =
+        vec![card_string("XTENSION", "BINTABLE", "binary table extension")];
     cards.push(card_int("BITPIX", 8, "8-bit bytes"));
     cards.push(card_int("NAXIS", 2, "2-dimensional binary table"));
     cards.push(card_int("NAXIS1", row_width as i64, "width of table in bytes"));
@@ -488,6 +488,7 @@ fn build_bintable_header_cards(
 // Used by FITS.create_table_hdu: the user-facing entry takes a PyAny
 // that may be a numpy.dtype OR a descr list of tuples.  Normalize
 // through numpy.dtype(), then emit cards.  Returns (cards, row_width).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn normalize_and_build_table_header(
     py: Python<'_>,
     dtype_in: &Bound<'_, PyAny>,
@@ -629,16 +630,15 @@ pub(crate) fn column_transform(
 
     // Unsigned-int trick: column letter + TZERO matches one of the
     // power-of-two offsets, and TSCAL is 1.
-    let unsigned_trick = col.tscal == 1.0 && matches!(
-        (col.tform_letter, col.tzero),
-        ('I', t) if t == 32768.0
-    ) || col.tscal == 1.0 && matches!(
-        (col.tform_letter, col.tzero),
-        ('J', t) if t == 2147483648.0
-    ) || col.tscal == 1.0 && matches!(
-        (col.tform_letter, col.tzero),
-        ('K', t) if t == 9223372036854775808.0
-    );
+    let unsigned_trick = col.tscal == 1.0
+        && (matches!(
+            (col.tform_letter, col.tzero), ('I', t) if t == 32768.0
+        ) || matches!(
+            (col.tform_letter, col.tzero), ('J', t) if t == 2147483648.0
+        ) || matches!(
+            (col.tform_letter, col.tzero),
+            ('K', t) if t == 9223372036854775808.0
+        ));
     if unsigned_trick {
         if input_kind == "u" && input_size == nat_size {
             return Ok(WriteTransform::UnsignedXor {

@@ -65,7 +65,7 @@ pub(crate) fn compute_n_tiles(image_shape: &[u64], tile_shape: &[u64]) -> u64 {
         if img == 0 || tile == 0 {
             return 0;
         }
-        total = total.saturating_mul((img + tile - 1) / tile);
+        total = total.saturating_mul(img.div_ceil(tile));
     }
     total
 }
@@ -385,7 +385,7 @@ fn tform_byte_width(tform: &str) -> PyResult<u64> {
         'K' | 'D' | 'C' => Ok(repeat * 8),
         'M' => Ok(repeat * 16),
         // Bit-array: ceil(repeat / 8) bytes.
-        'X' => Ok((repeat + 7) / 8),
+        'X' => Ok(repeat.div_ceil(8)),
         // Variable-length descriptors — fixed bytes per
         // descriptor; `repeat` here is the descriptor count.
         'P' => Ok(repeat * 8),
@@ -457,16 +457,14 @@ pub(crate) fn parse_rice_params(header: &[String]) -> (Option<u32>, Option<u32>)
         }
         let v = parse_keyword(header, &val_key);
         match (name.as_deref().map(|s| s.trim()), v) {
-            (Some("BLOCKSIZE"), Some(val)) => {
-                if val > 0 {
+            (Some("BLOCKSIZE"), Some(val))
+                if val > 0 => {
                     blocksize = Some(val as u32);
                 }
-            }
-            (Some("BYTEPIX"), Some(val)) => {
-                if val > 0 {
+            (Some("BYTEPIX"), Some(val))
+                if val > 0 => {
                     bytepix = Some(val as u32);
                 }
-            }
             _ => {}
         }
     }

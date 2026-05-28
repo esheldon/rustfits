@@ -109,6 +109,10 @@ use super::write_vla::{
 /// Compressed binary tables (``ZTABLE=T``) return the subclass
 /// :class:`CompressedTableHDU` instead, which overrides the read
 /// and write methods to handle per-tile decompression.
+// Version-stamped parsed-metadata cache (see `meta()`); the u64 is the
+// `cards_version` at parse time.
+type MetaCache = Arc<Mutex<Option<(u64, Arc<TableMeta>)>>>;
+
 #[pyclass(extends = HDU, subclass)]
 pub(crate) struct TableHDU {
     // Lazily-populated per-HDU parsed-metadata cache.  See `meta()`
@@ -119,7 +123,7 @@ pub(crate) struct TableHDU {
     // call observes a higher version (Phase 1 atomic) and re-parses.
     // See `CompressedImageHDU.meta_cache` for the parallel pattern
     // on the image side.
-    pub(crate) meta_cache: Arc<Mutex<Option<(u64, Arc<TableMeta>)>>>,
+    pub(crate) meta_cache: MetaCache,
 }
 
 impl TableHDU {

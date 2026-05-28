@@ -99,6 +99,10 @@ pub(crate) type TileCache = BytesBoundLruCache<u64>;
 /// Use :meth:`FITS.create_image_hdu` with ``compress=`` to
 /// create a tile-compressed image.  Direct construction from
 /// Python is not supported.
+// Version-stamped parsed-metadata cache (see `meta()`); the u64 is the
+// `cards_version` at parse time.
+type MetaCache = Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>;
+
 #[pyclass(extends = ImageHDU)]
 pub(crate) struct CompressedImageHDU {
     pub(crate) cache: Arc<TileCache>,
@@ -133,10 +137,11 @@ pub(crate) struct CompressedImageHDU {
     // re-parses.  Wrapped in Arc<Mutex<...>> so concurrent readers
     // briefly serialize on the lock (uncontended in the GIL-held
     // case today, correct for future allow_threads use).
-    meta_cache: Arc<Mutex<Option<(u64, Arc<CompressedImageMeta>)>>>,
+    meta_cache: MetaCache,
 }
 
 impl CompressedImageHDU {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         header: Vec<String>,
         index: usize,

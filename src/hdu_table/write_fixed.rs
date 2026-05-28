@@ -708,6 +708,7 @@ pub(crate) fn write_table_one_column(
 // Bulk write path for tables with no VLA columns.  Validates input
 // against the table schema, then dispatches to write_table_data,
 // which writes contiguous main-section rows.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_fixed_only(
     py: Python<'_>,
     super_: &HDU,
@@ -829,9 +830,8 @@ pub(crate) fn append_fixed_only(
         columns, &prep.transforms, &sources, prep.layout_matches,
         &super_.file, append_offset, append_nrows, row_width,
         &super_.tainted,
-    ).map_err(|e| {
+    ).inspect_err(|_e| {
         super_.tainted.store(true, Ordering::Release);
-        e
     })
 }
 
@@ -848,7 +848,7 @@ pub(crate) fn append_fixed_only(
 // hint, keep the larger value (so append/setitem never shrink it
 // below a previously-recorded peak).
 pub(crate) fn set_x_vla_tform_maxlen_in_cards(
-    new_cards: &mut Vec<String>,
+    new_cards: &mut [String],
     column_index_1based: usize,
     descriptor_kind: char,
     new_max_bits: usize,
