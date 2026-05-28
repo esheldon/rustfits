@@ -4006,6 +4006,70 @@ Don't aim for 100% on `/src`.  90-95% covered + the
 remaining gaps explicitly catalogued (in code comments or
 this section) is the actual target.
 
+## Cleanup / refactoring TODO
+
+Code-organization backlog (logged 2026-05-28).  These are
+janitorial, not feature work — none changes behavior.  **Suggested
+ordering: do the structural splits (1 + 2) first, then the cleanup
+passes (3 + 4) on the settled structure so you don't clean code
+you're about to move; 5 is independent and can happen anytime.**
+
+1. **Split the two giant `.rs` files into directory modules.**
+   `src/hdu_table_compressed.rs` (~5970 lines) and
+   `src/hdu_image_compressed.rs` (~5360 lines) are still single
+   files, while the *uncompressed* table side was already split into
+   the `src/hdu_table/` directory module (the 2026-05 refactor).
+   Mirror that pattern: break each into single-responsibility files
+   (rough cut: `detection`/accessors, `read`, `write`, `setitem`,
+   `repack`, `checksum`) behind a `mod.rs` that re-exports only the
+   external surface.  Keep the visibility discipline from the
+   `hdu_table/` split (private `fn` by default; `pub(crate)` only
+   when a sibling file actually imports it).  Leave
+   `src/zimage/hcompress.rs` (~2440) alone — it's a faithful
+   line-by-line port of cfitsio's `fits_hdecompress.c`/`fits_hcompress.c`
+   and the function-name parity with cfitsio is a debugging asset;
+   splitting it would hurt side-by-side diffing.
+
+2. **Extract compression code shared by the image + table compressed
+   HDUs.**  Really a sub-goal of #1, best done *during* the split,
+   not as a separate pass.  Both compressed HDUs duplicate per-tile
+   encode/decode dispatch, P/Q descriptor I/O, and gzip-blob
+   handling.  (`src/cache.rs`'s `BytesBoundLruCache` is already
+   shared.)  Pull the common bits into a `zimage`-adjacent shared
+   module so per-tile semantics evolve in one place — the same
+   motivation behind reusing `apply_transform_cell` /
+   `serialize_vla_cell` across the uncompressed write paths.
+
+3. **Audit for gratuitous `pub(crate)`.**  Mechanical and low-risk
+   (the compiler flags over-demotion).  Demote helpers that only
+   their own file uses back to private `fn`.  Do this AFTER #1/#2 —
+   moving code changes what genuinely needs cross-module visibility,
+   so an earlier pass would just be redone.  See the visibility-
+   discipline note under "Project structure".
+
+4. **Clippy: fix or consciously `#[allow]`.**  ~140 lib warnings as
+   of 2026-05-28.  The bulk (~49 "manually reimplementing", ~15
+   index-only `for i in 0..len` loops, plus assorted needless
+   refs/casts) is auto-fixable — start with `cargo clippy --fix
+   --lib`.  The judgment calls are ~22 `too_many_arguments` (8–11
+   args, in the encode / setitem / extend dispatchers): some already
+   bundle their stable args into a ctx struct (`IntTileCtx`,
+   `FloatTileCtx`, `SetItemCtx`); the rest either get the same
+   treatment or an `#[allow(clippy::too_many_arguments)]` with a
+   one-line rationale.  Target: zero warnings OR each remaining one
+   explicitly `#[allow]`-ed with a reason.  Also AFTER #1/#2.
+
+5. **Reorganize tests by feature, not dev phase.**  The
+   `tests/test_compressed_table_phase1.py` … `_phase6*.py` files
+   (and any other phase-numbered suites) are ordered by the
+   development phase that introduced them.  Regroup by what they
+   exercise (read / write / append / repack / setitem / checksum /
+   vla / accessors).  Independent of #1–#4.  **Caveat:** CLAUDE.md
+   references many of these suites by filename AND by phase number
+   throughout the ZTABLE / ZIMAGE roadmaps — those references move
+   with the files, so budget a doc-update pass alongside the test
+   shuffle.
+
 ## Performance — ZIMAGE chunked-read profiling history
 
 Reading a 1.49-billion-pixel f8 GZIP_2 ZIMAGE file (~12 GB;
