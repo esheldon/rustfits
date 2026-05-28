@@ -265,6 +265,107 @@ def test_non_contiguous_rejected():
                 fits.hdus[0].write(non_contig)
 
 
+# -------------------- create_image_hdu dtype-like inputs --------------------
+
+
+@pytest.mark.parametrize(
+    "dtype_input, expected_bitpix",
+    [
+        # Plain numpy short-codes (existing behavior).
+        ("f8", -64),
+        ("i4", 32),
+        ("u2", 16),
+        # Endianness-prefixed numpy short-codes — stripped by
+        # dtype_to_bitpix's leading-prefix trim.
+        ("<i4", 32),
+        (">f4", -32),
+        # Long-form numpy aliases handled by np.dtype(...).str
+        # normalization on the Rust side.
+        ("int32", 32),
+        ("float64", -64),
+        ("uint8", 8),
+        # numpy scalar types.
+        (np.int32, 32),
+        (np.float64, -64),
+        (np.uint8, 8),
+        (np.int8, 8),  # unsigned-int trick (i1 stored as i2 + BZERO).
+        # Python builtins (numpy maps int → i8, float → f8).
+        (int, 64),
+        (float, -64),
+        # An existing np.dtype object.
+        (np.dtype("i2"), 16),
+        (np.dtype(">f8"), -64),
+    ],
+)
+def test_create_image_hdu_dtype_like_inputs(dtype_input, expected_bitpix):
+    """
+    create_image_hdu accepts anything np.dtype() accepts — strings
+    (with or without endianness), long-form aliases, numpy scalar
+    types, Python builtins, and np.dtype objects all normalize to
+    the same BITPIX.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "dtype.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(dtype_input, (4,), extname="X")
+            assert fits[0].bitpix == expected_bitpix
+
+
+def test_create_image_hdu_dtype_object_write_roundtrip():
+    """
+    Passing np.dtype(...) directly (instead of a short-code) yields
+    an HDU that round-trips a matching-dtype write.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "rt.fits")
+        data = np.arange(12, dtype="f4").reshape(3, 4)
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(np.dtype("f4"), data.shape, extname="X")
+            fits[0].write(data)
+        with rustfits.FITS(fname) as fits:
+            np.testing.assert_array_equal(fits[0].read(), data)
+
+
+def test_create_image_hdu_python_float_writes_f8():
+    """
+    `float` is a stand-in for `np.float64` per numpy's convention;
+    repeat the round-trip end-to-end so the BITPIX + data path agree.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "pyfloat.fits")
+        data = np.linspace(0.0, 1.0, 8, dtype="f8")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(float, data.shape, extname="X")
+            assert fits[0].bitpix == -64
+            fits[0].write(data)
+        with rustfits.FITS(fname) as fits:
+            np.testing.assert_array_equal(fits[0].read(), data)
+
+
+def test_create_image_hdu_rejects_unsupported_dtype_object():
+    """
+    Complex dtypes still raise the dtype_to_bitpix error message
+    (np.complex64 normalizes to '<c8' which is not supported).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "bad.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises(ValueError, match="unsupported numpy dtype"):
+                fits.create_image_hdu(np.complex64, (4,))
+
+
+def test_create_image_hdu_rejects_garbage_dtype():
+    """
+    np.dtype() raises TypeError on completely bogus input
+    (e.g. a list or a random object); the error surfaces unchanged.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "bad.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises((TypeError, ValueError)):
+                fits.create_image_hdu(object(), (4,))
+
+
 # -------------------- extension HDU write --------------------
 
 

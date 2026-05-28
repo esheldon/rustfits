@@ -1466,9 +1466,13 @@ impl FITS {
     ///
     /// Parameters
     /// ----------
-    /// dtype : str
-    ///     numpy short-code for the image element type, e.g.
-    ///     ``'f8'``, ``'i4'``, ``'u2'``.  Both the BITPIX-native
+    /// dtype : dtype-like
+    ///     Anything :func:`numpy.dtype` accepts: a short-code
+    ///     string (``'f8'``, ``'i4'``, ``'u2'``), a numpy scalar
+    ///     type (``numpy.int32``, ``numpy.float64``), a Python
+    ///     builtin (``int``, ``float``), or a
+    ///     :class:`numpy.dtype` instance.  Normalized internally
+    ///     via ``numpy.dtype(...)``.  Both the BITPIX-native
     ///     dtypes (``u1`` / ``i2`` / ``i4`` / ``i8`` / ``f4`` /
     ///     ``f8``) and the unsigned-int trick dtypes (``i1`` /
     ///     ``u2`` / ``u4`` / ``u8``) are accepted; the latter
@@ -1525,7 +1529,7 @@ impl FITS {
     fn create_image_hdu(
         &mut self,
         py: Python<'_>,
-        dtype: String,
+        dtype: &Bound<'_, PyAny>,
         dims: Vec<i64>,
         extname: Option<String>,
         extver: Option<i64>,
@@ -1533,9 +1537,20 @@ impl FITS {
         quantize: Option<Py<PyAny>>,
         blank: Option<i64>,
     ) -> PyResult<()> {
+        // Normalize the dtype-like input through `numpy.dtype(...)`
+        // so callers can pass any of: a short-code string ('f8'),
+        // numpy scalar type (np.int32), Python builtin (float), or
+        // an existing np.dtype object.  Use .str (e.g. '<i4') which
+        // dtype_to_bitpix already handles (it trims byte-order
+        // prefixes and lowercases).
+        let np = py.import("numpy")?;
+        let dtype_str: String = np
+            .call_method1("dtype", (dtype,))?
+            .getattr("str")?
+            .extract()?;
         if let Some(cfg) = compress {
             return self.create_compressed_image_hdu_impl(
-                py, dtype, dims, extname, extver, cfg, quantize, blank,
+                py, dtype_str, dims, extname, extver, cfg, quantize, blank,
             );
         }
         if quantize.is_some() {
@@ -1553,7 +1568,7 @@ impl FITS {
             }
         }
 
-        let (bitpix, bzero) = dtype_to_bitpix(&dtype)?;
+        let (bitpix, bzero) = dtype_to_bitpix(&dtype_str)?;
         let naxis = dims.len() as i64;
 
         // numpy (row-major) -> FITS (NAXIS1 is fastest-varying): reverse.
@@ -1845,12 +1860,11 @@ impl FITS {
         // the mask) but coerces plain lists/tuples to ndarrays.
         let np = py.import("numpy")?;
         let arr = np.call_method1("asanyarray", (data,))?;
-        let dtype_str: String =
-            arr.getattr("dtype")?.getattr("str")?.extract()?;
+        let dtype = arr.getattr("dtype")?;
         let shape: Vec<i64> = arr.getattr("shape")?.extract()?;
 
         self.create_image_hdu(
-            py, dtype_str, shape, extname, extver,
+            py, &dtype, shape, extname, extver,
             compress, quantize, blank,
         )?;
 
