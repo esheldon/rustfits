@@ -145,6 +145,17 @@ The wrapper `tools/cargo-test.sh` prepends the conda env's lib
 directory to `LD_LIBRARY_PATH` so the PyO3-linked test binary can
 find `libpython.X.so` — bare `cargo test` fails without it.
 
+## Contributing
+
+Contributions and bug reports are welcome.  Please feel free to open pull
+requests or issues at https://github.com/esheldon/rustfits
+
+rustfits is mostly written in rust.  If you don't know rust, you can
+still make contributions.  The extensive CLAUDE.md file can be used
+by claude code or other agents to help you fix bugs or add features.
+Just start the agent, ask it to load from CLAUDE.md, and ask the agent
+to help you make changes or find the source of bugs. 
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.
