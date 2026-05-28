@@ -3918,6 +3918,34 @@ with rustfits.FITS(fname, "r") as fits:
 Or a `_check_both(fname, fits, predicate)` helper for tests with multiple
 assertions.  Either is fine.
 
+### Test file naming (topic-prefix scheme)
+
+`tests/` is a flat directory; files are named `test_<area>_<feature>.py`
+so a plain `ls` groups them by area.  `<area>` is one of:
+
+- `image` / `table` — uncompressed image / BINTABLE features.  Sub-clusters
+  follow as further words: `compressed`, `vla`, `create`, `read`, `write`,
+  `setitem`, `append`, `repack`, etc. — e.g.
+  `test_image_compressed_read_rice.py`,
+  `test_table_compressed_setitem_vla.py`, `test_table_create_dtypes.py`,
+  `test_table_vla_write.py`.  Compressed-HDU tests live under the HDU type
+  they belong to (`test_image_compressed_*`, `test_table_compressed_*`),
+  and VLA is a table concept (`test_table_vla_*`).
+- `header` — `FITSHeader` / `FITSHeaderEdit` features.
+- `hdu` — cross-HDU / base-HDU concerns that aren't type-specific
+  (`test_hdu_accessors`, `test_hdu_checksum`, `test_hdu_data_size`,
+  `test_hdu_units`).
+- `fits` — `FITS` container / file level (`test_fits_open`,
+  `test_fits_open_multi`, `test_fits_getitem`).
+- `convenience` — the top-level `rustfits.read` / `rustfits.write` wrappers
+  (`test_convenience_read`, `test_convenience_write`).
+
+Two files are intentionally left unprefixed because they don't belong to a
+single area: `test_repr.py` (spans `FITS` + every HDU type) and
+`test_healsparse_bitpack_roundtrip.py` (an end-to-end integration test).
+When adding a test, name it for the area + feature it exercises, not the
+work item that introduced it (no "phaseN" / dev-stage names).
+
 ## Known CI limitations
 
 **macOS dropped from the test matrix (May 2026).**  The CI
@@ -4096,18 +4124,15 @@ Items 1–5 all shipped 2026-05-28; this backlog is complete.
    clippy; re-running `cargo clippy --lib` should stay at zero.
 
 5. ✅ **Reorganize tests by feature, not dev phase.**  Done
-   2026-05-28.  The 25 phase-numbered suites were `git mv`-renamed to
-   feature names (flat layout, history preserved): compressed-image
-   `phaseN_*` → `accessors` / `read_{rice,slice,gzip,quantize,hcompress,plio}`
-   / `write_{gzip,gzip2,rice,hcompress,plio,quantize,unquantized}`;
-   compressed-table `phaseN` → `accessors` / `read` / `read_slice` /
-   `read_vla` / `write` / `write_vla` / `append`; `create_table_1{b,c,d,e}`
-   → `dtypes` / `subarray` / `strings` / `input_forms`.  Module-docstring
-   "Phase N" summary tokens were dropped; all filename references in the
-   roadmaps below and across the test suite were swept to the new names.
-   (Subdirectory layout was considered and declined — flat + descriptive
-   names was preferred for `ls`-browsability.)  Deeper "Phase N" narrative
-   in roadmap prose and in body comments is kept as dev history.
+   2026-05-28 in two steps: the phase-numbered suites were first renamed
+   to feature names, then the whole suite was renamed to a **topic-prefix
+   scheme** so a flat `ls tests/` groups by area.  See the test-naming
+   convention under "Testing conventions" for the final scheme.  All
+   `git mv` (history preserved); module-docstring "Phase N" summary tokens
+   dropped; every filename reference in the roadmaps below was swept to
+   the new names (the "Phase N" *narrative* there is kept as dev history).
+   Subdirectory layout was considered and declined — flat + descriptive
+   names was preferred for `ls`-browsability.
 
 ## Performance — ZIMAGE chunked-read profiling history
 
