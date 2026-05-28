@@ -28,6 +28,45 @@ insensitive).  HDUs come back typed: :class:`~rustfits.ImageHDU`,
 :class:`~rustfits.TableHDU`, :class:`~rustfits.CompressedImageHDU`,
 etc.
 
+In a repl, the FITS object gives a nice representation
+
+.. code-block::
+
+  >>> fits
+  file: /home/esheldon/data/tmp/tmp9fl85sgs/mix.fits
+  mode: r
+  extnum  hdutype     extname
+  0       IMAGE_HDU
+  1       BINARY_TBL  MYTABLE
+
+As do the HDUs
+
+.. code-block::
+
+  >>> fits['image_hdu']
+  file: img.fits
+  extension: 0
+  type: IMAGE_HDU
+  image info:
+    data type: f8
+    dims: [300, 400]
+
+  >>> fits['table_hdu']
+  file: table.fits
+  extension: 1
+  type: BINARY_TBL
+  extname: WIDE
+  rows: 3
+  column info:
+    index      i8
+    flags      ?
+    name       U   array[var]
+    source     U12
+    ra         f8
+    dec        f8
+    shape      f4  array[2]
+    samples    f4  array[16]
+
 File modes
 ----------
 
