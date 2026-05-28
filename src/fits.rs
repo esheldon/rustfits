@@ -1956,6 +1956,102 @@ impl FITS {
         Ok(hdu)
     }
 
+    /// Write ``data`` to a new HDU, auto-detecting image vs table.
+    ///
+    /// Minimal-tier counterpart to :meth:`write_image` and
+    /// :meth:`write_table` — accepts only the universal kwargs
+    /// (``extname``, ``header``) and dispatches on the data type:
+    ///
+    ///   * plain (non-structured) :class:`numpy.ndarray` →
+    ///     :meth:`write_image`
+    ///   * structured :class:`numpy.ndarray`
+    ///     (``dtype.fields is not None``) → :meth:`write_table`
+    ///   * ``{name: array}`` dict → :meth:`write_table`
+    ///   * list-of-arrays + ``names=`` → rejected (call
+    ///     :meth:`write_table` directly)
+    ///   * anything else → :class:`ValueError`
+    ///
+    /// Convenient for copying HDUs between files without caring
+    /// about their type::
+    ///
+    ///     with rustfits.FITS(infile) as src:
+    ///         with rustfits.FITS(outfile, "w+") as dst:
+    ///             for hdu in src:
+    ///                 if hdu.has_data:
+    ///                     dst.write(hdu.read())
+    ///
+    /// For knobs like ``compress=``, ``quantize=``, ``blank=``,
+    /// ``var_dtypes=``, ``units=``, etc., use the type-specific
+    /// :meth:`write_image` / :meth:`write_table` directly.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray or dict
+    ///     Image: a plain ndarray.  Table: a structured ndarray or
+    ///     a ``{name: ndarray}`` dict.
+    /// extname : str, optional
+    ///     EXTNAME to set on the new HDU.
+    /// header : FITSHeader or dict, optional
+    ///     Cards to copy into the new HDU after the write.
+    ///
+    /// Returns
+    /// -------
+    /// hdu : ImageHDU, TableHDU, or compressed variant
+    ///     The newly created HDU, ready for further reads/writes
+    ///     while the FITS handle is open.
+    ///
+    /// See Also
+    /// --------
+    /// write_image : Image-specific create+write with all knobs.
+    /// write_table : Table-specific create+write with all knobs.
+    #[pyo3(signature = (data, *, extname=None, header=None))]
+    fn write(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        extname: Option<String>,
+        header: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        // Dict → table.  Checked first so a dict subclass with
+        // a `dtype` attribute (unlikely but possible) still routes
+        // to the table path.
+        if data.is_instance_of::<PyDict>() {
+            return self.write_table(
+                py, data, None, extname, None, None,
+                None, None, None, None, None, header,
+            );
+        }
+        // numpy.ndarray → image or table depending on structured dtype.
+        // Strict isinstance against numpy.ndarray rather than
+        // asanyarray-coercion: a bare list could be either "image
+        // pixels" or "column arrays for a table", and the ambiguity
+        // is better resolved by sending the user to the explicit
+        // write_table(names=...) form than by guessing.
+        let np = py.import("numpy")?;
+        let ndarray = np.getattr("ndarray")?;
+        if data.is_instance(&ndarray)? {
+            let dtype = data.getattr("dtype")?;
+            let is_structured = !dtype.getattr("fields")?.is_none();
+            if is_structured {
+                return self.write_table(
+                    py, data, None, extname, None, None,
+                    None, None, None, None, None, header,
+                );
+            }
+            return self.write_image(
+                py, data, extname, None, None, None, None, header,
+            );
+        }
+        Err(PyValueError::new_err(format!(
+            "FITS.write() accepts a numpy ndarray (image or \
+             structured) or a {{name: array}} dict (table); got {}.  \
+             For lists of arrays with names=, or any of the \
+             type-specific kwargs (compress=, blank=, var_dtypes=, \
+             ...), use FITS.write_image() / FITS.write_table().",
+            data.get_type().name()?,
+        )))
+    }
+
     // Accept either an integer (positional, with Python-style negative
     // indexing) or a string (EXTNAME lookup, case-insensitive).  A bool is
     // rejected explicitly because Python's int/bool subclass relationship

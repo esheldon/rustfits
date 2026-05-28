@@ -5,7 +5,7 @@ compressed tables.
 `CompressedTableHDU.__setitem__` for the three column-targeted forms:
 
   - hdu["col"] = arr           (whole-column; all tiles)
-  - hdu[r, "col"] = v          (single cell; one tile)
+  - hdu["col"][r] = v          (single cell; one tile; subset form)
   - hdu[[c1, c2]] = arr        (multi-column subset; structured RHS)
 
 Affected tiles are decoded for ONLY the selected columns, the rows'
@@ -193,7 +193,7 @@ def test_setitem_cell_scalar_int():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "id"] = 99_999
+            f[1]["id"][50] = 99_999
         modified = original.copy()
         modified["id"][50] = 99_999
         _check_round_trip(fname, modified, dt)
@@ -204,8 +204,8 @@ def test_setitem_cell_scalar_float():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "v"] = 12.5
-            f[1][100, "c"] = -0.125
+            f[1]["v"][50] = 12.5
+            f[1]["c"][100] = -0.125
         modified = original.copy()
         modified["v"][50] = 12.5
         modified["c"][100] = -0.125
@@ -217,7 +217,7 @@ def test_setitem_cell_numpy_scalar():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "id"] = np.int32(7)
+            f[1]["id"][50] = np.int32(7)
         modified = original.copy()
         modified["id"][50] = 7
         _check_round_trip(fname, modified, dt)
@@ -228,7 +228,7 @@ def test_setitem_cell_negative_row_index():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][-1, "id"] = 42
+            f[1]["id"][-1] = 42
         modified = original.copy()
         modified["id"][-1] = 42
         _check_round_trip(fname, modified, dt)
@@ -240,9 +240,9 @@ def test_setitem_cell_out_of_range_row_raises():
         _make_table(fname, nrows=100, ztilelen=50)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises(IndexError):
-                f[1][100, "id"] = 5
+                f[1]["id"][100] = 5
             with pytest.raises(IndexError):
-                f[1][-101, "v"] = 5.0
+                f[1]["v"][-101] = 5.0
 
 
 def test_setitem_cell_unknown_column_raises():
@@ -251,7 +251,7 @@ def test_setitem_cell_unknown_column_raises():
         _make_table(fname, nrows=100, ztilelen=50)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises(ValueError) as ei:
-                f[1][10, "nope"] = 1
+                f[1]["nope"][10] = 1
             assert "nope" in str(ei.value)
 
 
@@ -269,7 +269,7 @@ def test_setitem_cell_subarray_column_with_full_vector():
             f[1].write(data)
         new_vec = np.array([1.0, 2.0, 3.0], dtype="f4")
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "vec"] = new_vec
+            f[1]["vec"][50] = new_vec
         modified = data.copy()
         modified["vec"][50] = new_vec
         _check_round_trip(fname, modified, dt)
@@ -286,7 +286,7 @@ def test_setitem_cell_subarray_column_broadcasts_scalar():
             f.create_table_hdu(dt, nrows=nrows, compress=True, ztilelen=25)
             f[1].write(data)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][10, "vec"] = 5.0
+            f[1]["vec"][10] = 5.0
         modified = data.copy()
         modified["vec"][10] = [5.0, 5.0, 5.0]
         _check_round_trip(fname, modified, dt)
@@ -301,7 +301,7 @@ def test_setitem_cell_modifies_only_one_column():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=300, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][150, "id"] = -1
+            f[1]["id"][150] = -1
             same = f[1].read()
         modified = original.copy()
         modified["id"][150] = -1
@@ -320,7 +320,7 @@ def test_setitem_cell_then_repack_reclaims_orphan():
         original, dt = _make_table(fname, nrows=400, ztilelen=200)
         with rustfits.FITS(fname, "r+") as f:
             for k in range(5):
-                f[1][100, "id"] = 5000 + k
+                f[1]["id"][100] = 5000 + k
             pcount_before = int(f[1].header["PCOUNT"])
             f[1].repack()
             pcount_after = int(f[1].header["PCOUNT"])
@@ -459,7 +459,7 @@ def test_setitem_column_round_trip_across_algorithms(algo):
         new_b = np.arange(nrows, dtype="i4") + 10_000
         with rustfits.FITS(fname, "r+") as f:
             f[1]["b"] = new_b
-            f[1][250, "a"] = -1
+            f[1]["a"][250] = -1
         modified = data.copy()
         modified["b"] = new_b
         modified["a"][250] = -1
@@ -491,7 +491,7 @@ def test_setitem_cell_clears_cache():
             hdu = f[1]
             _ = hdu.read()
             assert hdu.tile_cache_used > 0
-            hdu[50, "id"] = 5
+            hdu["id"][50] = 5
             assert hdu.tile_cache_used == 0
 
 
@@ -548,7 +548,7 @@ def test_funpack_decompresses_col_cell_multi_modified_file():
         with rustfits.FITS(fname, "r+") as f:
             f[1]["v"] = new_v
             f[1][["id", "c"]] = sub
-            f[1][500, "v"] = 9999.0
+            f[1]["v"][500] = 9999.0
         modified = original.copy()
         modified["v"] = new_v
         modified["id"] = sub["id"]
@@ -623,7 +623,7 @@ def test_setitem_col_cell_multi_same_handle_and_reopen_agree():
         new_id = np.arange(300, dtype="i4") + 7
         with rustfits.FITS(fname, "r+") as f:
             f[1]["id"] = new_id
-            f[1][50, "v"] = 7.5
+            f[1]["v"][50] = 7.5
             sub_dt = np.dtype([("c", "f4")])
             sub = np.zeros(300, dtype=sub_dt)
             sub["c"] = np.arange(300, dtype="f4") * -3.0

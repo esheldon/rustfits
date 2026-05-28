@@ -2,8 +2,11 @@
 Tests for `rustfits.read()` (top-level convenience wrapper).
 
 Covers the auto-skip-to-first-HDU-with-data default, ext selectors
-by int and EXTNAME, table kwarg pass-through (rows / columns / scale /
-mask_null), header=True returning the tuple, and the error paths.
+by int and EXTNAME, ``header=True`` returning the tuple, the error
+paths, and the rejection of removed kwargs.  ``rustfits.read()`` is
+intentionally minimal — knobs like ``scale=`` / ``rows=`` /
+``columns=`` / ``mask_null=`` live on the underlying ``HDU.read()``
+calls.
 """
 
 import os
@@ -209,76 +212,30 @@ def test_read_explicit_ext_returns_empty_data():
 
 
 # ---------------------------------------------------------------------------
-# Table kwarg pass-through
+# Removed kwargs (rows / columns / scale / mask_null) raise TypeError
 # ---------------------------------------------------------------------------
 
 
-def test_read_passes_rows_kwarg():
-    rows_data = struct.pack(">5i", 10, 20, 30, 40, 50)
+@pytest.mark.parametrize(
+    "bad_kw",
+    [
+        {"rows": [0]},
+        {"columns": ["X"]},
+        {"scale": False},
+        {"mask_null": True},
+    ],
+)
+def test_read_rejects_removed_kwargs(bad_kw):
+    """rustfits.read() is minimal — these kwargs live on HDU.read()."""
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _write_file(
             fname,
             (_primary_no_data(), b""),
-            (_bintable_ext(4, 5, [("X", "1J")]), rows_data),
+            (_bintable_ext(4, 1, [("X", "1J")]), struct.pack(">i", 7)),
         )
-        got = rustfits.read(fname, rows=[1, 3])
-        assert got["X"].tolist() == [20, 40]
-
-
-def test_read_passes_columns_kwarg():
-    rows_data = b""
-    for x, y in [(1, 1.5), (2, 2.5), (3, 3.5)]:
-        rows_data += struct.pack(">id", x, y)
-    fields = [("X", "1J"), ("Y", "1D")]
-    with tempfile.TemporaryDirectory() as tmp:
-        fname = os.path.join(tmp, "t.fits")
-        _write_file(
-            fname,
-            (_primary_no_data(), b""),
-            (_bintable_ext(12, 3, fields), rows_data),
-        )
-        got = rustfits.read(fname, columns=["Y"])
-        assert got.dtype.names == ("Y",)
-        np.testing.assert_allclose(got["Y"], [1.5, 2.5, 3.5])
-
-
-def test_read_passes_scale_false():
-    """
-    scale=False reaches the read path: unsigned-int-trick column
-    comes back as raw i2 instead of u2."""
-    rows = struct.pack(">3h", -32768, 0, 32767)
-    extras = [
-        "TSCAL1  =                    1",
-        "TZERO1  =                32768",
-    ]
-    with tempfile.TemporaryDirectory() as tmp:
-        fname = os.path.join(tmp, "t.fits")
-        _write_file(
-            fname,
-            (_primary_no_data(), b""),
-            (_bintable_ext(2, 3, [("X", "1I")], extras=extras), rows),
-        )
-        got_scaled = rustfits.read(fname)
-        got_raw = rustfits.read(fname, scale=False)
-        assert got_scaled["X"].dtype == np.uint16
-        assert got_raw["X"].dtype == np.int16
-
-
-def test_read_passes_mask_null_true():
-    """mask_null=True reaches the read path and returns a MaskedArray."""
-    rows = struct.pack(">4i", 1, -1, 3, -1)
-    extras = ["TNULL1  =                   -1"]
-    with tempfile.TemporaryDirectory() as tmp:
-        fname = os.path.join(tmp, "t.fits")
-        _write_file(
-            fname,
-            (_primary_no_data(), b""),
-            (_bintable_ext(4, 4, [("X", "1J")], extras=extras), rows),
-        )
-        got = rustfits.read(fname, mask_null=True)
-        assert isinstance(got, np.ma.MaskedArray)
-        assert got["X"].mask.tolist() == [False, True, False, True]
+        with pytest.raises(TypeError):
+            rustfits.read(fname, **bad_kw)
 
 
 # ---------------------------------------------------------------------------
@@ -344,3 +301,73 @@ def test_read_unsupported_hdu_type_raises():
         _write_file(fname, (primary, b""), (ascii_ext, bytes(20)))
         with pytest.raises(ValueError, match="does not yet support"):
             rustfits.read(fname, ext=1)
+
+
+# ---------------------------------------------------------------------------
+# read_header
+# ---------------------------------------------------------------------------
+
+
+def test_read_header_default_is_primary():
+    """ext=0 (the default) returns the primary HDU's header."""
+    primary = _primary_no_data() + ["OBJECT  = 'M31     '"]
+    # Re-emit END at the end if needed; _primary_no_data already includes END.
+    # Inject OBJECT before END instead:
+    primary = [c for c in _primary_no_data() if c != "END"]
+    primary.append("OBJECT  = 'M31     '")
+    primary.append("END")
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "h.fits")
+        _write_file(fname, (primary, b""))
+        hdr = rustfits.read_header(fname)
+        assert hdr["OBJECT"] == "M31"
+
+
+def test_read_header_ext_by_int():
+    """ext=int picks that HDU's header."""
+    primary = _primary_no_data()
+    ext = _bintable_ext(4, 1, [("X", "1J")], extras=["EXTNAME = 'TBL     '"])
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "h.fits")
+        _write_file(fname, (primary, b""), (ext, struct.pack(">i", 7)))
+        hdr0 = rustfits.read_header(fname)
+        hdr1 = rustfits.read_header(fname, ext=1)
+        assert "EXTNAME" not in hdr0
+        assert hdr1["EXTNAME"] == "TBL"
+
+
+def test_read_header_ext_by_extname():
+    """ext='name' looks up by EXTNAME (case-insensitive)."""
+    primary = _primary_no_data()
+    ext = _bintable_ext(4, 1, [("X", "1J")], extras=["EXTNAME = 'TBL     '"])
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "h.fits")
+        _write_file(fname, (primary, b""), (ext, struct.pack(">i", 7)))
+        hdr = rustfits.read_header(fname, ext="tbl")
+        assert hdr["EXTNAME"] == "TBL"
+
+
+def test_read_header_outlives_file_close():
+    """The returned header is safe to inspect after the function exits."""
+    primary = [c for c in _primary_no_data() if c != "END"]
+    primary.append("OBJECT  = 'NGC1    '")
+    primary.append("END")
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "h.fits")
+        _write_file(fname, (primary, b""))
+        hdr = rustfits.read_header(fname)
+        # File has been closed by now (function returned).  Read-only
+        # access still works because FITSHeader holds the cards Arc.
+        assert hdr["OBJECT"] == "NGC1"
+        assert list(hdr.keys())  # iteration works
+
+
+def test_read_header_missing_ext_raises():
+    """Bad int index raises; missing EXTNAME raises."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "h.fits")
+        _write_file(fname, (_primary_no_data(), b""))
+        with pytest.raises((IndexError, ValueError)):
+            rustfits.read_header(fname, ext=5)
+        with pytest.raises(ValueError):
+            rustfits.read_header(fname, ext="nope")

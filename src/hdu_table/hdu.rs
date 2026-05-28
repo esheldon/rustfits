@@ -20,7 +20,7 @@ use super::read::{
     build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
 };
 use super::setitem::{
-    classify_setitem_key, setitem_cell, setitem_fancy_rows,
+    classify_setitem_key, setitem_fancy_rows,
     setitem_fancy_rows_vla_aware, setitem_multi_columns, setitem_row_slice,
     setitem_row_slice_vla_aware, setitem_single_column,
     setitem_single_column_vla, setitem_single_row,
@@ -188,6 +188,12 @@ impl TableHDU {
 // would error (C/M with non-default TSCAL/TZERO).
 fn column_repr_info(col: &Column) -> (String, Option<String>) {
     if col.var_kind.is_some() {
+        // 'A' → "U" so VLA PA columns render consistently with the
+        // fixed-A path in field_dtype_and_shape (which emits "U<n>").
+        // The read side returns Python str objects per cell, so the
+        // numpy-unicode label "U" is also more accurate than the
+        // bytes label "S".  VLA cells have no single length so no
+        // suffix is appended.
         let inner = match col.tform_letter {
             'L' => "?",
             'B' => "u1",
@@ -198,7 +204,7 @@ fn column_repr_info(col: &Column) -> (String, Option<String>) {
             'D' => "f8",
             'C' => "c8",
             'M' => "c16",
-            'A' => "S",
+            'A' => "U",
             _   => return (col.tform_letter.to_string(),
                            Some("array[var]".to_string())),
         };
@@ -782,9 +788,6 @@ impl TableHDU {
             SetItemKey::MultiColumns(names) => setitem_multi_columns(
                 py, &super_, &cards, &columns, nrows, row_width,
                 &names, value, data_offset),
-            SetItemKey::Cell(i, name) => setitem_cell(
-                py, &super_, &cards, &columns, nrows, row_width,
-                i, &name, value, data_offset),
         }
     }
 

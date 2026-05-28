@@ -39,7 +39,8 @@ def _mk_uncompressed(path):
         [(1.0, 10, 0), (2.0, 20, 1), (3.0, 30, 0), (4.0, 40, 1)],
         dtype=dt,
     )
-    rustfits.write_table(path, rows, extname="T")
+    with rustfits.FITS(path, "w+") as f:
+        f.write_table(rows, extname="T")
     return rows
 
 
@@ -55,7 +56,8 @@ def _mk_compressed(path):
         ],
         dtype=dt,
     )
-    rustfits.write_table(path, rows, extname="T", compress=True, ztilelen=2)
+    with rustfits.FITS(path, "w+") as f:
+        f.write_table(rows, extname="T", compress=True, ztilelen=2)
     return rows
 
 
@@ -116,7 +118,8 @@ def test_single_col_write_with_unsigned_trick():
         path = os.path.join(d, "u.fits")
         dt = np.dtype([("v", "u4")])
         rows = np.array([(1,), (2,), (3,)], dtype=dt)
-        rustfits.write_table(path, rows, extname="T")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(rows, extname="T")
         new_v = np.array([4000000000, 5000, 0], dtype="u4")
         with rustfits.FITS(path, "r+") as f:
             f[1]["v"].write(new_v)
@@ -171,7 +174,8 @@ def test_multi_col_read_scale_false():
         # scale=False should return the stored (signed) view.
         dt = np.dtype([("v", "u4")])
         rows = np.array([(0,), (1,), (4000000000,)], dtype=dt)
-        rustfits.write_table(path, rows, extname="T")
+        with rustfits.FITS(path, "w+") as f:
+            f.write_table(rows, extname="T")
         with rustfits.FITS(path) as f:
             sub = f[1][["v"]]
             scaled = sub.read()

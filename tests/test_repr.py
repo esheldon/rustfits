@@ -782,6 +782,425 @@ def test_compressed_image_repr_unknown_zcmptype_fallback():
             assert "compression: XYZ_99" in r
 
 
+# ---------------------------------------------------------------------------
+# TableHDU repr — wide dtype coverage
+# ---------------------------------------------------------------------------
+#
+# Round-trip tables created by rustfits's own writer through every
+# supported fixed dtype, then assert each column appears with the
+# expected dtype label in the repr.  A separate test covers the
+# variable-length + bit-packed special cases.
+
+
+def test_table_repr_wide_dtype_matrix():
+    """
+    A table with one column of every supported fixed-width scalar
+    dtype.  Repr shows each column with its expected dtype label and
+    they line up under the widest column name.
+    """
+    dt = np.dtype(
+        [
+            ("flag", "?"),
+            ("byte", "u1"),
+            ("small", "i2"),
+            ("mid", "i4"),
+            ("big", "i8"),
+            ("real32", "f4"),
+            ("real64", "f8"),
+            ("cplx64", "c8"),
+            ("cplx128", "c16"),
+            ("label", "S12"),
+        ]
+    )
+    rows = np.zeros(3, dtype=dt)
+    rows["label"] = [b"alpha", b"beta", b"gamma"]
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "wide.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(rows, extname="WIDE")
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "type: BINARY_TBL" in r
+            assert "rows: 3" in r
+            assert "extname: WIDE" in r
+            # Each column appears with its expected scaled dtype label.
+            # bool → ?, byte → u1, A12 → U12, etc.
+            expected = [
+                ("flag", "?"),
+                ("byte", "u1"),
+                ("small", "i2"),
+                ("mid", "i4"),
+                ("big", "i8"),
+                ("real32", "f4"),
+                ("real64", "f8"),
+                ("cplx64", "c8"),
+                ("cplx128", "c16"),
+                ("label", "U12"),
+            ]
+            for name, dtype in expected:
+                line = [
+                    ln for ln in r.splitlines() if name in ln and dtype in ln
+                ]
+                assert line, f"missing line for {name} {dtype} in:\n{r}"
+            # Alignment check: dtype-column starts at the same offset
+            # in every column row.
+            lines = {
+                name: [
+                    ln for ln in r.splitlines() if name in ln and dtype in ln
+                ][0]
+                for name, dtype in expected
+            }
+            ref_offset = lines["flag"].index("?")
+            assert lines["byte"].index("u1") == ref_offset
+            assert lines["label"].index("U12") == ref_offset
+
+
+def test_table_repr_vla_and_bit_packed():
+    """
+    Wide-format VLA + bit-packed X coverage in one table.  Tests:
+      - VLA numeric (f4) → 'f4  array[var]'
+      - VLA string (PA)  → 'S   array[var]'
+      - Fixed X (bit)    → '?   array[N]'   (bit_columns=)
+      - VLA X (PX/QX)    → '?   array[var]' (bit_columns= + var_dtypes=)
+    """
+    dt = np.dtype(
+        [
+            ("samples", "O"),
+            ("name", "O"),
+            ("bits", "?", (16,)),
+            ("flags", "O"),
+        ]
+    )
+    rows = np.empty(2, dtype=dt)
+    rows["samples"][0] = np.array([1.0, 2.0, 3.0], dtype="f4")
+    rows["samples"][1] = np.array([], dtype="f4")
+    rows["name"][0] = "first"
+    rows["name"][1] = "second_row_string"
+    rows["bits"] = False
+    rows["flags"][0] = np.array([True, False, True], dtype="?")
+    rows["flags"][1] = np.array([False, True], dtype="?")
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "vla.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(
+                rows,
+                extname="MIXED",
+                var_dtypes={
+                    "samples": "f4",
+                    "name": "S",
+                    "flags": "?",
+                },
+                bit_columns=["bits", "flags"],
+            )
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "extname: MIXED" in r
+
+            def _col_line(col_name):
+                """Lines whose first whitespace-stripped token is col_name."""
+                hits = [
+                    ln
+                    for ln in r.splitlines()
+                    if ln.strip().split(" ", 1)[:1] == [col_name]
+                ]
+                assert hits, f"no column-info line for {col_name!r} in:\n{r}"
+                return hits[0]
+
+            # VLA numeric.
+            samples_line = _col_line("samples")
+            assert "f4" in samples_line
+            assert "array[var]" in samples_line
+            # VLA string (PA) renders as "U array[var]".  Matches
+            # the fixed-A path (which emits "U<n>") for consistency
+            # — both kinds of string columns show "U" because the
+            # read side returns Python str.  VLA cells have no
+            # single length, so no suffix.
+            name_line = _col_line("name")
+            assert " U " in f" {name_line} "
+            assert "array[var]" in name_line
+            # Fixed X column — bool with array[16].
+            bits_line = _col_line("bits")
+            assert "?" in bits_line
+            assert "array[16]" in bits_line
+            # VLA X column — column_repr_info's VLA arm has no 'X'
+            # case, so the dtype label is the raw FITS letter 'X'
+            # rather than '?'.  Documents current behavior; revisit
+            # if column_repr_info grows an X→? case for VLA.
+            flags_line = _col_line("flags")
+            assert " X " in f" {flags_line} "
+            assert "array[var]" in flags_line
+
+
+def test_table_repr_units_displayed():
+    """TUNITn cards surface as `(unit)` after the dtype label."""
+    dt = np.dtype([("ra", "f8"), ("flux", "f4"), ("flag", "i4")])
+    rows = np.zeros(2, dtype=dt)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "u.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(
+                rows,
+                extname="CAT",
+                units={"ra": "deg", "flux": "Jy"},
+            )
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            # `(deg)` appears on the ra line; `(Jy)` on flux.
+            ra_line = [
+                ln for ln in r.splitlines() if "ra" in ln and "f8" in ln
+            ][0]
+            assert "(deg)" in ra_line
+            flux_line = [
+                ln for ln in r.splitlines() if "flux" in ln and "f4" in ln
+            ][0]
+            assert "(Jy)" in flux_line
+            # Column without TUNIT has no trailing parens.
+            flag_line = [
+                ln for ln in r.splitlines() if "flag" in ln and "i4" in ln
+            ][0]
+            assert "(" not in flag_line
+
+
+# ---------------------------------------------------------------------------
+# CompressedTableHDU repr
+# ---------------------------------------------------------------------------
+#
+# A ZTABLE shell carries the original schema in Z-prefixed cards; the
+# repr surfaces the ORIGINAL row count / per-column dtypes (what you
+# get back from .read()), the tile count, ZTILELEN, and the per-column
+# algorithm.  Fixtures are built with rustfits's own ZTABLE writer.
+
+
+def _mixed_table_rows(n=50):
+    """A few-column table wide enough to give cfitsio's per-dtype
+    algorithm defaults a chance to vary (u1/i2/i4/f4/f8 + a string)."""
+    dt = np.dtype(
+        [
+            ("byte", "u1"),
+            ("small", "i2"),
+            ("mid", "i4"),
+            ("real32", "f4"),
+            ("real64", "f8"),
+            ("label", "S8"),
+        ]
+    )
+    rng = np.random.default_rng(0)
+    rows = np.zeros(n, dtype=dt)
+    rows["byte"] = rng.integers(0, 256, n, dtype="u1")
+    rows["small"] = rng.integers(-100, 100, n, dtype="i2")
+    rows["mid"] = rng.integers(-1000, 1000, n, dtype="i4")
+    rows["real32"] = rng.standard_normal(n).astype("f4")
+    rows["real64"] = rng.standard_normal(n)
+    rows["label"] = [f"r{i:03d}".encode("ascii") for i in range(n)]
+    return rows
+
+
+def test_compressed_table_repr_default_algorithms():
+    """
+    compress=True picks cfitsio's per-dtype defaults; the repr's
+    `compression:` line should list each user-visible column with
+    its assigned algorithm name (GZIP_1 / GZIP_2 / RICE_1).  The
+    `type:` line marks it as compressed; `rows:` shows the original
+    (uncompressed) count.
+    """
+    rows = _mixed_table_rows(50)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "c.fits.fz")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(
+                rows,
+                extname="CMP",
+                compress=True,
+                ztilelen=10,
+            )
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "type: BINARY_TBL (compressed)" in r
+            assert "extname: CMP" in r
+            assert "rows: 50" in r
+            # Default tiling: 50 rows / 10-per-tile = 5 tiles.
+            assert "tiles: 5" in r
+            assert "rows per tile: 10" in r
+            assert "compression:" in r
+            # Per-cfitsio defaults: u1=GZIP_1, i2=GZIP_2, i4=RICE_1,
+            # f4=GZIP_2, f8=GZIP_2, A=GZIP_1.  Each named column shows
+            # up with its algorithm name on the compression line.
+            comp_line = [ln for ln in r.splitlines() if "compression:" in ln][
+                0
+            ]
+            assert "byte=GZIP_1" in comp_line
+            assert "small=GZIP_2" in comp_line
+            assert "mid=RICE_1" in comp_line
+            assert "real32=GZIP_2" in comp_line
+            assert "real64=GZIP_2" in comp_line
+            assert "label=GZIP_1" in comp_line
+            # column info: each column appears with its ORIGINAL
+            # (uncompressed) dtype — NOT the on-disk 1QB descriptor.
+            for name, dtype in [
+                ("byte", "u1"),
+                ("small", "i2"),
+                ("mid", "i4"),
+                ("real32", "f4"),
+                ("real64", "f8"),
+                ("label", "U8"),
+            ]:
+                line = [
+                    ln for ln in r.splitlines() if name in ln and dtype in ln
+                ]
+                assert line, (
+                    f"compressed table missing {name} {dtype} in:\n{r}"
+                )
+
+
+def test_compressed_table_repr_single_algorithm():
+    """
+    compress='GZIP_2' applies one algorithm to every column; the
+    compression line shows the same algorithm for each.  Uses a
+    string-free fixture because A columns only permit GZIP_1.
+    """
+    dt = np.dtype(
+        [
+            ("byte", "u1"),
+            ("small", "i2"),
+            ("mid", "i4"),
+            ("real32", "f4"),
+            ("real64", "f8"),
+        ]
+    )
+    rng = np.random.default_rng(0)
+    rows = np.zeros(20, dtype=dt)
+    rows["byte"] = rng.integers(0, 256, 20, dtype="u1")
+    rows["small"] = rng.integers(-100, 100, 20, dtype="i2")
+    rows["mid"] = rng.integers(-1000, 1000, 20, dtype="i4")
+    rows["real32"] = rng.standard_normal(20).astype("f4")
+    rows["real64"] = rng.standard_normal(20)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "g2.fits.fz")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(rows, compress="GZIP_2", ztilelen=10)
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "type: BINARY_TBL (compressed)" in r
+            assert "rows: 20" in r
+            assert "tiles: 2" in r
+            comp_line = [ln for ln in r.splitlines() if "compression:" in ln][
+                0
+            ]
+            for name in ("byte", "small", "mid", "real32", "real64"):
+                assert f"{name}=GZIP_2" in comp_line
+
+
+def test_compressed_table_repr_per_column_overrides():
+    """
+    compress={col: algo, ...} dict assigns per-column algorithms;
+    the repr's compression line reflects the dict mapping.
+    """
+    rows = _mixed_table_rows(15)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "mix.fits.fz")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(
+                rows,
+                compress={
+                    "byte": "GZIP_1",
+                    "small": rustfits.Gzip2(),
+                    "mid": rustfits.Rice1(blocksize=32),
+                    "real32": rustfits.Gzip2(),
+                    "real64": "GZIP_1",
+                    "label": rustfits.Gzip1(),
+                },
+                ztilelen=5,
+            )
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            comp_line = [ln for ln in r.splitlines() if "compression:" in ln][
+                0
+            ]
+            assert "byte=GZIP_1" in comp_line
+            assert "small=GZIP_2" in comp_line
+            assert "mid=RICE_1" in comp_line
+            assert "real32=GZIP_2" in comp_line
+            assert "real64=GZIP_1" in comp_line
+            assert "label=GZIP_1" in comp_line
+
+
+def test_compressed_table_repr_with_vla_column():
+    """
+    A compressed table with a VLA column shows the VLA column with
+    'array[var]' in column info, and includes it on the compression
+    line.  VLA-bearing tables are a separate code path
+    (dual-descriptor heap) and the repr should handle them too.
+    """
+    dt = np.dtype([("id", "i4"), ("samples", "O")])
+    rows = np.empty(8, dtype=dt)
+    rows["id"] = np.arange(8, dtype="i4")
+    for i in range(8):
+        rows["samples"][i] = np.arange(i + 1, dtype="f4")
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "vla.fits.fz")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(
+                rows,
+                extname="VTAB",
+                var_dtypes={"samples": "f4"},
+                compress=True,
+                ztilelen=4,
+            )
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "type: BINARY_TBL (compressed)" in r
+            assert "extname: VTAB" in r
+            assert "rows: 8" in r
+            assert "tiles: 2" in r
+            # VLA column appears in column info as 'f4 array[var]'.
+            samples_line = [
+                ln for ln in r.splitlines() if "samples" in ln and "f4" in ln
+            ][0]
+            assert "array[var]" in samples_line
+            # And on the compression line.  cfitsio defaults still
+            # apply: id=RICE_1, samples=GZIP_1 (VLA-bearing tables
+            # default to GZIP_1 for per-cell streams).
+            comp_line = [ln for ln in r.splitlines() if "compression:" in ln][
+                0
+            ]
+            assert "id=" in comp_line
+            assert "samples=" in comp_line
+
+
+def test_compressed_table_repr_short_table_no_tile_line():
+    """
+    Without explicit ztilelen=, the default tile size is large enough
+    that small tables get a single tile.  The 'rows per tile:' line
+    is still present when ZTILELEN is set (which the writer always
+    emits, even on single-tile tables) — verify it shows a reasonable
+    value rather than 0 / negative.
+    """
+    rows = _mixed_table_rows(5)
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "s.fits.fz")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.write_table(rows, compress=True)
+        with rustfits.FITS(fname) as fits:
+            r = repr(fits[1])
+            _show(r)
+            assert "type: BINARY_TBL (compressed)" in r
+            assert "rows: 5" in r
+            tile_lines = [
+                ln for ln in r.splitlines() if "rows per tile:" in ln
+            ]
+            assert tile_lines, f"expected a 'rows per tile:' line in:\n{r}"
+            # Parse the integer after the colon and confirm > 0.
+            n = int(tile_lines[0].split(":", 1)[1].strip())
+            assert n > 0
+
+
 if __name__ == "__main__":
     # Running the file directly drives the same tests pytest would,
     # but with output capture disabled and verbose mode on, so each

@@ -5,6 +5,11 @@ captures architectural decisions and conventions that aren't obvious from
 reading the code.  Claude Code loads this automatically into every session
 in this directory; humans should read it before making structural changes.
 
+For the project-level distribution plan (how rustfits relates to fitsio,
+the freeze-and-shim handoff strategy, the migration doc location), see
+[STRATEGY.md](STRATEGY.md) at the repo root.  This file (`CLAUDE.md`) is
+for code architecture; `STRATEGY.md` is for project management.
+
 ## Project structure
 
 The Rust extension is split into single-responsibility modules.  Each only
@@ -130,16 +135,19 @@ else stays private to its file.
   modify affected tiles by decode → row-bytes replace →
   re-encode + append to heap, with orphans reclaimed by
   `repack()`), 6c-2c (column-targeted `__setitem__`
-  forms — `hdu["col"]=arr`, `hdu[r,"col"]=v`,
-  `hdu[[c1,c2]]=arr` — sharing the same per-tile primitive
-  but narrowing the column selection per call), 6c-2d
-  (stepped-slice row writes + subset-object writes —
-  `hdu[a:b:s]=arr`, `hdu["col"][rows]=v`,
-  `hdu[[a,b]][rows]=v`), and 6c-2e (VLA `__setitem__` for
-  every dispatch form — `hdu[r,"vla_col"]=v`,
-  `hdu["vla_col"]=arr`, `hdu[i]=record` with mixed
-  fixed+VLA cols, mixed multi-column subsets — completing
-  the full `__setitem__` surface on compressed tables.
+  forms — `hdu["col"]=arr` and `hdu[[c1,c2]]=arr` — sharing
+  the same per-tile primitive but narrowing the column
+  selection per call), 6c-2d (stepped-slice row writes +
+  subset-object writes — `hdu[a:b:s]=arr`,
+  `hdu["col"][rows]=v`, `hdu[[a,b]][rows]=v`), and 6c-2e
+  (VLA `__setitem__` for every dispatch form —
+  `hdu["vla_col"][r]=v`, `hdu["vla_col"]=arr`,
+  `hdu[i]=record` with mixed fixed+VLA cols, mixed
+  multi-column subsets — completing the full `__setitem__`
+  surface on compressed tables.  Single-cell writes go
+  through the symmetric subset form `hdu["col"][row]=v`;
+  the tuple form `hdu[row,"col"]` is rejected for symmetry
+  with the read side.
   Detection lives in `header_has_ztable`; routing
   in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
   cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
@@ -834,8 +842,8 @@ astropy reads our PA columns as per-cell chararrays of single chars;
 we read astropy's PA columns as Python str (the natural mapping).
 Tests in `tests/test_vla_string_write.py` (24 cases).
 
-**Multi-column / fancy / `(row, col)` `__setitem__`.**  Shipped.
-Three new forms complete the table `__setitem__` surface:
+**Multi-column / fancy-row `__setitem__`.**  Shipped.  Two
+additional forms complete the table `__setitem__` surface:
 
 - `hdu[[c1, c2]] = arr` — multi-column subset write.  Value is a
   structured ndarray with the named fields (extras tolerated for
@@ -849,20 +857,19 @@ Three new forms complete the table `__setitem__` surface:
   (the existing stepped-slice writer).  VLA tables are rejected
   with a clear error pointing at the per-row / whole-column
   workarounds (strided VLA writes would need per-row heap layouts).
-- `hdu[row, "col"] = value` — single-cell write.  Fixed cells:
-  promote value to a length-1 ndarray of the column's expected
-  dtype via `np.asarray(..., dtype=...) + np.broadcast_to`,
-  encode, write `byte_width` bytes at the row+column offset.
-  Subarray columns accept an ndarray matching the per-cell shape.
-  VLA cells: append cell bytes to heap end, rewrite descriptor,
-  update PCOUNT (same orphan-and-append model as
-  `setitem_single_column_vla` but for one row).  Other tuple
-  shapes — `(slice, str)`, `(int, [str, str])` — rejected with a
-  clear "tuple shapes" message.
 
-`SetItemKey` now has six variants (was three); `classify_setitem_key`
-mirrors `classify_table_key`'s iterable/tuple inspection.  Tests in
-`tests/test_setitem_multi.py` (25 cases).
+Single-cell writes go through the symmetric subset form
+`hdu["col"][row] = v` — see "Subset `__setitem__`" below.  The
+tuple form `hdu[row, "col"] = v` is NOT supported: the read side's
+`classify_table_key` has no `Cell` variant (a `(int, str)` tuple
+falls through to the iterator branch and raises "sequence must be
+all int or all str"), and `__setitem__` matches that exact
+behavior.  Anything readable via `hdu[key]` is writable via
+`hdu[key] = value`, nothing more.
+
+`SetItemKey` has five variants (mirrors the read-side `TableKey`);
+`classify_setitem_key` mirrors `classify_table_key`'s iterable
+inspection.  Tests in `tests/test_setitem_multi.py`.
 
 **Subset `__setitem__`.**  Shipped.  Both subset objects returned by
 `hdu["name"]` and `hdu[["a","b"]]` are now writable, so anything the
@@ -1106,34 +1113,74 @@ and `tests/test_vla_x_bit.py` (16 cases, VLA PX/QX).
 
 ## Top-level convenience functions
 
-One-call wrappers for the most common patterns.  The architecture
-is the same for all three: real `#[pymethods]` on `FITS` in
-`src/fits.rs` do the work; a thin Python wrapper in
-`rustfits/convenience.py` adds the open / close cycle for users
-who don't want to manage a `FITS` handle.  Top-level wrappers are
-re-exported from `rustfits/__init__.py` so users write
-`rustfits.read(...)` / `rustfits.write_image(...)` /
-`rustfits.write_table(...)`.
+Three minimal one-call wrappers in `rustfits/convenience.py`,
+re-exported at the package top level so users write
+`rustfits.read(...)` / `rustfits.read_header(...)` /
+`rustfits.write(...)`:
 
-### `read` (read-only)
+- `rustfits.read(filename, ext=None, *, header=False)` — opens
+  in `'r'`, picks the first HDU with data (`ext=None`) or the
+  requested ext, dispatches on HDU type, returns the array
+  (and optionally the `FITSHeader`).
+- `rustfits.read_header(filename, ext=0)` — opens in `'r'`,
+  returns the chosen HDU's `FITSHeader`.  Default `ext=0` reads
+  the primary HDU (where file-level metadata typically lives).
+- `rustfits.write(filename, data, *, mode='w+', extname=None,
+  header=None)` — auto-detects image vs table:
+    - plain (non-structured) `numpy.ndarray` → image
+    - structured `numpy.ndarray` (`dtype.fields is not None`)
+      or `{name: ndarray}` dict → table
+    - list-of-arrays + names= → rejected (use the explicit
+      `FITS.write_table` form for that)
+    - anything else → `ValueError`
+  Default `mode='w+'` truncates-or-creates (equivalent to
+  fitsio's `'rw'` + `clobber=True`).  Pass `mode='r+'` to
+  append HDUs without truncating.  Supported modes: `'r'`,
+  `'r+'`, `'w+'`.
 
-`rustfits.read(filename, ext=None, *, rows=None, columns=None,
-scale=True, mask_null=False, header=False)` — opens in `'r'`,
-picks the first HDU with data (`ext=None`) or the requested
-ext, dispatches on HDU type, returns the array (and optionally
-the `FITSHeader`).  See `rustfits/convenience.py` for the
-docstring.
+**Intentionally minimal.**  These accept only the universal
+kwargs (`ext` / `mode` / `extname` / `header`).  No
+type-specific knobs (`compress=`, `quantize=`, `blank=`,
+`var_dtypes=`, `units=`, `bit_columns=`, `scale=`, `rows=`,
+`columns=`, ...).  The boundary keeps `convenience.py`
+genuinely convenient (no kwarg-sync burden against the
+underlying create/write surface) and pushes callers who need
+knobs into the explicit `with FITS(...) as f: f.write_image(
+...)` shape, which is two lines and reads more clearly.
 
-### `write_image` / `write_table` (method form)
+The `write` dispatch logic lives on the Rust side as
+`FITS.write(data, *, extname=None, header=None)` — the
+top-level wrapper is a 2-line `with FITS(filename, mode) as f:
+f.write(data, ...)` around it.  This is the form fitsio users
+reach for when copying HDUs between files without caring about
+type:
+
+```python
+with rustfits.FITS(infile) as src:
+    with rustfits.FITS(outfile, "w+") as dst:
+        for hdu in src:
+            if hdu.has_data:
+                dst.write(hdu.read())
+```
+
+### Rich tier — `FITS.write_image` / `FITS.write_table`
 
 `FITS.write_image(data, *, extname, extver, compress, quantize,
 blank, header)` and `FITS.write_table(data, *, names, extname,
 extver, units, var_dtypes, bit_columns, heap_format, compress,
-ztilelen, header)` combine `create_*_hdu` + `write` into one
-call.  Both return the new HDU (`ImageHDU` /
-`CompressedImageHDU` / `TableHDU` / `CompressedTableHDU`) so
-callers can continue operating on it within the same `FITS`
-handle.
+ztilelen, header)` are pymethods on `FITS` in `src/fits.rs`
+that combine `create_*_hdu` + `write` into one call.  Both
+return the new HDU (`ImageHDU` / `CompressedImageHDU` /
+`TableHDU` / `CompressedTableHDU`) so callers can continue
+operating on it within the same `FITS` handle.
+
+These are NOT exposed as top-level filename-taking wrappers —
+that boundary was deliberately collapsed (2026-05) to keep
+`convenience.py` minimal and avoid keyword-sync drift between
+the wrappers and the underlying methods.  For one-call write
++ close from a filename, the explicit shape
+`with rustfits.FITS(path, "w+") as f: f.write_image(...)` is
+two lines and gets all knobs.
 
 Schema derivation: `create_table_hdu` stays schema-only (first
 arg = dtype).  A small free helper
@@ -1158,32 +1205,23 @@ skips protected; dict source raises on protected).
 the existing `ensure_primary` path inside `create_table_hdu` —
 no special-casing needed in `write_table` itself.
 
-### Top-level wrappers (filename-takers)
-
-`rustfits.write_image(filename, data, *, mode='w+', ...kwargs)`
-and `rustfits.write_table(filename, data, *, mode='w+',
-...kwargs)` open the file, delegate to the method form, close.
-**They return None** — returning the HDU from inside a
-closed-file `with` block would be a sharp edge (the HDU's
-methods would fail with "file is closed"); users who need the
-HDU should reopen.
-
-Default `mode='w+'` truncates-or-creates (equivalent to
-fitsio's `'rw'` + `clobber=True`).  Pass `mode='r+'` to append
-HDUs to an existing file without truncating.  Supported modes
-are `'r'`, `'r+'`, `'w+'`.
-
-**Explicit kwargs, not `**kwargs`.**  The top-level wrappers
-list every forwarded keyword by name in their signature.  Costs
-a few lines of boilerplate when create_/write signatures grow;
-buys self-documenting signatures and protection against typo
-bugs that `**kwargs` would silently swallow.
-
-Tests: `tests/test_write_convenience.py` (38 cases) covers all
-four entry points across the dtype matrix, unsigned-int trick,
-compress=, blank/mask, MaskedArray input, header= (dict +
-FITSHeader source), all four reject paths, auto-primary,
-mode='w+' truncates vs mode='r+' appends.
+Tests: `tests/test_write_convenience.py` covers
+`FITS.write_image` / `FITS.write_table` across the dtype matrix,
+unsigned-int trick, `compress=`, `blank=`/`mask_blank=True`,
+MaskedArray input, `header=` (dict + FITSHeader source), all
+four reject paths, and auto-primary on table writes.  The
+`FITS.write` dispatcher (and the top-level `rustfits.write`
+that delegates to it) is covered for the image / structured /
+dict matrix plus list-of-arrays rejection, the
+copy-from-source-file loop pattern, multi-HDU writes in one
+handle, `extname=` / `header=` forwarding, and bit-exact
+equivalence between top-level and method form.
+`tests/test_convenience_read.py` (15 cases) covers the minimal
+`read` + `read_header` surface: default-picks-first-with-data,
+ext by int / by extname, removed-kwargs (rows / columns /
+scale / mask_null) rejected with TypeError, header=True returns
+tuple, read_header default-is-primary / int / extname /
+outlives-close / bad-ext rejection.
 
 ## Table write roadmap
 
@@ -1247,13 +1285,14 @@ dispatch.  Forms supported:
   full-table` to modify a thin column slice (pathological when
   `byte_width << row_width`, which is the common case).
 
-All of multi-column subset writes (`hdu[[c1,c2]] = ...`), fancy
-row-list writes (`hdu[[1,3,5]] = ...`), single-cell tuple writes
-(`hdu[r, c] = ...`), and the subset-then-rows forms
+Multi-column subset writes (`hdu[[c1,c2]] = ...`), fancy row-list
+writes (`hdu[[1,3,5]] = ...`), and the subset-then-rows forms
 (`hdu["name"][rows] = ...`, `hdu[[c1,c2]][rows] = ...`) have since
-shipped — see the "Multi-column / fancy / `(row, col)`
-`__setitem__`" and "Subset `__setitem__`" sections under "Table
-write Supported" above.
+shipped — see the "Multi-column / fancy-row `__setitem__`" and
+"Subset `__setitem__`" sections under "Table write Supported"
+above.  Single-cell writes go through the symmetric subset form
+`hdu["col"][row] = v`; the tuple form `hdu[row, "col"]` was
+removed for symmetry with the read side (which never accepted it).
 
 **Phase 3 — `TableHDU.append()` (with `extend` alias).**  Done.
 Primary method name is `append` because that's the natural verb
@@ -2684,7 +2723,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
 | 6c-1b | VLA `append()` (existing-cell copy + per-cell re-encode for new rows) | ✅ Shipped |
 | 6c-2a | VLA `repack()` (streaming staging + dual-descriptor blob re-gzip) | ✅ Shipped |
 | 6c-2b | Fixed-col row writes: `hdu[i]=record`, `hdu[a:b]=arr`, `hdu[[i,j,k]]=arr` | ✅ Shipped |
-| 6c-2c | Fixed-col col/cell/multi writes: `hdu["col"]=arr`, `hdu[r,"col"]=v`, `hdu[[c1,c2]]=arr` | ✅ Shipped |
+| 6c-2c | Fixed-col col/multi writes: `hdu["col"]=arr`, `hdu[[c1,c2]]=arr` | ✅ Shipped |
 | 6c-2d | Stepped slices + subset-object writes (`hdu[a:b:s]=arr`, `hdu["name"][rows]=v`, `hdu[[a,b]][rows]=v`) | ✅ Shipped |
 | 6c-2e | VLA `__setitem__` (all forms, decode → modify → re-encode dual-descriptor blob) | ✅ Shipped |
 
@@ -3454,12 +3493,6 @@ with uncompressed-side `TableHDU.__setitem__`):
     Object-dtype ndarray of length `nrows` with per-row inner
     ndarrays.  Touches all tiles; other columns' descriptors
     stay unchanged.
-  - `hdu[r, "col"] = v` — single-cell write.  For a fixed
-    column: RHS is a scalar (Python int/float, numpy scalar, or
-    0-d ndarray — broadcast to the per-cell shape) or an ndarray
-    matching per-cell shape.  For a VLA column: RHS is the
-    cell value directly (inner-element ndarray, or str/bytes for
-    `PA`).  Touches one tile, one column.
   - `hdu[[c1, c2]] = arr` — multi-column subset write.  RHS is
     a structured ndarray of length = nrows with the named
     fields (extras tolerated; missing rejected; duplicates in
@@ -3534,7 +3567,6 @@ dispatcher dispatch table:
 | `hdu[[i,j,k]]=arr` (6c-2b) | all columns | row list |
 | `hdu[a:b:s]=arr` (6c-2d) | all columns | stepped range |
 | `hdu["col"]=arr` (6c-2c) | `[col_idx]` | `0..nrows` |
-| `hdu[r,"col"]=v` (6c-2c) | `[col_idx]` | `[r]` |
 | `hdu[[c1,c2]]=arr` (6c-2c) | `[c1_idx, c2_idx]` | `0..nrows` |
 | `hdu["col"][rows]=v` (6c-2d) | `[col_idx]` | rows |
 | `hdu[[c1,c2]][rows]=v` (6c-2d) | `[c1_idx, c2_idx]` | rows |
@@ -3819,6 +3851,62 @@ Worth keeping an eye on the failing test
 (`tests/test_compressed_image_phase1.py`'s
 `test_other_compression_types_dispatched` was the first to
 abort) when the time comes.
+
+## Documentation TODO — tutorial gap audit
+
+The Sphinx tutorial under `docs/tutorial/` covers the main
+surface but a 2026-05 audit identified gaps users would expect.
+Cross items off as they land; revisit ordering when a real user
+request flags something.
+
+1. ✅ **File modes table** — `"r"` / `"r+"` / `"w+"` in
+   ``quickstart.rst`` covering read-only vs read-write,
+   truncates vs preserves, creates vs requires-exists.
+2. ✅ **Walking HDUs / picking the right one** — section in
+   ``quickstart.rst`` showing the realistic ``hdu.has_data +
+   isinstance(hdu, ImageHDU)`` pattern.
+3. ✅ **`AsciiTableHDU` note** — section in ``tables.rst``
+   documenting the read-stub state and pointing at astropy as
+   the fallback.
+4. ✅ **Known limitations** — new ``limitations.rst`` page
+   listing gaps tagged ``(not yet)`` vs ``(by design)`` with
+   workarounds, plus cross-tool interop caveats.
+5. ✅ **Cross-tool interop** — one-sentence callout at the top
+   of each topic page asserting bit-exact round-trip with
+   astropy and fitsio.
+6. ✅ **Subset object semantics** — "How subsets relate to
+   the parent table" subsection in ``tables.rst`` covering
+   lazy selectors, fresh-read semantics, and parent-handle
+   lifetime.
+7. ✅ **Error/recovery model** — new ``errors.rst`` page
+   covering the standard-Python-exceptions choice, what raises
+   what, the taint flag, recovery via close+reopen, and the
+   in-process-mutex / no-OS-lock multi-writer story.
+8. **Performance / chunked reads** — the big-chunk and small-
+   chunk wins vs fitsio (see "Performance — ZIMAGE chunked-read
+   profiling history" elsewhere in this file) are unmatched and
+   currently undocumented user-facing.  Worth a short page if
+   we want users to know; deferred because benchmark numbers age
+   fast and invite arguments about methodology.
+9. ✅ **Migration guide** — ``docs/tutorial/migration.rst``,
+   wired into the toctree between ``headers.rst`` and
+   ``errors.rst``.  Frames rustfits as the modern successor to
+   fitsio (matches the [STRATEGY.md](STRATEGY.md) freeze-and-
+   shim plan), walks through the behavior differences (headers,
+   compression kwargs), shows side-by-side porting recipes for
+   the common patterns (open+read, table subset, write image /
+   table to fresh file, compressed image, lossy float
+   compression, read header only), lists what rustfits doesn't
+   have (``vstorage=fixed``, ``case_sensitive=True``, ASCII
+   table writes), and lists what fitsio doesn't have that
+   rustfits does (full ``__getitem__`` / ``__setitem__`` on
+   every HDU, ZTABLE writes, faster compressed reads).
+   Includes a short "from astropy.io.fits" section for users
+   coming from there instead.
+
+Out of scope (don't write these without a specific ask):
+migration guide from astropy / fitsio; WCS handling (rustfits
+doesn't parse WCS — users hand the header to `astropy.wcs`).
 
 ## Coverage TODO — sweep once feature-complete
 

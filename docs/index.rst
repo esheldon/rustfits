@@ -15,8 +15,16 @@ Quick example
    import rustfits
 
    with rustfits.FITS("data.fits") as fits:
-       arr = fits[1].read()                  # whole HDU
-       stamp = fits["SCI"][100:200, 50:150]  # slice by EXTNAME
+       arr = fits[1].read()                  # read all of HDU 1
+       stamp = fits["sci"][100:200, 50:150]  # image slice of HDU "sci"
+
+Tutorial
+--------
+
+.. toctree::
+   :maxdepth: 2
+
+   tutorial/index
 
 API reference
 -------------

@@ -379,7 +379,7 @@ def test_x_column_setitem_single_cell():
         with rustfits.FITS(fname, "w+") as f:
             f.create_table_hdu(dt, nrows=nrows, bit_columns=["flags"])
             f[1].write(data)
-            f[1][2, "flags"] = np.array(
+            f[1]["flags"][2] = np.array(
                 [True, False, True, True, False, False, True, False],
                 dtype="b1",
             )

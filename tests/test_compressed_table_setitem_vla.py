@@ -23,7 +23,7 @@ funpack always sees per-cell offsets that don't collide, even when
 nelements changes between an edit's old and new value.
 
 Forms covered:
-  - hdu[r, "vla_col"] = v       (single cell)
+  - hdu["vla_col"][r] = v       (single cell via subset)
   - hdu["vla_col"] = arr        (whole column; Object ndarray)
   - hdu[i] = record             (single row touching a VLA col)
   - hdu[a:b] = arr              (slice row writes)
@@ -95,7 +95,7 @@ def _read_and_compare(fname, expected, dt):
 
 
 # ---------------------------------------------------------------------
-# Single-cell VLA write: hdu[r, "vla_col"] = v
+# Single-cell VLA write via subset: hdu["vla_col"][r] = v
 # ---------------------------------------------------------------------
 
 
@@ -106,7 +106,7 @@ def test_setitem_vla_cell_same_length():
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         new_cell = np.arange(len(original["v"][50]), dtype="f4") + 1000.0
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "v"] = new_cell
+            f[1]["v"][50] = new_cell
         expected = original.copy()
         expected["v"] = original["v"].copy()
         expected["v"][50] = new_cell
@@ -120,7 +120,7 @@ def test_setitem_vla_cell_grows_in_size():
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         new_cell = np.arange(20, dtype="f4") + 9_000.0
         with rustfits.FITS(fname, "r+") as f:
-            f[1][70, "v"] = new_cell
+            f[1]["v"][70] = new_cell
         expected = original.copy()
         expected["v"] = original["v"].copy()
         expected["v"][70] = new_cell
@@ -133,7 +133,7 @@ def test_setitem_vla_cell_shrinks_to_empty():
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][10, "v"] = np.array([], dtype="f4")
+            f[1]["v"][10] = np.array([], dtype="f4")
         expected = original.copy()
         expected["v"] = original["v"].copy()
         expected["v"][10] = np.array([], dtype="f4")
@@ -149,7 +149,7 @@ def test_setitem_vla_cell_grows_zpcount():
             zpcount_before = int(f[1].header["ZPCOUNT"])
             pcount_before = int(f[1].header["PCOUNT"])
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "v"] = np.arange(8, dtype="f4")
+            f[1]["v"][50] = np.arange(8, dtype="f4")
         with rustfits.FITS(fname, "r") as f:
             zpcount_after = int(f[1].header["ZPCOUNT"])
             pcount_after = int(f[1].header["PCOUNT"])
@@ -165,7 +165,7 @@ def test_setitem_vla_cell_negative_row_index():
         original, dt = _make_table(fname, nrows=100, ztilelen=50)
         new_cell = np.arange(3, dtype="f4") + 77.0
         with rustfits.FITS(fname, "r+") as f:
-            f[1][-1, "v"] = new_cell
+            f[1]["v"][-1] = new_cell
         expected = original.copy()
         expected["v"] = original["v"].copy()
         expected["v"][-1] = new_cell
@@ -178,7 +178,7 @@ def test_setitem_vla_cell_out_of_range_raises():
         _make_table(fname, nrows=50, ztilelen=25)
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises(IndexError):
-                f[1][50, "v"] = np.arange(2, dtype="f4")
+                f[1]["v"][50] = np.arange(2, dtype="f4")
 
 
 def test_setitem_vla_cell_wrong_inner_dtype_raises():
@@ -188,7 +188,7 @@ def test_setitem_vla_cell_wrong_inner_dtype_raises():
         # Cell uses i4 but the column's inner is f4.
         with rustfits.FITS(fname, "r+") as f:
             with pytest.raises((ValueError, TypeError)):
-                f[1][10, "v"] = np.arange(3, dtype="i4")
+                f[1]["v"][10] = np.arange(3, dtype="i4")
 
 
 # ---------------------------------------------------------------------
@@ -444,7 +444,7 @@ def test_setitem_vla_then_repack_reclaims():
         original, dt = _make_table(fname, nrows=100, ztilelen=50)
         with rustfits.FITS(fname, "r+") as f:
             for k in range(5):
-                f[1][20, "v"] = np.arange(10, dtype="f4") + k
+                f[1]["v"][20] = np.arange(10, dtype="f4") + k
             pcount_before = int(f[1].header["PCOUNT"])
             f[1].repack()
             pcount_after = int(f[1].header["PCOUNT"])
@@ -480,7 +480,7 @@ def test_setitem_vla_non_last_hdu_preserves_trailing():
             f[2].write(trail)
         new_cell = np.arange(20, dtype="f4") + 88.0
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "v"] = new_cell
+            f[1]["v"][50] = new_cell
             np.testing.assert_array_equal(f[2].read(), trail)
             assert f[2].extname == "TRAIL"
         with rustfits.FITS(fname, "r") as f:
@@ -513,7 +513,7 @@ def test_setitem_vla_string_pa_cell():
                 data["s"][i] = f"orig_{i}"
             f[1].write(data)
         with rustfits.FITS(fname, "r+") as f:
-            f[1][3, "s"] = "hello world"
+            f[1]["s"][3] = "hello world"
         with rustfits.FITS(fname, "r") as f:
             out = f[1].read()
         assert out["s"][3] == "hello world"
@@ -543,7 +543,7 @@ def test_funpack_decompresses_vla_mutated_file():
         for i in range(20):
             sub["v"][i] = np.arange((i % 5) + 1, dtype="f4") - 999
         with rustfits.FITS(fname, "r+") as f:
-            f[1][50, "v"] = new_cell
+            f[1]["v"][50] = new_cell
             f[1][["id", "v"]][100:120] = sub
         expected = original.copy()
         expected["v"] = original["v"].copy()
@@ -580,7 +580,7 @@ def test_setitem_vla_same_handle_and_reopen_agree():
         original, dt = _make_table(fname, nrows=150, ztilelen=50)
         new_cell = np.arange(7, dtype="f4") - 1.0
         with rustfits.FITS(fname, "r+") as f:
-            f[1][70, "v"] = new_cell
+            f[1]["v"][70] = new_cell
             same = f[1].read()
         with rustfits.FITS(fname, "r") as f:
             re = f[1].read()

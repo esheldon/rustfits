@@ -20,7 +20,9 @@ from ._rust import (
     is_protected_key,
 )
 
-# User-facing convenience wrappers (read, future read_header, write, ...).
-# Definitions live in convenience.py; we re-export at the top level so
-# users can write `rustfits.read(...)` directly.
-from .convenience import read, write_image, write_table
+# User-facing convenience wrappers (read, read_header, write).
+# Definitions live in convenience.py; we re-export at the top level
+# so users can write `rustfits.read(...)` directly.  These are
+# intentionally minimal — for type-specific knobs open the file
+# explicitly with FITS() and call .write_image / .write_table.
+from .convenience import read, read_header, write

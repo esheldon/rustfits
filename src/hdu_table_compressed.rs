@@ -690,21 +690,6 @@ impl CompressedTableHDU {
                     py, &ctx, &per_column, &selected, &disk_rows,
                 )
             }
-            SetItemKey::Cell(row_idx_signed, name) => {
-                let r = normalize_disk_row(row_idx_signed, meta.nrows)?;
-                let col_idx = find_compressed_column_index(
-                    &meta.columns, &name)?;
-                let col = &meta.columns[col_idx];
-                let promoted = if col.var_kind.is_some() {
-                    coerce_vla_cell_value_to_len1(py, value)?
-                } else {
-                    coerce_cell_value_to_len1(py, col, value)?
-                };
-                let per_column = vec![promoted];
-                setitem_compressed_cols(
-                    py, &ctx, &per_column, &[col_idx], &[r],
-                )
-            }
         }
     }
 
