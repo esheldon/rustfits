@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
+use flate2::read::GzDecoder;
 use std::fs::OpenOptions;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -123,6 +124,20 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
 // FITS pyclass and to_bytes() copies it out regardless (see CLAUDE.md).
 fn is_mem_url(filename: &str) -> bool {
     filename == "mem://" || filename == "memkeep://"
+}
+
+// True for a whole-file gzip path (read-only).  Detection is by the
+// `.gz` extension (case-insensitive), matching cfitsio.  cfitsio also
+// transparently handles `.Z` (LZW) and `.zip`, but those need different
+// codecs and are out of scope; only gzip is supported, via flate2 (an
+// existing dependency).  The whole file is gunzipped into a `Mem`
+// buffer at open — gzip streams aren't randomly seekable and FITS needs
+// random access — so the decompressed file lives in RAM (same caveat as
+// `mem://`).
+fn is_gz_path(filename: &str) -> bool {
+    std::path::Path::new(filename)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
 }
 
 // Walks the file from byte 0, extracting every HDU header and skipping over
@@ -1354,6 +1369,28 @@ impl FITS {
         // writable, so read-only mode is advisory only for mem files.
         let storage = if is_mem_url(&filename) {
             Storage::Mem(Cursor::new(Vec::new()))
+        } else if is_gz_path(&filename) {
+            // Whole-file gzip: read-only.  Write-back (recompress on
+            // close) is not yet implemented, so reject r+ / w+ with a
+            // clear pointer rather than silently dropping mutations.
+            if mode != "r" {
+                return Err(PyIOError::new_err(format!(
+                    "gzipped files are read-only; open '{}' with mode='r' \
+                     (write-back to .gz is not yet implemented — to edit, \
+                     read it, write to a plain .fits, and gzip that)",
+                    filename
+                )));
+            }
+            let file = OpenOptions::new().read(true).open(&filename).map_err(|e| {
+                PyIOError::new_err(format!("Failed to open '{}': {}", filename, e))
+            })?;
+            // Gunzip the whole file into RAM, then parse it like any
+            // other in-memory file.
+            let mut buf = Vec::new();
+            GzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
+                PyIOError::new_err(format!("Failed to gunzip '{}': {}", filename, e))
+            })?;
+            Storage::Mem(Cursor::new(buf))
         } else {
             let mut options = OpenOptions::new();
             match mode {

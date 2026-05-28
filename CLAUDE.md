@@ -1201,14 +1201,15 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
 - **Remote file reads (`http`/`https`)** — open a FITS file from a
   URL.  Design sketched but not implemented — see the "Remote file
   reads" roadmap below.
-- **In-memory files (`mem://` / `memkeep://`)** — create / read /
-  extract a FITS file with no disk access, via `FITS("mem://", "w+")`
-  + `to_bytes()` / `FITS.from_bytes(b)`.  **Shipped** (the `Storage`
-  seam + `Disk`/`Mem` backends).  The broader cfitsio driver set
-  (gzip whole-file, stdin/stdout, shared memory, remote range reads)
-  is still sketched — see the "In-memory files + the storage-driver
-  abstraction" roadmap below, which now plugs each remaining backend
-  into the shipped `enum Storage`.
+- **In-memory files (`mem://` / `memkeep://`) + gzip read** —
+  create / read / extract a FITS file with no disk access, via
+  `FITS("mem://", "w+")` + `to_bytes()` / `FITS.from_bytes(b)`; and
+  read a gzipped file via a `.gz` path.  **Shipped** (the `Storage`
+  seam + `Disk`/`Mem` backends + gunzip-on-open).  The rest of the
+  cfitsio driver set (`.gz` write-back, stdin/stdout, shared memory,
+  remote download + range reads) is still sketched — see the
+  "In-memory files + the storage-driver abstraction" roadmap below,
+  which plugs each remaining backend into the shipped `enum Storage`.
 
 ## Top-level convenience functions
 
@@ -3889,15 +3890,27 @@ the same architectural work as cfitsio's *whole* driver set, so this
 roadmap is scoped as "the storage abstraction" rather than just the
 mem case.
 
-**Status: the seam + the first two backends shipped (2026-05-28).**
+**Status: the seam + Mem/gzip read backends shipped (2026-05-28).**
 
 | Piece | Status |
 |---|---|
 | Storage seam (`FileHandle` over `enum Storage`) | ✅ Shipped |
 | `Disk` backend (`file://`) | ✅ Shipped |
 | `Mem` backend + `mem://` / `memkeep://` + `to_bytes`/`from_bytes` | ✅ Shipped |
-| Whole-file `.gz`/`.Z`/`.zip`, `stdin://`/`stdout://`, `shmem://` | ⬜ Sketched below |
+| Whole-file `.gz` **read** (gunzip-on-open → `Mem`) | ✅ Shipped |
+| `.gz` write-back (recompress-on-close), `.Z`/`.zip` | ⬜ Sketched below |
+| `stdin://` / `stdout://`, `shmem://` | ⬜ Sketched below |
 | `http`/`https` download + range reads | ⬜ See "Remote file reads" roadmap |
+
+**Gzip read (shipped).**  A path with a `.gz` extension
+(case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
+whole into a `Storage::Mem` buffer at open via `flate2::read::GzDecoder`,
+then parsed like any in-memory file.  Read-only: `r+`/`w+` on a `.gz`
+raise (write-back not implemented).  Decompressed file lives in RAM
+(gzip isn't seekable; FITS needs random access) — same caveat as
+`mem://`.  `to_bytes()` returns the decompressed bytes.  Only gzip
+(`.gz`); `.Z` (LZW) and `.zip` are out of scope (different codecs).
+Tests: `tests/test_fits_gz.py` (13 cases).
 
 The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
 `Box<dyn FitsStorage>` — see "The shape (as built)" below for the
@@ -3988,7 +4001,8 @@ store** or **(b) something materialized into a memory buffer**.  The
 |---|---|---|
 | `file://` | the `Disk` variant | ✅ |
 | `mem://` / `memkeep://` | the `Mem` (`Cursor<Vec<u8>>`) variant; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair | ✅ |
-| whole-file `.gz` / `.Z` / `.zip` | `Mem` filled by gunzip-on-open, recompress-on-close | ⬜ |
+| whole-file `.gz` (read) | `Mem` filled by gunzip-on-open | ✅ |
+| `.gz` write-back / `.Z` / `.zip` | `Mem` + recompress-on-close (gz); LZW / zip codecs (others) | ⬜ |
 | `stdin://` / `stdout://` / `"-"` | `Mem`: slurp the non-seekable reader at open / flush the sink at close | ⬜ |
 | `http`/`https`/`ftp` (download) | fill the `Mem` buffer (or temp file) from the network at open | ⬜ |
 | http **range** reads (remote roadmap #2) | a *lazy* read-only backend: seek+read → Range requests, no full buffer (the case that would justify `dyn`) | ⬜ |

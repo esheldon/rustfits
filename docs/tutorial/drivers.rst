@@ -6,13 +6,13 @@ small set of *driver* prefixes that select where the bytes live.  The
 prefix is part of the filename string — the same convention cfitsio
 and fitsio use — so existing muscle memory carries over.
 
-Today the in-memory driver is implemented.  Remote (``http://`` /
-``https://``) and whole-file-compressed (``.gz``) drivers are planned
-but not yet available.
+Today the in-memory and (read-only) gzip drivers are implemented.
+Remote (``http://`` / ``https://``) drivers are planned but not yet
+available.
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 16 54
+   :widths: 30 18 52
 
    * - Filename
      - Backend
@@ -23,6 +23,9 @@ but not yet available.
    * - ``"mem://"`` / ``"memkeep://"``
      - in memory
      - build or parse a FITS file with no disk access
+   * - ``"path/to.fits.gz"``
+     - in memory (gunzipped)
+     - read a gzipped FITS file (read-only)
 
 In-memory files
 ---------------
@@ -129,3 +132,36 @@ The trade-off is memory: the whole file lives in RAM, which gives up
 rustfits's usual streaming property (peak RSS ~1 MiB above the output
 array on disk reads).  That's inherent to in-memory files; for large
 files, work from a path on disk.
+
+Gzipped files
+-------------
+
+Opening a path ending in ``.gz`` reads a gzipped FITS file: rustfits
+gunzips the whole file into an in-memory buffer and then parses it
+exactly like any in-memory file.
+
+.. code-block:: python
+
+   with rustfits.FITS("image.fits.gz") as fits:   # read-only
+       image = fits[0].read()
+
+Gzipped files are **read-only** — open them with the default
+``mode="r"``; ``"r+"`` and ``"w+"`` raise, because write-back
+(recompress on close) is not yet implemented.  To edit a gzipped
+file, read it, write a plain ``.fits``, and gzip that yourself.
+
+A few details:
+
+* Because a gzip stream can't be seeked and FITS needs random access,
+  the *decompressed* file is held in RAM — the same caveat as
+  ``mem://``.  Fine for typical files; for very large data prefer an
+  uncompressed path on disk.
+* :meth:`~rustfits.FITS.to_bytes` on a ``.gz``-opened file returns the
+  **decompressed** bytes (the in-memory representation), not the gzip
+  stream.
+* Detection is by the ``.gz`` extension (case-insensitive).  cfitsio's
+  ``.Z`` (LZW) and ``.zip`` whole-file formats are not supported —
+  only gzip.
+* The top-level :func:`rustfits.read` / :func:`rustfits.read_header`
+  handle ``.gz`` paths too, since they open via
+  :class:`~rustfits.FITS`.
