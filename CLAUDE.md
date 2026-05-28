@@ -3940,7 +3940,7 @@ trait *is* (a); the in-memory impl *is* (b).  Coverage map:
 | cfitsio driver | how it rides on `FitsStorage` |
 |---|---|
 | `file://` | the `File` impl (exists today) |
-| `mem://` / `memkeep://` | the `Cursor<Vec<u8>>` impl; `from_bytes`/`to_bytes` = memkeep |
+| `mem://` / `memkeep://` | the `Cursor<Vec<u8>>` impl; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair |
 | whole-file `.gz` / `.Z` / `.zip` | mem impl filled by gunzip-on-open, recompress-on-close |
 | `stdin://` / `stdout://` / `"-"` | mem impl: slurp the non-seekable reader at open / flush the sink at close |
 | `http`/`https`/`ftp` (download) | fill the mem buffer (or temp file) from the network at open |
@@ -3970,10 +3970,37 @@ immediately.  Not *zero-disk*, but covers most of the practical
 
 ### Python surface
 
-- Read: `rustfits.FITS.from_bytes(b)` (or the temp-file shortcut
-  behind the same name).
-- Create-in-memory: `FITS(":memory:", "w+")` … then `fits.to_bytes()`
-  to extract.
+Two layers, chosen so cfitsio/fitsio migrators see familiar names and
+everyone else gets a Pythonic path:
+
+- **cfitsio driver names (primary surface).**  `FITS("mem://", "w+")`
+  and `FITS("memkeep://", "w+")` both open an in-memory file.  These
+  are the names sophisticated users already know from cfitsio/fitsio,
+  and — being `scheme://`-shaped — they slot into the *same*
+  constructor prefix-dispatch branch the remote roadmap uses for
+  `http://` / `https://`, rather than needing a special-cased magic
+  filename.  (An earlier sketch proposed a SQLite-style `":memory:"`
+  sentinel; dropped in favor of the cfitsio spelling for familiarity
+  and dispatch uniformity.)
+- **`to_bytes()` / `from_bytes()` (Pythonic pair).**  `fits.to_bytes()`
+  returns the in-memory file's bytes as a Python `bytes`;
+  `rustfits.FITS.from_bytes(b)` parses bytes you already hold (DB blob,
+  socket, astropy) without a disk round-trip (or via the temp-file
+  shortcut behind the same name — see below).  This layer exists
+  because cfitsio's *native* extraction is clunky (hand it a buffer
+  pointer + size); the byte methods are the discoverable, idiomatic
+  way in and out.
+
+**`mem://` and `memkeep://` are aliases — both do the same thing.**  In
+C the distinction is load-bearing (the caller manages the buffer
+pointer; `memkeep://` means "don't free it on close so I can read it
+back").  In rustfits the buffer is a `Vec` owned by the `FITS`
+pyclass, alive exactly as long as the Python object, and `to_bytes()`
+copies it out regardless of which name opened the file — so the
+keep/free semantic doesn't map onto anything the Python user controls.
+Both names back the same `Cursor<Vec<u8>>` impl; `to_bytes()` is the
+supported extraction path either way.  We accept both purely so a
+migrator's existing spelling keeps working.
 
 ### Main tradeoff
 
