@@ -94,6 +94,56 @@ applied; pass ``scale=False`` for raw stored values.  For columns
 with a ``TNULLn`` integer sentinel, ``mask_null=True`` returns a
 ``numpy.ma.MaskedArray``.
 
+Iterating over rows
+-------------------
+
+For a table that doesn't fit comfortably in memory, iterate
+instead of reading the whole thing.  ``for row in hdu`` yields one
+row at a time as a numpy scalar record (the same value ``hdu[i]``
+returns):
+
+.. code-block:: python
+
+   with rustfits.FITS("cat.fits") as fits:
+       hdu = fits[1]
+       for row in hdu:
+           use(row["ra"], row["dec"])
+
+Rows are read from disk in internally-buffered batches — not one
+read per row — so this stays memory-bounded even on a huge table.
+The buffer is auto-sized (no knob to tune).
+
+For vectorized work, iterate in chunks with
+:meth:`~rustfits.TableHDU.iter`.  Each iteration yields a
+structured ndarray of up to ``chunksize`` rows (the last chunk may
+be shorter):
+
+.. code-block:: python
+
+   with rustfits.FITS("cat.fits") as fits:
+       hdu = fits[1]
+       for chunk in hdu.iter(chunksize=100_000):
+           total += chunk["flux"].sum()
+
+``iter`` forwards ``columns=`` and ``scale=`` to
+:meth:`~rustfits.TableHDU.read`, so you can stream just the columns
+you need:
+
+.. code-block:: python
+
+   for chunk in hdu.iter(chunksize=100_000, columns=["ra", "dec"]):
+       ...
+
+Each yielded record or chunk then carries only the named fields —
+this is the way to iterate a column subset (a single-column
+``iter(columns=["ra"])`` still yields one-field records, so reach
+the value with ``row["ra"]``).
+
+The same surface works on a tile-compressed
+:class:`~rustfits.CompressedTableHDU`, decoding only the tiles each
+batch touches.  Note that the row count is fixed when the iterator
+is created, so rows appended mid-loop are not seen.
+
 Column subsets
 --------------
 
