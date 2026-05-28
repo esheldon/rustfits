@@ -140,6 +140,35 @@ fn is_gz_path(filename: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
 }
 
+// True for a remote URL we can fetch (read-only download-then-open).
+// Only http/https; cfitsio also speaks ftp/root, but those need separate
+// crates and are out of scope (the user's ftp:// example is not handled).
+fn is_remote_url(filename: &str) -> bool {
+    filename.starts_with("http://") || filename.starts_with("https://")
+}
+
+// Whether a URL's path component (ignoring ?query / #fragment) ends in
+// `.gz`, so a downloaded remote file gets gunzipped like a local `.gz`.
+fn url_path_is_gz(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.to_ascii_lowercase().ends_with(".gz")
+}
+
+// Fetch a remote file whole into memory (blocking).  The GIL is released
+// for the duration of the network I/O so other Python threads run.  The
+// whole file lands in RAM (download-then-open); for huge remote files,
+// range reads are the future answer (see CLAUDE.md).
+fn download_remote(py: Python<'_>, url: &str) -> PyResult<Vec<u8>> {
+    py.detach(|| -> Result<Vec<u8>, String> {
+        let response = ureq::get(url).call().map_err(|e| e.to_string())?;
+        let mut reader = response.into_body().into_reader();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf)
+    })
+    .map_err(|e| PyIOError::new_err(format!("Failed to fetch '{}': {}", url, e)))
+}
+
 // Walks the file from byte 0, extracting every HDU header and skipping over
 // each data section, returning the parsed HDU Python objects.  Each HDU is
 // constructed with its data-section byte offset and a clone of the file
@@ -1369,6 +1398,28 @@ impl FITS {
         // writable, so read-only mode is advisory only for mem files.
         let storage = if is_mem_url(&filename) {
             Storage::Mem(Cursor::new(Vec::new()))
+        } else if is_remote_url(&filename) {
+            // Download-then-open: fetch the whole file into RAM, then
+            // parse like any in-memory file.  Read-only.
+            if mode != "r" {
+                return Err(PyIOError::new_err(format!(
+                    "remote files are read-only; open '{}' with mode='r'",
+                    filename
+                )));
+            }
+            let mut bytes = download_remote(py, &filename)?;
+            // A remote .gz (path ends in .gz) is gunzipped, same as a
+            // local .gz path.
+            if url_path_is_gz(&filename) {
+                let mut out = Vec::new();
+                GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| {
+                    PyIOError::new_err(format!(
+                        "Failed to gunzip remote '{}': {}", filename, e
+                    ))
+                })?;
+                bytes = out;
+            }
+            Storage::Mem(Cursor::new(bytes))
         } else if is_gz_path(&filename) {
             // Whole-file gzip: read-only.  Write-back (recompress on
             // close) is not yet implemented, so reject r+ / w+ with a

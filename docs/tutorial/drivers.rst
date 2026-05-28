@@ -6,13 +6,12 @@ small set of *driver* prefixes that select where the bytes live.  The
 prefix is part of the filename string — the same convention cfitsio
 and fitsio use — so existing muscle memory carries over.
 
-Today the in-memory and (read-only) gzip drivers are implemented.
-Remote (``http://`` / ``https://``) drivers are planned but not yet
-available.
+Today the in-memory, gzip-read, and remote (``http`` / ``https``) read
+drivers are implemented.
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 18 52
+   :widths: 34 22 44
 
    * - Filename
      - Backend
@@ -26,6 +25,9 @@ available.
    * - ``"path/to.fits.gz"``
      - in memory (gunzipped)
      - read a gzipped FITS file (read-only)
+   * - ``"http://..."`` / ``"https://..."``
+     - in memory (downloaded)
+     - read a FITS file from a URL (read-only)
 
 In-memory files
 ---------------
@@ -165,3 +167,36 @@ A few details:
 * The top-level :func:`rustfits.read` / :func:`rustfits.read_header`
   handle ``.gz`` paths too, since they open via
   :class:`~rustfits.FITS`.
+
+Remote files
+------------
+
+A ``http://`` or ``https://`` URL is fetched whole and parsed in
+memory — *download-then-open*:
+
+.. code-block:: python
+
+   url = "https://example.org/data/image.fits"
+   with rustfits.FITS(url) as fits:        # read-only
+       image = fits[0].read()
+
+   # or the one-liner:
+   image = rustfits.read(url)
+
+Details:
+
+* **Read-only.** ``"r+"`` and ``"w+"`` raise before any network
+  request (there is no write-back to a URL).
+* **Whole file in RAM.** The entire file is downloaded into memory and
+  parsed there, so this pays the full transfer even for a one-tile
+  read, and peak RSS is the file size (same caveat as ``mem://``).
+  Range-based partial reads — pulling only the bytes a slice needs —
+  are a planned follow-up.
+* A URL whose path ends in ``.gz`` is **gunzipped** after download,
+  just like a local ``.gz`` path.
+* The GIL is released during the transfer, so other Python threads
+  keep running while a download is in flight.
+* **Schemes:** ``http`` and ``https`` only.  ``ftp://`` and cfitsio's
+  ``root://`` are not supported (they need separate protocol
+  libraries).  For an ``ftp`` file, download it with another tool
+  first, then open the local copy.

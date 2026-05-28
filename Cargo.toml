@@ -10,6 +10,10 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.28" }
 lru = "0.18"
 flate2 = "1"
+# Blocking HTTP client (rustls TLS) for the http:// / https:// download
+# driver.  Blocking-native — no tokio — which fits the synchronous PyO3
+# path.
+ureq = "3"
 
 [profile.release]
 debug = "line-tables-only"   # ~10–15% bigger .so; near-zero perf hit

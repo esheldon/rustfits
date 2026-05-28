@@ -1199,17 +1199,18 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
 - **Streaming / row-iterator API** — for tables that don't fit in
   RAM.  No user has asked yet; add when one does.
 - **Remote file reads (`http`/`https`)** — open a FITS file from a
-  URL.  Design sketched but not implemented — see the "Remote file
-  reads" roadmap below.
+  URL.  **Shipped** (download-then-open, read-only; see the "Remote
+  file reads" roadmap below).  Range-based partial reads, and
+  `ftp`/`root`, are still deferred.
 - **In-memory files (`mem://` / `memkeep://`) + gzip read** —
   create / read / extract a FITS file with no disk access, via
   `FITS("mem://", "w+")` + `to_bytes()` / `FITS.from_bytes(b)`; and
   read a gzipped file via a `.gz` path.  **Shipped** (the `Storage`
   seam + `Disk`/`Mem` backends + gunzip-on-open).  The rest of the
   cfitsio driver set (`.gz` write-back, stdin/stdout, shared memory,
-  remote download + range reads) is still sketched — see the
-  "In-memory files + the storage-driver abstraction" roadmap below,
-  which plugs each remaining backend into the shipped `enum Storage`.
+  remote range reads) is still sketched — see the "In-memory files +
+  the storage-driver abstraction" roadmap below, which plugs each
+  remaining backend into the shipped `enum Storage`.
 
 ## Top-level convenience functions
 
@@ -3789,19 +3790,18 @@ same-handle vs reopen parity.
 ## Remote file reads (download-then-open) — roadmap
 
 cfitsio can open files over the network (HTTP/FTP/root drivers).
-This is the rustfits plan for the equivalent.  **Status: design
-sketched, not implemented.**
+This is the rustfits plan for the equivalent.  **Status: flavor #1
+(http/https download) shipped 2026-05-28; flavor #2 (range reads)
+deferred.**
 
-Two distinct flavors, very different cost — only #1 is in scope
-for the first pass:
+Two distinct flavors, very different cost:
 
-1. **Download-then-open (this roadmap).**  Fetch the whole remote
-   file to a temp local file, then hand it to the existing local
-   machinery.  Zero downstream change: reads / slicing / parsing
-   keep seeing a `std::fs::File`.  Read-only against the remote
-   (no write-back); pays the full download even for a one-tile
-   read.  This is essentially what cfitsio does for most of its
-   network drivers.
+1. **Download-then-open (shipped).**  Fetch the whole remote file
+   into a `Storage::Mem` buffer, then parse it like any in-memory
+   file.  Read-only against the remote (no write-back); pays the
+   full download even for a one-tile read.  This is essentially what
+   cfitsio does for most of its network drivers.  See "Design
+   (flavor #1, as built)" below.
 2. **Range-based partial reads (deferred, NOT this roadmap).**
    HTTP `Range` requests so `fits["sci"][100:200]` or a single
    compressed tile pulls only the bytes it needs — the real
@@ -3816,71 +3816,60 @@ for the first pass:
    (the in-place grow / `shift_file_tail` / taint machinery is
    fundamentally local), and depends on the server honoring Range.
 
-### Design (flavor #1)
+### Design (flavor #1, as built)
 
-Guiding principle: keep `FileHandle` and everything downstream
-**completely unchanged** by materializing the remote bytes into a
-temp local file and opening *that*.
+Implemented by downloading the whole file into a `Storage::Mem`
+buffer and parsing it like any in-memory file — simpler than the
+original temp-file sketch, and it reuses the `Mem` backend the
+storage seam already provides (no `TempPath` guard, no new `FITS`
+field, no cleanup).
 
 **Where it lands.**  One branch at the top of `FITS::new`
-(`src/fits.rs`).  Detect a URL scheme on `filename`; if present,
-download to a temp file and open the temp path instead of the
-user-supplied path.  Sketch:
+(`src/fits.rs`), checked before the local-`.gz` and disk branches:
 
 ```rust
-let (open_path, _tempfile): (String, Option<TempPath>) =
-    if is_remote_url(&filename) {
-        if mode != "r" {
-            return Err(PyIOError::new_err(
-                "Remote files are read-only; only mode='r' is supported",
-            ));
-        }
-        let tmp = download_to_tempfile(py, &filename)?;  // GIL released inside
-        (tmp.path_str(), Some(tmp))
-    } else {
-        (filename.clone(), None)
-    };
-// ... existing OpenOptions / parse_hdus_from_file, but using `open_path` ...
-// FITS struct keeps `filename` = the URL (for repr / .filename),
-// and gains a `_tempfile: Option<TempPath>` guard field.
+} else if is_remote_url(&filename) {       // http:// or https://
+    if mode != "r" { /* reject: remote is read-only */ }
+    let mut bytes = download_remote(py, &filename)?;   // GIL released
+    if url_path_is_gz(&filename) { /* gunzip bytes */ }
+    Storage::Mem(Cursor::new(bytes))
+}
 ```
 
-**Key decisions.**
-- *Temp-file lifetime.*  Reads are lazy/chunked, so the temp file
-  must outlive the constructor.  Store a `tempfile::TempPath` (or
-  `TempDir`) guard on the `FITS` struct so it is deleted on
-  `close()`/drop.  (The open `File` keeps it readable even after
-  unlink on Linux, but holding the guard is the portable, explicit
-  choice.)
-- *Stream to disk, don't buffer in RAM.*  Copy the HTTP response
-  reader → temp file via `std::io::copy`, matching the project's
-  bounded-memory ethos — a multi-GB remote file must not transiently
-  land in memory.
-- *Release the GIL during the fetch.*  Wrap the download in
-  `py.allow_threads(...)`.
-- *Read-only, enforced early.*  Reject `r+`/`w+` for URLs before any
-  network work.  `rustfits.write()` rejects URLs at its own boundary.
-- *Free convenience coverage.*  `read` / `read_header` call
-  `FITS(...)` under the hood, so they get remote support
-  automatically once the constructor branch exists.  Only `write`
-  needs the explicit URL rejection.
+`FITS.filename` keeps the URL (for repr).  `to_bytes()` returns the
+downloaded (and, for a `.gz` URL, decompressed) bytes.
 
-**Open questions to settle before coding.**
-1. *HTTP crate.*  `reqwest` (blocking feature) is obvious but drags
-   in tokio; `ureq` is blocking-native, far lighter, rustls-based —
-   a better fit for a synchronous PyO3 path and the project's "we
-   just install the gzip crate" minimalism.  Lean `ureq` unless
-   async is foreseen.
-2. *Which schemes.*  `http`/`https` cover the realistic cases.  Skip
-   `ftp` (nearly dead, needs a separate crate).  `file://` is trivial
-   (strip the prefix) if URL parity is wanted.
-3. *Whole-file `.gz`.*  cfitsio transparently gunzips `*.fits.gz`;
-   rustfits doesn't do that for *local* files either, so it's an
-   orthogonal feature — out of scope here, don't entangle it.
-4. *Re-download caching.*  First cut downloads fresh on every
-   `FITS(url)`.  An on-disk cache keyed by URL (+ ETag/Last-Modified)
-   is a tempting follow-up but adds invalidation complexity — defer
-   unless repeat-open is a real pattern.
+**Decisions (as built).**
+- *HTTP crate: `ureq` 3.x* (blocking-native, rustls TLS, no tokio) —
+  the right fit for the synchronous PyO3 path.  `download_remote`
+  does `ureq::get(url).call()?.into_body().into_reader()` →
+  `read_to_end`.
+- *Whole file in RAM*, not streamed to a temp file.  The original
+  sketch favored a temp file for bounded memory; the `Mem` backend
+  makes the in-RAM path trivial and consistent with `mem://` /
+  `.gz`.  For huge remote files the real answer is flavor #2 (range
+  reads), which avoids downloading the whole thing at all — so
+  bounded-memory *whole-file* download isn't worth the temp-file
+  complexity.  (A streamed-to-temp-file variant stays a possible
+  follow-up if a workload needs it.)
+- *GIL released during the fetch* via `py.detach(...)` (pyo3 0.28's
+  rename of `allow_threads`).
+- *Read-only, enforced early.*  `r+`/`w+` raise before any network
+  request.  `rustfits.read` / `read_header` get remote support for
+  free (they open via `FITS`).
+- *Schemes: `http` / `https` only.*  `ftp` / `root` need separate
+  protocol crates and are out of scope — the user's `ftp://` example
+  is not handled (download it with another tool first).
+- *`.gz` composes:* a URL whose path (sans `?query` / `#frag`) ends
+  in `.gz` is gunzipped after download, same as a local `.gz` path.
+- *No caching.*  Each `FITS(url)` downloads fresh.  An on-disk cache
+  keyed by URL + ETag/Last-Modified is a possible follow-up; deferred
+  (invalidation complexity) unless repeat-open is a real pattern.
+
+Tests: `tests/test_fits_remote.py` (11 cases) run against a local
+`http.server` — deterministic, no external network.  `https` uses the
+same code path (only the scheme differs) and isn't unit-tested (would
+need a self-signed cert).
 
 ## In-memory files + the storage-driver abstraction — roadmap
 
@@ -3900,7 +3889,8 @@ mem case.
 | Whole-file `.gz` **read** (gunzip-on-open → `Mem`) | ✅ Shipped |
 | `.gz` write-back (recompress-on-close), `.Z`/`.zip` | ⬜ Sketched below |
 | `stdin://` / `stdout://`, `shmem://` | ⬜ Sketched below |
-| `http`/`https` download + range reads | ⬜ See "Remote file reads" roadmap |
+| `http`/`https` **download** read (→ `Mem`) | ✅ Shipped |
+| `http`/`https` range reads, `ftp`/`root` | ⬜ See "Remote file reads" roadmap |
 
 **Gzip read (shipped).**  A path with a `.gz` extension
 (case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
@@ -4004,7 +3994,8 @@ store** or **(b) something materialized into a memory buffer**.  The
 | whole-file `.gz` (read) | `Mem` filled by gunzip-on-open | ✅ |
 | `.gz` write-back / `.Z` / `.zip` | `Mem` + recompress-on-close (gz); LZW / zip codecs (others) | ⬜ |
 | `stdin://` / `stdout://` / `"-"` | `Mem`: slurp the non-seekable reader at open / flush the sink at close | ⬜ |
-| `http`/`https`/`ftp` (download) | fill the `Mem` buffer (or temp file) from the network at open | ⬜ |
+| `http`/`https` (download) | fill the `Mem` buffer from the network at open (`ureq`); read-only; gunzips a `.gz` URL | ✅ |
+| `ftp` / `root` (download) | needs a separate protocol crate | ⬜ |
 | http **range** reads (remote roadmap #2) | a *lazy* read-only backend: seek+read → Range requests, no full buffer (the case that would justify `dyn`) | ⬜ |
 | `shmem://` | `Mem` backed by an OS shared-memory mapping | ⬜ |
 | `root://` / `gsiftp://` | same as http — materialize-to-mem, or a lazy protocol backend | ⬜ |
