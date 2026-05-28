@@ -4038,7 +4038,7 @@ janitorial, not feature work — none changes behavior.  **Suggested
 ordering: do the structural splits (1 + 2) first, then the cleanup
 passes (3 + 4) on the settled structure so you don't clean code
 you're about to move; 5 is independent and can happen anytime.**
-Items 1 + 2 shipped 2026-05-28; 3 + 4 + 5 remain.
+Items 1–4 shipped 2026-05-28; only 5 remains.
 
 1. ✅ **Split the two giant `.rs` files into directory modules.**
    Done 2026-05-28.  `src/hdu_table_compressed.rs` (5970 lines) →
@@ -4069,24 +4069,31 @@ Items 1 + 2 shipped 2026-05-28; 3 + 4 + 5 remain.
    side reuses the uncompressed `hdu_table` descriptor helpers; a
    forced merge wasn't worth the surface churn.)
 
-3. **Audit for gratuitous `pub(crate)`.**  Mechanical and low-risk
-   (the compiler flags over-demotion).  Demote helpers that only
-   their own file uses back to private `fn`.  Do this AFTER #1/#2 —
-   moving code changes what genuinely needs cross-module visibility,
-   so an earlier pass would just be redone.  See the visibility-
-   discipline note under "Project structure".
+3. ✅ **Audit for gratuitous `pub(crate)`.**  Done 2026-05-28.
+   Demoted every top-level item in the two compressed directory
+   modules, then let the compiler re-bump only what a sibling or
+   external module actually imports — 8 file-internal helpers went
+   back to private (`default_table_algorithm`, `encode_tile_int`/
+   `_float`, `TileRow`, `IntTileCtx`, `FloatTileCtx`, `read_descriptor`,
+   `encode_vla_column_tile_with_merge`).  Struct fields on the
+   cross-module data-carrier structs were left `pub(crate)` (rustc
+   has no over-visible-field lint and they genuinely cross modules).
 
-4. **Clippy: fix or consciously `#[allow]`.**  ~140 lib warnings as
-   of 2026-05-28.  The bulk (~49 "manually reimplementing", ~15
-   index-only `for i in 0..len` loops, plus assorted needless
-   refs/casts) is auto-fixable — start with `cargo clippy --fix
-   --lib`.  The judgment calls are ~22 `too_many_arguments` (8–11
-   args, in the encode / setitem / extend dispatchers): some already
-   bundle their stable args into a ctx struct (`IntTileCtx`,
-   `FloatTileCtx`, `SetItemCtx`); the rest either get the same
-   treatment or an `#[allow(clippy::too_many_arguments)]` with a
-   one-line rationale.  Target: zero warnings OR each remaining one
-   explicitly `#[allow]`-ed with a reason.  Also AFTER #1/#2.
+4. ✅ **Clippy: fix or consciously `#[allow]`.**  Done 2026-05-28.
+   ~141 lib warnings → zero.  Auto-fixed the bulk via `cargo clippy
+   --fix --lib`; hand-fixed the non-machine-applicable remainder
+   (`checked_div`, `strip_prefix`, `nonminimal_bool` factoring,
+   `&mut Vec` → `&mut [_]`, `vec![]` init, `enumerate`/`zip` loop
+   rewrites only where provably equivalent, type aliases for the
+   meta-cache fields).  `#[allow]` with rationale for the intentional
+   cases: per-function `too_many_arguments` on the wide dispatchers
+   (matching the codebase's existing convention — 44 such allows
+   predated this pass), module-level `needless_range_loop` on the
+   cfitsio-port files (`hcompress`/`plio`/`quantize`/`checksum` —
+   index loops mirror the C source), `upper_case_acronyms` on the
+   public `FITS`/`HDU` pyclass names, and `dead_code` on the
+   test-only `decode_checksum_ascii`.  CI does not yet gate on
+   clippy; re-running `cargo clippy --lib` should stay at zero.
 
 5. **Reorganize tests by feature, not dev phase.**  The
    `tests/test_compressed_table_phase1.py` … `_phase6*.py` files
