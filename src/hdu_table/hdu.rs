@@ -188,6 +188,12 @@ impl TableHDU {
 // would error (C/M with non-default TSCAL/TZERO).
 fn column_repr_info(col: &Column) -> (String, Option<String>) {
     if col.var_kind.is_some() {
+        // 'A' → "U" so VLA PA columns render consistently with the
+        // fixed-A path in field_dtype_and_shape (which emits "U<n>").
+        // The read side returns Python str objects per cell, so the
+        // numpy-unicode label "U" is also more accurate than the
+        // bytes label "S".  VLA cells have no single length so no
+        // suffix is appended.
         let inner = match col.tform_letter {
             'L' => "?",
             'B' => "u1",
@@ -198,7 +204,7 @@ fn column_repr_info(col: &Column) -> (String, Option<String>) {
             'D' => "f8",
             'C' => "c8",
             'M' => "c16",
-            'A' => "S",
+            'A' => "U",
             _   => return (col.tform_letter.to_string(),
                            Some("array[var]".to_string())),
         };
