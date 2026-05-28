@@ -85,6 +85,9 @@ Read just the columns or rows you need:
        head = hdu.read(rows=slice(0, 100))      # first 100 rows
        picks = hdu.read(rows=[0, 5, 10, 17])    # fancy rows
 
+       data_slice = hdu[10:30]                  # slice of rows
+       subcols = hdu[['ra', 'dec']][50:200]     # column subset and slice
+
 ``rows=`` accepts a slice (with arbitrary step, including
 negative) or an iterable of ints (negative indices wrap;
 duplicates are deduped, output order preserved).
@@ -156,9 +159,9 @@ Indexing a table with a column name returns a lazy subset object:
        ra_col = hdu["ra"]              # SingleColumnSubset
        sub    = hdu[["ra", "dec"]]     # ColumnSubset (structured)
 
-Subset objects support slicing, indexing, ``read()``, and
-``write()`` — they're a thin selector over the parent HDU, not
-a snapshot:
+No data are read until rows are specified.  Subset objects support slicing,
+indexing, ``read()``, and ``write()`` — they're a thin selector over the parent
+HDU, not a snapshot:
 
 .. code-block:: python
 
@@ -171,12 +174,12 @@ a snapshot:
    head = sub[:10]
    head_via_read = sub.read(rows=slice(0, 10))   # equivalent
 
-Single-row indexing on the parent table returns a 0-d structured
-record (``numpy.void``):
+Single-row indexing on the parent table returns a scalar, 0-d structured record
+(``numpy.void``):
 
 .. code-block:: python
 
-   row = hdu[0]              # numpy.void with field access
+   row = hdu[0]              # scalar record with field access
    row["ra"], row["dec"]
 
    first_row = hdu[0:1]      # structured ndarray of length 1
