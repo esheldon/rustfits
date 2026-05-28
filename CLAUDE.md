@@ -46,6 +46,28 @@ else stays private to its file.
 - `src/hdu_image.rs` — `ImageHDU` pyclass + image read/write/slicing,
   bitpix conversions, shape parsing.  Only exports `ImageHDU` (+ `new`)
   and `dtype_to_bitpix` (used by `FITS::create_image_hdu`).
+- `src/hdu_image_compressed/` — `CompressedImageHDU` (`ZIMAGE`
+  convention) pyclass, split (2026-05) into single-responsibility files
+  behind a `mod.rs` that re-exports only the external surface
+  (`CompressedImageHDU`, `header_has_zimage`, `compute_n_tiles`).
+  Subclasses `ImageHDU` (so `isinstance(hdu, ImageHDU)` holds on a
+  tile-compressed HDU).  Submodules:
+  - `hdu.rs` — the pyclass + `#[pymethods]` dispatch, ZIMAGE detection
+    (`header_has_zimage`), the `TileCache` alias, and the per-HDU
+    meta-cache accessor.
+  - `meta.rs` — `CompressedImageMeta` cache struct + parser, shape /
+    tile parsing, data-column discovery, quant-context build, TFORM
+    helpers, compression-config rebuild.
+  - `read.rs` — whole-image read, per-tile decode + cache, slice
+    walking, descriptor/heap byte readers.
+  - `write.rs` — per-tile encode (int / float / quantized), bulk
+    write, `extend`, `__setitem__`, descriptor-buffer helpers.
+  - `repack.rs` — heap repack (drop orphans + shrink file).
+  - `checksum.rs` — ZHECKSUM/ZDATASUM over the equivalent
+    uncompressed-image bytes.
+  Imports the shared `crate::zimage::tile_io::DEFAULT_TILE_CACHE_BYTES`.
+  Full feature status + phase history is in the "Tile-compressed images
+  (ZIMAGE)" roadmap below.
 - `src/hdu_table/` — `TableHDU` (BINTABLE) pyclass split across eight
   single-responsibility files (was a 6400-line `hdu_table.rs` until
   the 2026-05 refactor).  `mod.rs` just wires the submodules and
@@ -111,55 +133,55 @@ else stays private to its file.
     `classify_table_key` + `try_extract_column_name` for `__getitem__`
     dispatch, and the `SingleColumnSubset` / `ColumnSubset` pyclasses
     returned by the one-column / multi-column read shortcuts.
-- `src/hdu_table_compressed.rs` — `CompressedTableHDU` (`ZTABLE`
-  convention) pyclass.  Subclasses `TableHDU` (so
+- `src/hdu_table_compressed/` — `CompressedTableHDU` (`ZTABLE`
+  convention) pyclass, split (2026-05) into single-responsibility
+  files behind a `mod.rs` that re-exports only the external surface
+  (`CompressedTableHDU`, `CompressedSingleColumnSubset`,
+  `CompressedColumnSubset`, `header_has_ztable`,
+  `build_compressed_table_header`, `default_ztilelen`,
+  `resolve_compress_arg`).  Subclasses `TableHDU` (so
   `isinstance(hdu, TableHDU)` holds on a compressed-table HDU).
-  Phases 1 (detection + accessors + I/O stubs), 2 (whole-table
-  read across GZIP_1 / GZIP_2 / RICE_1), 3 (`read(rows=)` /
-  `__getitem__` / `CompressedSingleColumnSubset` +
-  `CompressedColumnSubset` / per-(tile, col) `ColumnTileCache`),
-  4 (VLA-column read via dual-descriptor heap), 5 (bulk write
-  via `create_table_hdu(..., compress=...)` for fixed columns),
-  6a (VLA write via dual-descriptor heap + ZPCOUNT for
-  funpack interop), 6b (`append()` for fixed-column tables
-  with merge-into-partial-last-tile), 6c-1a (`repack()`
-  for fixed-column tables — streaming fast path + staging
-  fallback, ~1 MiB peak memory), 6c-1b (VLA `append()`
-  — existing per-cell compressed bytes copied verbatim, new
-  rows encoded per-cell, ZPCOUNT updated for funpack interop),
-  6c-2a (VLA `repack()` — streaming staging-only path
-  rewrites per-cell offsets in the dual-descriptor blob and
-  re-gzips it; also handles mixed fixed + VLA tables), and
-  6c-2b (row `__setitem__` for fixed-column tables —
-  `hdu[i]=record` / `hdu[a:b]=arr` step=1 / `hdu[[i,j,k]]=arr`
-  modify affected tiles by decode → row-bytes replace →
-  re-encode + append to heap, with orphans reclaimed by
-  `repack()`), 6c-2c (column-targeted `__setitem__`
-  forms — `hdu["col"]=arr` and `hdu[[c1,c2]]=arr` — sharing
-  the same per-tile primitive but narrowing the column
-  selection per call), 6c-2d (stepped-slice row writes +
-  subset-object writes — `hdu[a:b:s]=arr`,
-  `hdu["col"][rows]=v`, `hdu[[a,b]][rows]=v`), and 6c-2e
-  (VLA `__setitem__` for every dispatch form —
-  `hdu["vla_col"][r]=v`, `hdu["vla_col"]=arr`,
-  `hdu[i]=record` with mixed fixed+VLA cols, mixed
-  multi-column subsets — completing the full `__setitem__`
-  surface on compressed tables.  Single-cell writes go
-  through the symmetric subset form `hdu["col"][row]=v`;
-  the tuple form `hdu[row,"col"]` is rejected for symmetry
-  with the read side.
-  Detection lives in `header_has_ztable`; routing
-  in `fits.rs::parse_hdus_from_file` checks ZTABLE BEFORE ZIMAGE
-  cannot both apply (defensive ordering).  Accessors `nrows`, `dtype`,
-  `colnames`, `units`, `__len__` override TableHDU's so they parse the
-  ORIGINAL-schema view via `synthesize_uncompressed_cards` (which
-  substitutes NAXIS1←ZNAXIS1, NAXIS2←ZNAXIS2, PCOUNT←ZPCOUNT,
-  TFORMn←ZFORMn and drops the Z-prefixed cards from the working
-  list).  Compression-specific accessors: `compression` returns
+  Submodules:
+  - `hdu.rs` — the pyclass + `#[pymethods]` dispatch (read /
+    `__getitem__` / write / append / repack / `__setitem__` /
+    checksum / accessors / repr), ZTABLE detection
+    (`header_has_ztable`), the `CacheKey` + `ColumnTileCache`
+    types, original-schema synthesis (`synthesize_uncompressed_cards`),
+    and the repr helpers.
+  - `meta.rs` — `CompressedTableMeta` cache struct + parser.
+  - `read.rs` — whole-table + `rows=` read, the per-tile `RowPlan`
+    planner, column-slab + VLA-cell decompression, the gzip-blob
+    helper.
+  - `subset.rs` — the `CompressedSingleColumnSubset` /
+    `CompressedColumnSubset` pyclasses.
+  - `write_setup.rs` — algorithm/config resolution + per-dtype
+    defaults, per-column prep (`ColPrep`), tile-slab encode helpers,
+    `build_compressed_table_header`.
+  - `write.rs` — `write_compressed_table_data` + the file-grow /
+    ZPCOUNT / VLA-tile encode helpers.
+  - `append.rs` — merge-into-partial-last-tile (fixed + VLA), heap
+    relocation, existing-tile decode.
+  - `repack.rs` — fixed + VLA dual-descriptor heap repack + the
+    chunked in-file copy primitive.
+  - `setitem.rs` — the shared per-tile column writer + VLA tile
+    writer + `SetItemCtx` + the row/value coercion + resolution
+    helpers.
+  - `checksum.rs` — ZHECKSUM/ZDATASUM over the equivalent
+    uncompressed-table bytes (streaming per-tile, incl. the VLA
+    synthetic heap).
+  Accessors `nrows`, `dtype`, `colnames`, `units`, `__len__`
+  override TableHDU's so they parse the ORIGINAL-schema view via
+  `synthesize_uncompressed_cards` (NAXIS1←ZNAXIS1, NAXIS2←ZNAXIS2,
+  PCOUNT←ZPCOUNT, TFORMn←ZFORMn, dropping the Z-prefixed cards).
+  Compression-specific accessors: `compression` returns
   `{col_name: ZCTYPn_value}`, `n_tiles` is the on-disk NAXIS2,
-  `ztile_rows` is ZTILELEN.  Imports shared helpers from
-  `crate::hdu_table` (`parse_columns`, `build_numpy_dtype`,
-  `field_dtype_and_shape`).
+  `ztile_rows` is ZTILELEN.  Routing in `fits.rs::parse_hdus_from_file`
+  checks ZTABLE before ZIMAGE (defensive ordering).  Imports shared
+  helpers from `crate::hdu_table` (`parse_columns`,
+  `build_numpy_dtype`, `field_dtype_and_shape`, the descriptor
+  codecs, ...) and `crate::zimage::tile_io::DEFAULT_TILE_CACHE_BYTES`.
+  Full feature status + phase history is in the "Tile-compressed
+  tables (ZTABLE)" roadmap below.
 - `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub
   (read returns header only; no column read/write yet).
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
@@ -178,8 +200,11 @@ Promote to `pub(crate)` only when the compiler complains — the smaller
 module surface area is the whole point of the split.  Inside the
 `hdu_table/` directory module, sibling files reach each other via
 `use super::write_fixed::*` (etc.) — those cross-file calls do need
-`pub(crate)`, but external modules (`fits.rs`, `lib.rs`, `hdu_image_compressed.rs`)
-only see what `hdu_table/mod.rs` explicitly re-exports.
+`pub(crate)`, but external modules (`fits.rs`, `lib.rs`,
+`hdu_image_compressed/`) only see what `hdu_table/mod.rs` explicitly
+re-exports.  The two compressed-HDU directory modules
+(`hdu_image_compressed/`, `hdu_table_compressed/`) follow the same
+rule internally.
 
 ## Axis order: numpy throughout, FITS only at the boundary
 
@@ -1541,7 +1566,7 @@ Test fixtures use fitsio for normal-path round-trips and hand-
 crafted bytes for synthetic fallback-column cases (astropy is
 also in the env for richer cases).
 
-Implementation lives in `src/hdu_image_compressed.rs` (the
+Implementation lives in `src/hdu_image_compressed/` (the
 pyclass + dispatch) and `src/zimage/` (algorithm-specific
 decoders).  Detection happens in `parse_hdus_from_file` in
 `fits.rs`: a BINTABLE with `ZIMAGE=T` routes to
@@ -4013,32 +4038,36 @@ janitorial, not feature work — none changes behavior.  **Suggested
 ordering: do the structural splits (1 + 2) first, then the cleanup
 passes (3 + 4) on the settled structure so you don't clean code
 you're about to move; 5 is independent and can happen anytime.**
+Items 1 + 2 shipped 2026-05-28; 3 + 4 + 5 remain.
 
-1. **Split the two giant `.rs` files into directory modules.**
-   `src/hdu_table_compressed.rs` (~5970 lines) and
-   `src/hdu_image_compressed.rs` (~5360 lines) are still single
-   files, while the *uncompressed* table side was already split into
-   the `src/hdu_table/` directory module (the 2026-05 refactor).
-   Mirror that pattern: break each into single-responsibility files
-   (rough cut: `detection`/accessors, `read`, `write`, `setitem`,
-   `repack`, `checksum`) behind a `mod.rs` that re-exports only the
-   external surface.  Keep the visibility discipline from the
-   `hdu_table/` split (private `fn` by default; `pub(crate)` only
-   when a sibling file actually imports it).  Leave
-   `src/zimage/hcompress.rs` (~2440) alone — it's a faithful
+1. ✅ **Split the two giant `.rs` files into directory modules.**
+   Done 2026-05-28.  `src/hdu_table_compressed.rs` (5970 lines) →
+   `src/hdu_table_compressed/` (10 files) and
+   `src/hdu_image_compressed.rs` (5364 lines) →
+   `src/hdu_image_compressed/` (7 files), mirroring the
+   `src/hdu_table/` pattern: single-responsibility files behind a
+   `mod.rs` that re-exports only the external surface, visibility
+   tightened to `pub(crate)` only where a sibling imports.  Pure code
+   move (full pytest + Rust unit tests green).  See the two
+   directory-module entries under "Project structure".
+   `src/zimage/hcompress.rs` (~2440) was left intact — a faithful
    line-by-line port of cfitsio's `fits_hdecompress.c`/`fits_hcompress.c`
-   and the function-name parity with cfitsio is a debugging asset;
-   splitting it would hurt side-by-side diffing.
+   whose function-name parity with cfitsio is a debugging asset.
 
-2. **Extract compression code shared by the image + table compressed
-   HDUs.**  Really a sub-goal of #1, best done *during* the split,
-   not as a separate pass.  Both compressed HDUs duplicate per-tile
-   encode/decode dispatch, P/Q descriptor I/O, and gzip-blob
-   handling.  (`src/cache.rs`'s `BytesBoundLruCache` is already
-   shared.)  Pull the common bits into a `zimage`-adjacent shared
-   module so per-tile semantics evolve in one place — the same
-   motivation behind reusing `apply_transform_cell` /
-   `serialize_vla_cell` across the uncompressed write paths.
+2. ✅ **Extract compression code shared by the image + table compressed
+   HDUs.**  Done 2026-05-28 alongside #1.  Outcome was deliberately
+   small: the codecs were already shared via `src/zimage/`
+   (gzip / rice / hcompress / plio) and `src/cache.rs`'s
+   `BytesBoundLruCache`, so the only genuine cross-file duplication
+   left was the tile-cache default, now in `src/zimage/tile_io.rs`
+   (`DEFAULT_TILE_CACHE_BYTES`).  The per-tile encode/decode
+   **dispatch** was intentionally NOT unified: the image path is
+   2-D-tile + quant-context shaped, the table path is
+   per-column-slab shaped, and one abstraction would fit neither
+   cleanly — documented in `tile_io.rs`.  (P/Q descriptor I/O also
+   stayed split: the image side uses buffer-based codecs, the table
+   side reuses the uncompressed `hdu_table` descriptor helpers; a
+   forced merge wasn't worth the surface churn.)
 
 3. **Audit for gratuitous `pub(crate)`.**  Mechanical and low-risk
    (the compiler flags over-demotion).  Demote helpers that only
