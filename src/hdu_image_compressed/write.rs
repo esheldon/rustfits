@@ -115,7 +115,7 @@ fn normalize_compressed_input_dtype(
 // fallback column).  `zscale` / `zzero` are the per-tile
 // quantization parameters; they're meaningless when the fallback
 // path fires but get written anyway since the row width is fixed.
-pub(crate) struct TileRow {
+struct TileRow {
     primary_nelem: u64,
     primary_off: u64,
     zscale: f64,
@@ -126,7 +126,7 @@ pub(crate) struct TileRow {
 
 // HDU-invariant context for the integer-tile encode helper.
 // Everything that doesn't vary tile-to-tile.
-pub(crate) struct IntTileCtx {
+struct IntTileCtx {
     algorithm: crate::zimage::CompressionAlgorithm,
     bytepix: u32,
     zbitpix: i32,
@@ -141,7 +141,7 @@ pub(crate) struct IntTileCtx {
 // HDU-invariant context for the float-tile encode helper.
 // Carries the noise-estimation knobs (qlevel) and dither state
 // (method + zdither0) alongside the algorithm parameters.
-pub(crate) struct FloatTileCtx {
+struct FloatTileCtx {
     algorithm: crate::zimage::CompressionAlgorithm,
     zbitpix: i32, // -32 or -64
     inner_byte_width: u64,
@@ -160,7 +160,7 @@ pub(crate) struct FloatTileCtx {
 // append the encoded bytes to `primary_heap`, return the row's
 // descriptor.  The float fields of TileRow stay at their defaults
 // (caller knows to ignore them for integer HDUs).
-pub(crate) fn encode_tile_int(
+fn encode_tile_int(
     ctx: &IntTileCtx,
     tile_bytes: &[u8],
     tile_idx: u64,
@@ -207,7 +207,7 @@ pub(crate) fn encode_tile_int(
 // Per-pixel NaN handling: NaN inputs become NULL_VALUE_I32 in the
 // quantized stream regardless of dither method (cfitsio's
 // convention).  Exact zeros become ZERO_VALUE_I32 under DITHER_2.
-pub(crate) fn encode_tile_float(
+fn encode_tile_float(
     ctx: &FloatTileCtx,
     tile_bytes: &[u8],
     tile_idx: u64,

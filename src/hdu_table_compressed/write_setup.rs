@@ -22,7 +22,7 @@ use crate::zimage::CompressionAlgorithm;
 
 use super::write::{grow_file_to_at_least};
 
-pub(crate) fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
+fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
     match letter {
         'B' | 'L' | 'A' | 'X' => CompressionAlgorithm::Gzip1,
         'J' => CompressionAlgorithm::Rice1,

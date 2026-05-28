@@ -552,7 +552,7 @@ fn read_big_endian_f64(
 // Read one variable-length descriptor at the given absolute file
 // offset.  Returns (nelements, heap_offset).  Both `P` (8 bytes,
 // two u32s) and `Q` (16 bytes, two u64s) forms are big-endian.
-pub(crate) fn read_descriptor(
+fn read_descriptor(
     file: &mut std::fs::File,
     desc_offset: u64,
     is_q: bool,

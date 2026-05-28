@@ -113,7 +113,7 @@ pub(crate) fn read_vla_merge_old_blob(
 // the uncompressed-fallback contract, original-descriptor offset
 // from the planner (extends past current ZPCOUNT).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_vla_column_tile_with_merge(
+fn encode_vla_column_tile_with_merge(
     py: Python<'_>,
     ndarray: &Bound<'_, PyAny>,
     file: &FileHandle,
