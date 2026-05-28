@@ -60,8 +60,8 @@ Side-by-side:
    import fitsio
    with fitsio.FITS(path) as f:
        hdr = f[0].read_header()
-       exptime = hdr["EXPTIME"]
-       comment = hdr.get_comment("EXPTIME")
+       exptime = hdr["exptime"]
+       comment = hdr.get_comment("exptime")
        for record in hdr.records():
            print(record["name"], record["value"], record["comment"])
 
@@ -178,7 +178,7 @@ Write a table to a fresh file
 
    # fitsio
    with fitsio.FITS(path, "rw", clobber=True) as f:
-       f.write(table, extname="CAT")
+       f.write(table, extname="cat")
 
    # rustfits — explicit, gets table-side kwargs
    with rustfits.FITS(path, "w+") as fits:
@@ -258,9 +258,9 @@ migration:
 
 **Full ``__getitem__`` / ``__setitem__`` surface on every HDU.**
 
-fitsio writes whole HDUs and appends rows.  rustfits lets you
-modify them in place — slice an image, replace a column, patch
-individual rows or ranges, all without rewriting the file:
+rustfits has symmetry between read and write, letting you modify in place as
+with a numpy array — slice an image, replace a column, patch individual rows or
+ranges, all without rewriting the file:
 
 .. code-block:: python
 
