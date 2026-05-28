@@ -334,6 +334,11 @@ impl ImageHDU {
     /// combined shape, writes the new pixels, and bumps the
     /// corresponding ``NAXISn`` card in the header.
     ///
+    /// A first ``extend`` on an empty HDU created with
+    /// ``create_image_hdu(dtype, (0, ...))`` is the natural way to
+    /// fill a streaming-write image: the ``0 -> N`` growth uses the
+    /// same machinery as growing a non-empty image.
+    ///
     /// For HDUs that are not the last on disk, the file tail is
     /// shifted forward and every later HDU's offsets are bumped in
     /// lockstep — previously-issued handles remain valid.

@@ -110,12 +110,19 @@ def test_unsupported_dtype_raises():
                 fits.create_image_hdu(dtype="c8", dims=(2, 3))
 
 
-def test_zero_dim_rejected():
+def test_zero_dim_on_inner_axis_rejected():
+    """
+    Zero is only allowed on axis 0 (numpy slowest = FITS NAXIS-last) so
+    callers can stream rows in via `ImageHDU.extend`.  Inner axes must
+    stay strictly positive — the FITS standard forbids zero pixels on
+    inner axes.  See `test_write_image.py::test_empty_*` for the
+    supported axis-0 case.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
         with rustfits.FITS(fname, "w+") as fits:
             with pytest.raises(ValueError, match="must be > 0"):
-                fits.create_image_hdu(dtype="f8", dims=(0, 3))
+                fits.create_image_hdu(dtype="f8", dims=(3, 0))
 
 
 def test_roundtrip_via_reopen():

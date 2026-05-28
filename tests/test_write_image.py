@@ -404,6 +404,228 @@ def test_write_to_extension_hdu():
         )
 
 
+# -------------------- empty-shape create + extend later --------------------
+#
+# `create_image_hdu` accepts a 0 on numpy axis 0 (= FITS NAXIS-last) so
+# callers can size the rest of the shape up-front and stream rows in via
+# `ImageHDU.extend`.  Inner-axis 0 stays rejected (FITS standard forbids
+# zero pixels on inner axes).
+
+
+def test_empty_2d_create_then_extend_uncompressed():
+    """shape=(0, M) HDU + later extend with N rows lands as shape=(N, M)."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("f4", (0, 1024), extname="SCI")
+            assert fits[0].shape == (0, 1024)
+            assert fits[0].dtype == np.dtype("f4")
+            data = np.arange(10 * 1024, dtype="f4").reshape(10, 1024) * 0.5
+            fits[0].extend(data)
+            assert fits[0].shape == (10, 1024)
+            np.testing.assert_array_equal(fits[0].read(), data)
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].shape == (10, 1024)
+            np.testing.assert_array_equal(fits[0].read(), data)
+
+
+def test_empty_1d_create_then_extend_uncompressed():
+    """shape=(0,) HDU + extend turns into a regular 1-D image."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("i4", (0,))
+            assert fits[0].shape == (0,)
+            data = np.arange(7, dtype="i4")
+            fits[0].extend(data)
+            np.testing.assert_array_equal(fits[0].read(), data)
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(fits[0].read(), data)
+
+
+def test_empty_3d_create_then_extend_uncompressed():
+    """shape=(0, M, K) HDU only grows axis 0 on extend."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("f8", (0, 4, 5))
+            data = np.arange(3 * 4 * 5, dtype="f8").reshape(3, 4, 5)
+            fits[0].extend(data)
+            assert fits[0].shape == (3, 4, 5)
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(fits[0].read(), data)
+
+
+def test_empty_create_then_multiple_extends_accumulate():
+    """Successive extends append along axis 0."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        a = np.arange(6, dtype="i2").reshape(2, 3)
+        b = (np.arange(9, dtype="i2") + 100).reshape(3, 3)
+        c = (np.arange(3, dtype="i2") - 50).reshape(1, 3)
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("i2", (0, 3))
+            fits[0].extend(a)
+            fits[0].extend(b)
+            fits[0].extend(c)
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(
+                fits[0].read(), np.concatenate([a, b, c], axis=0)
+            )
+
+
+def test_empty_read_returns_empty_array_uncompressed():
+    """Reading a freshly-created shape=(0, M) HDU yields a 0-row array."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("f4", (0, 8))
+            arr = fits[0].read()
+            assert arr.shape == (0, 8)
+            assert arr.dtype == np.dtype("f4")
+        with rustfits.FITS(fname, "r") as fits:
+            arr = fits[0].read()
+            assert arr.shape == (0, 8)
+
+
+def test_empty_create_rejects_zero_on_inner_axes():
+    """Zero on any axis other than axis 0 is rejected — FITS forbids it."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises(ValueError, match=r"dimension 1 must be > 0"):
+                fits.create_image_hdu("f4", (10, 0))
+            with pytest.raises(ValueError, match=r"dimension 1 must be > 0"):
+                fits.create_image_hdu("f4", (0, 0))
+            with pytest.raises(ValueError, match=r"dimension 2 must be > 0"):
+                fits.create_image_hdu("f4", (10, 4, 0))
+
+
+def test_empty_create_rejects_negative_axis0():
+    """Axis 0 may be 0 (empty) but not negative."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises(ValueError, match=r"dimension 0 must be >= 0"):
+                fits.create_image_hdu("f4", (-1, 1024))
+
+
+def test_empty_create_then_extend_not_last_hdu_uncompressed():
+    """Growing an empty HDU that's not the last shifts the trailing HDU."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        trailing = np.arange(20, dtype="i4").reshape(4, 5) - 7
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu("f4", (0, 8), extname="EMPTY")
+            fits.create_image_hdu("i4", (4, 5), extname="TRAIL")
+            fits[1].write(trailing)
+            data = np.arange(6 * 8, dtype="f4").reshape(6, 8) * 0.25
+            fits[0].extend(data)
+            np.testing.assert_array_equal(fits[0].read(), data)
+            np.testing.assert_array_equal(fits[1].read(), trailing)
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(fits[0].read(), data)
+            np.testing.assert_array_equal(fits[1].read(), trailing)
+
+
+def test_empty_2d_create_then_extend_compressed_gzip1():
+    """Empty compressed image + extend round-trips through Gzip1."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "c.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(
+                "i4",
+                (0, 1024),
+                extname="SCI",
+                compress=rustfits.Gzip1(tile_shape=(50, 1024)),
+            )
+            assert isinstance(fits[1], rustfits.CompressedImageHDU)
+            assert fits[1].shape == (0, 1024)
+            assert fits[1].n_tiles == 0
+            data = np.arange(100 * 1024, dtype="i4").reshape(100, 1024)
+            fits[1].extend(data)
+            assert fits[1].shape == (100, 1024)
+            assert fits[1].n_tiles == 2
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(fits[1].read(), data)
+
+
+def test_empty_2d_create_then_extend_compressed_rice1():
+    """Same flow under Rice1 (different encoder)."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "c.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            fits.create_image_hdu(
+                "i4",
+                (0, 256),
+                compress=rustfits.Rice1(tile_shape=(32, 256)),
+            )
+            data = np.arange(32 * 256, dtype="i4").reshape(32, 256)
+            fits[1].extend(data)
+        with rustfits.FITS(fname, "r") as fits:
+            np.testing.assert_array_equal(fits[1].read(), data)
+
+
+def test_empty_compressed_rejects_zero_on_inner_axes():
+    """Compressed path also rejects 0 on inner axes."""
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "c.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises(ValueError, match=r"dimension 1 must be > 0"):
+                fits.create_image_hdu(
+                    "i4",
+                    (10, 0),
+                    compress=rustfits.Gzip1(tile_shape=(5, 1024)),
+                )
+
+
+def test_empty_compressed_hcompress_still_rejects_axis0_zero():
+    """HCOMPRESS_1's own dim >= 4 check still rejects axis 0 == 0.
+
+    The looser create-time validation allows axis 0 == 0, but HCOMPRESS
+    has algorithm-specific minimum-dim constraints (every dim >= 4) that
+    fire on top of the create check, so the empty-create + extend-later
+    pattern is not available under HCOMPRESS.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "h.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            with pytest.raises(ValueError, match=r"axis 0 has size 0"):
+                fits.create_image_hdu(
+                    "i4",
+                    (0, 64),
+                    compress=rustfits.Hcompress1(tile_shape=(16, 64)),
+                )
+
+
+def test_empty_create_copy_loop_pattern():
+    """fitsio-style copy loop: empty HDU per source + extend with .read()."""
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "src.fits")
+        dst = os.path.join(td, "dst.fits")
+        img1 = np.arange(20, dtype="i4").reshape(4, 5) + 1
+        img2 = (np.arange(60, dtype="f4").reshape(5, 12) - 30.0) * 0.1
+        img3 = np.arange(8, dtype="i2") - 4
+        with rustfits.FITS(src, "w+") as fits:
+            fits.write(img1)
+            fits.write(img2)
+            fits.write(img3)
+        with rustfits.FITS(src, "r") as srcf, rustfits.FITS(dst, "w+") as dstf:
+            for hdu in srcf:
+                if not hdu.has_data:
+                    continue
+                if not isinstance(hdu, rustfits.ImageHDU):
+                    continue
+                empty_shape = (0,) + tuple(hdu.shape[1:])
+                target_idx = len(dstf)
+                dstf.create_image_hdu(str(hdu.dtype.str), empty_shape)
+                dstf[target_idx].extend(hdu.read())
+        with rustfits.FITS(dst, "r") as fits:
+            np.testing.assert_array_equal(fits[0].read(), img1)
+            np.testing.assert_array_equal(fits[1].read(), img2)
+            np.testing.assert_array_equal(fits[2].read(), img3)
+
+
 if __name__ == "__main__":
     test_full_write_roundtrip_f8()
     test_full_write_roundtrip_i4()
@@ -415,4 +637,17 @@ if __name__ == "__main__":
     test_partial_write_3d()
     test_partial_write_full_inner_axis_coalesces()
     test_write_to_extension_hdu()
+    test_empty_2d_create_then_extend_uncompressed()
+    test_empty_1d_create_then_extend_uncompressed()
+    test_empty_3d_create_then_extend_uncompressed()
+    test_empty_create_then_multiple_extends_accumulate()
+    test_empty_read_returns_empty_array_uncompressed()
+    test_empty_create_rejects_zero_on_inner_axes()
+    test_empty_create_rejects_negative_axis0()
+    test_empty_create_then_extend_not_last_hdu_uncompressed()
+    test_empty_2d_create_then_extend_compressed_gzip1()
+    test_empty_2d_create_then_extend_compressed_rice1()
+    test_empty_compressed_rejects_zero_on_inner_axes()
+    test_empty_compressed_hcompress_still_rejects_axis0_zero()
+    test_empty_create_copy_loop_pattern()
     print("all tests passed")

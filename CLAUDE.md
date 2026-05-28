@@ -704,29 +704,34 @@ in `hdu_image.rs` dispatches on `image_scaling_kind`; the scaled
 branch promotes the scalar to a 0-d ndarray of the scaled dtype
 and routes through `normalize_input_dtype`.
 
+**Empty-shape create + extend-later.**  Shipped.  Parallel to
+`create_table_hdu(nrows=0)` + `append()`, `create_image_hdu`
+accepts a zero in the slowest-varying axis
+(e.g. `create_image_hdu("f4", (0, 1024))`) and a subsequent
+`ImageHDU.extend(data)` fills it incrementally.  Inner axes
+stay strictly positive (the FITS standard forbids zero pixels
+on inner axes — `create_image_hdu`'s dim loop in `fits.rs`
+allows `dims[0] >= 0` but keeps `d <= 0` rejection on every
+other axis; same split in `create_compressed_image_hdu_impl`).
+The zero-data-section case needed no special handling:
+`data_section_padded(0) == 0`, `append_header_and_data_to_file`
+skips its `set_len` when `data_padded == 0`, and the extend
+path's "0-rows → N-rows" grow exercises the same
+`shift_file_tail_and_update_offsets` / `set_len` code the
+partial-last-tile case already does.  Works for both
+uncompressed and compressed HDUs across all algorithms except
+HCOMPRESS_1 (whose own dim >= 4 check rejects axis 0 == 0 —
+workaround: use Gzip1/Gzip2/Rice1).  Useful for streaming
+writers and the fitsio-style copy loop documented under
+`FITS.write`: a destination with an empty image HDU + an
+`extend(src.read())` per source HDU.  Tests in
+`tests/test_write_image.py` (`test_empty_*`, 13 cases:
+1-D/2-D/3-D uncompressed, Gzip1/Rice1 compressed, copy-loop
+pattern, non-last HDU shift, inner-axis rejection, HCOMPRESS
+rejection, negative-axis-0 rejection).
+
 **Missing.**
-- **Empty-shape create + extend-later.**  Parallel to
-  `create_table_hdu(nrows=0)` + `append()`, an image HDU should
-  accept a zero in the slowest-varying axis
-  (e.g. `create_image_hdu("f4", (0, 1024))`) and let a subsequent
-  `ImageHDU.extend(data)` fill it incrementally.  Currently
-  `create_image_hdu` rejects any non-positive dim in `fits.rs`
-  (the `d <= 0` loop).  Two pieces to land:
-  (1) lift the rejection to allow `dims[0] == 0` (numpy
-  slowest-varying axis; FITS NAXISN), keep `d <= 0` rejection
-  on every other axis (FITS standard forbids zero pixels on
-  inner axes);
-  (2) handle the zero-data-section case in the surrounding
-  write path (zero-fill / NAXISN-card emit / padded extent =
-  block-aligned 0 bytes are already correct; the only special
-  case is the `set_len` of the data section, which should be a
-  no-op).  The extend path already builds the file tail forward
-  via `shift_file_tail_and_update_offsets`, so the
-  "0-rows → N-rows" first extend just exercises the same code
-  the partial-last-tile case already does.  Useful for
-  streaming writers and the same fitsio-style copy loop
-  documented under `FITS.write`: a destination with an empty
-  image HDU + an `extend(src.read())` per source HDU.
+- (None tracked on the image-write side.)
 
 ### Table read
 

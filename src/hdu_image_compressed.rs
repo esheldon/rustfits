@@ -623,6 +623,12 @@ impl CompressedImageHDU {
     /// boundary tile is decoded, combined with the first portion
     /// of new data, and re-encoded.
     ///
+    /// A first ``extend`` on an empty HDU created with
+    /// ``create_image_hdu(dtype, (0, ...), compress=...)`` fills
+    /// a streaming-write compressed image (every algorithm except
+    /// HCOMPRESS_1, which requires every axis ``>= 4`` at create
+    /// time).
+    ///
     /// Notes
     /// -----
     /// Validate-then-mutate; mid-write I/O failures taint the

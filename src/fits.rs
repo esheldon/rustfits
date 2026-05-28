@@ -774,17 +774,27 @@ impl FITS {
         quantize: Option<Py<PyAny>>,
         blank: Option<i64>,
     ) -> PyResult<()> {
-        for (i, &d) in dims.iter().enumerate() {
-            if d <= 0 {
-                return Err(PyValueError::new_err(format!(
-                    "dimension {} must be > 0, got {}", i, d
-                )));
-            }
-        }
         if dims.is_empty() {
             return Err(PyValueError::new_err(
                 "compressed images must have NAXIS >= 1"
             ));
+        }
+        // Axis 0 (numpy slowest, = FITS NAXIS-last) may be 0 to
+        // permit "create empty + extend later" workflows.  Every
+        // other axis must be strictly positive — the FITS standard
+        // forbids zero-pixel inner axes.  HCOMPRESS_1 imposes its
+        // own dim >= 4 check further below; this looser check just
+        // controls the create-time empty case.
+        for (i, &d) in dims.iter().enumerate() {
+            let allow_zero = i == 0;
+            if (allow_zero && d < 0) || (!allow_zero && d <= 0) {
+                return Err(PyValueError::new_err(format!(
+                    "dimension {} must be {} 0, got {}",
+                    i,
+                    if allow_zero { ">=" } else { ">" },
+                    d
+                )));
+            }
         }
 
         // Extract the compress config.  Try each supported algorithm
@@ -1480,7 +1490,14 @@ impl FITS {
     /// dims : sequence of int
     ///     Image shape in numpy (row-major) axis order — slowest
     ///     axis first.  Reversed internally to produce FITS
-    ///     ``NAXISn``.  Every dimension must be ``> 0``.
+    ///     ``NAXISn``.  Axis 0 (the slowest-varying axis) may be
+    ///     ``0`` to create an empty HDU that a later
+    ///     :meth:`ImageHDU.extend` fills incrementally (parallel
+    ///     to ``create_table_hdu(nrows=0)`` + ``append``).  Every
+    ///     other axis must be ``> 0`` — the FITS standard forbids
+    ///     zero-pixel inner axes.  (HCOMPRESS_1 additionally
+    ///     requires every axis ``>= 4``, so the empty-axis-0 form
+    ///     is unavailable under ``compress=Hcompress1(...)``.)
     /// extname : str, optional
     ///     ``EXTNAME`` to assign.  Defaults to no EXTNAME card.
     /// extver : int, optional
@@ -1509,7 +1526,8 @@ impl FITS {
     /// Raises
     /// ------
     /// ValueError
-    ///     Unsupported dtype, non-positive dimension, ``quantize=``
+    ///     Unsupported dtype, a non-positive inner dimension (axis
+    ///     0 may be ``0`` but must not be negative), ``quantize=``
     ///     without ``compress=``, ``blank=`` on a float dtype, or
     ///     other algorithm/dtype incompatibilities (see
     ///     :class:`Rice1` / :class:`Hcompress1` / :class:`Plio1`
@@ -1560,10 +1578,18 @@ impl FITS {
                  images); for uncompressed images, omit quantize=",
             ));
         }
+        // Axis 0 (numpy slowest, = FITS NAXIS-last) may be 0 to
+        // permit "create empty + extend later" workflows.  Every
+        // other axis must be strictly positive — the FITS standard
+        // forbids zero-pixel inner axes.
         for (i, &d) in dims.iter().enumerate() {
-            if d <= 0 {
+            let allow_zero = i == 0;
+            if (allow_zero && d < 0) || (!allow_zero && d <= 0) {
                 return Err(PyValueError::new_err(format!(
-                    "dimension {} must be > 0, got {}", i, d
+                    "dimension {} must be {} 0, got {}",
+                    i,
+                    if allow_zero { ">=" } else { ">" },
+                    d
                 )));
             }
         }
