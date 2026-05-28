@@ -23,7 +23,7 @@ import rustfits
 # ---------------------------------------------------------------------------
 
 
-def test_write_image_returns_hdu():
+def test_image_write_returns_hdu():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ret.fits")
         data = np.arange(12, dtype="f4").reshape(3, 4)
@@ -36,7 +36,7 @@ def test_write_image_returns_hdu():
 
 
 @pytest.mark.parametrize("dtype", ["u1", "i2", "i4", "i8", "f4", "f8"])
-def test_write_image_dtype_matrix(dtype):
+def test_image_write_dtype_matrix(dtype):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, f"dt_{dtype}.fits")
         data = np.arange(20, dtype=dtype).reshape(4, 5)
@@ -48,7 +48,7 @@ def test_write_image_dtype_matrix(dtype):
 
 
 @pytest.mark.parametrize("dtype", ["i1", "u2", "u4", "u8"])
-def test_write_image_unsigned_trick(dtype):
+def test_image_write_unsigned_trick(dtype):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, f"u_{dtype}.fits")
         data = np.arange(24, dtype=dtype).reshape(4, 6)
@@ -59,7 +59,7 @@ def test_write_image_unsigned_trick(dtype):
         assert np.array_equal(back, data)
 
 
-def test_write_image_extname_and_extver():
+def test_image_write_extname_and_extver():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ev.fits")
         with rustfits.FITS(path, "w+") as f:
@@ -69,7 +69,7 @@ def test_write_image_extname_and_extver():
             assert f[0].extver == 3
 
 
-def test_write_image_with_compress():
+def test_image_write_with_compress():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "comp.fits")
         data = np.arange(100, dtype="i4").reshape(10, 10)
@@ -80,7 +80,7 @@ def test_write_image_with_compress():
         assert np.array_equal(back, data)
 
 
-def test_write_image_with_blank_and_mask_blank_read():
+def test_image_write_with_blank_and_mask_blank_read():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "blank.fits")
         data = np.array([1, 2, -999, 4, 5], dtype="i4")
@@ -91,7 +91,7 @@ def test_write_image_with_blank_and_mask_blank_read():
             assert arr.mask.tolist() == [False, False, True, False, False]
 
 
-def test_write_image_with_masked_array_input():
+def test_image_write_with_masked_array_input():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ma.fits")
         data = np.ma.MaskedArray(
@@ -107,7 +107,7 @@ def test_write_image_with_masked_array_input():
             assert arr[0] == 1 and arr[2] == 3
 
 
-def test_write_image_with_header_from_dict():
+def test_image_write_with_header_from_dict():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "hdr.fits")
         hdr = {"OBJECT": "NGC 1234", "RA": 12.3456, "DEC": -45.6}
@@ -119,7 +119,7 @@ def test_write_image_with_header_from_dict():
             assert f[0].header["DEC"] == -45.6
 
 
-def test_write_image_with_header_from_fitsheader():
+def test_image_write_with_header_from_fitsheader():
     with tempfile.TemporaryDirectory() as d:
         # Build a source HDU whose header we'll copy from.
         src_path = os.path.join(d, "src.fits")
@@ -140,7 +140,7 @@ def test_write_image_with_header_from_fitsheader():
             assert f[0].header["OBJECT"] == "M51"
 
 
-def test_write_image_accepts_list_input():
+def test_image_write_accepts_list_input():
     """asanyarray promotes Python lists to ndarray."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "lst.fits")
@@ -150,7 +150,7 @@ def test_write_image_accepts_list_input():
         assert back.shape == (2, 3)
 
 
-def test_write_image_rejects_unsupported_dtype():
+def test_image_write_rejects_unsupported_dtype():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "bad.fits")
         with rustfits.FITS(path, "w+") as f:

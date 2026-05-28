@@ -215,7 +215,7 @@ def test_colnames_preserved():
             assert hdu.colnames == ("a", "b", "c", "s")
 
 
-def test_units_preserved():
+def test_hdu_units_preserved():
     with tempfile.TemporaryDirectory() as td:
         fz = _make_ztable_fixture(
             td,

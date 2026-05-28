@@ -335,7 +335,7 @@ def test_setitem_cell_then_repack_reclaims_orphan():
 # ---------------------------------------------------------------------
 
 
-def test_setitem_multi_columns_subset_round_trip():
+def test_table_setitem_multi_columns_subset_round_trip():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=400, ztilelen=200)
@@ -351,7 +351,7 @@ def test_setitem_multi_columns_subset_round_trip():
         _check_round_trip(fname, modified, dt)
 
 
-def test_setitem_multi_columns_tolerates_extra_fields_in_value():
+def test_table_setitem_multi_columns_tolerates_extra_fields_in_value():
     """The RHS may carry extra fields; only the named ones are used."""
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
@@ -369,7 +369,7 @@ def test_setitem_multi_columns_tolerates_extra_fields_in_value():
         _check_round_trip(fname, modified, dt)
 
 
-def test_setitem_multi_columns_case_insensitive():
+def test_table_setitem_multi_columns_case_insensitive():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
@@ -385,7 +385,7 @@ def test_setitem_multi_columns_case_insensitive():
         _check_round_trip(fname, modified, dt)
 
 
-def test_setitem_multi_columns_duplicate_name_raises():
+def test_table_setitem_multi_columns_duplicate_name_raises():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         _make_table(fname, nrows=100, ztilelen=50)
@@ -397,7 +397,7 @@ def test_setitem_multi_columns_duplicate_name_raises():
             assert "duplicate" in str(ei.value).lower()
 
 
-def test_setitem_multi_columns_missing_field_in_value_raises():
+def test_table_setitem_multi_columns_missing_field_in_value_raises():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         _make_table(fname, nrows=100, ztilelen=50)
@@ -409,7 +409,7 @@ def test_setitem_multi_columns_missing_field_in_value_raises():
                 f[1][["id", "v"]] = sub
 
 
-def test_setitem_multi_columns_unknown_column_raises():
+def test_table_setitem_multi_columns_unknown_column_raises():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         _make_table(fname, nrows=100, ztilelen=50)
@@ -421,7 +421,7 @@ def test_setitem_multi_columns_unknown_column_raises():
             assert "nope" in str(ei.value)
 
 
-def test_setitem_multi_columns_length_mismatch_raises():
+def test_table_setitem_multi_columns_length_mismatch_raises():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         _make_table(fname, nrows=200, ztilelen=100)
@@ -568,11 +568,11 @@ def test_funpack_decompresses_col_cell_multi_modified_file():
 
 # ---------------------------------------------------------------------
 # Positive non-VLA-on-VLA-table case (VLA-targeting tests live in
-# tests/test_compressed_table_setitem_vla.py)
+# tests/test_table_compressed_setitem_vla.py)
 # ---------------------------------------------------------------------
 
 
-def test_setitem_multi_columns_non_vla_subset_on_vla_table_works():
+def test_table_setitem_multi_columns_non_vla_subset_on_vla_table_works():
     """
     Multi-col write to NON-VLA columns of a table that ALSO has a
     VLA column should succeed (the VLA column is untouched).

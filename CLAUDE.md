@@ -588,10 +588,10 @@ and `UNCOMPRESSED_DATA` fallbacks (each with its own
 checked before any write); mid-write failures taint the file.
 Pre-write failures (THEAP rejection, locks) don't taint.
 
-**Tests.**  `tests/test_vla_repack.py` (9 cases: drop orphans,
+**Tests.**  `tests/test_table_vla_repack.py` (9 cases: drop orphans,
 shrink last HDU, no-op compact, no-op non-VLA, multiple VLA
 columns, mixed fixed+VLA, non-last shift, all-empty cells,
-repack→setitem→repack).  `tests/test_compressed_image_repack.py`
+repack→setitem→repack).  `tests/test_image_compressed_repack.py`
 (11 cases: drop orphans, shrink last HDU, no-op compact, non-last
 shift, algorithm matrix Gzip1/Gzip2/Rice1/Hcompress1, quantized
 float, unquantized float, cache invalidation).
@@ -750,7 +750,7 @@ workaround: use Gzip1/Gzip2/Rice1).  Useful for streaming
 writers and the fitsio-style copy loop documented under
 `FITS.write`: a destination with an empty image HDU + an
 `extend(src.read())` per source HDU.  Tests in
-`tests/test_write_image.py` (`test_empty_*`, 13 cases:
+`tests/test_image_write.py` (`test_empty_*`, 13 cases:
 1-D/2-D/3-D uncompressed, Gzip1/Rice1 compressed, copy-loop
 pattern, non-last HDU shift, inner-axis rejection, HCOMPRESS
 rejection, negative-axis-0 rejection).
@@ -928,7 +928,7 @@ small `extract_string_vla_cell_bytes` helper that handles the str/
 bytes type-check and ASCII validation in one place.  Cross-tool:
 astropy reads our PA columns as per-cell chararrays of single chars;
 we read astropy's PA columns as Python str (the natural mapping).
-Tests in `tests/test_vla_string_write.py` (24 cases).
+Tests in `tests/test_table_vla_string_write.py` (24 cases).
 
 **Multi-column / fancy-row `__setitem__`.**  Shipped.  Two
 additional forms complete the table `__setitem__` surface:
@@ -957,7 +957,7 @@ behavior.  Anything readable via `hdu[key]` is writable via
 
 `SetItemKey` has five variants (mirrors the read-side `TableKey`);
 `classify_setitem_key` mirrors `classify_table_key`'s iterable
-inspection.  Tests in `tests/test_setitem_multi.py`.
+inspection.  Tests in `tests/test_table_setitem_multi.py`.
 
 **Subset `__setitem__`.**  Shipped.  Both subset objects returned by
 `hdu["name"]` and `hdu[["a","b"]]` are now writable, so anything the
@@ -978,7 +978,7 @@ hot-path workload ever needs bulk per-column slice writes, the
 existing `write_table_one_column` / `write_table_strided` can be
 specialized for the rows-restricted case.
 
-Tests in `tests/test_setitem_subset.py` (20 cases) — single-column
+Tests in `tests/test_table_setitem_subset.py` (20 cases) — single-column
 + multi-column subset across cell / slice / fancy / full-slice /
 negative-index / VLA-numeric / VLA-string / round-trip read+write.
 
@@ -1006,7 +1006,7 @@ to the subset's own `__setitem__(rows, data)`, equivalent to
 `subset[rows] = data`.  Same value-shape contract as the matching
 `__setitem__` form.
 
-Tests in `tests/test_subset_read_write.py` (29 cases) — read
+Tests in `tests/test_table_subset_read_write.py` (29 cases) — read
 returns expected shape, matches `subset[:]`, kwargs forward
 correctly; write round-trips both wholesale (`rows=None`) and
 row-restricted (`rows=` slice / int / fancy) across all four
@@ -1183,7 +1183,7 @@ the maxlen) and cfitsio supports it natively, so cross-tool
 interop is solid in practice — just not with astropy.
 
 Tests: `tests/test_table_bit_columns.py` (18 cases, fixed X)
-and `tests/test_vla_x_bit.py` (16 cases, VLA PX/QX).
+and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
 
 ### Cross-cutting (read + write)
 
@@ -1293,7 +1293,7 @@ skips protected; dict source raises on protected).
 the existing `ensure_primary` path inside `create_table_hdu` —
 no special-casing needed in `write_table` itself.
 
-Tests: `tests/test_write_convenience.py` covers
+Tests: `tests/test_convenience_write.py` covers
 `FITS.write_image` / `FITS.write_table` across the dtype matrix,
 unsigned-int trick, `compress=`, `blank=`/`mask_blank=True`,
 MaskedArray input, `header=` (dict + FITSHeader source), all
@@ -1503,7 +1503,7 @@ post-Phase-1 `dbc7bfc` refactor.
 **Phase 5 — VLA `__setitem__`.**  Shipped.  See "VLA `__setitem__`"
 under the Table write Supported section above for the API + heap
 model (always-append-and-orphan).  19 tests in
-`tests/test_vla_setitem.py`.
+`tests/test_table_vla_setitem.py`.
 
 **Phase 6 — out of scope.**  ASCII tables (rare in modern files);
 adding / removing columns from existing tables (header rewriting
@@ -1626,7 +1626,7 @@ specific implementations:
 
 Phase 2 follow-ups (not blocking):
 - **Add CompressedImageHDU cases to tests/test_repr.py** —
-  the Phase 1 smoke test in test_compressed_image_accessors.py
+  the Phase 1 smoke test in test_image_compressed_accessors.py
   exists, but the full _show-instrumented visual-inspection
   suite in test_repr.py doesn't include compressed images
   yet.  Add alongside the ImageHDU/TableHDU cases.
@@ -1706,7 +1706,7 @@ GZIP_COMPRESSED_DATA are always `1PB` so inner_byte_width=1.
 *Test fixtures.*  Normal-path GZIP_1 / GZIP_2 round-trips
 use fitsio.  Fitsio's high-level write API doesn't expose
 fallback-column knobs, so the three fallback tests in
-`tests/test_compressed_image_read_gzip.py` build minimal
+`tests/test_image_compressed_read_gzip.py` build minimal
 FITS files by hand (`_build_fallback_fixture` and friends):
 empty primary descriptor + populated fallback column + a
 hand-built BINTABLE header.  This pattern is reusable for
@@ -1892,7 +1892,7 @@ is "divide by 2^n truncating toward zero", which Rust's signed
 `/` does directly — translated as `s / 8` / `s / 64` for
 readability.
 
-*Tests.*  `tests/test_compressed_image_read_hcompress.py`
+*Tests.*  `tests/test_image_compressed_read_hcompress.py`
 covers accessors, lossless round-trip on u8/i16/i32, non-square
 edge tiles, default tiles, slicing parity, bit-exact agreement
 with cfitsio on a lossy hcomp_scale=4 fixture, and SMOOTH=1
@@ -1930,7 +1930,7 @@ layer — `tform_vla_inner_byte_width` returns 2 for 'I' so
 `fetch_tile_payload_inner` correctly reads `nelements * 2`
 bytes from the heap.
 
-*Tests.*  `tests/test_compressed_image_read_plio.py` covers
+*Tests.*  `tests/test_image_compressed_read_plio.py` covers
 the compression_type accessor, bit-exact agreement with cfitsio
 on u8/i16/i32 mask-style fixtures (mostly zero with random
 runs), all-zero tiles (header-only encoded stream), solid-value
@@ -2113,9 +2113,9 @@ Gzip2 lands within ~5% of where i64 RICE would compress, and is
 universally readable.  The encoder itself also rejects bytepix=8
 as a defensive check.
 
-*Tests.*  `tests/test_compressed_image_write_gzip.py` (GZIP_1),
-`tests/test_compressed_image_write_gzip2.py` (GZIP_2), and
-`tests/test_compressed_image_write_rice.py` (RICE_1) —
+*Tests.*  `tests/test_image_compressed_write_gzip.py` (GZIP_1),
+`tests/test_image_compressed_write_gzip2.py` (GZIP_2), and
+`tests/test_image_compressed_write_rice.py` (RICE_1) —
 each covers accessors after create, dtype matrix (u1/i2/i4 +
 i8 for GZIP only), shape matrix (1-D / 2-D square / 2-D non-square
 with edge tiles / 3-D / whole-image single tile), default-tile-shape
@@ -2168,7 +2168,7 @@ stripes are what HST/DECam/HSC files in the wild use (cfitsio
 is the dominant writer of these), so the default matches.
 
 *HCOMPRESS_1 tests.*
-`tests/test_compressed_image_write_hcompress.py` covers
+`tests/test_image_compressed_write_hcompress.py` covers
 accessors after create, dtype matrix (u1/i2/i4), shape matrix
 (divisible 2-D cases), default-tile-shape (small-image,
 large-image stripe, and fallback-when-16-doesn't-work cases),
@@ -2217,7 +2217,7 @@ inner type, not bytes — so on the write side
 filling descriptors.  The read side already worked correctly
 because `tform_vla_inner_byte_width` returns the right value.
 
-*PLIO_1 tests.*  `tests/test_compressed_image_write_plio.py`
+*PLIO_1 tests.*  `tests/test_image_compressed_write_plio.py`
 covers accessors after create (including TFORM1='1PI'
 verification), dtype matrix (u1/i2/i4), shape matrix, default
 tile shape, degenerate cases (all-zeros, all-solid, large-pv,
@@ -2240,7 +2240,7 @@ based on the input dtype and the HDU's BSCALE/BZERO.  BSCALE/
 BZERO cards are emitted at create time in
 `create_compressed_image_hdu_impl` using the same pattern as
 the uncompressed path.  See
-`tests/test_compressed_image_unsigned_trick.py` (33 cases).
+`tests/test_image_compressed_unsigned_trick.py` (33 cases).
 *Known limitation (not new):* astropy returns f8 (with
 precision loss) on u8 + BZERO=2^63 — also affects uncompressed
 u8.  rustfits's own round-trip is bit-exact.
@@ -2326,7 +2326,7 @@ commit 3 added the missing checks to both branches.  No
 existing tests caught the gap because no Phase 5 fixture had
 NULL_VALUE_I32 in the stored stream under NoDither or DITHER_1.
 
-*Tests (`test_compressed_image_write_quantize.py`).*  29
+*Tests (`test_image_compressed_write_quantize.py`).*  29
 cases covering: schema (TFORM / TTYPE / ZQUANTIZ / ZDITHER0 /
 ZBLANK cards), round-trip across f4/f8 + (NO_DITHER, DITHER_1,
 DITHER_2), default Quantize defaults, fitsio cross-read agreement
@@ -2431,7 +2431,7 @@ unchanged from Phase 5: `build_quant_context` returns None
 float bytepix, no dequantization applied.
 
 Tests in
-`tests/test_compressed_image_write_unquantized.py`:
+`tests/test_image_compressed_write_unquantized.py`:
 schema validation, round-trip f4/f8 × Gzip1/Gzip2, astropy +
 fitsio cross-read agreement (both directions), non-last HDU
 growth, omit-kwarg semantics, rejections (Rice1/Hcompress1
@@ -2464,7 +2464,7 @@ header (NAXIS2 + PCOUNT + ZNAXIS<last>).  Same taint contract as
 write: pre-shift failures don't taint; failures inside the write
 loop do.
 
-Tests in `tests/test_compressed_image_extend.py` (46 cases):
+Tests in `tests/test_image_compressed_extend.py` (46 cases):
 1-D + 2-D + 3-D extends, tile-aligned and partial-last-tile,
 dtype matrix (u1/i2/i4 + unsigned trick i1/u2/u4), algorithm
 matrix (Gzip1/Gzip2/Rice1/Hcompress1), multiple sequential
@@ -2494,7 +2494,7 @@ orphans (left in place; descriptors no longer reference them).
 PCOUNT grows; file may grow if past the padded extent.  Same
 taint discipline as extend.
 
-Tests in `tests/test_compressed_image_setitem.py` (29 cases):
+Tests in `tests/test_image_compressed_setitem.py` (29 cases):
 single-pixel writes (1-D and 2-D), row/col writes, multi-tile
 contiguous slices, scalar broadcast, stepped slices, 3-D,
 dtype matrix including unsigned trick, algorithm matrix,
@@ -2546,7 +2546,7 @@ threading it through `IntTileCtx` / `FloatTileCtx` /
 `encode_quant_boundary_tile` / `AlgorithmEncodeParams` and into
 `encode_gzip1` / `encode_gzip2`.
 
-Tests in `tests/test_gzip_level.py` (26 cases): config-class API
+Tests in `tests/test_image_compressed_gzip_level.py` (26 cases): config-class API
 (default, repr, equality, validation), same-session round-trip,
 reopen loses level, file-size proxy (level=9 ≥ 10% smaller than
 level=1 on compressible data), bit-exact round-trip across all
@@ -2593,7 +2593,7 @@ preamble.  Read-side reuses
 `compute_blank_mask_for_key(header, arr, key)` generalized
 from the existing `compute_blank_mask`.
 
-Tests in `tests/test_blank_mask.py` (27 cases): round-trip
+Tests in `tests/test_image_blank_mask.py` (27 cases): round-trip
 across u1/i2/i4 × {compressed Gzip1/Gzip2/Rice1, uncompressed};
 unsigned-int trick interaction; MaskedArray input on all 6
 write paths; float-NaN fill; all rejection paths; astropy +
@@ -2615,7 +2615,7 @@ seed (deterministic from `row_1based` + `ZDITHER0`).  This
 makes `requantize(dequantize(stored))` idempotent: unchanged
 pixels in the modified tile round-trip BIT-EXACT — no
 compounding quantization noise.  Verified by tests in
-`tests/test_compressed_image_quant_mutation.py` (24 cases)
+`tests/test_image_compressed_quant_mutation.py` (24 cases)
 that compare a reference no-mutation file against a post-
 mutation file across f4/f8 × {no_dither, dither1, dither2}.
 
@@ -2748,13 +2748,13 @@ than cfitsio — and astropy's `verify_checksum` does a
 byte-exact comparison of the encoded sum, so the offset
 mattered.  Fix is purely formatting; values unchanged.
 
-Tests in `tests/test_checksum.py` (19 cases) — round-trip on
+Tests in `tests/test_hdu_checksum.py` (19 cases) — round-trip on
 all three uncompressed/compressed-image HDU types, add_datasum
 independence, None when absent, corruption detection on
 ZDATASUM card + heap byte, astropy/fitsio cross-verify
 (uncompressed), algorithm matrix (compressed image), ZDATASUM
 = uncompressed-equivalent DATASUM.
-Plus `tests/test_compressed_table_checksum.py` (22 cases) for
+Plus `tests/test_table_compressed_checksum.py` (22 cases) for
 the table side: round-trip with various nrows/ztilelen
 combinations (single tile, partial last tile, parametrized
 matrix), add_datasum-only, verify-None-when-absent, ZDATASUM
@@ -2859,7 +2859,7 @@ table's schema preserved via Z-prefixed cards.  Detection is
   number so contributors can grep `Phase N` to find what's
   pending.
 
-Tests: `tests/test_compressed_table_accessors.py` (21 cases) —
+Tests: `tests/test_table_compressed_accessors.py` (21 cases) —
 detection, isinstance chain, all accessors, remaining stubs,
 plain table unaffected, raw header cards still visible.
 
@@ -2928,7 +2928,7 @@ before fpack runs.  To set `ZTILELEN`, write `FZTILELN` on the
 source HDU (fpack has no CLI flag for it — surprising and
 worth noting in the test helper).
 
-Tests: `tests/test_compressed_table_read.py` (17 cases) —
+Tests: `tests/test_table_compressed_read.py` (17 cases) —
 mixed-dtype round trip; per-algorithm coverage (RICE_1 on i4 +
 the GZIP defaults for u1/i2/f4/f8/A); multi-tile + partial last
 tile; unsigned-int trick round trip; `scale=False` returns raw
@@ -3003,7 +3003,7 @@ also promotes `hdu_table::read::resolve_rows`,
 `pub(crate)` so the compressed-table dispatch reuses the same
 key-classification logic as the uncompressed path.
 
-Tests: `tests/test_compressed_table_read_slice.py` (27 cases) —
+Tests: `tests/test_table_compressed_read_slice.py` (27 cases) —
 `read(rows=...)` for slice / stepped slice / iterable / negative
 indices / duplicates / dedup / combined with `columns=`;
 `__getitem__` for int / negative int / slice / stepped /
@@ -3073,7 +3073,7 @@ descriptors that the per-cell loop feeds straight to
 inline in `hdu_table_compressed.rs` using `flate2::read::GzDecoder`
 directly.
 
-Tests: `tests/test_compressed_table_read_vla.py` (16 cases) —
+Tests: `tests/test_table_compressed_read_vla.py` (16 cases) —
 whole-table VLA round trip across u1 / i2 / i4 / i8 / f4 / f8
 inner dtypes (covers all three algorithms fpack picks
 per-dtype); empty cells; multiple VLA columns in one table;
@@ -3176,7 +3176,7 @@ write-only params like `Gzip1(level=9)` survive within a session
 through `.compression`.  Reopened HDUs have `None` here and
 `.compression` falls back to the dict-of-strings from ZCTYPn.
 
-Tests: `tests/test_compressed_table_write.py` (27 cases) —
+Tests: `tests/test_table_compressed_write.py` (27 cases) —
 every `compress=` shape (True / False / string / class / dict),
 default per-dtype matrix, invalid-algorithm rejection,
 image-only-algorithm rejection, three input forms (structured
@@ -3186,7 +3186,7 @@ string columns, default vs explicit ztilelen, **byte-exact
 funpack interop** (cfitsio decompresses our files and we get
 the original BINTABLE bit-exactly).
 
-Plus `tests/test_compressed_image_write_gzip.py`
+Plus `tests/test_image_compressed_write_gzip.py`
 (11 new cases) covering image-side string aliases including
 cfitsio synonyms and the case-insensitive match.
 
@@ -3238,7 +3238,7 @@ and `VlaCellPlan` from `hdu_table::write_vla` — shared with the
 uncompressed VLA write path so per-cell semantics evolve in one
 place.
 
-Tests: `tests/test_compressed_table_write_vla.py` (14 cases) —
+Tests: `tests/test_table_compressed_write_vla.py` (14 cases) —
 inner dtype matrix (u1/i2/i4/i8/f4/f8) covering all three
 per-dtype default algorithms; empty cells; multiple VLA columns;
 mixed VLA + fixed columns; multi-tile VLA writes; PA (string
@@ -3300,7 +3300,7 @@ and is selected by `columns.iter().any(|c| c.var_kind.is_some())`.
 than per-tile invalidation; append is rare-vs-read in any
 realistic workflow).
 
-Tests: `tests/test_compressed_table_append.py` (14 cases) —
+Tests: `tests/test_table_compressed_append.py` (14 cases) —
 merge-only, exact-fill, merge + new tile, no-merge (full last
 tile), multiple appends accumulating, three input forms,
 `extend()` alias, zero-row no-op, **non-last-HDU preserves
@@ -3396,7 +3396,7 @@ rewriting (per-cell compressed bytes referenced from inside
 each tile's GZIP_1'd descriptor blob).  Deferred until VLA
 repack is genuinely needed.
 
-Tests: `tests/test_compressed_table_repack.py` (9 cases) —
+Tests: `tests/test_table_compressed_repack.py` (9 cases) —
 PCOUNT shrinks after merge orphan, no-op when compact,
 multiple appends accumulating then one repack, last-HDU file
 shrinks via set_len, **non-last-HDU preserves trailing HDU**
@@ -3467,7 +3467,7 @@ during `plan_vla_heap_layout`, once during encode); both
 acceptable since the call is cheap and the second pass keeps
 the encode loop simple.
 
-Tests: `tests/test_compressed_table_vla_append.py` (12 cases) —
+Tests: `tests/test_table_compressed_vla_append.py` (12 cases) —
 append into fresh tile, merge-only, merge-and-spill, mixed
 fixed + VLA, empty cells, multiple VLA cols, ZPCOUNT
 accounting (bytes match the uncompressed-cell-bytes sum),
@@ -3537,7 +3537,7 @@ streamlined fixed-only path (with fast path + slow path);
 any-VLA tables take the VLA-aware path which handles both kinds
 of columns uniformly per (tile, col).
 
-Tests: `tests/test_compressed_table_vla_repack.py` (14 cases) —
+Tests: `tests/test_table_compressed_vla_repack.py` (14 cases) —
 PCOUNT shrinks after merge orphan, no-op when compact, multi-
 append accumulation then one repack, last-HDU file shrinks,
 **non-last HDU preserves trailing HDU** (catches the want_total
@@ -3747,13 +3747,13 @@ at the bottom of `hdu_table_compressed.rs`; dispatcher in the
 `__setitem__` methods all use the same shape.
 
 Tests across four files:
-- `tests/test_compressed_table_setitem_rows.py` (27 cases,
+- `tests/test_table_compressed_setitem_rows.py` (27 cases,
   6c-2b).
-- `tests/test_compressed_table_setitem_cols.py` (34 cases,
+- `tests/test_table_compressed_setitem_cols.py` (34 cases,
   6c-2c).
-- `tests/test_compressed_table_setitem_stepped_subsets.py`
+- `tests/test_table_compressed_setitem_stepped_subsets.py`
   (25 cases, 6c-2d).
-- `tests/test_compressed_table_setitem_vla.py` (25 cases,
+- `tests/test_table_compressed_setitem_vla.py` (25 cases,
   6c-2e).
 
 Combined coverage: row-form (single-row / slice-step=1 /
@@ -3858,7 +3858,7 @@ matches byte-for-byte, but the encoder is a single function
 (`encode_rice`) rather than three separate functions and uses a
 clean `BitWriter` rather than cfitsio's `Buffer` struct.  Byte-
 exactness is verified by the heap-comparison tests in
-`tests/test_compressed_image_write_rice.py`.
+`tests/test_image_compressed_write_rice.py`.
 
 ### Performance / large fixture files
 
@@ -3936,7 +3936,7 @@ macOS build there.  Once a fixed fitsio is released on
 conda-forge, re-add `macos-latest` to the `test.matrix.os`
 list in `.github/workflows/ci.yml` and delete this note.
 Worth keeping an eye on the failing test
-(`tests/test_compressed_image_accessors.py`'s
+(`tests/test_image_compressed_accessors.py`'s
 `test_other_compression_types_dispatched` was the first to
 abort) when the time comes.
 

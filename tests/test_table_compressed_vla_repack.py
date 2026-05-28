@@ -46,7 +46,7 @@ def _make_vla_data(start, stop, dt, inner="f4"):
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_reclaims_append_merge_orphans():
+def test_table_vla_repack_reclaims_append_merge_orphans():
     """
     Append with merge orphans the old dual-descriptor blob + the
     old per-cell bytes for the merged tile.  Repack reclaims
@@ -83,7 +83,7 @@ def test_vla_repack_reclaims_append_merge_orphans():
         assert _vla_arr_equal(out["v"], combined["v"])
 
 
-def test_vla_repack_noop_when_compact():
+def test_table_vla_repack_noop_when_compact():
     """
     Fresh compressed VLA table (no append → no orphans).  Repack
     re-gzips the dual-descriptor blobs but should leave PCOUNT
@@ -121,7 +121,7 @@ def test_vla_repack_noop_when_compact():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_after_multiple_appends_with_merge():
+def test_table_vla_repack_after_multiple_appends_with_merge():
     """
     Several VLA appends, each merging into the current partial
     last tile, accumulate orphans of both kinds (per-cell bytes
@@ -166,7 +166,7 @@ def test_vla_repack_after_multiple_appends_with_merge():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_shrinks_last_hdu_file_size():
+def test_table_vla_repack_shrinks_last_hdu_file_size():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         dt = np.dtype([("id", "i4"), ("v", "O")])
@@ -192,7 +192,7 @@ def test_vla_repack_shrinks_last_hdu_file_size():
         assert size_after <= size_before
 
 
-def test_vla_repack_non_last_hdu_preserves_trailing():
+def test_table_vla_repack_non_last_hdu_preserves_trailing():
     """
     Compressed VLA table is NOT the last HDU.  After repack, the
     trailing HDU's content must survive the back-copy + shrink +
@@ -235,7 +235,7 @@ def test_vla_repack_non_last_hdu_preserves_trailing():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_mixed_fixed_and_vla_columns():
+def test_table_vla_repack_mixed_fixed_and_vla_columns():
     """
     Table has both fixed (id, big_fixed) and VLA (v) cols.  Repack
     must handle each (tile, col) correctly: fixed cols stream-copy
@@ -286,7 +286,7 @@ def test_vla_repack_mixed_fixed_and_vla_columns():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_multiple_vla_columns():
+def test_table_vla_repack_multiple_vla_columns():
     """
     Two VLA cols + one fixed.  Repack walks both VLA cols per
     (tile, col), each with its own dual-descriptor blob.
@@ -331,7 +331,7 @@ def test_vla_repack_multiple_vla_columns():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_preserves_zpcount():
+def test_table_vla_repack_preserves_zpcount():
     """
     ZPCOUNT is the original (uncompressed) heap size — the sum
     of `vlalen * elem_size` over live cells.  Repack only
@@ -374,7 +374,7 @@ def test_vla_repack_preserves_zpcount():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_clears_tile_cache():
+def test_table_vla_repack_clears_tile_cache():
     """
     Repack rewrites every descriptor, so prior cache entries are
     stale.  Repack must clear the cache.
@@ -413,7 +413,7 @@ def test_vla_repack_clears_tile_cache():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_preserves_empty_cells():
+def test_table_vla_repack_preserves_empty_cells():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         dt = np.dtype([("v", "O")])
@@ -506,7 +506,7 @@ def test_funpack_decompresses_repacked_vla_file():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_then_append_then_repack():
+def test_table_vla_repack_then_append_then_repack():
     """
     Compose mutations: write, append, repack, append again,
     repack again.  Catches stale-state bugs between repack +
@@ -544,7 +544,7 @@ def test_vla_repack_then_append_then_repack():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_string_pa_column():
+def test_table_vla_repack_string_pa_column():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         dt = np.dtype([("s", "O")])
@@ -579,7 +579,7 @@ def test_vla_repack_string_pa_column():
 # ---------------------------------------------------------------------
 
 
-def test_vla_repack_round_trip_same_handle_and_reopen():
+def test_table_vla_repack_round_trip_same_handle_and_reopen():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         dt = np.dtype([("id", "i4"), ("v", "O")])

@@ -378,7 +378,7 @@ def test_compressed_table_after_other_hdus():
 
 # ---------------------------------------------------------------------
 # Phase boundaries — mask_null= and VLA still rejected
-# (rows= subset moved into Phase 3 — see test_compressed_table_read_slice.py)
+# (rows= subset moved into Phase 3 — see test_table_compressed_read_slice.py)
 # ---------------------------------------------------------------------
 
 

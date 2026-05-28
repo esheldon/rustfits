@@ -297,7 +297,7 @@ def test_non_contiguous_rejected():
         (np.dtype(">f8"), -64),
     ],
 )
-def test_create_image_hdu_dtype_like_inputs(dtype_input, expected_bitpix):
+def test_image_create_hdu_dtype_like_inputs(dtype_input, expected_bitpix):
     """
     create_image_hdu accepts anything np.dtype() accepts — strings
     (with or without endianness), long-form aliases, numpy scalar
@@ -311,7 +311,7 @@ def test_create_image_hdu_dtype_like_inputs(dtype_input, expected_bitpix):
             assert fits[0].bitpix == expected_bitpix
 
 
-def test_create_image_hdu_dtype_object_write_roundtrip():
+def test_image_create_hdu_dtype_object_write_roundtrip():
     """
     Passing np.dtype(...) directly (instead of a short-code) yields
     an HDU that round-trips a matching-dtype write.
@@ -326,7 +326,7 @@ def test_create_image_hdu_dtype_object_write_roundtrip():
             np.testing.assert_array_equal(fits[0].read(), data)
 
 
-def test_create_image_hdu_python_float_writes_f8():
+def test_image_create_hdu_python_float_writes_f8():
     """
     `float` is a stand-in for `np.float64` per numpy's convention;
     repeat the round-trip end-to-end so the BITPIX + data path agree.
@@ -342,7 +342,7 @@ def test_create_image_hdu_python_float_writes_f8():
             np.testing.assert_array_equal(fits[0].read(), data)
 
 
-def test_create_image_hdu_rejects_unsupported_dtype_object():
+def test_image_create_hdu_rejects_unsupported_dtype_object():
     """
     Complex dtypes still raise the dtype_to_bitpix error message
     (np.complex64 normalizes to '<c8' which is not supported).
@@ -354,7 +354,7 @@ def test_create_image_hdu_rejects_unsupported_dtype_object():
                 fits.create_image_hdu(np.complex64, (4,))
 
 
-def test_create_image_hdu_rejects_garbage_dtype():
+def test_image_create_hdu_rejects_garbage_dtype():
     """
     np.dtype() raises TypeError on completely bogus input
     (e.g. a list or a random object); the error surfaces unchanged.

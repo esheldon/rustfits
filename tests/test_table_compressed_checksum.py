@@ -552,7 +552,7 @@ def test_compressed_table_same_handle_and_reopen_agree():
 # ---------------------------------------------------------------------
 
 
-def test_compressed_table_checksum_refresh_after_setitem():
+def test_table_compressed_checksum_refresh_after_setitem():
     """
     After hdu[i] = record, the previous ZDATASUM is stale.
     Re-running add_checksum produces a new value that re-verifies.

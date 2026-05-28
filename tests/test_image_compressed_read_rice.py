@@ -275,24 +275,24 @@ def test_scaled_compressed_hdu():
 # -------------------- NotImplementedError stubs --------------------
 
 
-# __getitem__ shipped in Phase 3 — see test_compressed_image_read_slice.py.
+# __getitem__ shipped in Phase 3 — see test_image_compressed_read_slice.py.
 # write() for Rice1 shipped in the Phase 7 follow-up — see
-# test_compressed_image_write_rice.py.
+# test_image_compressed_write_rice.py.
 
 
 # test_extend_raises_not_implemented: removed — CompressedImageHDU.extend
 # is now supported (integer + unsigned-trick + unquantized-float HDUs).
-# See tests/test_compressed_image_extend.py.
+# See tests/test_image_compressed_extend.py.
 
 
 # test_setitem_raises_not_implemented: removed — CompressedImageHDU.__setitem__
 # is now supported (integer + unsigned-trick + unquantized-float HDUs).
-# See tests/test_compressed_image_setitem.py.
+# See tests/test_image_compressed_setitem.py.
 
 
 # test_mask_blank_rejected_with_clear_message: removed —
 # mask_blank=True is now supported on compressed integer reads.
-# See tests/test_blank_mask.py.
+# See tests/test_image_blank_mask.py.
 
 
 # -------------------- repr / accessors after Phase 2 ---------------

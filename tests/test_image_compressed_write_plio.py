@@ -78,7 +78,7 @@ def _heap_bytes(fn):
 # ---------------------- accessors ----------------------------------
 
 
-def test_accessors_after_create():
+def test_hdu_accessors_after_create():
     """
     create_image_hdu(..., compress=Plio1(...)) produces a
     CompressedImageHDU with ZCMPTYPE=PLIO_1 and TFORM1='1PI'
@@ -476,7 +476,7 @@ def test_unsigned_trick_dtype_rejected():
     PLIO-specific error: the reverse XOR produces signed stored
     values that include negatives, which PLIO's non-negative-only
     encoder can't represent.  Other algorithms now accept these
-    dtypes — see tests/test_compressed_image_unsigned_trick.py.
+    dtypes — see tests/test_image_compressed_unsigned_trick.py.
     """
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")

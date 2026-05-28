@@ -328,7 +328,7 @@ def test_setitem_vla_stepped_slice():
 # ---------------------------------------------------------------------
 
 
-def test_setitem_multi_col_mixed_fixed_and_vla():
+def test_table_setitem_multi_col_mixed_fixed_and_vla():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
         original, dt = _make_table(fname, nrows=200, ztilelen=100)
@@ -346,7 +346,7 @@ def test_setitem_multi_col_mixed_fixed_and_vla():
         _read_and_compare(fname, expected, dt)
 
 
-def test_setitem_multi_col_vla_only():
+def test_table_setitem_multi_col_vla_only():
     """[['v']] = ... with a VLA-only subset list."""
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

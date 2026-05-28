@@ -13,7 +13,7 @@ def _write_test_file_one_image(fname):
         fits.write(data, extname='image1')
 
 
-def test_open_single_image():
+def test_fits_open_single_image():
     """
     The mode argument defaults to 'r', matching the built-in
     open() convention.  Most read-only tests can be written as
@@ -37,7 +37,7 @@ def test_open_single_image():
             pprint(hdus[0].header)
 
 
-def test_open_default_mode_is_read_only():
+def test_fits_open_default_mode_is_read_only():
     """
     Explicit-default sanity check: passing no mode gives a read-only
     handle.  Writes through that handle should fail; reopening with
@@ -60,5 +60,5 @@ def test_open_default_mode_is_read_only():
 
 
 if __name__ == '__main__':
-    test_open_single_image()
-    test_open_default_mode_is_read_only()
+    test_fits_open_single_image()
+    test_fits_open_default_mode_is_read_only()

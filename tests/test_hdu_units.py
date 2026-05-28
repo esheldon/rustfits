@@ -103,7 +103,7 @@ def _tunit_card(col_index, value):
 # ---------------------------------------------------------------------------
 
 
-def test_units_accessor_with_tunit():
+def test_hdu_units_accessor_with_tunit():
     """
     TUNIT1 set → units dict carries the value; the unaffected
     column maps to None."""
@@ -118,7 +118,7 @@ def test_units_accessor_with_tunit():
             assert u == {"flux": "Jy", "name": None}
 
 
-def test_units_accessor_no_tunit_at_all():
+def test_hdu_units_accessor_no_tunit_at_all():
     """No TUNITn anywhere → every entry is None."""
     fields = [("a", "1J"), ("b", "1D")]
     cards = _bintable_ext(12, 1, fields)
@@ -129,7 +129,7 @@ def test_units_accessor_no_tunit_at_all():
             assert fits[1].units == {"a": None, "b": None}
 
 
-def test_units_accessor_preserves_column_order():
+def test_hdu_units_accessor_preserves_column_order():
     """The dict reflects the on-disk column order, not alphabetical."""
     fields = [("z", "1J"), ("a", "1J"), ("m", "1J")]
     extras = [
@@ -146,7 +146,7 @@ def test_units_accessor_preserves_column_order():
             assert list(u.keys()) == ["z", "a", "m"]
 
 
-def test_units_accessor_preserves_case():
+def test_hdu_units_accessor_preserves_case():
     """Unit strings keep their case verbatim — `kJy` stays `kJy`."""
     fields = [("flux", "1E")]
     extras = [_tunit_card(1, "kJy")]

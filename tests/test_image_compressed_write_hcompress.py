@@ -77,7 +77,7 @@ def _heap_bytes(fn):
 # ---------------------- accessors ----------------------------------
 
 
-def test_accessors_after_create():
+def test_hdu_accessors_after_create():
     """
     create_image_hdu(..., compress=Hcompress1(...)) produces a
     CompressedImageHDU with ZCMPTYPE=HCOMPRESS_1 and the SCALE +
@@ -557,12 +557,12 @@ def test_i8_hcompress_rejected():
 
 # test_float_compress_rejected: removed in Phase 8 commit 2 —
 # float-compressed writes are now supported via quantize=.  See
-# tests/test_compressed_image_write_quantize.py.
+# tests/test_image_compressed_write_quantize.py.
 
 
 # test_unsigned_trick_dtype_rejected: removed — u2/u4/u8/i1 are
 # now supported for compressed writes via Gzip1/Gzip2/Rice1/
-# Hcompress1.  See tests/test_compressed_image_unsigned_trick.py.
+# Hcompress1.  See tests/test_image_compressed_unsigned_trick.py.
 
 
 def test_non_2d_image_rejected():

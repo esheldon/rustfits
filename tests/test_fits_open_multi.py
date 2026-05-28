@@ -32,7 +32,7 @@ def _write_test_file_two_images_and_table(fname):
         fits.write(tab1, extname='table1')
 
 
-def test_open_two_images():
+def test_fits_open_two_images():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, 'test.fits')
 
@@ -52,7 +52,7 @@ def test_open_two_images():
             assert hdus[1].index == 1
 
 
-def test_open_two_images_and_table():
+def test_fits_open_two_images_and_table():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, 'test.fits')
 
@@ -81,4 +81,4 @@ def test_open_two_images_and_table():
 
 
 if __name__ == '__main__':
-    test_open_two_images_and_table()
+    test_fits_open_two_images_and_table()

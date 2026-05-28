@@ -43,7 +43,7 @@ def test_create_primary_image_hdu():
             assert hd["EXTNAME"] == "image1"
 
 
-def test_create_image_extension():
+def test_image_create_extension():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "test.fits")
         with rustfits.FITS(fname, "w+") as fits:
@@ -115,7 +115,7 @@ def test_zero_dim_on_inner_axis_rejected():
     Zero is only allowed on axis 0 (numpy slowest = FITS NAXIS-last) so
     callers can stream rows in via `ImageHDU.extend`.  Inner axes must
     stay strictly positive — the FITS standard forbids zero pixels on
-    inner axes.  See `test_write_image.py::test_empty_*` for the
+    inner axes.  See `test_image_write.py::test_empty_*` for the
     supported axis-0 case.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -203,7 +203,7 @@ def test_extname_with_embedded_quote():
 
 if __name__ == "__main__":
     test_create_primary_image_hdu()
-    test_create_image_extension()
+    test_image_create_extension()
     test_roundtrip_via_reopen()
     test_data_section_padded_and_zero()
     test_naxis0_has_no_data_section()

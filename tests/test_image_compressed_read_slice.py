@@ -433,7 +433,7 @@ def test_empty_slice_returns_empty_array():
 
 
 # test_setitem_still_raises: removed — CompressedImageHDU.__setitem__
-# is now supported.  See tests/test_compressed_image_setitem.py.
+# is now supported.  See tests/test_image_compressed_setitem.py.
 
 
 def test_fancy_list_raises_clear_error():

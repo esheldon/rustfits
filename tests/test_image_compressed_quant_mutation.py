@@ -260,7 +260,7 @@ def test_extend_out_of_range_in_boundary_rejected():
 # ---------------------- multi-tile slice setitem -------------------
 
 
-def test_setitem_multi_tile_slice():
+def test_table_setitem_multi_tile_slice():
     """
     Slice that spans multiple tiles modifies each tile correctly
     without disturbing the others.

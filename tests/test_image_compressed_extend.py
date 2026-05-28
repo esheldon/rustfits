@@ -450,7 +450,7 @@ def test_empty_data_rejected():
 # extend is now supported with the careful re-encoding scheme
 # (re-uses existing per-tile bscale/bzero/seed to avoid compounding
 # loss on unchanged pixels).  See
-# tests/test_compressed_image_quant_mutation.py.
+# tests/test_image_compressed_quant_mutation.py.
 
 
 def test_axis_count_mismatch_rejected():

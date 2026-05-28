@@ -1,7 +1,7 @@
 """
 ZIMAGE Gzip2 compressed image writes.
 
-Parallels test_compressed_image_write_gzip.py for the
+Parallels test_image_compressed_write_gzip.py for the
 GZIP_2 algorithm: byte-shuffle preprocessor in front of the same
 gzip framing GZIP_1 uses.  Tests cover:
     - Round-trip via same-handle read and via post-reopen read
@@ -51,7 +51,7 @@ def _seq(shape, dtype):
 # ---------------------- accessors ----------------------------------
 
 
-def test_accessors_after_create():
+def test_hdu_accessors_after_create():
     """
     create_image_hdu(..., compress=Gzip2(...)) produces a
     CompressedImageHDU with ZCMPTYPE=GZIP_2.
@@ -304,12 +304,12 @@ def test_mixed_gzip1_and_gzip2_in_one_file():
 
 # test_float_compress_rejected: removed in Phase 8 commit 2 —
 # float-compressed writes are now supported via quantize=.  See
-# tests/test_compressed_image_write_quantize.py.
+# tests/test_image_compressed_write_quantize.py.
 
 
 # test_unsigned_trick_dtype_rejected: removed — u2/u4/u8/i1 are
 # now supported for compressed writes via Gzip1/Gzip2/Rice1/
-# Hcompress1.  See tests/test_compressed_image_unsigned_trick.py.
+# Hcompress1.  See tests/test_image_compressed_unsigned_trick.py.
 
 
 def test_input_shape_mismatch_rejected():

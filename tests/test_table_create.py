@@ -224,7 +224,7 @@ def test_extname_extver():
             assert fits["mytable"].header["EXTVER"] == 7
 
 
-def test_units_kwarg_round_trips():
+def test_hdu_units_kwarg_round_trips():
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "t.fits")
         dt = np.dtype([("flux", "f4"), ("snr", "f4"), ("id", "i4")])

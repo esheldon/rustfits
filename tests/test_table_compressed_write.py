@@ -209,7 +209,7 @@ def test_ztilelen_requires_compress():
 
 
 # VLA + compress shipped in Phase 6a; round-trip coverage lives in
-# tests/test_compressed_table_write_vla.py.
+# tests/test_table_compressed_write_vla.py.
 
 
 # ---------------------------------------------------------------------
