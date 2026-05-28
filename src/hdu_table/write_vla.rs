@@ -12,7 +12,7 @@ use crate::common::{
     check_not_tainted, lock_file, parse_keyword,
     shift_file_tail_and_update_offsets,
     shift_file_tail_backward_and_update_offsets, zero_fill_range,
-    FileHandle, RawBuffer,
+    FileHandle, RawBuffer, Storage,
 };
 use crate::hdu::HDU;
 use crate::hdu_image::{round_up_to_block, serialize_header_to_disk_bytes};
@@ -622,7 +622,7 @@ fn build_vla_heap_buf(
 // under the same lock as the main-row writes that precede it.
 // Mid-write failures taint per the standard discipline.
 fn write_heap_and_flush(
-    f: &mut std::fs::File,
+    f: &mut Storage,
     heap_buf: &[u8],
     heap_start_offset_in_file: u64,
     tainted: &crate::common::TaintFlag,
@@ -841,9 +841,8 @@ pub(crate) fn write_vla_aware(
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_and_update_offsets(
@@ -1008,9 +1007,8 @@ pub(crate) fn append_vla_aware(
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_and_update_offsets(
@@ -1260,9 +1258,8 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_backward_and_update_offsets(

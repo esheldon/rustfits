@@ -884,9 +884,8 @@ fn grow_or_shrink_data_extent(
         let g = lock_file(&super_.file)?;
         let f = g.as_ref()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.metadata()
+        f.len()
             .map_err(|e| PyIOError::new_err(e.to_string()))?
-            .len()
     };
     if new_padded > current_padded {
         let delta = new_padded - current_padded;

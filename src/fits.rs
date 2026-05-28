@@ -8,13 +8,13 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
 use crate::common::{
     lock_file, parse_keyword, parse_string_keyword,
-    FileHandle, FileLayout, HduOffsets, TaintFlag,
+    FileHandle, FileLayout, HduOffsets, Storage, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
@@ -115,6 +115,14 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
     } else {
         raw_size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64
     }
+}
+
+// True for the in-memory driver URLs.  `mem://` and `memkeep://` are
+// cfitsio's spellings; they are aliases here — the C-level free-on-close
+// vs keep distinction does not apply, since the buffer is owned by the
+// FITS pyclass and to_bytes() copies it out regardless (see CLAUDE.md).
+fn is_mem_url(filename: &str) -> bool {
+    filename == "mem://" || filename == "memkeep://"
 }
 
 // Walks the file from byte 0, extracting every HDU header and skipping over
@@ -276,7 +284,7 @@ fn parse_hdus_from_file(
         offset += header_size + data_size;
         let _ = file.seek(SeekFrom::Start(offset));
 
-        if offset >= file.metadata().map(|m| m.len()).unwrap_or(0) {
+        if offset >= file.len().unwrap_or(0) {
             break;
         }
     }
@@ -1332,22 +1340,36 @@ impl FITS {
     #[new]
     #[pyo3(signature = (filename, mode="r"))]
     fn new(py: Python<'_>, filename: String, mode: &str) -> PyResult<Self> {
-        let mut options = OpenOptions::new();
-
-        match mode {
-            "r"  => options.read(true),
-            "r+" => options.read(true).write(true),
-            "w+" => options.read(true).write(true).truncate(true).create(true),
-            _ => return Err(PyIOError::new_err(format!(
+        if !matches!(mode, "r" | "r+" | "w+") {
+            return Err(PyIOError::new_err(format!(
                 "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",
                 mode
-            ))),
+            )));
+        }
+
+        // mem:// / memkeep:// (aliases) open an empty in-memory file —
+        // no disk access.  Build HDUs in RAM, then extract with
+        // to_bytes(); or use FITS.from_bytes(...) to parse existing
+        // bytes.  Unlike a disk file, the backing buffer is always
+        // writable, so read-only mode is advisory only for mem files.
+        let storage = if is_mem_url(&filename) {
+            Storage::Mem(Cursor::new(Vec::new()))
+        } else {
+            let mut options = OpenOptions::new();
+            match mode {
+                "r"  => options.read(true),
+                "r+" => options.read(true).write(true),
+                "w+" => options.read(true).write(true).truncate(true).create(true),
+                // Unreachable: mode was validated above.
+                _ => unreachable!(),
+            };
+            let file = options.open(&filename).map_err(|e| {
+                PyIOError::new_err(format!("Failed to open '{}': {}", filename, e))
+            })?;
+            Storage::Disk(file)
         };
 
-        let file = options.open(&filename)
-            .map_err(|e| PyIOError::new_err(format!("Failed to open '{}': {}", filename, e)))?;
-
-        let handle: FileHandle = Arc::new(Mutex::new(Some(file)));
+        let handle: FileHandle = Arc::new(Mutex::new(Some(storage)));
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
         let layout = FileLayout::new();
         let hdus = parse_hdus_from_file(
@@ -1362,6 +1384,60 @@ impl FITS {
             layout,
             tainted,
         })
+    }
+
+    /// Parse a FITS file from in-memory bytes (no disk access).
+    ///
+    /// ``data`` is copied into a private in-memory buffer, so the
+    /// returned :class:`FITS` is fully independent of the original
+    /// object.  ``mode`` may be ``'r'`` (default) or ``'r+'`` (allow
+    /// in-memory mutation of the private copy); ``'w+'`` is rejected
+    /// because it would discard the bytes you just passed — use
+    /// ``FITS("mem://", "w+")`` to create an empty in-memory file.
+    #[staticmethod]
+    #[pyo3(signature = (data, mode="r"))]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>, mode: &str) -> PyResult<Self> {
+        if !matches!(mode, "r" | "r+") {
+            return Err(PyValueError::new_err(format!(
+                "from_bytes supports mode 'r' or 'r+' (got '{}'); 'w+' would \
+                 discard the provided bytes — use FITS(\"mem://\", \"w+\") to \
+                 create an empty in-memory file",
+                mode
+            )));
+        }
+        let handle: FileHandle =
+            Arc::new(Mutex::new(Some(Storage::Mem(Cursor::new(data)))));
+        let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
+        let layout = FileLayout::new();
+        let hdus = parse_hdus_from_file(
+            py, "mem://", &handle, &layout, &tainted,
+        )?;
+        Ok(FITS {
+            filename: "mem://".to_string(),
+            mode: mode.to_string(),
+            file: handle,
+            hdus,
+            layout,
+            tainted,
+        })
+    }
+
+    /// Return the FITS file's current bytes as a Python ``bytes``.
+    ///
+    /// Primarily for in-memory files (``mem://`` / :meth:`from_bytes`),
+    /// where it extracts the file you built in RAM.  Also works on a
+    /// disk-backed file: it flushes, then reads the whole file into
+    /// memory — note that the entire file lands in RAM, unlike the
+    /// streaming read paths.  Call it before :meth:`close`, which drops
+    /// the buffer.
+    fn to_bytes(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        let mut guard = lock_file(&self.file)?;
+        let storage = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        storage.flush().map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let buf = storage.read_all()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyBytes::new(py, &buf).unbind())
     }
 
     /// List of HDU objects in file order.
@@ -1391,7 +1467,7 @@ impl FITS {
     fn close(&mut self) -> PyResult<()> {
         let mut guard = lock_file(&self.file)?;
         if let Some(file) = guard.take() {
-            let _ = file.sync_all();
+            let _ = file.sync();
         }
         Ok(())
     }

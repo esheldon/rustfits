@@ -1201,12 +1201,14 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
 - **Remote file reads (`http`/`https`)** — open a FITS file from a
   URL.  Design sketched but not implemented — see the "Remote file
   reads" roadmap below.
-- **In-memory files (`mem://` equivalent) + other storage backends** —
-  create / read / extract a FITS file with no disk access, plus the
-  basis for cfitsio's broader driver set (gzip whole-file, stdin/
-  stdout, shared memory, ...).  Design sketched but not implemented —
-  see the "In-memory files + the storage-driver abstraction" roadmap
-  below.
+- **In-memory files (`mem://` / `memkeep://`)** — create / read /
+  extract a FITS file with no disk access, via `FITS("mem://", "w+")`
+  + `to_bytes()` / `FITS.from_bytes(b)`.  **Shipped** (the `Storage`
+  seam + `Disk`/`Mem` backends).  The broader cfitsio driver set
+  (gzip whole-file, stdin/stdout, shared memory, remote range reads)
+  is still sketched — see the "In-memory files + the storage-driver
+  abstraction" roadmap below, which now plugs each remaining backend
+  into the shipped `enum Storage`.
 
 ## Top-level convenience functions
 
@@ -3802,17 +3804,16 @@ for the first pass:
 2. **Range-based partial reads (deferred, NOT this roadmap).**
    HTTP `Range` requests so `fits["sci"][100:200]` or a single
    compressed tile pulls only the bytes it needs — the real
-   payoff for a multi-GB `.fz` on a server.  Requires abstracting
-   `common.rs`'s `FileHandle` (`Arc<Mutex<Option<std::fs::File>>>`)
-   over a "ReadSeek-like source" trait so seek+read paths don't
-   assume `std::fs::File` — this is the same `FitsStorage` trait
-   formalized in the "In-memory files + the storage-driver
-   abstraction" roadmap below (a range-read source is a lazy,
-   read-only `FitsStorage` impl).  Read-only (the in-place grow /
-   `shift_file_tail` / taint machinery is fundamentally local),
-   and depends on the server honoring Range.  Build it together
-   with the storage abstraction — that's where the architectural
-   work lives.
+   payoff for a multi-GB `.fz` on a server.  The storage seam this
+   needs is **already done**: `common.rs`'s `FileHandle` is now
+   `Arc<Mutex<Option<Storage>>>` (see the "In-memory files +
+   storage-driver abstraction" roadmap below).  A range-read source
+   is a lazy, read-only backend; because it carries its own state
+   (URL, http client, position) and isn't cheaply enumerable, it's
+   the specific case that would justify switching `enum Storage` to
+   `Box<dyn FitsStorage>` rather than adding a variant.  Read-only
+   (the in-place grow / `shift_file_tail` / taint machinery is
+   fundamentally local), and depends on the server honoring Range.
 
 ### Design (flavor #1)
 
@@ -3886,18 +3887,37 @@ cfitsio's `mem://` driver opens a FITS file entirely in RAM (create,
 manipulate, extract bytes — no disk).  Supporting it in rustfits is
 the same architectural work as cfitsio's *whole* driver set, so this
 roadmap is scoped as "the storage abstraction" rather than just the
-mem case.  **Status: design sketched, not implemented.**
+mem case.
 
-### The obstacle (shared with remote range-reads)
+**Status: the seam + the first two backends shipped (2026-05-28).**
 
-`common.rs`'s `FileHandle = Arc<Mutex<Option<std::fs::File>>>`
-hardcodes the on-disk file.  In-memory needs that source abstracted,
+| Piece | Status |
+|---|---|
+| Storage seam (`FileHandle` over `enum Storage`) | ✅ Shipped |
+| `Disk` backend (`file://`) | ✅ Shipped |
+| `Mem` backend + `mem://` / `memkeep://` + `to_bytes`/`from_bytes` | ✅ Shipped |
+| Whole-file `.gz`/`.Z`/`.zip`, `stdin://`/`stdout://`, `shmem://` | ⬜ Sketched below |
+| `http`/`https` download + range reads | ⬜ See "Remote file reads" roadmap |
+
+The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
+`Box<dyn FitsStorage>` — see "The shape (as built)" below for the
+decision.  The remaining rows below stay as design notes; they all
+plug into the same `enum Storage` (a new variant each) or, for the
+non-enumerable lazy backends, would be the moment to revisit `dyn`.
+Tests for the shipped part: `tests/test_fits_mem.py`.
+
+### The obstacle (shared with remote range-reads) — RESOLVED
+
+`common.rs`'s `FileHandle` used to be `Arc<Mutex<Option<std::fs::File>>>`,
+hardcoding the on-disk file.  In-memory needed that source abstracted,
 and — unlike the read-only remote-download case — mem must support
 **read AND write** (creating a FITS in RAM and extracting the bytes
-is the primary use case).  So this is the *more complete*
-abstraction, and once it exists it also unlocks the remote range-read
-flavor (#2 in the "Remote file reads" roadmap above).  One refactor,
-multiple features.
+is the primary use case).  So this was the *more complete*
+abstraction, and now that it exists it also unlocks the remote
+range-read flavor (#2 in the "Remote file reads" roadmap above) — one
+refactor, multiple features.  `FileHandle` is now
+`Arc<Mutex<Option<Storage>>>`; the rest of this section is the design
+rationale, kept for the remaining (unshipped) backends.
 
 ### Why it's tractable
 
@@ -3907,89 +3927,135 @@ files, but the overwhelming majority are `std::io` *trait* methods —
 `read` (31) — which `std::io::Cursor<Vec<u8>>` already implements.
 Only `set_len` (23), `metadata().len()` (23), and `sync_all` (1) are
 `std::fs::File`-specific.  So most call sites compile unchanged
-against a trait object; only the ~47 File-specific sites get
+against the abstracted handle; only the File-specific sites got
 mechanically rewritten.
 
-### The shape
+**Played out as predicted:** the ~30 `guard.as_mut()` sites needed
+zero changes (they just yield `&mut Storage` now); the rewrite was 24
+`metadata().len()`→`len()`, 2 `sync_all`→`sync`, and 5 helper-fn
+signatures (`&mut std::fs::File`→`&mut Storage`).  Behavior-preserving
+— the full suite was unchanged after the seam landed.
 
-A small supertrait over the std I/O traits, adding only the three
-File-specific operations:
+### The shape (as built)
+
+The original sketch was a `trait FitsStorage: Read + Write + Seek +
+Send` with `Box<dyn FitsStorage>`.  **What shipped is the enum
+alternative** the sketch named — chosen because it monomorphizes (no
+vtable), every call site keeps a concrete `&mut Storage` (the ~30
+`guard.as_mut()` sites needed no change, and the 5 helper fns just
+swapped `&mut std::fs::File` → `&mut Storage` with no deref dance),
+and it matches the codebase's no-premature-abstraction style:
 
 ```rust
-trait FitsStorage: Read + Write + Seek + Send {
-    fn set_len(&mut self, n: u64) -> io::Result<()>;
-    fn len(&self) -> io::Result<u64>;
-    fn sync(&mut self) -> io::Result<()>;
+// common.rs
+pub(crate) enum Storage {
+    Disk(std::fs::File),
+    Mem(std::io::Cursor<Vec<u8>>),
+}
+
+// std Read/Write/Seek impls forward by matching the variant.
+// Three inherent methods cover the File-specific operations:
+impl Storage {
+    fn set_len(&mut self, size: u64) -> io::Result<()>;  // File::set_len
+                                                          // / Vec::resize
+    fn len(&self) -> io::Result<u64>;       // metadata().len() / vec.len()
+    fn sync(&self) -> io::Result<()>;       // fsync / no-op
+    fn read_all(&mut self) -> io::Result<Vec<u8>>;  // backs to_bytes()
 }
 ```
 
-`FileHandle` becomes `Arc<Mutex<Option<Box<dyn FitsStorage>>>>` (or
-an `enum Storage { Disk(File), Mem(MemCursor) }` to avoid `dyn`).
-Two initial impls:
-- **`File`** — trivial forwarding to the real methods.
-- **In-memory** — `Cursor<Vec<u8>>` for the `Read/Write/Seek` part;
-  `set_len` truncates / zero-extends the `Vec`; `len` is `vec.len()`;
-  `sync` is a no-op.
+`FileHandle` is now `Arc<Mutex<Option<Storage>>>`; `lock_file` returns
+`MutexGuard<'_, Option<Storage>>`.  `set_len` takes `&mut self` (the
+`Mem` variant resizes its `Vec`; every caller already holds
+`&mut Storage`).  The two backends:
+- **`Disk`** — trivial forwarding to `std::fs::File`.
+- **`Mem`** — `Cursor<Vec<u8>>` for `Read/Write/Seek`; `set_len`
+  truncates / zero-extends the `Vec`; `len` is `vec.len()`; `sync`
+  is a no-op.
+
+A future lazy remote-range backend (its own state, not cheaply
+enumerable) would be the point to reconsider `dyn` — until then the
+enum is the right call.
 
 ### This is the basis for cfitsio's full driver set
 
 cfitsio's drivers are all either **(a) a seekable random-access
 store** or **(b) something materialized into a memory buffer**.  The
-trait *is* (a); the in-memory impl *is* (b).  Coverage map:
+`Disk` variant *is* (a); the `Mem` variant *is* (b).  Coverage map
+(✅ = shipped, ⬜ = sketched):
 
-| cfitsio driver | how it rides on `FitsStorage` |
-|---|---|
-| `file://` | the `File` impl (exists today) |
-| `mem://` / `memkeep://` | the `Cursor<Vec<u8>>` impl; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair |
-| whole-file `.gz` / `.Z` / `.zip` | mem impl filled by gunzip-on-open, recompress-on-close |
-| `stdin://` / `stdout://` / `"-"` | mem impl: slurp the non-seekable reader at open / flush the sink at close |
-| `http`/`https`/`ftp` (download) | fill the mem buffer (or temp file) from the network at open |
-| http **range** reads (remote roadmap #2) | a *lazy* read-only impl: seek+read → Range requests, no full buffer |
-| `shmem://` | mem impl backed by an OS shared-memory mapping |
-| `root://` / `gsiftp://` | same as http — materialize-to-mem, or a lazy protocol impl |
+| cfitsio driver | how it rides on `Storage` | status |
+|---|---|---|
+| `file://` | the `Disk` variant | ✅ |
+| `mem://` / `memkeep://` | the `Mem` (`Cursor<Vec<u8>>`) variant; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair | ✅ |
+| whole-file `.gz` / `.Z` / `.zip` | `Mem` filled by gunzip-on-open, recompress-on-close | ⬜ |
+| `stdin://` / `stdout://` / `"-"` | `Mem`: slurp the non-seekable reader at open / flush the sink at close | ⬜ |
+| `http`/`https`/`ftp` (download) | fill the `Mem` buffer (or temp file) from the network at open | ⬜ |
+| http **range** reads (remote roadmap #2) | a *lazy* read-only backend: seek+read → Range requests, no full buffer (the case that would justify `dyn`) | ⬜ |
+| `shmem://` | `Mem` backed by an OS shared-memory mapping | ⬜ |
+| `root://` / `gsiftp://` | same as http — materialize-to-mem, or a lazy protocol backend | ⬜ |
 
 **The one genuine caveat:** non-seekable sources (pipes, streaming
-network) cannot be a `FitsStorage` directly — FITS needs random
+network) cannot be a `Storage` variant directly — FITS needs random
 access (HDU offsets, `shift_file_tail`, etc.).  They are buffered
-into the mem impl at the boundary (slurp stdin at open, flush stdout
-at close).  That is exactly what cfitsio does too, so it's the
+into the `Mem` variant at the boundary (slurp stdin at open, flush
+stdout at close).  That is exactly what cfitsio does too, so it's the
 standard pattern, not a limitation of the abstraction.
 
-So `FitsStorage` is the **single seam** every non-`file://` driver
-plugs into — the argument for doing it once, properly, rather than
+So `Storage` is the **single seam** every non-`file://` driver plugs
+into — the argument for having done it once, properly, rather than
 bolting each backend on ad hoc.
 
-### Cheap shortcut (if you only need read-from-bytes)
+### Cheap shortcut (superseded for read-from-bytes)
 
-If the real need is just "I already have FITS bytes (DB blob, socket,
-astropy) and want to parse them," skip the refactor: spill the bytes
-to a temp file and open that — the same download-then-open trick from
-the remote roadmap.  Read-only, zero architectural change, available
-immediately.  Not *zero-disk*, but covers most of the practical
-"parse these bytes" demand.
+Before the seam landed, the "I already have FITS bytes (DB blob,
+socket, astropy) and want to parse them" case had a zero-refactor
+shortcut: spill the bytes to a temp file and open that.  **No longer
+needed** — `FITS.from_bytes(b)` now parses directly from a
+`Cursor<Vec<u8>>`, zero-disk.  The temp-file trick remains the
+fallback for the *remote* roadmap (download whole file → open),
+where it's the deliberate "download-then-open" design, not a
+shortcut.
 
-### Python surface
+### Python surface (shipped)
 
 Two layers, chosen so cfitsio/fitsio migrators see familiar names and
 everyone else gets a Pythonic path:
 
 - **cfitsio driver names (primary surface).**  `FITS("mem://", "w+")`
-  and `FITS("memkeep://", "w+")` both open an in-memory file.  These
-  are the names sophisticated users already know from cfitsio/fitsio,
-  and — being `scheme://`-shaped — they slot into the *same*
-  constructor prefix-dispatch branch the remote roadmap uses for
-  `http://` / `https://`, rather than needing a special-cased magic
-  filename.  (An earlier sketch proposed a SQLite-style `":memory:"`
-  sentinel; dropped in favor of the cfitsio spelling for familiarity
-  and dispatch uniformity.)
-- **`to_bytes()` / `from_bytes()` (Pythonic pair).**  `fits.to_bytes()`
-  returns the in-memory file's bytes as a Python `bytes`;
-  `rustfits.FITS.from_bytes(b)` parses bytes you already hold (DB blob,
-  socket, astropy) without a disk round-trip (or via the temp-file
-  shortcut behind the same name — see below).  This layer exists
-  because cfitsio's *native* extraction is clunky (hand it a buffer
-  pointer + size); the byte methods are the discoverable, idiomatic
-  way in and out.
+  and `FITS("memkeep://", "w+")` both open an empty in-memory file.
+  These are the names sophisticated users already know from
+  cfitsio/fitsio, and — being `scheme://`-shaped — they slot into the
+  *same* constructor prefix-dispatch branch (`is_mem_url` in
+  `fits.rs`) the remote roadmap will use for `http://` / `https://`,
+  rather than needing a special-cased magic filename.  (An earlier
+  sketch proposed a SQLite-style `":memory:"` sentinel; dropped in
+  favor of the cfitsio spelling for familiarity and dispatch
+  uniformity.)
+- **`to_bytes()` / `from_bytes()` (Pythonic pair).**
+  `fits.to_bytes()` returns the file's current bytes as a Python
+  `bytes` (works on `Mem` *and* `Disk` — for `Disk` it flushes then
+  reads the whole file, loading it into RAM; call before `close()`,
+  which drops the buffer).  `rustfits.FITS.from_bytes(b, mode='r')`
+  parses bytes you already hold (DB blob, socket, astropy) directly
+  from a `Cursor<Vec<u8>>` — no disk.  This layer exists because
+  cfitsio's *native* extraction is clunky (hand it a buffer pointer +
+  size); the byte methods are the discoverable, idiomatic way in and
+  out.
+
+**Shipped semantics:**
+- `from_bytes` **copies** the input into a private `Vec`, so the
+  returned `FITS` is fully independent of the source object; accepts
+  `mode='r'` (default) or `'r+'`; rejects `'w+'` (it would discard the
+  bytes you just passed — use `FITS("mem://", "w+")` to start empty).
+- An empty `mem://` file has zero HDUs (same as a fresh `w+` disk
+  file); `to_bytes()` on it returns `b""`.
+- **Read-only mode is advisory for mem files.**  A `Cursor<Vec<u8>>`
+  has no OS permission layer, so (unlike a `Disk` file opened `"r"`)
+  writes to a `mem://`/`from_bytes` file aren't rejected by the OS.
+  Harmless — writes only touch the private in-memory copy — but worth
+  knowing.  A cross-cutting Rust-level writable gate was deemed out of
+  scope (disk relies entirely on OS enforcement today).
 
 **`mem://` and `memkeep://` are aliases — both do the same thing.**  In
 C the distinction is load-bearing (the caller manages the buffer
@@ -4004,17 +4070,21 @@ migrator's existing spelling keeps working.
 
 ### Main tradeoff
 
-The whole file lives in RAM — which negates rustfits's "~1 MiB above
-the output array" RSS property, but that's inherent to mem files, not
-a flaw.  The enum/trait change touches the locked-handle type, so
-every I/O file recompiles even though most sites don't change
-semantically.
+The whole file lives in RAM for a `mem://` file — which negates
+rustfits's "~1 MiB above the output array" RSS property, but that's
+inherent to mem files, not a flaw.  (The `Disk` path is unchanged and
+keeps the streaming property.)  The enum change touched the
+locked-handle type, so the whole `src/` tree recompiled once even
+though most sites didn't change semantically — a one-time cost.
 
-**Recommendation:** if the goal is "parse bytes I have," do the
-temp-file shortcut.  If it's the true `mem://` driver (create /
-manipulate / extract, zero disk), do the `FitsStorage` trait — and do
-it *together* with the remote range-read plan, since they're the same
-abstraction.
+**Where the remaining work lives:** the unshipped rows in the coverage
+map above (gz / stdin / shmem) are each a new `enum Storage` variant
+filled at the open boundary.  The remote `http`/`https` *download*
+case is the same (fill `Mem` from the network); the remote **range**
+case (remote roadmap #2) is the lazy read-only backend that would
+justify switching `Storage` to `dyn` — build it together with the
+remote roadmap when a real workload needs partial reads of a remote
+multi-GB `.fz`.
 
 ## Build / dev workflow
 

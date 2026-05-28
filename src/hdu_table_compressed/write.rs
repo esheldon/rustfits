@@ -149,8 +149,8 @@ pub(crate) fn write_compressed_table_data<'py>(
         let f = guard.as_mut()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
         let current_end = data_offset + current_padded;
-        let file_len = f.metadata()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?.len();
+        let file_len = f.len()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
         if file_len < current_end {
             f.set_len(current_end)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -320,8 +320,8 @@ pub(crate) fn grow_file_to_at_least(
         let g = lock_file(file)?;
         let f = g.as_ref()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.metadata()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?.len()
+        f.len()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
     };
     // Effective end is bounded by the next HDU's start (non-last)
     // or by the file length (last HDU).

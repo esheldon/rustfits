@@ -765,9 +765,8 @@ pub(crate) fn append_fixed_only(
             let guard = lock_file(&super_.file)?;
             let file = guard.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            file.metadata()
+            file.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_and_update_offsets(

@@ -4,13 +4,111 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyValueError};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// The backing store for an open FITS file.  This is the `FitsStorage`
+// seam from the storage-driver roadmap (see CLAUDE.md), realized as an
+// enum rather than `Box<dyn ...>` so dispatch is monomorphized and every
+// call site keeps working with a concrete `&mut Storage` (no vtable, no
+// deref dance).  All random-access I/O flows through the std
+// `Read`/`Write`/`Seek` impls below; only the three operations that
+// `std::fs::File` exposes outside those traits — `set_len`, byte length,
+// and durable sync — need explicit forwarding.
+//
+// `Disk` is the on-disk `file://` backend; `Mem` is the in-memory
+// `mem://` / `memkeep://` backend (the two URL spellings are aliases —
+// both land here, see CLAUDE.md).  A future lazy remote-range backend
+// that can't be enumerated cheaply would be the moment to reconsider
+// `dyn`.
+pub(crate) enum Storage {
+    Disk(std::fs::File),
+    Mem(Cursor<Vec<u8>>),
+}
+
+impl Storage {
+    // Truncate or zero-extend the backing store to `size` bytes.  Takes
+    // `&mut self` (not `&self` like `File::set_len`) because the in-memory
+    // backend resizes its `Vec`; every caller already holds `&mut Storage`
+    // via `guard.as_mut()`.  The cursor position is left unchanged (matches
+    // `File::set_len`, which never moves the file offset) — every read/write
+    // site seeks explicitly anyway.
+    pub(crate) fn set_len(&mut self, size: u64) -> io::Result<()> {
+        match self {
+            Storage::Disk(f) => f.set_len(size),
+            Storage::Mem(c) => {
+                c.get_mut().resize(size as usize, 0);
+                Ok(())
+            }
+        }
+    }
+
+    // Current length of the backing store in bytes (replaces the old
+    // `f.metadata()?.len()` pattern at every call site).
+    pub(crate) fn len(&self) -> io::Result<u64> {
+        match self {
+            Storage::Disk(f) => Ok(f.metadata()?.len()),
+            Storage::Mem(c) => Ok(c.get_ref().len() as u64),
+        }
+    }
+
+    // Flush durable state: fsync on disk, no-op for an in-memory buffer.
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        match self {
+            Storage::Disk(f) => f.sync_all(),
+            Storage::Mem(_) => Ok(()),
+        }
+    }
+
+    // Copy the entire backing store out as a fresh Vec, from byte 0.
+    // Backs `FITS.to_bytes()`.  Seeks (and leaves the cursor at EOF);
+    // harmless because every other I/O site seeks before reading/writing.
+    pub(crate) fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        let len = self.len()?;
+        self.seek(SeekFrom::Start(0))?;
+        let mut buf = vec![0u8; len as usize];
+        self.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl Read for Storage {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Storage::Disk(f) => f.read(buf),
+            Storage::Mem(c) => c.read(buf),
+        }
+    }
+}
+
+impl Write for Storage {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Storage::Disk(f) => f.write(buf),
+            Storage::Mem(c) => c.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Storage::Disk(f) => f.flush(),
+            Storage::Mem(c) => c.flush(),
+        }
+    }
+}
+
+impl Seek for Storage {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Storage::Disk(f) => f.seek(pos),
+            Storage::Mem(c) => c.seek(pos),
+        }
+    }
+}
+
 // Shared, mutable file handle.  FITS owns the master Arc, each HDU clones it.
 // `None` after close().
-pub(crate) type FileHandle = Arc<Mutex<Option<std::fs::File>>>;
+pub(crate) type FileHandle = Arc<Mutex<Option<Storage>>>;
 
 // Per-HDU byte offsets stored as atomics so they can be mutated in place
 // when a header (or, later, an image/table data section) grows and shifts
@@ -73,7 +171,7 @@ impl FileLayout {
 
 pub(crate) fn lock_file(
     handle: &FileHandle,
-) -> PyResult<MutexGuard<'_, Option<std::fs::File>>> {
+) -> PyResult<MutexGuard<'_, Option<Storage>>> {
     handle.lock().map_err(|_| PyIOError::new_err("file lock poisoned"))
 }
 
@@ -165,9 +263,8 @@ pub(crate) fn shift_file_tail_and_update_offsets(
     let f = guard.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
 
-    let original_len = f.metadata()
-        .map_err(|e| PyIOError::new_err(e.to_string()))?
-        .len();
+    let original_len = f.len()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
     // `tail_len` is the number of pre-existing bytes that must be relocated
     // (everything from after_offset to EOF).  When growing the header of
@@ -365,9 +462,8 @@ pub(crate) fn shift_file_tail_backward_and_update_offsets(
     let mut guard = lock_file(file_handle)?;
     let f = guard.as_mut()
         .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-    let original_len = f.metadata()
-        .map_err(|e| PyIOError::new_err(e.to_string()))?
-        .len();
+    let original_len = f.len()
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
     let tail_len = original_len.saturating_sub(old_after_offset);
 
     if tail_len > 0 {

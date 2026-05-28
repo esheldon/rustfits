@@ -10,7 +10,7 @@ use pyo3::types::{PyBytes, PySlice, PyTuple};
 
 use crate::common::{
     check_not_tainted,
-    FileHandle, RawBuffer, TaintFlag,
+    FileHandle, RawBuffer, Storage, TaintFlag,
 };
 use crate::hdu_image::{
     normalize_slice_key, AxisSlice,
@@ -474,7 +474,7 @@ fn fetch_tile_payload(
 }
 
 fn fetch_tile_payload_inner(
-    file: &mut std::fs::File,
+    file: &mut Storage,
     tile_idx: u64,
     data_offset: u64,
     theap: u64,
@@ -537,7 +537,7 @@ fn fetch_tile_payload_inner(
 // Used for the per-tile ZSCALE / ZZERO (TFORM=`1D`) reads on the
 // quantized-float path.
 fn read_big_endian_f64(
-    file: &mut std::fs::File,
+    file: &mut Storage,
     offset: u64,
 ) -> PyResult<f64> {
     file.seek(SeekFrom::Start(offset))
@@ -552,7 +552,7 @@ fn read_big_endian_f64(
 // offset.  Returns (nelements, heap_offset).  Both `P` (8 bytes,
 // two u32s) and `Q` (16 bytes, two u64s) forms are big-endian.
 fn read_descriptor(
-    file: &mut std::fs::File,
+    file: &mut Storage,
     desc_offset: u64,
     is_q: bool,
 ) -> PyResult<(u64, u64)> {
@@ -579,7 +579,7 @@ fn read_descriptor(
 // offset.  Convenience wrapper for the read_descriptor + heap-read
 // pair done in fetch_tile_payload.
 fn read_heap_bytes(
-    file: &mut std::fs::File,
+    file: &mut Storage,
     heap_byte_offset: u64,
     n_bytes: u64,
 ) -> PyResult<Vec<u8>> {
