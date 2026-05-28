@@ -4,11 +4,10 @@ A Python FITS library with the heavy lifting written in Rust.
 
 ## What it does
 
-`rustfits` reads and writes [FITS](https://fits.gsfc.nasa.gov/) files
-— the astronomical data format — from Python. The Python surface
-mirrors `astropy.io.fits` and `fitsio` conventions: open a file with
-`FITS(path)`, index into HDUs with `fits[i]` or `fits["sci"]`, call
-`hdu.read()` for the data, and slice with `hdu[a:b, c:d]`.
+`rustfits` reads and writes [FITS](https://fits.gsfc.nasa.gov/) files — the
+astronomical data format — from Python. The Python surface mirrors `fitsio`
+conventions: open a file with `FITS(path)`, index into HDUs with `fits[i]` or
+`fits["sci"]`, call `hdu.read()` for the data, and slice with `hdu[a:b, c:d]`.
 
 What's there today:
 
@@ -150,7 +149,7 @@ find `libpython.X.so` — bare `cargo test` fails without it.
 Contributions and bug reports are welcome.  Please feel free to open pull
 requests or issues at https://github.com/esheldon/rustfits
 
-rustfits is mostly written in rust.  If you don't know rust, you can
+`rustfits` is mostly written in rust.  If you don't know rust, you can
 still make contributions.  The extensive CLAUDE.md file can be used
 by claude code or other agents to help you fix bugs or add features.
 Just start the agent, ask it to load from CLAUDE.md, and ask the agent
