@@ -9,6 +9,7 @@ pub(crate) mod hcompress;
 pub(crate) mod plio;
 pub(crate) mod quantize;
 pub(crate) mod rice;
+pub(crate) mod tile_io;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
