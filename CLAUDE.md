@@ -4648,6 +4648,29 @@ healsparse/random distinction.  A clear split:
   `.read()` — a big-allocation/page-fault effect — but rustfits trails
   on bulk either way.)
 
+**Uncompressed image writes + extend (2026-05-29).**
+`perf-image-write-1d.py` / `-2d.py` and `perf-image-extend-1d.py`.
+
+- **Uncompressed write is a tall pole — slower AND 2× memory.**  rustfits
+  is ~2.3× slower than fitsio (1-D f8 0.44×, 2-D f4 0.41×), and its
+  write-once peak RSS is **2,101 MB for a 1 GB array** vs fitsio's
+  1,204 MB: rustfits byteswaps the WHOLE array into a big-endian copy
+  (`ascontiguousarray(..., ">f8")`), doubling memory, where fitsio
+  byteswaps in bounded chunks.  Fix: byteswap streaming/in-place in the
+  uncompressed write path (the read path already streams).
+- **Uncompressed extend is a big bounded-memory win and confirms the
+  predicted contrast.**  Building a 1 GB map: extend uses **30.5× less
+  RAM** (69 MB vs 2,101 MB) and is even faster than rustfits's own
+  write-once (0.58×, by sidestepping the full-array copy).  Time is
+  ~flat across chunk size (no compressed heap to relocate → O(N)
+  linear), unlike the compressed extend's ~quadratic chunk penalty.
+  (fitsio's raw write-once is still faster in wall-time but uses ~17×
+  more RAM than extend.)
+
+So the open optimization leads are: **RICE decode**, **uncompressed bulk
+read**, and **uncompressed write (speed + the 2× byteswap copy)**.  GZIP_2
+read+encode, RICE encode, and both extend paths favor rustfits.
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
