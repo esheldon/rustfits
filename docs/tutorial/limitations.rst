@@ -74,6 +74,14 @@ General
   would help, file an issue with the access pattern.
 * **Streaming / row-iterator API** *(not yet)* — for tables that
   don't fit in RAM.  Add when a real workload prompts it.
+* **Multithreaded throughput (GIL release)** *(not yet)* — rustfits
+  releases the GIL only during remote (``http`` / ``ftp``) downloads.
+  The heavy CPU paths — tile decode/encode, large chunked I/O,
+  checksum — currently hold it, so several Python threads calling into
+  rustfits serialize on those.  Single-threaded use is unaffected (the
+  common case).  Releasing the GIL around the pure-Rust decode/encode
+  spans is a targeted future change, gated on a real multithreaded
+  workload — file an issue if you have one.
 
 Cross-tool interop caveats
 --------------------------
