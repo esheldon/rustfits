@@ -4601,6 +4601,31 @@ the encode/decode × GZIP/RICE matrix:
   path — the two RICE directions need separate attention; only decode
   is a problem.
 
+**Extend / bounded-memory build (2026-05-29).**
+`perf-compressed-image-extend-healsparse.py` measures building a 1-D
+GZIP_2 map incrementally via `CompressedImageHDU.extend` — a capability
+healsparse doesn't use today (it holds the whole map in RAM and writes
+once via fitsio).  fitsio can't append to a compressed image, so this is
+a rustfits self-characterization (per-build wall time + peak `ru_maxrss`,
+each build in its own subprocess).  Building a **1 GB** map:
+
+| regime | build | peak RSS |
+|---|---|---|
+| fitsio write-once | 3.05 s | 1,225 MB |
+| rustfits write-once | 2.03 s | 1,146 MB |
+| rustfits extend, C=1 tile (K=128) | 2.96 s | **129 MB** (8.9× less) |
+| rustfits extend, C=8 tiles (K=16) | 1.41 s | **185 MB** (6.2× less) |
+
+- **The win is peak memory (~9× less)**: extend builds maps that don't
+  fit in RAM; write-once needs the whole array resident.
+- **Time is competitive — even faster with larger chunks** (C=8 tiles is
+  0.70× write-once, the bounded chunks avoiding full-array memory
+  pressure).  `extend` relocates the growing compressed heap each call,
+  so many tiny chunks cost more (C=1 tile = 1.46×, 128 relocations) — a
+  clean chunk-size = speed/RAM tradeoff the caller tunes by memory
+  budget.  (Heap-relocation-per-extend is O(current compressed size), so
+  build-via-K-extends is ~quadratic in K; large chunks keep K small.)
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
