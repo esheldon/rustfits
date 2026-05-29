@@ -2523,8 +2523,17 @@ mechanism with `TableHDU.repack()`).
 
 **GZIP compression level (`Gzip1(level=...)` / `Gzip2(level=...)`).**
 Shipped 2026-05-23.  Accepts 0..=9 (zlib levels: 0 = none, 1 =
-fastest, 9 = best); `None` (default) uses the codec default of 6
-— same as cfitsio/zlib/astropy.
+fastest, 9 = best); `None` (default) uses flate2's default of 6.
+
+**Caveat (corrected 2026-05-29):** that default of 6 is the
+zlib/flate2 library default, but it is NOT what cfitsio uses for tile
+compression — cfitsio hardcodes `Z_BEST_SPEED` (level 1) in
+`<cfitsio>/zcompress.c` (`deflateInit2(..., Z_BEST_SPEED, ...)`).  So
+rustfits at its default writes ~18% smaller `.fz` files than cfitsio
+but does more encode work (a deliberate size/speed tradeoff, not a
+deficiency).  At MATCHED level 1, rustfits's GZIP_2 encode is ~2.3×
+FASTER than fitsio (see the perf section).  Whether rustfits should
+adopt cfitsio's level-1 default is an open question.
 
 The level is a **write-only** parameter: the gzip stream format
 itself doesn't preserve the level that produced it (the decoder
@@ -4567,6 +4576,30 @@ not quantization, float, or 2-D tile assembly:
   with large tiles + scattered 32×32 stamp reads, fitsio re-decodes a
   full tile per stamp and is catastrophically slow — rustfits ~17×
   faster there.)
+
+**Write/encode benchmarks (2026-05-29).**  The write side
+(`perf-compressed-image-write-healsparse.py` for 1-D GZIP_2,
+`perf-compressed-image-write-des.py` for 2-D RICE+dither2) completes
+the encode/decode × GZIP/RICE matrix:
+
+| compression path | rustfits vs fitsio |
+|---|---|
+| GZIP_2 decode (1-D healsparse) | 1.8–45× faster |
+| GZIP_2 encode (matched level 1) | **2.32× faster** |
+| RICE decode (2-D)  | 0.38× (~2.6× slower — the one tall pole) |
+| RICE encode        | 0.99× (≈ par) |
+
+- **GZIP_2 encode is rustfits-faster once the level is matched.**  A
+  first run looked 0.48× (slower), but that was a level mismatch:
+  rustfits defaults to level 6 while cfitsio uses `Z_BEST_SPEED` (1).
+  At matched level 1 rustfits encodes ~2.3× faster (833 vs 359 MB/s).
+  The write benchmark defaults to `--level 1` for the fair comparison.
+  Lesson for write comparisons: match the gzip level (cfitsio = 1),
+  and watch that fitsio's float GZIP **lossy-quantizes by default** —
+  pass `qlevel=0` for a lossless comparison.
+- **RICE encode is ~par** (0.99×) even though RICE *decode* is the slow
+  path — the two RICE directions need separate attention; only decode
+  is a problem.
 
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**

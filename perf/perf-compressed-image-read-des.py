@@ -58,22 +58,17 @@ import os
 import numpy as np
 import rustfits
 
+import _data
 import _harness as h
 import _read2d as r2
 
 
 def generate(fname, rows, cols, tile, q, seed, zero_frac):
     """
-    Write a 2-D f4 RICE+dither2 lossy image of random noise with a
-    fraction ``zero_frac`` of exact-zero (masked) pixels.  Pixel [0, 0]
-    is always zeroed as a known point for the zero-preservation check.
+    Write a 2-D f4 RICE+dither2 lossy image of noise with a fraction
+    ``zero_frac`` of exact-zero (masked) pixels (see _data.des_array).
     """
-    rng = np.random.default_rng(0)
-    data = rng.standard_normal((rows, cols), dtype=np.float32)
-    if zero_frac > 0:
-        mask = rng.random((rows, cols), dtype=np.float32) < zero_frac
-        data[mask] = 0.0
-    data[0, 0] = 0.0
+    data = _data.des_array(rows, cols, zero_frac)
     with rustfits.FITS(fname, "w+") as f:
         f.write_image(
             data,

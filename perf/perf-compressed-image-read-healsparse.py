@@ -40,37 +40,21 @@ from __future__ import annotations
 
 import argparse
 
-import numpy as np
 import rustfits
 
 import _compread as cr
+import _data
 import _harness as h
-
-# healpy's UNSEEN sentinel: most healsparse pixels carry it, which is
-# what makes these maps compress so well.
-SENTINEL = -1.6375e30
 
 
 def generate(fname, ntiles, tile, run_len, cov, quant):
     """
-    Write a 1-D f8 GZIP_2 image of ``ntiles`` tiles that mimics a real
-    healsparse map: the array is a sequence of fixed-length runs of one
-    repeated value.  Most runs are the SENTINEL (uncovered sky); a
-    fraction ``cov`` of runs carry a real value, quantized to ``quant``
-    decimals so the same values recur across many runs.  ``run_len`` is
-    the main knob: it sets how much decode work each tile costs, and is
-    tuned (default 32) so the rustfits-vs-fitsio timing ratios match the
-    real file rather than to hit a target compression ratio.  Returns n.
+    Write a 1-D f8 GZIP_2 image of ``ntiles`` tiles of healsparse-like
+    run-structured data (see _data.healsparse_array; ``run_len`` is the
+    knob tuned so timing ratios match the real file).  Returns n.
     """
     n = ntiles * tile
-    rng = np.random.default_rng(0)
-    nruns = (n + run_len - 1) // run_len
-    is_real = rng.random(nruns) < cov
-    vals = np.full(nruns, SENTINEL, dtype="f8")
-    nreal = int(is_real.sum())
-    if nreal:
-        vals[is_real] = np.round(rng.standard_normal(nreal), quant)
-    data = np.repeat(vals, run_len)[:n]
+    data = _data.healsparse_array(n, run_len, cov, quant)
     with rustfits.FITS(fname, "w+") as f:
         f.write_image(
             data,
