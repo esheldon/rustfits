@@ -4626,6 +4626,28 @@ each build in its own subprocess).  Building a **1 GB** map:
   budget.  (Heap-relocation-per-extend is O(current compressed size), so
   build-via-K-extends is ~quadratic in K; large chunks keep K small.)
 
+**Uncompressed image reads (2026-05-29).**  `perf-image-read-1d.py`
+(1-D f8) and `perf-image-read-2d.py` (2-D f4) benchmark plain
+(uncompressed) reads — data content is irrelevant (raw bytes), so no
+healsparse/random distinction.  A clear split:
+
+| regime | rustfits vs fitsio |
+|---|---|
+| 1-D chunk 1000 (partial) | 1.28× faster |
+| 1-D chunk 50000 (whole)  | **0.56× (slower)** |
+| 1-D whole `.read()`      | **0.83× (slower)** |
+| 2-D stamps 32×32 (x1000) | 2.40× faster |
+| 2-D whole `.read()`      | **0.70× (slower)** |
+
+- **Small / scattered reads favor rustfits** (lower per-call overhead:
+  1.28× and 2.40×).
+- **Bulk reads are slower** (0.56–0.83×): fitsio's whole-array read +
+  byteswap path beats rustfits's strip-walk + byteswap.  So
+  **uncompressed bulk read is a third optimization lead**, alongside
+  RICE decode.  (Both tools read faster in 50k chunks than in one
+  `.read()` — a big-allocation/page-fault effect — but rustfits trails
+  on bulk either way.)
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
