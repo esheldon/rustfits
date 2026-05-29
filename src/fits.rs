@@ -10,6 +10,8 @@ use pyo3::Bound;
 use flate2::read::GzDecoder;
 use std::fs::OpenOptions;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use suppaftp::types::FileType;
+use suppaftp::{FtpStream, RustlsConnector, RustlsFtpStream};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
@@ -165,6 +167,128 @@ fn download_remote(py: Python<'_>, url: &str) -> PyResult<Vec<u8>> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
         Ok(buf)
+    })
+    .map_err(|e| PyIOError::new_err(format!("Failed to fetch '{}': {}", url, e)))
+}
+
+// Gunzip just-downloaded bytes if the URL path ends in `.gz` (shared by
+// the http and ftp download branches); otherwise return them unchanged.
+fn maybe_gunzip_url(bytes: Vec<u8>, url: &str) -> PyResult<Vec<u8>> {
+    if !url_path_is_gz(url) {
+        return Ok(bytes);
+    }
+    let mut out = Vec::new();
+    GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| {
+        PyIOError::new_err(format!("Failed to gunzip remote '{}': {}", url, e))
+    })?;
+    Ok(out)
+}
+
+// True for an ftp/ftps URL.
+fn is_ftp_url(filename: &str) -> bool {
+    filename.starts_with("ftp://") || filename.starts_with("ftps://")
+}
+
+// Parsed pieces of an ftp/ftps URL.
+struct FtpUrl {
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    path: String,
+    secure: bool,
+}
+
+// Parse `ftp://[user[:pass]@]host[:port]/path` (and `ftps://...`).
+// Anonymous login by default.  Minimal parser for the common case —
+// percent-encoded credentials and bracketed IPv6 literals are not
+// handled (a real archive URL doesn't use them).
+fn parse_ftp_url(url: &str) -> PyResult<FtpUrl> {
+    let (secure, rest) = if let Some(r) = url.strip_prefix("ftps://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("ftp://") {
+        (false, r)
+    } else {
+        return Err(PyIOError::new_err(format!("not an ftp URL: {}", url)));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let (user, pass) = match userinfo {
+        Some(ui) => match ui.split_once(':') {
+            Some((u, p)) => (u.to_string(), p.to_string()),
+            None => (ui.to_string(), String::new()),
+        },
+        // Anonymous FTP convention: user "anonymous", any non-empty
+        // password (some servers want an email-shaped string).
+        None => ("anonymous".to_string(), "anonymous".to_string()),
+    };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p.parse::<u16>().map_err(|_| {
+                PyIOError::new_err(format!("bad port in ftp URL: {}", url))
+            })?;
+            (h.to_string(), port)
+        }
+        None => (hostport.to_string(), 21u16),
+    };
+    if host.is_empty() {
+        return Err(PyIOError::new_err(format!("ftp URL has no host: {}", url)));
+    }
+    Ok(FtpUrl {
+        host,
+        port,
+        user,
+        pass,
+        path: path.to_string(),
+        secure,
+    })
+}
+
+// Build the rustls TLS connector for FTPS: ring crypto backend (already
+// the process default via ureq, but install idempotently in case ftps
+// is used before any https), Mozilla root bundle, no client auth.
+fn ftps_connector() -> RustlsConnector {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    RustlsConnector::from(std::sync::Arc::new(config))
+}
+
+// Fetch a file over ftp/ftps whole into memory (blocking; GIL released).
+// Binary transfer type is forced so FITS bytes aren't mangled by the
+// server's ASCII (CRLF) translation.  Plain and FTPS paths are distinct
+// suppaftp types (`FtpStream` vs `RustlsFtpStream`), hence two arms.
+fn download_ftp(py: Python<'_>, url: &str) -> PyResult<Vec<u8>> {
+    let p = parse_ftp_url(url)?;
+    py.detach(|| -> Result<Vec<u8>, String> {
+        let addr = format!("{}:{}", p.host, p.port);
+        if p.secure {
+            let ftp = RustlsFtpStream::connect(&addr).map_err(|e| e.to_string())?;
+            let mut ftp = ftp
+                .into_secure(ftps_connector(), &p.host)
+                .map_err(|e| e.to_string())?;
+            ftp.login(&p.user, &p.pass).map_err(|e| e.to_string())?;
+            ftp.transfer_type(FileType::Binary).map_err(|e| e.to_string())?;
+            let buf = ftp.retr_as_buffer(&p.path).map_err(|e| e.to_string())?;
+            let _ = ftp.quit();
+            Ok(buf.into_inner())
+        } else {
+            let mut ftp = FtpStream::connect(&addr).map_err(|e| e.to_string())?;
+            ftp.login(&p.user, &p.pass).map_err(|e| e.to_string())?;
+            ftp.transfer_type(FileType::Binary).map_err(|e| e.to_string())?;
+            let buf = ftp.retr_as_buffer(&p.path).map_err(|e| e.to_string())?;
+            let _ = ftp.quit();
+            Ok(buf.into_inner())
+        }
     })
     .map_err(|e| PyIOError::new_err(format!("Failed to fetch '{}': {}", url, e)))
 }
@@ -1399,26 +1523,25 @@ impl FITS {
         let storage = if is_mem_url(&filename) {
             Storage::Mem(Cursor::new(Vec::new()))
         } else if is_remote_url(&filename) {
-            // Download-then-open: fetch the whole file into RAM, then
-            // parse like any in-memory file.  Read-only.
+            // Download-then-open over http/https: fetch the whole file
+            // into RAM, then parse like any in-memory file.  Read-only.
             if mode != "r" {
                 return Err(PyIOError::new_err(format!(
                     "remote files are read-only; open '{}' with mode='r'",
                     filename
                 )));
             }
-            let mut bytes = download_remote(py, &filename)?;
-            // A remote .gz (path ends in .gz) is gunzipped, same as a
-            // local .gz path.
-            if url_path_is_gz(&filename) {
-                let mut out = Vec::new();
-                GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| {
-                    PyIOError::new_err(format!(
-                        "Failed to gunzip remote '{}': {}", filename, e
-                    ))
-                })?;
-                bytes = out;
+            let bytes = maybe_gunzip_url(download_remote(py, &filename)?, &filename)?;
+            Storage::Mem(Cursor::new(bytes))
+        } else if is_ftp_url(&filename) {
+            // Download-then-open over ftp/ftps.  Read-only.
+            if mode != "r" {
+                return Err(PyIOError::new_err(format!(
+                    "remote files are read-only; open '{}' with mode='r'",
+                    filename
+                )));
             }
+            let bytes = maybe_gunzip_url(download_ftp(py, &filename)?, &filename)?;
             Storage::Mem(Cursor::new(bytes))
         } else if is_gz_path(&filename) {
             // Whole-file gzip: read-only.  Write-back (recompress on

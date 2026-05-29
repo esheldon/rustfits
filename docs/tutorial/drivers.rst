@@ -6,12 +6,12 @@ small set of *driver* prefixes that select where the bytes live.  The
 prefix is part of the filename string — the same convention cfitsio
 and fitsio use — so existing muscle memory carries over.
 
-Today the in-memory, gzip-read, and remote (``http`` / ``https``) read
-drivers are implemented.
+Today the in-memory, gzip-read, and remote (``http`` / ``https`` /
+``ftp`` / ``ftps``) read drivers are implemented.
 
 .. list-table::
    :header-rows: 1
-   :widths: 34 22 44
+   :widths: 36 22 42
 
    * - Filename
      - Backend
@@ -28,6 +28,9 @@ drivers are implemented.
    * - ``"http://..."`` / ``"https://..."``
      - in memory (downloaded)
      - read a FITS file from a URL (read-only)
+   * - ``"ftp://..."`` / ``"ftps://..."``
+     - in memory (downloaded)
+     - read a FITS file from an FTP server (read-only)
 
 In-memory files
 ---------------
@@ -171,8 +174,8 @@ A few details:
 Remote files
 ------------
 
-A ``http://`` or ``https://`` URL is fetched whole and parsed in
-memory — *download-then-open*:
+A ``http://``, ``https://``, ``ftp://``, or ``ftps://`` URL is fetched
+whole and parsed in memory — *download-then-open*:
 
 .. code-block:: python
 
@@ -182,6 +185,9 @@ memory — *download-then-open*:
 
    # or the one-liner:
    image = rustfits.read(url)
+
+   # FTP works the same way (anonymous login by default):
+   image = rustfits.read("ftp://archive.example.org/pub/vela.fits")
 
 Details:
 
@@ -196,7 +202,48 @@ Details:
   just like a local ``.gz`` path.
 * The GIL is released during the transfer, so other Python threads
   keep running while a download is in flight.
-* **Schemes:** ``http`` and ``https`` only.  ``ftp://`` and cfitsio's
-  ``root://`` are not supported (they need separate protocol
-  libraries).  For an ``ftp`` file, download it with another tool
-  first, then open the local copy.
+* **HTTP schemes:** ``http`` and ``https`` (TLS handled by rustls).
+* **FTP schemes:** ``ftp`` and ``ftps`` (explicit ``AUTH TLS``).
+  Login is **anonymous** unless the URL carries credentials
+  (``ftp://user:pass@host/path``); the port defaults to 21.  Transfers
+  are forced to binary mode so FITS bytes aren't mangled.
+* cfitsio's ``root://`` / ``gsiftp://`` are **not** supported — see
+  *Deferred drivers* below.
+
+Deferred drivers
+----------------
+
+cfitsio supports a few more storage backends that rustfits has **not**
+implemented yet.  They aren't hard to add on top of the existing
+backend abstraction — they're deferred for lack of a concrete user
+need, not for technical reasons.  **If you have a use case for any of
+these, please open an issue** — a real request is exactly what moves
+one off this list.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
+
+   * - Driver
+     - Status / workaround
+   * - ``stream://`` (stdin / stdout, ``-``)
+     - Deferred.  In Python the byte API already covers pipelines:
+       ``rustfits.FITS.from_bytes(sys.stdin.buffer.read())`` to read,
+       ``sys.stdout.buffer.write(fits.to_bytes())`` to write.
+   * - ``shmem://`` (POSIX shared memory)
+     - Deferred.  To share a file between processes via RAM today,
+       pair :meth:`~rustfits.FITS.to_bytes` / :meth:`~rustfits.FITS.from_bytes`
+       with the standard library's
+       :class:`multiprocessing.shared_memory.SharedMemory` (one copy
+       in and out; true zero-copy shared access is the harder feature
+       that's deferred).
+   * - ``root://`` (XRootD)
+     - Deferred.  Needs the XRootD client library.  Download the file
+       with an XRootD tool first, then open the local copy.
+   * - ``gsiftp://`` (GridFTP)
+     - Deferred.  Needs a GridFTP client.  Fetch with a grid tool
+       first, then open the local copy.
+
+Everything above plugs into the same internal backend abstraction the
+in-memory, gzip, and remote drivers already use, so adding one is
+mostly a matter of wiring up the byte source.

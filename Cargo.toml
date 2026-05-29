@@ -14,6 +14,17 @@ flate2 = "1"
 # driver.  Blocking-native — no tokio — which fits the synchronous PyO3
 # path.
 ureq = "3"
+# Blocking FTP/FTPS client for the ftp:// / ftps:// download driver.
+# rustls feature so it shares ureq's TLS stack rather than pulling a
+# second one.
+suppaftp = { version = "6", features = ["rustls"] }
+# Direct handles to rustls + the Mozilla root bundle, used to build the
+# FTPS TLS connector.  Both are already in the tree (via ureq), so this
+# adds no new crates.  default-features = false + "ring" keeps rustls on
+# the ring backend (already present) instead of pulling the heavier
+# aws-lc-rs default.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 [profile.release]
 debug = "line-tables-only"   # ~10–15% bigger .so; near-zero perf hit

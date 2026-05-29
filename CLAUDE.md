@@ -1198,10 +1198,10 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
   RSS at ~1 MiB above the output array, so motivation is weak.
 - **Streaming / row-iterator API** — for tables that don't fit in
   RAM.  No user has asked yet; add when one does.
-- **Remote file reads (`http`/`https`)** — open a FITS file from a
-  URL.  **Shipped** (download-then-open, read-only; see the "Remote
-  file reads" roadmap below).  Range-based partial reads, and
-  `ftp`/`root`, are still deferred.
+- **Remote file reads (`http`/`https`/`ftp`/`ftps`)** — open a FITS
+  file from a URL.  **Shipped** (download-then-open, read-only; see the
+  "Remote file reads" roadmap below).  Range-based partial reads, and
+  `root`/`gsiftp`, are still deferred.
 - **In-memory files (`mem://` / `memkeep://`) + gzip read** —
   create / read / extract a FITS file with no disk access, via
   `FITS("mem://", "w+")` + `to_bytes()` / `FITS.from_bytes(b)`; and
@@ -3791,17 +3791,18 @@ same-handle vs reopen parity.
 
 cfitsio can open files over the network (HTTP/FTP/root drivers).
 This is the rustfits plan for the equivalent.  **Status: flavor #1
-(http/https download) shipped 2026-05-28; flavor #2 (range reads)
-deferred.**
+download-then-open shipped for `http`/`https` (2026-05-28) and
+`ftp`/`ftps` (2026-05-28); flavor #2 (range reads) deferred;
+`root`/`gsiftp` deferred (need separate protocol crates).**
 
 Two distinct flavors, very different cost:
 
-1. **Download-then-open (shipped).**  Fetch the whole remote file
-   into a `Storage::Mem` buffer, then parse it like any in-memory
-   file.  Read-only against the remote (no write-back); pays the
-   full download even for a one-tile read.  This is essentially what
-   cfitsio does for most of its network drivers.  See "Design
-   (flavor #1, as built)" below.
+1. **Download-then-open (shipped: http/https/ftp/ftps).**  Fetch the
+   whole remote file into a `Storage::Mem` buffer, then parse it like
+   any in-memory file.  Read-only against the remote (no write-back);
+   pays the full download even for a one-tile read.  This is
+   essentially what cfitsio does for most of its network drivers.
+   See "Design (flavor #1, as built)" below.
 2. **Range-based partial reads (deferred, NOT this roadmap).**
    HTTP `Range` requests so `fits["sci"][100:200]` or a single
    compressed tile pulls only the bytes it needs — the real
@@ -3863,19 +3864,34 @@ downloaded (and, for a `.gz` URL, decompressed) bytes.
 - *Read-only, enforced early.*  `r+`/`w+` raise before any network
   request.  `rustfits.read` / `read_header` get remote support for
   free (they open via `FITS`).
-- *Schemes: `http` / `https` only.*  `ftp` / `root` need separate
-  protocol crates and are out of scope — the user's `ftp://` example
-  is not handled (download it with another tool first).
+- *FTP crate: `suppaftp` 6.x* (`rustls` feature → **shares** ureq's
+  rustls 0.23, no second TLS stack).  `download_ftp` parses
+  `ftp://[user[:pass]@]host[:port]/path` (anonymous default, port 21),
+  forces `FileType::Binary` (FTP defaults to ASCII, which would mangle
+  FITS), and `RETR`s into a Vec.  `ftps` = explicit `AUTH TLS` via
+  `RustlsFtpStream::into_secure` with a connector built from
+  `webpki-roots` (`ftps_connector`); we declare `rustls` +
+  `webpki-roots` as direct deps (already in-tree, `default-features =
+  false` + `ring` to avoid the aws-lc-rs default).  Plain vs FTPS are
+  distinct suppaftp types, so `download_ftp` has two arms.  `root` /
+  `gsiftp` still deferred (separate protocol crates).
 - *`.gz` composes:* a URL whose path (sans `?query` / `#frag`) ends
-  in `.gz` is gunzipped after download, same as a local `.gz` path.
+  in `.gz` is gunzipped after download (`maybe_gunzip_url`, shared by
+  the http and ftp branches), same as a local `.gz` path.
 - *No caching.*  Each `FITS(url)` downloads fresh.  An on-disk cache
   keyed by URL + ETag/Last-Modified is a possible follow-up; deferred
   (invalidation complexity) unless repeat-open is a real pattern.
 
-Tests: `tests/test_fits_remote.py` (11 cases) run against a local
-`http.server` — deterministic, no external network.  `https` uses the
-same code path (only the scheme differs) and isn't unit-tested (would
-need a self-signed cert).
+Tests: `tests/test_fits_remote.py` (11 cases, local `http.server`) and
+`tests/test_fits_ftp.py` (10 cases, local `aioftp` server in a
+background asyncio thread — a test-only dep in
+`conda-test-requirements.txt`; we use `aioftp` not `pyftpdlib` because
+the latter still imports the `asynchat` module removed in Python 3.12).
+Both are deterministic, no external network.  A full `https` / `ftps` handshake
+isn't unit-tested locally (would need a CA-valid server); `https` is
+all inside `ureq`, and the `ftps` path is exercised by a negative test
+(`ftps://` to the plain server → the `AUTH TLS` upgrade fails, proving
+the connector build + `into_secure` run).
 
 ## In-memory files + the storage-driver abstraction — roadmap
 
@@ -3895,8 +3911,8 @@ mem case.
 | Whole-file `.gz` **read** (gunzip-on-open → `Mem`) | ✅ Shipped |
 | `.gz` write-back (recompress-on-close), `.Z`/`.zip` | ⬜ Sketched below |
 | `stdin://` / `stdout://`, `shmem://` | ⬜ Sketched below |
-| `http`/`https` **download** read (→ `Mem`) | ✅ Shipped |
-| `http`/`https` range reads, `ftp`/`root` | ⬜ See "Remote file reads" roadmap |
+| `http`/`https`/`ftp`/`ftps` **download** read (→ `Mem`) | ✅ Shipped |
+| `http`/`https` range reads, `root`/`gsiftp` | ⬜ See "Remote file reads" roadmap |
 
 **Gzip read (shipped).**  A path with a `.gz` extension
 (case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
@@ -4001,7 +4017,8 @@ store** or **(b) something materialized into a memory buffer**.  The
 | `.gz` write-back / `.Z` / `.zip` | `Mem` + recompress-on-close (gz); LZW / zip codecs (others) | ⬜ |
 | `stdin://` / `stdout://` / `"-"` | `Mem`: slurp the non-seekable reader at open / flush the sink at close | ⬜ |
 | `http`/`https` (download) | fill the `Mem` buffer from the network at open (`ureq`); read-only; gunzips a `.gz` URL | ✅ |
-| `ftp` / `root` (download) | needs a separate protocol crate | ⬜ |
+| `ftp`/`ftps` (download) | same, via `suppaftp` (shares ureq's rustls); anonymous default, binary mode | ✅ |
+| `root` / `gsiftp` (download) | needs a separate protocol crate (XRootD / GridFTP) | ⬜ |
 | http **range** reads (remote roadmap #2) | a *lazy* read-only backend: seek+read → Range requests, no full buffer (the case that would justify `dyn`) | ⬜ |
 | `shmem://` | `Mem` backed by an OS shared-memory mapping | ⬜ |
 | `root://` / `gsiftp://` | same as http — materialize-to-mem, or a lazy protocol backend | ⬜ |

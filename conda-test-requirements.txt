@@ -10,8 +10,15 @@
 # by most of the test suite.  astropy is used for some richer
 # fixture patterns (e.g. the tile-compressed fallback-column
 # tests) and is also a useful cross-check for FITS reads.
+#
+# aioftp runs a local FTP server for the ftp:// driver tests
+# (tests/test_fits_ftp.py); it is test-only.  We use aioftp rather than
+# pyftpdlib because pyftpdlib (through 2.2.0 on conda-forge) still
+# imports the `asynchat` module, removed from Python in 3.12 — it
+# doesn't work on our 3.12 / 3.14 matrix.  aioftp is asyncio-based.
 
 pytest
 fitsio
 astropy
 ruff
+aioftp
