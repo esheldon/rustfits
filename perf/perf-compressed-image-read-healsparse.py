@@ -6,7 +6,7 @@ Modeled on a real healsparse-style map: a 1-D float64 GZIP_2 image with
 1,048,576-element tiles (8 MB/tile) built from long runs of repeated,
 quantized values -- mostly a sentinel (uncovered sky) with covered runs
 carrying real values.  The run length is tuned so the rustfits-vs-fitsio
-timing RATIOS reproduce the real file (~42x small / ~3.5x big), which
+timing RATIOS reproduce the real file (~42x small / ~3.3x big), which
 reflects the actual decode work better than matching the disk
 compression ratio does.  We generate a smaller version by default to
 keep the write fast; point --file at a real .fits.fz to measure that
@@ -43,12 +43,12 @@ import argparse
 import numpy as np
 import rustfits
 
+import _compread as cr
 import _harness as h
 
 # healpy's UNSEEN sentinel: most healsparse pixels carry it, which is
 # what makes these maps compress so well.
 SENTINEL = -1.6375e30
-DEFAULT_TILE = 1048576
 
 
 def generate(fname, ntiles, tile, run_len, cov, quant):
@@ -79,23 +79,9 @@ def generate(fname, ntiles, tile, run_len, cov, quant):
     return n
 
 
-def whole_ranges(n, chunk):
-    return [(lo, min(lo + chunk, n)) for lo in range(0, n, chunk)]
-
-
-def partial_ranges(n, chunk, cover):
-    cover = min(n, cover)
-    return [(lo, min(lo + chunk, cover)) for lo in range(0, cover, chunk)]
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--file",
-        help="read this existing .fits.fz instead of generating one",
-    )
-    ap.add_argument("--ntiles", type=int, default=h.env_int("PERF_NTILES", 64))
-    ap.add_argument("--tile", type=int, default=DEFAULT_TILE)
+    cr.add_common_args(ap)
     ap.add_argument(
         "--run-len", type=int, default=32, help="length of each value run"
     )
@@ -105,98 +91,27 @@ def main():
     ap.add_argument(
         "--quant", type=int, default=1, help="decimals to round real values"
     )
-    ap.add_argument(
-        "--small-chunk", type=int, default=1000, help="sub-tile, partial"
-    )
-    ap.add_argument(
-        "--mid-chunk", type=int, default=50000, help="sub-tile, whole"
-    )
-    ap.add_argument("--repeat", type=int, default=5)
     args = ap.parse_args()
 
     if not h.HAVE_FITSIO:
         raise SystemExit("fitsio not installed; this comparison needs it")
-    import fitsio
+
+    def gen(fname, ntiles, tile):
+        return generate(
+            fname, ntiles, tile, args.run_len, args.cov, args.quant
+        )
 
     with h.scratch():
-        if args.file:
-            fname = args.file
-            with rustfits.FITS(fname) as f:
-                hdu = f[1]
-                n = int(hdu.shape[0])
-                tile = int(hdu.compression.tile_shape[0])
-            print(f"file: {fname} (n={n:,}, tile={tile:,})")
-        else:
-            fname = h.path("comp1d.fits.fz")
-            tile = args.tile
-            n = generate(
-                fname, args.ntiles, tile, args.run_len, args.cov, args.quant
-            )
-            import os
-
-            ratio = (n * 8) / os.path.getsize(fname)
-            print(
-                f"generated: n={n:,} ({n * 8 / 1e6:,.0f} MB raw), "
-                f"tile={tile:,}, {os.path.getsize(fname) / 1e6:,.0f} MB "
-                f"on disk ({ratio:.1f}x)"
-            )
-
-        # Correctness gate across a tile boundary before any timing.
-        with rustfits.FITS(fname) as rf, fitsio.FITS(fname) as fi:
-            lo, hi = tile - 500, tile + 500
-            np.testing.assert_array_equal(rf[1][lo:hi], fi[1][lo:hi])
-
-        # We OPEN A FRESH HANDLE inside every timed iteration so each
-        # tool starts with an empty tile cache and genuinely decodes.
-        # Timing repeated reads of one open handle would instead measure
-        # fitsio's unbounded "cache every tile forever" hits against
-        # rustfits's bounded LRU re-decoding -- backwards from the real
-        # workload, which reads each tile once.  The harness's warmup
-        # pass primes the OS page (FS) cache first, so the timed passes
-        # read the compressed bytes from RAM and we measure decode-code
-        # speed, not the (I/O-bound, near-identical) cold first read.
-        def reader(mod, ranges):
-            def run():
-                with mod.FITS(fname) as f:
-                    hdu = f[1]
-                    for lo, hi in ranges:
-                        hdu[lo:hi]
-
-            return run
-
-        # cover ~8 tiles for the small partial regime
-        small_cover = min(n, 8 * tile)
-        regimes = [
-            (
-                f"chunk {args.small_chunk} (partial, {small_cover // tile} "
-                f"tiles)",
-                partial_ranges(n, args.small_chunk, small_cover),
-            ),
-            (
-                f"chunk {args.mid_chunk} (whole array)",
-                whole_ranges(n, args.mid_chunk),
-            ),
-            (
-                f"chunk {tile} = tile (whole array)",
-                whole_ranges(n, tile),
-            ),
-        ]
-
-        results = []
-        for label, ranges in regimes:
-            nbytes = sum(hi - lo for lo, hi in ranges) * 8
-            results.append(
-                h.bench(
-                    label,
-                    reader(rustfits, ranges),
-                    run_fitsio=reader(fitsio, ranges),
-                    nbytes=nbytes,
-                    repeat=args.repeat,
-                )
-            )
-
-        h.print_env()
-        h.report("Compressed 1-D image read (GZIP_2 f8)", results)
+        fname, n, tile = cr.resolve_source(args, gen)
+        cr.run_read_benchmark(
+            fname,
+            n,
+            tile,
+            title="Compressed 1-D image read (GZIP_2 f8, healsparse-like)",
+            small_chunk=args.small_chunk,
+            mid_chunk=args.mid_chunk,
+            repeat=args.repeat,
+        )
 
 
 if __name__ == "__main__":
