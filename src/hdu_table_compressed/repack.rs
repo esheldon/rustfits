@@ -294,7 +294,7 @@ pub(crate) fn repack_compressed_table_heap(
         let g = lock_file(&super_.file)?;
         let f = g.as_ref()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.metadata().map_err(|e| PyIOError::new_err(e.to_string()))?.len()
+        f.len().map_err(|e| PyIOError::new_err(e.to_string()))?
     };
     if new_hdu_end < file_len {
         // Identify the next HDU on disk (if any) to decide
@@ -673,7 +673,7 @@ fn repack_compressed_table_heap_vla(
         let g = lock_file(&super_.file)?;
         let f = g.as_ref()
             .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.metadata().map_err(|e| PyIOError::new_err(e.to_string()))?.len()
+        f.len().map_err(|e| PyIOError::new_err(e.to_string()))?
     };
     if new_hdu_end < file_len {
         let next_hdu_off: Option<u64> = {

@@ -793,9 +793,8 @@ pub(crate) fn write_compressed_image_data(
                 let g = lock_file(file_handle)?;
                 let f = g.as_ref()
                     .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.metadata()
+                f.len()
                     .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    .len()
             }
         }
     };
@@ -811,9 +810,8 @@ pub(crate) fn write_compressed_image_data(
             let g = lock_file(file_handle)?;
             let f = g.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             // Non-last HDU — shift the tail forward; later HDU
@@ -1584,9 +1582,8 @@ pub(crate) fn extend_compressed_image_data(
                 let f = g
                     .as_ref()
                     .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.metadata()
+                f.len()
                     .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    .len()
             }
         }
     };
@@ -1685,9 +1682,8 @@ pub(crate) fn extend_compressed_image_data(
             let f = g
                 .as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_and_update_offsets(
@@ -2401,9 +2397,8 @@ pub(crate) fn setitem_compressed_image(
                 let f = g
                     .as_ref()
                     .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-                f.metadata()
+                f.len()
                     .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    .len()
             }
         }
     };
@@ -2418,9 +2413,8 @@ pub(crate) fn setitem_compressed_image(
             let f = g
                 .as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_and_update_offsets(

@@ -168,9 +168,8 @@ pub(crate) fn repack_compressed_heap(
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
                 .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            f.metadata()
+            f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
-                .len()
         };
         if file_len > current_hdu_end {
             shift_file_tail_backward_and_update_offsets(
