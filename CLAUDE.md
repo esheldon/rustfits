@@ -4731,6 +4731,15 @@ excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
 - Synthetic random data compresses only ~1.2× here; real catalogs
   compress far more (the actual reason to use ZTABLE).
 
+**Compressed BINTABLE (ZTABLE) write (2026-05-29).**
+`perf-table-compressed-write.py`, same self-comparison shape (no
+high-level fitsio/astropy ZTABLE writer): rustfits ZTABLE write vs its
+own uncompressed write of the same catalog.  ZTABLE write is **~27×
+slower** (27.7 s vs 1.0 s; 11 MB/s) — the per-(tile, column) transpose +
+compress over 32 columns, plus the VLA dual-descriptor encode, is
+expensive.  A clear encode-bound optimization lead if ZTABLE write
+throughput ever matters.
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
