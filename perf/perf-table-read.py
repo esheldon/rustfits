@@ -39,32 +39,6 @@ import _harness as h
 SUBSET = ["c_f8", "c_i4", "c_f4"]
 
 
-def check(read, orig, vd):
-    """
-    Compare a table read to the original, tolerating rustfits reading
-    strings as str vs the original bytes.
-    """
-    n = len(orig)
-    for name in orig.dtype.names:
-        if name in vd:
-            for i in (0, n // 2, n - 1):
-                ov, rv = orig[name][i], read[name][i]
-                if vd[name] in ("S", "U"):
-                    ov = ov.decode() if isinstance(ov, bytes) else ov
-                    rv = rv.decode() if isinstance(rv, bytes) else rv
-                    assert ov == rv, (name, i)
-                else:
-                    assert np.array_equal(rv, ov), (name, i)
-        elif orig[name].dtype.kind in ("S", "U"):
-            o = orig[name]
-            r = read[name]
-            o = np.char.encode(o) if o.dtype.kind == "U" else o
-            r = np.char.encode(r) if r.dtype.kind == "U" else r
-            np.testing.assert_array_equal(r, o)
-        else:
-            np.testing.assert_array_equal(read[name], orig[name])
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -94,32 +68,42 @@ def main():
             f"row={itemsize} B, {os.path.getsize(fname) / 1e6:,.0f} MB on disk"
         )
 
-        # Correctness gate: both readers agree with the original.
+        # Correctness gate: both readers agree with the original.  fitsio
+        # needs vstorage="object" to return true VLA cells (its default,
+        # "fixed", pads each cell to the column's max length).
         with rustfits.FITS(fname) as f:
-            check(f[1].read(), data, vd)
+            _data.compare_catalog(f[1].read(), data, vd)
         with fitsio.FITS(fname) as f:
-            check(f[1].read(), data, vd)
+            _data.compare_catalog(f[1].read(vstorage="object"), data, vd)
 
         lo, hi = nrows // 4, nrows // 4 + nrows // 2
         rng = np.random.default_rng(1)
         scatter = rng.integers(0, nrows, size=args.scatter)
         sub_bytes = sum(data.dtype[c].itemsize for c in SUBSET)
 
+        # fitsio reads VLA as object arrays only with vstorage="object"
+        # (matching rustfits); its default pads to max length, which is
+        # different work.  rustfits.read() takes no such kwarg.
+        def vskw(mod):
+            return {"vstorage": "object"} if mod is fitsio else {}
+
         def whole(mod):
             def run():
                 with mod.FITS(fname) as f:
-                    f[1].read()
+                    f[1].read(**vskw(mod))
 
             return run
 
         def cols(mod):
             def run():
                 with mod.FITS(fname) as f:
-                    f[1].read(columns=SUBSET)
+                    f[1].read(columns=SUBSET, **vskw(mod))
 
             return run
 
         def rowslice(mod):
+            # native contiguous slice on both (fitsio returns fixed-padded
+            # VLA here; dwarfed by the fixed-column bulk).
             def run():
                 with mod.FITS(fname) as f:
                     f[1][lo:hi]
@@ -129,7 +113,7 @@ def main():
         def scattered(mod):
             def run():
                 with mod.FITS(fname) as f:
-                    f[1].read(rows=scatter)
+                    f[1].read(rows=scatter, **vskw(mod))
 
             return run
 

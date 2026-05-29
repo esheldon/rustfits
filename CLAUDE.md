@@ -4690,6 +4690,20 @@ reads:
   uncompressed image bulk read.
 - A 290 MB (500k-row) file gives the same ratios as a 1.1 GB (2M-row)
   one, so the smaller file is representative for iteration.
+- Cross-tool VLA caveat: fitsio reads VLA columns padded-to-max by
+  default (`vstorage="fixed"`); the benchmark reads fitsio with
+  `vstorage="object"` to match rustfits's object cells.  The timing
+  barely moves (VLA cells are tiny vs the fixed-column bulk), but it
+  makes the comparison apples-to-apples.
+
+**Uncompressed BINTABLE write (2026-05-29).**  `perf-table-write.py`
+writes the same catalog (fitsio writes the VLA object columns as true
+1PA/1PE, like rustfits).  rustfits is **2.24× FASTER** (1.04 s vs 2.33 s;
+295 vs 132 MB/s).  Note the asymmetry with the uncompressed *image*
+write, where rustfits is ~2.3× slower: the image f8 whole-array
+byteswap-copy tall pole doesn't dominate the per-column table write, and
+fitsio's table write (mixed types + VLA heap) is comparatively slow
+(132 MB/s vs its ~1870 MB/s image write).
 
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**

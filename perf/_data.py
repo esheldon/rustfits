@@ -161,3 +161,31 @@ def catalog_arrays(nrows, seed=0):
     _fill_vla(data, "v_ustr", rng, 5, 21, "u")
     _fill_vla(data, "v_f4", rng, 1, 11, "f")
     return data, dict(VAR_DTYPES)
+
+
+def compare_catalog(read, orig, vd):
+    """
+    Assert a table read matches ``orig``, tolerating string reps:
+    rustfits returns A columns as str, fitsio as bytes, and the original
+    is whatever it was generated as.  VLA columns are spot-checked per
+    cell (fitsio must be read with ``vstorage='object'`` to get cells).
+    """
+    n = len(orig)
+    for name in orig.dtype.names:
+        if name in vd:
+            for i in (0, n // 2, n - 1):
+                ov, rv = orig[name][i], read[name][i]
+                if vd[name] in ("S", "U"):
+                    ov = ov.decode() if isinstance(ov, bytes) else ov
+                    rv = rv.decode() if isinstance(rv, bytes) else rv
+                    assert ov == rv, (name, i)
+                else:
+                    assert np.array_equal(rv, ov), (name, i)
+        elif orig[name].dtype.kind in ("S", "U"):
+            o = orig[name]
+            r = read[name]
+            o = np.char.encode(o) if o.dtype.kind == "U" else o
+            r = np.char.encode(r) if r.dtype.kind == "U" else r
+            np.testing.assert_array_equal(r, o)
+        else:
+            np.testing.assert_array_equal(read[name], orig[name])
