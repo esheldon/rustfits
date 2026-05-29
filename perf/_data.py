@@ -93,10 +93,17 @@ _SCHEMA = [
 VAR_DTYPES = {"v_str": "S", "v_ustr": "U", "v_f4": "f4"}
 
 
-def catalog_dtype():
-    """The structured dtype for the type-exhaustive catalog schema."""
+def catalog_dtype(exclude=()):
+    """
+    The structured dtype for the type-exhaustive catalog schema.
+    ``exclude`` drops named columns (e.g. ``("c_c16",)`` for the
+    compressed-table benchmark, since rustfits's ZTABLE codecs don't
+    support 16-byte elements).
+    """
     fields = []
     for col in _SCHEMA:
+        if col[0] in exclude:
+            continue
         if len(col) == 3:
             fields.append((col[0], col[1], col[2]))
         else:
@@ -122,18 +129,20 @@ def _fill_vla(data, name, rng, lo, hi, kind):
     data[name] = out
 
 
-def catalog_arrays(nrows, seed=0):
+def catalog_arrays(nrows, seed=0, exclude=()):
     """
     Build a ``nrows``-row structured array for the catalog schema plus
-    the ``var_dtypes`` sidecar for the two VLA columns.  Integer/float
+    the ``var_dtypes`` sidecar for the VLA columns.  Integer/float
     content is random (irrelevant to read speed); VLA cells are
     variable-length (strings 5-20 bytes, f4 arrays 1-10 elements).
+    ``exclude`` drops named columns (see :func:`catalog_dtype`).
     """
     rng = np.random.default_rng(seed)
-    dt = catalog_dtype()
+    dt = catalog_dtype(exclude)
     data = np.empty(nrows, dtype=dt)
+    vd = {k: v for k, v in VAR_DTYPES.items() if k not in exclude}
     for name in dt.names:
-        if name in VAR_DTYPES:
+        if name in vd:
             continue
         base = dt[name].base
         shape = (nrows,) + dt[name].shape
@@ -157,10 +166,13 @@ def catalog_arrays(nrows, seed=0):
             sb = rng.integers(65, 91, size=(nrows, w), dtype=np.uint8)
             s = np.ascontiguousarray(sb).view(f"S{w}").reshape(nrows)
             data[name] = np.char.decode(s)
-    _fill_vla(data, "v_str", rng, 5, 21, "s")
-    _fill_vla(data, "v_ustr", rng, 5, 21, "u")
-    _fill_vla(data, "v_f4", rng, 1, 11, "f")
-    return data, dict(VAR_DTYPES)
+    if "v_str" in vd:
+        _fill_vla(data, "v_str", rng, 5, 21, "s")
+    if "v_ustr" in vd:
+        _fill_vla(data, "v_ustr", rng, 5, 21, "u")
+    if "v_f4" in vd:
+        _fill_vla(data, "v_f4", rng, 1, 11, "f")
+    return data, vd
 
 
 def compare_catalog(read, orig, vd):

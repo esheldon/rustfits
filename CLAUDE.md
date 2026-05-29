@@ -4705,6 +4705,32 @@ byteswap-copy tall pole doesn't dominate the per-column table write, and
 fitsio's table write (mixed types + VLA heap) is comparatively slow
 (132 MB/s vs its ~1870 MB/s image write).
 
+**Compressed BINTABLE (ZTABLE) read (2026-05-29).**
+`perf-table-compressed-read.py` is a rustfits SELF-comparison —
+**fitsio's Python API does not decompress ZTABLE** (it returns the raw
+compressed structure / wrong values) and astropy can't read it either,
+so there's no cross-tool Python comparison.  rustfits is uniquely able
+to read ZTABLE transparently from Python (cfitsio's `funpack` CLI is the
+only other decompressor).  So this measures rustfits ZTABLE read vs its
+own uncompressed read of the same 32-column catalog (complex columns
+excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
+
+| regime | ZTABLE / uncompressed |
+|---|---|
+| whole table        | 1.32× (decompression tax) |
+| column subset (3)  | 1.01× (≈ free) |
+| row slice          | 1.37× |
+| scattered rows     | **66× slower** |
+
+- **Column projection is nearly free** — decompresses only the selected
+  columns' tiles.  Bulk reads pay a modest ~1.3× decompression tax.
+- **Scattered random-row reads are catastrophic (~66×)**: each random
+  row forces decompressing its whole tile (all columns).  Inherent to
+  tile-compressed tables — ZTABLE is for bulk/columnar access, not
+  random row lookups.
+- Synthetic random data compresses only ~1.2× here; real catalogs
+  compress far more (the actual reason to use ZTABLE).
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
