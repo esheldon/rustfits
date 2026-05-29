@@ -5,10 +5,7 @@ Compressed BINTABLE (ZTABLE) write: rustfits self-comparison.
 No cross-tool comparison: fitsio/astropy have no high-level ZTABLE
 writer (only the `fpack -table` CLI), so this measures the WRITE cost of
 compression -- rustfits writing a ZTABLE vs rustfits writing the
-equivalent UNCOMPRESSED table, same 32-column catalog.
-
-Complex columns (c8/c16) are excluded -- broken in rustfits's ZTABLE
-codecs; see https://github.com/esheldon/rustfits/issues/8 .
+equivalent UNCOMPRESSED table, same 34-column catalog.
 
 Input built ONCE (untimed); each timed iteration overwrites a scratch
 file; no fsync; warmup primes.
@@ -33,8 +30,6 @@ import rustfits
 import _data
 import _harness as h
 
-EXCLUDE = ("c_c8", "c_c16")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -47,7 +42,7 @@ def main():
     nrows = args.nrows
     fz = h.path("ztable.fits.fz")
     uc = h.path("utable.fits")
-    data, vd = _data.catalog_arrays(nrows, exclude=EXCLUDE)
+    data, vd = _data.catalog_arrays(nrows)
 
     def write_z():
         with rustfits.FITS(fz, "w+") as f:

@@ -4729,19 +4729,19 @@ compressed structure / wrong values) and astropy can't read it either,
 so there's no cross-tool Python comparison.  rustfits is uniquely able
 to read ZTABLE transparently from Python (cfitsio's `funpack` CLI is the
 only other decompressor).  So this measures rustfits ZTABLE read vs its
-own uncompressed read of the same 32-column catalog (complex columns
-excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
+own uncompressed read of the same 34-column catalog (complex now
+round-trips — issue #8 fixed):
 
 | regime | ZTABLE / uncompressed |
 |---|---|
-| whole table        | 1.32× (decompression tax) |
-| column subset (3)  | 1.01× (≈ free) |
-| row slice          | 1.37× |
-| scattered rows     | **~70× slower** |
+| whole table        | 1.35× (decompression tax) |
+| column subset (3)  | 1.07× (≈ free) |
+| row slice          | 1.39× |
+| scattered rows     | **~74× slower** |
 
 - **Column projection is nearly free** — decompresses only the selected
   columns' tiles.  Bulk reads pay a modest ~1.3× decompression tax.
-- **Scattered random-row reads are catastrophic (~70×)**: each random
+- **Scattered random-row reads are catastrophic (~74×)**: each random
   row forces decompressing its whole tile (all columns).  This is
   *inherent*, NOT cache thrashing: the benchmark sizes the tile cache to
   hold the whole table (cache-neutral, like the image stamp test) and
@@ -4756,7 +4756,7 @@ excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
   2.0×, compression 1.1×; 2048 → 32× / 1.45× / 1.2×; default(~17k) → 28×
   / 1.31× / 1.2×.  Bigger tiles win monotonically on scattered, bulk,
   AND compression.  A ZTABLE stores each (tile, column) as its own gzip
-  blob, so with 32 columns `ztilelen=128` over 200k rows = ~50k tiny
+  blob, so with 34 columns `ztilelen=128` over 200k rows = ~53k tiny
   blobs; scattered reads then do ~36k tiny gzip decompresses and the
   **per-blob fixed overhead dominates** (slower despite decompressing
   *less* data).  So shrinking tiles is not a fix for scattered access —
@@ -4768,9 +4768,9 @@ excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
 **Compressed BINTABLE (ZTABLE) write (2026-05-29).**
 `perf-table-compressed-write.py`, same self-comparison shape (no
 high-level fitsio/astropy ZTABLE writer): rustfits ZTABLE write vs its
-own uncompressed write of the same catalog.  ZTABLE write is **~27×
-slower** (27.7 s vs 1.0 s; 11 MB/s) — the per-(tile, column) transpose +
-compress over 32 columns, plus the VLA dual-descriptor encode, is
+own uncompressed write of the same catalog.  ZTABLE write is **~26×
+slower** (28.0 s vs 1.1 s; 11 MB/s) — the per-(tile, column) transpose +
+compress over 34 columns, plus the VLA dual-descriptor encode, is
 expensive.  A clear encode-bound optimization lead if ZTABLE write
 throughput ever matters.
 

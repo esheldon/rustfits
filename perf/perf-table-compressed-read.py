@@ -8,11 +8,7 @@ and astropy has no compressed-table read.  cfitsio CAN read ZTABLE (the
 `funpack` CLI works); only rustfits exposes it transparently from Python.
 So this measures the READ cost of decompression: rustfits reading a
 ZTABLE vs rustfits reading the equivalent UNCOMPRESSED table, same
-32-column catalog, across four regimes.
-
-Complex columns (c8/c16) are excluded -- rustfits's ZTABLE codecs
-mishandle them (real/imag swap on c8, 16-byte elements unsupported); see
-https://github.com/esheldon/rustfits/issues/8 .
+34-column catalog, across four regimes.
 
 Regimes: whole / column subset / row slice / scattered rows.  Fresh open
 per timed iteration; warmup primes the FS cache.
@@ -39,7 +35,6 @@ import _data
 import _harness as h
 
 SUBSET = ["c_f8", "c_i4", "c_f4"]
-EXCLUDE = ("c_c8", "c_c16")
 
 
 def main():
@@ -64,7 +59,7 @@ def main():
     uc = h.path("utable.fits")
 
     with h.scratch():
-        data, vd = _data.catalog_arrays(nrows, exclude=EXCLUDE)
+        data, vd = _data.catalog_arrays(nrows)
         with rustfits.FITS(fz, "w+") as f:
             f.write_table(
                 data, var_dtypes=vd, compress=True, ztilelen=ztilelen
