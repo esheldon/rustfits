@@ -48,17 +48,27 @@ def main():
         "--nrows", type=int, default=h.env_int("PERF_NROWS", 500_000)
     )
     ap.add_argument("--scatter", type=int, default=2000)
+    ap.add_argument(
+        "--ztilelen",
+        type=int,
+        default=0,
+        help="rows per compression tile (0 = cfitsio default ~17k); "
+        "smaller helps scattered reads, hurts compression",
+    )
     ap.add_argument("--repeat", type=int, default=4)
     args = ap.parse_args()
 
     nrows = args.nrows
+    ztilelen = args.ztilelen or None
     fz = h.path("ztable.fits.fz")
     uc = h.path("utable.fits")
 
     with h.scratch():
         data, vd = _data.catalog_arrays(nrows, exclude=EXCLUDE)
         with rustfits.FITS(fz, "w+") as f:
-            f.write_table(data, var_dtypes=vd, compress=True)
+            f.write_table(
+                data, var_dtypes=vd, compress=True, ztilelen=ztilelen
+            )
         with rustfits.FITS(uc, "w+") as f:
             f.write_table(data, var_dtypes=vd)
 
@@ -72,8 +82,9 @@ def main():
         itemsize = data.dtype.itemsize
         print(
             f"table: {nrows:,} rows x {len(data.dtype.names)} cols, "
-            f"row={itemsize} B; uncompressed {usize / 1e6:,.0f} MB, "
-            f"ZTABLE {zsize / 1e6:,.0f} MB ({usize / zsize:.1f}x smaller)"
+            f"row={itemsize} B, ztilelen={ztilelen or 'default'}; "
+            f"uncompressed {usize / 1e6:,.0f} MB, ZTABLE "
+            f"{zsize / 1e6:,.0f} MB ({usize / zsize:.1f}x smaller)"
         )
 
         lo, hi = nrows // 4, nrows // 4 + nrows // 2
@@ -81,37 +92,44 @@ def main():
         scatter = rng.integers(0, nrows, size=args.scatter)
         sub_bytes = sum(data.dtype[c].itemsize for c in SUBSET)
 
-        def whole(fn):
-            with rustfits.FITS(fn) as f:
-                f[1].read()
+        # ZTABLE reads size the per-(tile,col) cache to hold the whole
+        # table so each tile decompresses once -- cache-neutral, matching
+        # the compressed-image stamp test.  Without this, scattered
+        # random-row reads thrash the default 32 MiB cache and the result
+        # measures eviction, not decode.  (No-op for the plain
+        # uncompressed table, which has no tile cache.)
+        cache = nrows * itemsize + (16 << 20)
 
-        def cols(fn):
+        def read(fn, op):
             with rustfits.FITS(fn) as f:
-                f[1].read(columns=SUBSET)
-
-        def rowslice(fn):
-            with rustfits.FITS(fn) as f:
-                f[1][lo:hi]
-
-        def scattered(fn):
-            with rustfits.FITS(fn) as f:
-                f[1].read(rows=scatter)
+                hdu = f[1]
+                if fn == fz:
+                    hdu.set_tile_cache_size(cache)
+                op(hdu)
 
         regimes = [
-            ("whole table", whole, nrows * itemsize),
-            (f"column subset ({len(SUBSET)} cols)", cols, nrows * sub_bytes),
-            (f"row slice [{lo}:{hi}]", rowslice, (hi - lo) * itemsize),
+            ("whole table", lambda x: x.read(), nrows * itemsize),
+            (
+                f"column subset ({len(SUBSET)} cols)",
+                lambda x: x.read(columns=SUBSET),
+                nrows * sub_bytes,
+            ),
+            (
+                f"row slice [{lo}:{hi}]",
+                lambda x: x[lo:hi],
+                (hi - lo) * itemsize,
+            ),
             (
                 f"scattered rows (x{args.scatter})",
-                scattered,
+                lambda x: x.read(rows=scatter),
                 args.scatter * itemsize,
             ),
         ]
 
         rows = []
-        for label, fn, nbytes in regimes:
-            zt = h.timeit(lambda fn=fn: fn(fz), repeat=args.repeat)
-            un = h.timeit(lambda fn=fn: fn(uc), repeat=args.repeat)
+        for label, op, nbytes in regimes:
+            zt = h.timeit(lambda op=op: read(fz, op), repeat=args.repeat)
+            un = h.timeit(lambda op=op: read(uc, op), repeat=args.repeat)
             rows.append((label, zt, un, nbytes))
 
         h.print_env()

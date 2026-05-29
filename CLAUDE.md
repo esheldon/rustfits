@@ -4720,14 +4720,31 @@ excluded — they're broken in rustfits's ZTABLE codecs, issue #8):
 | whole table        | 1.32× (decompression tax) |
 | column subset (3)  | 1.01× (≈ free) |
 | row slice          | 1.37× |
-| scattered rows     | **66× slower** |
+| scattered rows     | **~70× slower** |
 
 - **Column projection is nearly free** — decompresses only the selected
   columns' tiles.  Bulk reads pay a modest ~1.3× decompression tax.
-- **Scattered random-row reads are catastrophic (~66×)**: each random
-  row forces decompressing its whole tile (all columns).  Inherent to
-  tile-compressed tables — ZTABLE is for bulk/columnar access, not
-  random row lookups.
+- **Scattered random-row reads are catastrophic (~70×)**: each random
+  row forces decompressing its whole tile (all columns).  This is
+  *inherent*, NOT cache thrashing: the benchmark sizes the tile cache to
+  hold the whole table (cache-neutral, like the image stamp test) and
+  the number is unchanged, because the read planner already decompresses
+  each touched tile once per call.  The default `ZTILELEN` is large
+  (~17k rows → ~30 tiles for 500k rows), so 2000 random rows touch ~all
+  tiles → ~whole-table decompress.  (Contrast the image stamp test:
+  ~10k tiles, stamps touch only a fraction.)  ZTABLE is for
+  bulk/columnar access, not random row lookups.
+- **Smaller tiles don't help — they hurt on every axis.**  Sweeping
+  `--ztilelen` (200k rows, 2000 scattered): 128 → scattered 59×, whole
+  2.0×, compression 1.1×; 2048 → 32× / 1.45× / 1.2×; default(~17k) → 28×
+  / 1.31× / 1.2×.  Bigger tiles win monotonically on scattered, bulk,
+  AND compression.  A ZTABLE stores each (tile, column) as its own gzip
+  blob, so with 32 columns `ztilelen=128` over 200k rows = ~50k tiny
+  blobs; scattered reads then do ~36k tiny gzip decompresses and the
+  **per-blob fixed overhead dominates** (slower despite decompressing
+  *less* data).  So shrinking tiles is not a fix for scattered access —
+  it could be a future optimization lead (lower per-blob overhead), but
+  as implemented, larger tiles are better everywhere.
 - Synthetic random data compresses only ~1.2× here; real catalogs
   compress far more (the actual reason to use ZTABLE).
 
