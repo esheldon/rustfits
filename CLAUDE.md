@@ -4519,7 +4519,57 @@ per-user fixture, not committed — see "Performance / large
 fixture files" under "Build / dev workflow" for how to obtain or
 synthesize an equivalent) in chunks via `f[1][lo:hi]` slicing.
 
-**Current state (release builds; 2026-05-26):**
+**The `perf/` benchmark suite.**  Standalone scripts under `perf/`
+(run directly, NOT pytest tests — the `perf-*.py` names stay out of
+pytest collection) compare rustfits vs fitsio.  Shared methodology
+(see `perf/_harness.py` and the per-script docstrings): a release
+build is required (a debug build reads ~7× slower and reports rustfits
+as the loser); a fresh handle is opened inside every timed iteration
+(so fitsio's forever-cache can't masquerade as decode speed against
+rustfits's bounded LRU); and the harness warmup pass primes the OS
+page (FS) cache so timing measures decode, not cold disk I/O.
+Synthetic data is tuned to reproduce a real file's *timing ratios*,
+not its compression ratio.  Scripts:
+- `perf-compressed-image-read-healsparse.py` — 1-D GZIP_2 lossless
+  (the win documented below; validated against a real 706 MB map).
+- `perf-compressed-image-read-random.py` — 1-D GZIP_2 on incompressible
+  data (the gap narrows without runs to exploit, but rustfits still wins).
+- `perf-compressed-image-read-des.py` — 2-D RICE_1 + dither2 lossy
+  (DES-like), random 32×32 postage-stamp reads + whole-file tile-order
+  band walk.  `_read2d.py` holds the shared 2-D read regimes;
+  `_compread.py` the shared 1-D runner.
+- `perf-compressed-2d-isolation.py` — the codec isolation sweep below.
+
+**2-D RICE decode is ~2.5–3× SLOWER than cfitsio (open optimization
+target, 2026-05-29).**  The DES-like 2-D lossy workload (RICE_1 +
+quantize, SUBTRACTIVE_DITHER_2 so masked zeros survive) reads SLOWER in
+rustfits than fitsio — the opposite of the GZIP_2 result below.  The
+isolation sweep (`perf-compressed-2d-isolation.py`, 4000×4000 f4,
+whole-file band walk) pinned the cause to the **RICE decoder itself**,
+not quantization, float, or 2-D tile assembly:
+
+| isolation case | rustfits vs fitsio |
+|---|---|
+| gzip2 f4 unquantized | 1.28× (faster) |
+| gzip2 f4 quantized   | 1.09× (faster) |
+| rice  i4 lossless    | **0.38× (SLOWER)** |
+| rice  f4 quantized   | **0.38× (SLOWER)** |
+
+- GZIP_2 is rustfits-faster in 2-D too, so 2-D tile assembly is fine.
+- Dequant is free — gzip2-quant ≥ gzip2-unquant (quantized i32 is
+  smaller to inflate), so lossy quantization is not the cost.
+- `rice i4 lossless` is slow with NO quantization at all → the cost is
+  in `src/zimage/rice.rs` decode: cfitsio RICE ~615 MB/s vs rustfits
+  ~235 MB/s.  `rice.rs` is a correct, byte-exact port but its
+  `BitReader` decode loop has not had the profile-and-fix treatment the
+  GZIP_2 slice path got ("How the gap closed" below).  **Optimizing the
+  RICE decoder is the next perf lead.**  (Bonus oddity from the sweep:
+  with large tiles + scattered 32×32 stamp reads, fitsio re-decodes a
+  full tile per stamp and is catastrophically slow — rustfits ~17×
+  faster there.)
+
+**Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
+read:**
 
 - **Big chunks (50k rows)**: rustfits is **3.2× FASTER** than
   fitsio.  `decode_gzip2`'s remaining ~48% of slice time is now

@@ -5,19 +5,25 @@
 Modeled on Dark Energy Survey image compression: a 2-D float32 image
 tile-compressed with RICE_1 and lossy quantization (~q=16, "four bits to
 the noise", ~5x compression) using SUBTRACTIVE_DITHER_2 so exact-zero
-(masked) pixels are preserved bit-for-bit.  Default is 10000x10000 f4
-noise with a small fraction of masked zeros.
+(masked) pixels are preserved bit-for-bit.  Default is 4000x4000 f4
+noise with a small fraction of masked zeros -- big enough for a clean,
+decisive result; scale up with --rows/--cols if you want to revisit.
 
 This complements the 1-D lossless healsparse benchmark: 2-D access, a
-lossy codec, and a square tiling so cutouts touch a 2-D block of tiles.
+lossy codec, and a square tiling so stamps touch a 2-D block of tiles.
 
-Three read regimes:
+Two read regimes:
 
-* cutout NxN (partial)  -- many small 2-D boxes at cycling positions;
-                           per-call-overhead + few-tile bound.
-* row strips (whole)    -- the whole image in horizontal strips, a common
-                           streaming/processing pattern; decode-bound.
-* whole image (.read()) -- one full decode; pure decoder throughput.
+* stamps 32x32 (random) -- ~1000 randomly-positioned postage stamps, the
+                           real DES access pattern (cutouts around detected
+                           objects).  rustfits's tile cache is sized to hold
+                           the whole image so each tile decodes once for
+                           BOTH tools (fitsio's cache is effectively
+                           unbounded) -- a cache-neutral, decode-bound
+                           comparison, not a cache-size one.
+* whole file, in order  -- walk every tile-row band in storage order, each
+                           tile decoded once; bounded memory, so it scales
+                           to GB files (unlike a one-shot .read()).
 
 Quantized decode is deterministic, so rustfits and fitsio return the same
 values off the same file -- the correctness gate checks this, plus that a
@@ -37,7 +43,7 @@ zero-preserving dither2.
 Run::
 
     python perf/perf-compressed-image-read-des.py
-    python perf/perf-compressed-image-read-des.py --rows 4000 --cols 4000
+    python perf/perf-compressed-image-read-des.py --rows 10000 --cols 10000
     python perf/perf-compressed-image-read-des.py --file /path/to/img.fz
 
 Generated scratch file goes to CWD as perf-tmp-* and is removed on exit
@@ -53,6 +59,7 @@ import numpy as np
 import rustfits
 
 import _harness as h
+import _read2d as r2
 
 
 def generate(fname, rows, cols, tile, q, seed, zero_frac):
@@ -75,27 +82,16 @@ def generate(fname, rows, cols, tile, q, seed, zero_frac):
         )
 
 
-def cutout_positions(rows, cols, box, count):
-    """
-    Cycle ``count`` top-left corners for box x box cutouts, marching
-    across the image so repeated reads hit a spread of tiles.
-    """
-    rspan = max(1, rows - box)
-    cspan = max(1, cols - box)
-    return [((i * box) % rspan, (i * box * 7) % cspan) for i in range(count)]
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", type=int, default=h.env_int("PERF_ROWS", 10000))
-    ap.add_argument("--cols", type=int, default=h.env_int("PERF_COLS", 10000))
+    ap.add_argument("--rows", type=int, default=h.env_int("PERF_ROWS", 4000))
+    ap.add_argument("--cols", type=int, default=h.env_int("PERF_COLS", 4000))
     ap.add_argument("--tile", type=int, default=100, help="square tile dim")
     ap.add_argument("--q", type=float, default=16.0, help="quantize level")
     ap.add_argument("--seed", type=int, default=1, help="dither seed")
     ap.add_argument("--zero-frac", type=float, default=0.05)
-    ap.add_argument("--cutout", type=int, default=256)
-    ap.add_argument("--cutout-count", type=int, default=200)
-    ap.add_argument("--strip", type=int, default=1000, help="rows per strip")
+    ap.add_argument("--stamp", type=int, default=32, help="stamp size NxN")
+    ap.add_argument("--stamps", type=int, default=1000, help="num stamps")
     ap.add_argument("--repeat", type=int, default=5)
     ap.add_argument(
         "--file", help="read this existing .fz instead of generating one"
@@ -127,7 +123,7 @@ def main():
                 f"{os.path.getsize(fname) / 1e6:,.0f} MB ({ratio:.1f}x)"
             )
 
-        box = min(args.cutout, rows, cols)
+        box = min(args.stamp, rows, cols)
 
         # Correctness gate: both readers agree off the same file, and a
         # masked zero survives exactly (the dither2 guarantee).
@@ -136,57 +132,28 @@ def main():
             if not args.file:
                 assert rf[1][0, 0] == 0.0, "masked zero not preserved"
 
-        def read_cutouts(mod, positions, box):
-            def run():
-                with mod.FITS(fname) as f:
-                    hdu = f[1]
-                    for r, c in positions:
-                        hdu[r : r + box, c : c + box]
-
-            return run
-
-        def read_strips(mod, ranges):
-            def run():
-                with mod.FITS(fname) as f:
-                    hdu = f[1]
-                    for lo, hi in ranges:
-                        hdu[lo:hi, :]
-
-            return run
-
-        def read_whole(mod):
-            def run():
-                with mod.FITS(fname) as f:
-                    f[1].read()
-
-            return run
-
-        positions = cutout_positions(rows, cols, box, args.cutout_count)
-        strips = [
-            (lo, min(lo + args.strip, rows))
-            for lo in range(0, rows, args.strip)
-        ]
+        # rustfits's tile cache is sized to hold the whole image so the
+        # stamp regime is cache-neutral (each tile decodes once for both
+        # tools); see _read2d.
+        cache = r2.cache_bytes(rows, cols)
+        positions = r2.stamp_positions(rows, cols, box, args.stamps)
+        bands = r2.bands_for(rows, tile)
         full_bytes = rows * cols * 4
 
         results = [
             h.bench(
-                f"cutout {box}x{box} (x{len(positions)})",
-                read_cutouts(rustfits, positions, box),
-                run_fitsio=read_cutouts(fitsio, positions, box),
+                f"stamps {box}x{box} random (x{len(positions)})",
+                r2.read_stamps(rustfits, fname, positions, box, cache),
+                run_fitsio=r2.read_stamps(
+                    fitsio, fname, positions, box, cache
+                ),
                 nbytes=len(positions) * box * box * 4,
                 repeat=args.repeat,
             ),
             h.bench(
-                f"row strips ({args.strip} rows, whole)",
-                read_strips(rustfits, strips),
-                run_fitsio=read_strips(fitsio, strips),
-                nbytes=full_bytes,
-                repeat=args.repeat,
-            ),
-            h.bench(
-                "whole image (.read())",
-                read_whole(rustfits),
-                run_fitsio=read_whole(fitsio),
+                f"whole file, tiles in order ({len(bands)} bands)",
+                r2.read_band_walk(rustfits, fname, bands),
+                run_fitsio=r2.read_band_walk(fitsio, fname, bands),
                 nbytes=full_bytes,
                 repeat=args.repeat,
             ),
