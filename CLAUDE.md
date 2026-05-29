@@ -4114,6 +4114,44 @@ justify switching `Storage` to `dyn` — build it together with the
 remote roadmap when a real workload needs partial reads of a remote
 multi-GB `.fz`.
 
+## cfitsio extended filename syntax (EFS) — deferred
+
+cfitsio parses a rich mini-language embedded in the filename string
+(`fits_open_file` does it in C, so fitsio gets it for free).  rustfits
+has **only** implemented the *driver-prefix* subset of EFS — `mem://`,
+`http(s)://`, `ftp(s)://`, and the `.gz` suffix (see the storage-driver
+and remote roadmaps above).  **Everything else is deferred until a user
+asks**, and when it lands it should go in the planned
+`rustfits.compat.fitsio` shim (translating the string into core API
+calls), NOT in the core `FITS()` constructor — the core deliberately
+favors explicit Python (`fits["EVENTS"]`, `hdu[a:b:c]`, `columns=`,
+`rows=`) over an embedded string DSL (same reason `compress=Gzip1(...)`
+won over cfitsio's `[compress R]` flat-string form).
+
+The deferred surface, by cost (key realization: most of it rustfits
+already exposes more cleanly — the genuinely-missing capability is the
+Tier 3 row-filter calculator):
+
+- **Tier 1 — trivial, high-value (small parser).**  HDU selection
+  `file.fits[3]` / `[EVENTS]` / `[EVENTS,2]` (extname+extver) — by far
+  the most-used part; maps to `fits[i]` / pick-by-extname.  `!file.fits`
+  clobber prefix on write → `w+`.
+- **Tier 2 — moderate (reuse existing machinery).**  Image subsections
+  with strides `file.fits[1:512:2, *]` → `__getitem__` slicing; column
+  selection `[col TIME,X,Y]` → `read(columns=...)`.
+- **Tier 3 — large, each its own subproject.**  Row-filter expressions
+  `[EVENTS][TIME>5000 && X<100]` — cfitsio's *calculator*: a full
+  lexer/parser/evaluator with arithmetic, booleans, functions (trig,
+  regexp, `gtifilter()`, `regfilter()`), column refs.  Plus
+  binning/histogramming `[bin X,Y]`, GTI filtering, spatial-region
+  filtering, and `[compress R 100,100]` write specifiers.
+
+**Decision:** defer all of it; the value is migration smoothness for
+existing fitsio scripts, not new capability.  Before building Tier 3,
+scope how many real migrant scripts use the calculator/binning vs. just
+`[EXTNAME]` — Tier 1 is a weekend in the shim; Tier 3 is a parser
+project worth its own design pass.
+
 ## Build / dev workflow
 
 Three sets of dependencies, three install commands, one
