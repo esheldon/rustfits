@@ -4671,6 +4671,26 @@ So the open optimization leads are: **RICE decode**, **uncompressed bulk
 read**, and **uncompressed write (speed + the 2× byteswap copy)**.  GZIP_2
 read+encode, RICE encode, and both extend paths favor rustfits.
 
+**Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py` reads
+a deliberately type-exhaustive 34-column catalog (every scalar type, f4/f8
+fixed sub-arrays 1-D & 2-D, both S and U fixed + VLA strings, an f4 VLA;
+see `_data.catalog_arrays`).  Same selective-vs-bulk split as the image
+reads:
+
+| regime | rustfits vs fitsio |
+|---|---|
+| whole table          | 0.84× (slower) |
+| column subset (3/34) | **1.77× faster** |
+| row slice            | 0.88× (slower) |
+| scattered rows       | **2.23× faster** |
+
+- **Selective access favors rustfits** — column projection (1.77×) and
+  scattered object lookups (2.23×), the dominant catalog patterns.
+- **Bulk read trails** (0.84–0.88×) — same byteswap/copy tall pole as the
+  uncompressed image bulk read.
+- A 290 MB (500k-row) file gives the same ratios as a 1.1 GB (2M-row)
+  one, so the smaller file is representative for iteration.
+
 **Current state (release builds; 2026-05-26) — GZIP_2 1-D chunked
 read:**
 
