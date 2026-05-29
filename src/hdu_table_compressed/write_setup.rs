@@ -24,9 +24,14 @@ use super::write::{grow_file_to_at_least};
 
 fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
     match letter {
-        'B' | 'L' | 'A' | 'X' => CompressionAlgorithm::Gzip1,
+        // Complex (C/M) defaults to GZIP_1, not GZIP_2: cfitsio's table
+        // compressor defaults complex to GZIP_2 but can't read its own
+        // GZIP_2-complex output (funpack errors with "error
+        // uncompressing image"), so GZIP_2-complex is non-interoperable.
+        // GZIP_1-complex round-trips in both rustfits and cfitsio.
+        'B' | 'L' | 'A' | 'X' | 'C' | 'M' => CompressionAlgorithm::Gzip1,
         'J' => CompressionAlgorithm::Rice1,
-        'I' | 'K' | 'E' | 'D' | 'C' | 'M' => CompressionAlgorithm::Gzip2,
+        'I' | 'K' | 'E' | 'D' => CompressionAlgorithm::Gzip2,
         // Unknown letters land at Gzip1 (universally allowed).
         // parse_columns would have rejected anything truly bad
         // upstream; this is a safety net.
@@ -321,7 +326,13 @@ pub(crate) fn prepare_fixed_column<'py>(
     // elem_size = slab.len()` for the byte-shuffle / RICE arithmetic
     // (only GZIP_1 is actually allowed for X per the table-allowed
     // matrix, and GZIP_1 ignores both fields).
-    let (inner_elem_size, per_row_pixels) = if col.tform_letter == 'X' {
+    let (inner_elem_size, per_row_pixels) = if matches!(
+        col.tform_letter, 'X' | 'C' | 'M'
+    ) {
+        // Byte-flat: X is bit-packed; complex (C/M) is NOT byte-shuffled
+        // by cfitsio (its GZIP_2 shuffle skips complex), so encode it
+        // unshuffled too -- bytepix 1 makes GZIP_2's shuffle a no-op and
+        // keeps the on-disk form cfitsio/funpack-readable (issue #8).
         (1usize, col.byte_width)
     } else {
         let n = bytes_per_element(col.tform_letter)

@@ -371,7 +371,17 @@ pub(crate) fn decompress_column_slab(
     // (repeat/8) bytes); the per-cell unpack into bool happens later
     // in convert_x_cell.  All other letters have a fixed element
     // width; A's elem_bytes is 1 and its repeat is total bytes.
-    let (elem_bytes, n_elements) = if col.tform_letter == 'X' {
+    let (elem_bytes, n_elements) = if matches!(
+        col.tform_letter, 'X' | 'C' | 'M'
+    ) {
+        // Byte-flat columns: X is bit-packed; complex (C/M) is NOT
+        // byte-shuffled by cfitsio (its GZIP_2 shuffle dispatch skips
+        // complex), and a complex element is two floats that
+        // convert_column_cell byteswaps component-wise.  Treating them
+        // as one element of `byte_width` bytes (bytepix 1) gives a plain
+        // gunzip with no shuffle/byteswap, so the BE bytes pass straight
+        // through to convert_column_cell.  (Shuffling/byteswapping
+        // complex as an 8/16-byte unit is what corrupted it -- issue #8.)
         (1usize, rowspertile * col.byte_width)
     } else {
         let n = bytes_per_element(col.tform_letter)
@@ -410,12 +420,13 @@ pub(crate) fn decompress_column_slab(
         }
         _ => unreachable!("non-table algorithm filtered upstream"),
     };
-    // Decoder returns native-order bytes; convert_column_cell expects
-    // FITS big-endian.  Swap back so the per-cell converter (which
-    // handles unsigned-trick, general scaling, A/L, etc.) just works.
-    let swap_w = byteswap_unit(col.tform_letter);
-    if swap_w > 1 && !cfg!(target_endian = "big") {
-        byteswap_in_place(&mut slab, swap_w);
+    // The decoder byteswapped to native in `elem_bytes`-sized units;
+    // undo that (same unit!) so the bytes are FITS big-endian again for
+    // convert_column_cell, which does its own component-wise byteswap.
+    // Using elem_bytes (not byteswap_unit) is what makes this cancel for
+    // complex, where the element width and the byteswap unit differ.
+    if elem_bytes > 1 && !cfg!(target_endian = "big") {
+        byteswap_in_place(&mut slab, elem_bytes);
     }
     Ok(slab)
 }

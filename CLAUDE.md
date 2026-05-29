@@ -2950,6 +2950,23 @@ before fpack runs.  To set `ZTILELEN`, write `FZTILELN` on the
 source HDU (fpack has no CLI flag for it — surprising and
 worth noting in the test helper).
 
+**Complex columns (C / M) — byte-flat, GZIP_1 default (fixed
+2026-05-29, issue #8).**  rustfits compresses/decompresses complex
+columns as **byte-flat** (no GZIP_2 byte-shuffle, bytepix 1), letting
+`convert_column_cell` do the component-wise byteswap.  This matches
+cfitsio's *write* side, whose GZIP_2 shuffle dispatch silently skips
+complex (it shuffles only 2/4/8-byte I/J/E/D/K).  Two bugs were fixed:
+the old code shuffled/byteswapped complex as one 8/16-byte unit, which
+(a) swapped real/imag on `c8` read and (b) hit "unsupported bytepix 16"
+on `c16`.  **rustfits defaults complex to GZIP_1, not GZIP_2**, because
+cfitsio's GZIP_2 table *decompressor* errors on complex — its
+unshuffle `switch(colcode)` has no C/M case and falls into a
+`default: "...unsuitable data type"` → `DATA_DECOMPRESSION_ERR`
+(`imcompress.c`), so even cfitsio can't `funpack` its own
+GZIP_2-complex output.  GZIP_1-complex round-trips in both rustfits and
+cfitsio.  Explicit `compress={"col": "GZIP_2"}` on complex still
+round-trips in rustfits but won't `funpack` (the cfitsio read bug).
+
 Tests: `tests/test_table_compressed_read.py` (17 cases) —
 mixed-dtype round trip; per-algorithm coverage (RICE_1 on i4 +
 the GZIP defaults for u1/i2/f4/f8/A); multi-tile + partial last
