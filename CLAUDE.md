@@ -2727,18 +2727,27 @@ worth checking comes up; cross items off as they ship.
    it in ms/pixel-write so users have a number to budget
    against.
 
-7. **Fix: compressed-image checksum still materializes the
-   full ndarray.**  This is a FIX, not a measurement.
-   `read_uncompressed_image_be_bytes` in
-   `hdu_image_compressed/checksum.rs` builds the whole
-   equivalent-uncompressed image in RAM before feeding the
-   checksum stream — predates the [[feedback_stream_large_data]]
-   rule.  Every other large-data path in the codebase is
-   chunked; the compressed-table checksum already streams
-   per-tile and is the model.  Should be chunked per-tile (the
-   natural decode unit) so peak RSS is bounded at one tile of
-   bytes instead of full-image bytes.  Documented but never
-   closed.
+7. ✅ **Fix: compressed-image checksum still materializes the
+   full ndarray.**  Done.  Replaced `read_uncompressed_image_be_bytes`
+   with `stream_uncompressed_image_be_checksum` in
+   `hdu_image_compressed/checksum.rs`: walks the tile grid in
+   tile-stripes (outer N-1 axes), decodes the G_last tiles per
+   stripe, then emits image-rows in numpy-row-major by
+   interleaving row segments from each tile in the stripe
+   (FITS checksum is order-sensitive so tiles in the same
+   tile-row have to be live simultaneously).  Peak working set
+   = one tile-stripe of decoded bytes + one image-row scanline
+   buffer; for typical FITS tile choices (per-row strips or
+   sub-MB tiles) lands in the 1–10 MB range, comparable to the
+   codebase's 1 MiB streaming-chunk convention.
+
+   **Measured wins** on a (10 000 × 4 000) f4 GZIP_2 image
+   (160 MB raw, 135 MB compressed): `add_checksum` peak rose
+   only +38 MB (52 MB total) above baseline.  Old version
+   would have allocated +320 MB (decoded ndarray + BE-byte
+   buffer + numpy intermediates).  ~8× less RAM here, and the
+   win scales with image size — a (100 k × 4 k) image would
+   have gone from ~13 GB old to ~50 MB now.
 
 8. **Random/scattered access on compressed 1-D.**  Covered for
    2-D RICE (stamps in the DES bench); no equivalent for 1-D
