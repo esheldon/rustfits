@@ -120,19 +120,21 @@ that pattern against the equivalent one-shot
 build runs in its own subprocess for a clean per-build
 ``ru_maxrss``.
 
-fitsio appears as a cross-tool reference on the uncompressed
-variants only (its Python API cannot write ZTABLE).  ``vs rf
-write-once`` reports each row's wall time / RSS divided by the
-rustfits write-once measurement for that variant; values < 1
-mean the row was faster / lighter than the one-shot rustfits
-write.
-
 Sample numbers from the reference machine
 (N=100,000 rows, 34-column type-exhaustive catalog at
-~600 B/row, ZTILELEN ≈ 16 k rows):
+~600 B/row, ZTILELEN ≈ 16 k rows).  The first table is the
+rustfits self-comparison (append vs write-once across all
+four variants); the second is the rustfits-vs-fitsio cross-
+tool comparison on the uncompressed variants, where pairing
+is possible (fitsio's Python API cannot write ZTABLE).
 
-.. list-table:: Table append (N=100,000) — wall + peak RSS
-   :widths: 24 26 12 12 20
+In the self-comparison table, ``vs rf write-once`` reports
+each row's wall time / RSS divided by the rustfits write-once
+measurement for that variant; values < 1 mean the row was
+faster / lighter than the one-shot rustfits write.
+
+.. list-table:: Table append (N=100,000) — rustfits self
+   :widths: 24 26 14 12 22
    :header-rows: 1
 
    * - variant
@@ -141,11 +143,6 @@ Sample numbers from the reference machine
      - peak RSS
      - vs rf write-once
    * - uncompressed, fixed-only
-     - fitsio write-once
-     - 166.7 ms
-     - 163 MB
-     - :perf-slow:`3.36× time` (fitsio)
-   * -
      - rustfits write-once
      - 49.6 ms
      - 163 MB
@@ -156,26 +153,11 @@ Sample numbers from the reference machine
      - 163 MB
      - :perf-par:`1.27× time, ≈ RAM`
    * -
-     - fitsio append C=1k (K=100)
-     - 171.0 ms
-     - 163 MB
-     - :perf-slow:`3.45× time` (fitsio)
-   * -
      - rustfits append C=10k (K=10)
      - 50.5 ms
      - 163 MB
      - :perf-par:`1.02× time, ≈ RAM`
-   * -
-     - fitsio append C=10k (K=10)
-     - 153.9 ms
-     - 163 MB
-     - :perf-slow:`3.10× time` (fitsio)
    * - uncompressed, with VLA
-     - fitsio write-once
-     - 495.3 ms
-     - 186 MB
-     - :perf-slow:`2.83× time` (fitsio)
-   * -
      - rustfits write-once
      - 174.8 ms
      - 216 MB
@@ -186,20 +168,10 @@ Sample numbers from the reference machine
      - 165 MB
      - :perf-fast:`1.14× time, 1.3× less RAM`
    * -
-     - fitsio append C=1k (K=100)
-     - **40.08 s**
-     - 166 MB
-     - :perf-slow:`229× time` (fitsio)
-   * -
      - rustfits append C=10k (K=10)
      - 156.4 ms
      - 165 MB
      - :perf-fast:`0.89× time, 1.3× less RAM`
-   * -
-     - fitsio append C=10k (K=10)
-     - **32.79 s**
-     - 165 MB
-     - :perf-slow:`188× time` (fitsio)
    * - ZTABLE, fixed-only
      - rustfits write-once
      - 2.03 s
@@ -231,6 +203,50 @@ Sample numbers from the reference machine
      - 228 MB
      - :perf-slow:`6.3× time, ≈ RAM`
 
+Cross-tool comparison on the uncompressed variants, paired
+row-by-row (``vs fitsio`` = ``fitsio_time / rustfits_time``;
+> 1.0 means rustfits is faster):
+
+.. list-table:: Table append (N=100,000) — rustfits vs fitsio (uncompressed)
+   :widths: 24 26 14 14 22
+   :header-rows: 1
+
+   * - variant
+     - operation
+     - rustfits
+     - fitsio
+     - vs fitsio
+   * - fixed-only
+     - write-once
+     - 49.6 ms
+     - 166.7 ms
+     - :perf-fast:`3.36×`
+   * -
+     - append C=1k (K=100)
+     - 63.1 ms
+     - 171.0 ms
+     - :perf-fast:`2.71×`
+   * -
+     - append C=10k (K=10)
+     - 50.5 ms
+     - 153.9 ms
+     - :perf-fast:`3.05×`
+   * - with VLA
+     - write-once
+     - 174.8 ms
+     - 495.3 ms
+     - :perf-fast:`2.83×`
+   * -
+     - append C=1k (K=100)
+     - 199.9 ms
+     - **40.08 s**
+     - :perf-fast:`200×` (see note)
+   * -
+     - append C=10k (K=10)
+     - 156.4 ms
+     - **32.79 s**
+     - :perf-fast:`210×` (see note)
+
 Five things to take away:
 
 1. **Uncompressed write-once: rustfits is ~3× fitsio.**  The
@@ -248,8 +264,9 @@ Five things to take away:
 3. **rustfits append crushes fitsio append on VLA — ~200×.**
    On the fixed-only variant rustfits append is ~2.7–3.0×
    faster than fitsio append (in line with the write-once
-   ratio).  On VLA the gap blows out to **229× faster** at
-   chunk=1k and **188× faster** at chunk=10k.  See the note
+   ratio).  On VLA the gap blows out to **200× faster** at
+   chunk=1k and **210× faster** at chunk=10k — fitsio takes
+   ~33–40 s where rustfits takes ~160–200 ms.  See the note
    below for the root cause.
 
 4. **VLA append wins on peak RSS.**  The rustfits whole-table

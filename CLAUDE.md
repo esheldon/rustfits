@@ -2384,7 +2384,7 @@ wrapper around cfitsio).  Headline wins:
 | Uncompressed table read (post chunked VLA reader) | 1.23–2.56× faster |
 | Uncompressed table write | 2.60× faster |
 | Uncompressed table append (fixed, vs fitsio append) | 2.7–3.1× faster |
-| Uncompressed table append (VLA, vs fitsio append) | **188–229× faster** (fitsio per-call HDU close/reopen) |
+| Uncompressed table append (VLA, vs fitsio append) | **200–210× faster** (fitsio per-call HDU close/reopen) |
 | Image extend (peak RSS) | up to 16× less RAM than write-once |
 | Table append (VLA, peak RSS) | 1.3× less RAM than write-once |
 
