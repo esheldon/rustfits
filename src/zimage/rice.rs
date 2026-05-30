@@ -174,11 +174,81 @@ pub(crate) fn decode_rice(
             compressed, n_pixels, bbits, fsbits, fsmax, blocksize, zbitpix,
         );
     }
-    let mut decoded: Vec<i32> = vec![0; n_pixels];
-    decode_rice_int_u32buf(
-        compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut decoded,
-    )?;
-    Ok(cast_i32_to_target_bytes(&decoded, zbitpix))
+    // Allocate the target byte buffer up-front and decode straight
+    // into it.  Dispatching on ZBITPIX once at the outer layer lets
+    // the compiler monomorphize the inner loop's per-pixel store to
+    // the exact target width — no Vec<i32> intermediate, no cast
+    // pass over the data.
+    let zbytes: usize = match zbitpix {
+        8 | 16 | 32 | 64 => (zbitpix / 8) as usize,
+        _ => return Err(PyValueError::new_err(format!(
+            "RICE decode: unsupported ZBITPIX={}", zbitpix
+        ))),
+    };
+    let mut out_bytes: Vec<u8> = vec![0u8; n_pixels * zbytes];
+    match zbitpix {
+        8 => decode_rice_int_u32buf::<I8Out>(
+            compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut out_bytes,
+        )?,
+        16 => decode_rice_int_u32buf::<I16Out>(
+            compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut out_bytes,
+        )?,
+        32 => decode_rice_int_u32buf::<I32Out>(
+            compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut out_bytes,
+        )?,
+        64 => decode_rice_int_u32buf::<I64Out>(
+            compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut out_bytes,
+        )?,
+        _ => unreachable!(),
+    }
+    Ok(out_bytes)
+}
+
+// Trait + zero-sized witness types: dispatch on ZBITPIX once at the
+// outer layer, then specialize the decoder's inner store width via
+// monomorphization.  `write_at` is `#[inline(always)]` so each impl
+// reduces to a single store at the call site.
+trait PixelWrite {
+    #[allow(dead_code)]
+    const BYTES: usize;
+    fn write_at(out: &mut [u8], i: usize, v: i32);
+}
+
+struct I8Out;
+struct I16Out;
+struct I32Out;
+struct I64Out;
+
+impl PixelWrite for I8Out {
+    const BYTES: usize = 1;
+    #[inline(always)]
+    fn write_at(out: &mut [u8], i: usize, v: i32) {
+        out[i] = v as u8;
+    }
+}
+impl PixelWrite for I16Out {
+    const BYTES: usize = 2;
+    #[inline(always)]
+    fn write_at(out: &mut [u8], i: usize, v: i32) {
+        let bytes = (v as i16).to_ne_bytes();
+        out[i * 2..i * 2 + 2].copy_from_slice(&bytes);
+    }
+}
+impl PixelWrite for I32Out {
+    const BYTES: usize = 4;
+    #[inline(always)]
+    fn write_at(out: &mut [u8], i: usize, v: i32) {
+        let bytes = v.to_ne_bytes();
+        out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+    }
+}
+impl PixelWrite for I64Out {
+    const BYTES: usize = 8;
+    #[inline(always)]
+    fn write_at(out: &mut [u8], i: usize, v: i32) {
+        let bytes = (v as i64).to_ne_bytes();
+        out[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+    }
 }
 
 // Fast core: BYTEPIX in {1, 2, 4}.  Direct port of cfitsio's
@@ -189,16 +259,16 @@ pub(crate) fn decode_rice(
 // Unary counting uses `u32::leading_zeros` (LZCNT on x86-64-v2)
 // in place of cfitsio's 256-entry nonzero_count LUT.  Output
 // written directly to `out[i]` instead of pushed onto a Vec.
-fn decode_rice_int_u32buf(
+fn decode_rice_int_u32buf<T: PixelWrite>(
     c: &[u8],
     nx: usize,
     bbits: u32,
     fsbits: u32,
     fsmax: u32,
     nblock: u32,
-    out: &mut [i32],
+    out: &mut [u8],
 ) -> PyResult<()> {
-    debug_assert!(out.len() == nx);
+    debug_assert!(out.len() == nx * T::BYTES);
     debug_assert!(bbits == 8 || bbits == 16 || bbits == 32);
 
     let seed_bytes = (bbits / 8) as usize;
@@ -250,7 +320,7 @@ fn decode_rice_int_u32buf(
         if fs < 0 {
             // Low-entropy: every pixel in the block equals lastpix.
             for k in i..imax {
-                out[k] = lastpix;
+                T::write_at(out, k, lastpix);
             }
         } else if (fs as u32) == fsmax {
             // High-entropy: each diff is bbits raw bits, ZigZag-
@@ -283,7 +353,7 @@ fn decode_rice_int_u32buf(
                     !(diff >> 1) as i32
                 };
                 lastpix = lastpix.wrapping_add(zz);
-                out[k] = lastpix;
+                T::write_at(out, k, lastpix);
             }
         } else {
             // Normal Rice with parameter k = fs.  Unary high bits +
@@ -336,7 +406,7 @@ fn decode_rice_int_u32buf(
                     !(diff >> 1) as i32
                 };
                 lastpix = lastpix.wrapping_add(zz);
-                out[k] = lastpix;
+                T::write_at(out, k, lastpix);
             }
         }
         i = imax;
@@ -655,44 +725,6 @@ pub(crate) fn encode_rice(
     }
 
     Ok(writer.finish())
-}
-
-// Cast a Vec<i32> of decoded pixel values (from the BYTEPIX in
-// {1, 2, 4} fast path) to bytes in the target (stored) dtype,
-// numpy-native byte order.  Like the i64 cousin, but lets the fast
-// path stay in i32 throughout — narrower scratch, simpler code.
-fn cast_i32_to_target_bytes(values: &[i32], zbitpix: i32) -> Vec<u8> {
-    match zbitpix {
-        8 => {
-            let mut out = Vec::with_capacity(values.len());
-            for &v in values {
-                out.push(v as u8);
-            }
-            out
-        }
-        16 => {
-            let mut out = Vec::with_capacity(values.len() * 2);
-            for &v in values {
-                out.extend_from_slice(&(v as i16).to_ne_bytes());
-            }
-            out
-        }
-        32 => {
-            let mut out = Vec::with_capacity(values.len() * 4);
-            for &v in values {
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            out
-        }
-        64 => {
-            let mut out = Vec::with_capacity(values.len() * 8);
-            for &v in values {
-                out.extend_from_slice(&(v as i64).to_ne_bytes());
-            }
-            out
-        }
-        _ => Vec::new(),
-    }
 }
 
 // Cast a Vec<i64> of decoded pixel values to bytes in the target
