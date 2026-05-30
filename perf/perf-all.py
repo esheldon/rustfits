@@ -278,6 +278,374 @@ def _cell(text: str, width: int, align: str) -> str:
     return text.ljust(width) if align == "l" else text.rjust(width)
 
 
+# ---------- RST writer ----------
+
+
+# Per-script title + one-line subtitle for the docs tables.  The
+# subtitle supplies the file-layout context (dtype, shape, size)
+# that the per-row "operation" labels lack on their own.  Order in
+# this dict drives display order in the generated RST.
+SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
+    # Uncompressed images
+    "perf-image-read-1d.py": (
+        "Uncompressed 1-D image read",
+        "1-D ``f8`` image, 64 M pixels (~512 MB on disk).",
+    ),
+    "perf-image-read-2d.py": (
+        "Uncompressed 2-D image read",
+        "2-D ``f4`` image, 4000×4000 pixels (64 MB on disk).",
+    ),
+    "perf-image-write-1d.py": (
+        "Uncompressed 1-D image write",
+        "1-D ``f8`` image, 64 M pixels (~512 MB on disk); fresh file "
+        "per timed iteration.",
+    ),
+    "perf-image-write-2d.py": (
+        "Uncompressed 2-D image write",
+        "2-D ``f4`` image, 4000×4000 pixels (64 MB on disk); fresh "
+        "file per timed iteration.",
+    ),
+    # Compressed images — 1-D
+    "perf-compressed-image-read-healsparse.py": (
+        "Compressed 1-D image read (GZIP_2, healsparse-like)",
+        "1-D ``f8`` healsparse map with long quantized runs; "
+        "~537 MB raw, ~26 MB compressed (GZIP_2, 1 MiB tiles).",
+    ),
+    "perf-compressed-image-read-random.py": (
+        "Compressed 1-D image read (GZIP_2, random data)",
+        "1-D ``f8`` array of pure noise (worst case for any codec); "
+        "GZIP_2 with 1 MiB tiles, ~512 MB raw / ~485 MB compressed.",
+    ),
+    "perf-compressed-image-write-healsparse.py": (
+        "Compressed 1-D image write (GZIP_2, healsparse-like)",
+        "Same input as the healsparse read bench, lossless GZIP_2 "
+        "encode (level matched to cfitsio's ``Z_BEST_SPEED=1``).",
+    ),
+    # Compressed images — 2-D
+    "perf-compressed-image-read-des.py": (
+        "Compressed 2-D image read (RICE_1 + dither2, DES-like)",
+        "2-D ``f4`` image with ~5% masked zeros; RICE_1 + "
+        "``Quantize(level=16, method='dither2')``, 100×100 tiles, "
+        "4000×4000 pixels.  Stamps = 1000 random 32×32 windows; "
+        "whole = all tiles in disk order (band walk).",
+    ),
+    "perf-compressed-2d-isolation.py": (
+        "Compressed 2-D image read — codec isolation sweep",
+        "Same shape as DES, but varying ONE factor per row (codec, "
+        "quantization, tile size) so the gap from each contributing "
+        "factor is visible.  Helps separate \"decode is slow\" "
+        "from \"dequant is slow\".",
+    ),
+    "perf-compressed-image-write-des.py": (
+        "Compressed 2-D image write (RICE_1 + dither2, DES-like)",
+        "Same input/shape as the DES read bench; RICE_1 + dither2.",
+    ),
+    # Tables — uncompressed
+    "perf-table-read.py": (
+        "Uncompressed BINTABLE read",
+        "Type-exhaustive 34-column catalog (every scalar type, "
+        "1-D + 2-D ``f4``/``f8`` sub-arrays, ``S`` and ``U`` "
+        "strings fixed + VLA, an ``f4`` VLA); 500 k rows, ~306 MB.",
+    ),
+    "perf-table-write.py": (
+        "Uncompressed BINTABLE write",
+        "Same catalog as the BINTABLE read bench; fresh file per "
+        "timed iteration.",
+    ),
+    # Tables — compressed (ZTABLE; rustfits self-comparison)
+    "perf-table-compressed-read.py": (
+        "Compressed BINTABLE read (ZTABLE; rustfits self)",
+        "Same catalog as the uncompressed BINTABLE bench.  fitsio's "
+        "Python API does not decompress ZTABLE, so this is a rustfits "
+        "self-comparison (compressed vs uncompressed timing).",
+    ),
+    "perf-table-compressed-write.py": (
+        "Compressed BINTABLE write (ZTABLE; rustfits self)",
+        "Same catalog.  Self-comparison (no other Python library "
+        "writes ZTABLE).",
+    ),
+    # Extend (RSS)
+    "perf-image-extend-1d.py": (
+        "Uncompressed 1-D image build — bounded-memory extend vs write-once",
+        "1 GB ``f8`` map; ``ImageHDU.extend`` appends chunks instead "
+        "of holding the whole array in RAM.  fitsio cannot append; "
+        "RSS comparison is rustfits-self plus fitsio's write-once "
+        "as a reference.",
+    ),
+    "perf-compressed-image-extend-healsparse.py": (
+        "Compressed 1-D image build — bounded-memory extend vs write-once",
+        "Same shape as the compressed healsparse benches; "
+        "``CompressedImageHDU.extend`` appends chunks.  fitsio cannot "
+        "append compressed.",
+    ),
+}
+
+
+def _bench_env_string() -> str:
+    """One-line summary of the bench environment (versions + CPU + OS)."""
+    import platform
+
+    parts = [f"Python {platform.python_version()}"]
+    try:
+        import numpy
+
+        parts.append(f"numpy {numpy.__version__}")
+    except ImportError:
+        pass
+    try:
+        import rustfits
+
+        parts.append(f"rustfits {getattr(rustfits, '__version__', '?')}")
+    except ImportError:
+        pass
+    try:
+        import fitsio
+
+        parts.append(f"fitsio {fitsio.__version__}")
+    except ImportError:
+        pass
+    try:
+        import astropy
+
+        parts.append(f"astropy {astropy.__version__}")
+    except ImportError:
+        pass
+    parts.append(f"{platform.machine()} / {platform.system()}")
+    return ", ".join(parts)
+
+
+def _rst_escape(s: str) -> str:
+    """
+    Escape pipe characters that would break list-table cell parsing.
+    The bench labels don't usually contain markup, so we keep it
+    minimal — only the few characters that confuse RST inline.
+    """
+    return s.replace("|", r"\|")
+
+
+def _list_table(
+    title: str, widths: list[int], headers: list[str], rows: list[list[str]]
+) -> str:
+    """
+    Render a single RST ``list-table`` directive as a string.
+    """
+    lines = [
+        f".. list-table:: {title}",
+        f"   :widths: {' '.join(str(w) for w in widths)}",
+        "   :header-rows: 1",
+        "",
+    ]
+    for i, row in enumerate([headers, *rows]):
+        prefix = "   * - "
+        cont = "     - "
+        for j, cell in enumerate(row):
+            cell = _rst_escape(str(cell))
+            lines.append((prefix if j == 0 else cont) + cell)
+        # mark row boundary; the next * - begins a new row
+        if i < len(rows):
+            pass  # nothing extra; next iter writes its own "* -"
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _ratio_classify(ratio: float) -> tuple[str, str]:
+    """
+    Return (CSS role name, badge label) for a fitsio/rustfits ratio.
+
+    Roles are inline RST class directives declared at the top of the
+    generated file; the CSS in ``docs/_static/perf.css`` paints them
+    green / amber / red.  When the surrounding renderer ignores
+    roles (plain RST viewers, GitHub), the badge label still appears
+    so the win/loss tag is visible in monochrome.
+    """
+    if ratio >= 1.10:
+        return "perf-fast", "FAST"
+    if ratio >= 0.95:
+        return "perf-par", "~par"
+    return "perf-slow", "SLOW"
+
+
+def _colored_ratio(ratio: float) -> str:
+    """RST role-wrapped, colorized ratio cell."""
+    role, _tag = _ratio_classify(ratio)
+    return f":{role}:`{ratio:.2f}×`"
+
+
+def write_rst(records: list[dict], path: str) -> None:
+    """
+    Write per-script summary tables to ``path`` as RST list-table
+    directives.  The output is meant to be ``.. include::``-d from a
+    Sphinx page; it has no top-level header so the including page can
+    supply its own.
+
+    Each script gets its own table with a descriptive title and a
+    one-line subtitle (from ``SCRIPT_GROUPS``) supplying the file-
+    layout context the per-row operation labels lack on their own.
+    Three table flavors — cross_tool, self_comparison, rss — pick
+    their columns from the record shape.  Cross-tool ratio cells are
+    colorized via the ``:perf-fast:`` / ``:perf-par:`` / ``:perf-slow:``
+    inline roles declared at the file head (CSS in perf.css).  A
+    global tally at the end summarizes cross-tool wins/par/losses.
+    """
+    import datetime
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    out: list[str] = []
+    out.append(".. -- this file is generated by perf/perf-all.py --rst-out;")
+    out.append(".. -- do not edit by hand; re-run the script to refresh.")
+    out.append("")
+    # Inline-role declarations for the colorized ratio cells.  Each
+    # role's name becomes the CSS class Sphinx puts on the rendered
+    # span; perf.css supplies the actual color.
+    out.append(".. role:: perf-fast")
+    out.append(".. role:: perf-par")
+    out.append(".. role:: perf-slow")
+    out.append("")
+    out.append(
+        f"*Last generated {stamp}*.  Environment: {_bench_env_string()}."
+    )
+    out.append("")
+    out.append(
+        "These are point-in-time measurements.  The benchmarks under "
+        "``perf/`` are the source of truth — re-run "
+        "``python perf/perf-all.py`` for current numbers on your "
+        "hardware."
+    )
+    out.append("")
+
+    # Bucket records by script, preserving display order from
+    # SCRIPT_GROUPS.  Unknown scripts (new benches not yet registered)
+    # appear at the end in name order.
+    by_script: dict[str, list[dict]] = {}
+    for r in records:
+        by_script.setdefault(r.get("script", ""), []).append(r)
+    ordered_scripts = [s for s in SCRIPT_GROUPS if s in by_script]
+    extras = sorted(s for s in by_script if s not in SCRIPT_GROUPS)
+    ordered_scripts.extend(extras)
+
+    n_wins = n_par = n_loss = 0
+    for script in ordered_scripts:
+        rows = by_script[script]
+        title, subtitle = SCRIPT_GROUPS.get(
+            script, (_short_script(script), "")
+        )
+        out.append(f"**{title}**")
+        out.append("")
+        if subtitle:
+            out.append(subtitle)
+            out.append("")
+        # All records from a single script are the same kind today.
+        kind = rows[0].get("kind", "cross_tool")
+        if kind == "cross_tool":
+            tbl_rows = []
+            for r in sorted(rows, key=lambda r: r.get("op", "")):
+                rf = r.get("rustfits_s")
+                fi = r.get("fitsio_s")
+                ratio_cell = ""
+                if rf and fi and rf > 0:
+                    ratio = fi / rf
+                    ratio_cell = _colored_ratio(ratio)
+                    tag = _ratio_classify(ratio)[1]
+                    if tag == "FAST":
+                        n_wins += 1
+                    elif tag == "~par":
+                        n_par += 1
+                    else:
+                        n_loss += 1
+                tbl_rows.append(
+                    [
+                        r.get("op", ""),
+                        fmt_time(rf),
+                        fmt_time(fi),
+                        ratio_cell,
+                        fmt_rate(r.get("nbytes", 0), rf),
+                    ]
+                )
+            out.append(
+                _list_table(
+                    f"{title} — vs fitsio",
+                    [38, 12, 12, 14, 12],
+                    [
+                        "operation",
+                        "rustfits",
+                        "fitsio",
+                        "vs fitsio",
+                        "rustfits rate",
+                    ],
+                    tbl_rows,
+                )
+            )
+        elif kind == "self_comparison":
+            tbl_rows = []
+            for r in sorted(rows, key=lambda r: r.get("op", "")):
+                ps = r.get("primary_s")
+                ss = r.get("secondary_s")
+                ratio_cell = ""
+                if ps and ss and ss > 0:
+                    ratio_cell = f"{ps / ss:.2f}×"
+                tbl_rows.append(
+                    [
+                        r.get("op", ""),
+                        r.get("primary_label", ""),
+                        fmt_time(ps),
+                        r.get("secondary_label", ""),
+                        fmt_time(ss),
+                        ratio_cell,
+                    ]
+                )
+            out.append(
+                _list_table(
+                    title,
+                    [30, 12, 10, 12, 10, 10],
+                    [
+                        "operation",
+                        "primary",
+                        "primary t",
+                        "secondary",
+                        "secondary t",
+                        "ratio",
+                    ],
+                    tbl_rows,
+                )
+            )
+        elif kind == "rss":
+            tbl_rows = []
+            for r in sorted(rows, key=lambda r: r.get("op", "")):
+                tbl_rows.append(
+                    [
+                        r.get("op", ""),
+                        fmt_time(r.get("build_s")),
+                        f"{r.get('peak_rss_mb', 0):,.0f} MB",
+                    ]
+                )
+            out.append(
+                _list_table(
+                    f"{title} — build wall + peak RSS",
+                    [40, 14, 14],
+                    ["regime", "build", "peak RSS"],
+                    tbl_rows,
+                )
+            )
+
+    total = n_wins + n_par + n_loss
+    if total:
+        out.append("Cross-tool tally")
+        out.append("----------------")
+        out.append("")
+        out.append(
+            f"Across all cross-tool comparisons: "
+            f":perf-fast:`{n_wins}/{total} faster` (≥ 1.10×), "
+            f":perf-par:`{n_par}/{total} ≈ par` (0.95–1.10×), "
+            f":perf-slow:`{n_loss}/{total} slower` (< 0.95×)."
+        )
+        out.append("")
+
+    with open(path, "w") as fh:
+        fh.write("\n".join(out).rstrip() + "\n")
+
+
 # ---------- main ----------
 
 
@@ -306,6 +674,11 @@ def main() -> int:
         "--json-out",
         help="write the aggregated JSON-lines file to this path "
         "(default: tmp, deleted after)",
+    )
+    ap.add_argument(
+        "--rst-out",
+        help="write the summary tables as RST list-table directives "
+        "to this path (suitable for `.. include::` from a Sphinx page)",
     )
     args = ap.parse_args()
 
@@ -361,6 +734,10 @@ def main() -> int:
 
     print_cross_tool(records)
     print_self_and_rss(records)
+
+    if args.rst_out:
+        write_rst(records, args.rst_out)
+        print(f"\nwrote RST tables to {args.rst_out}")
 
     return 1 if failures else 0
 

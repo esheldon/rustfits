@@ -25,4 +25,5 @@ every access rather than caching parsed values.
    errors
    drivers
    limitations
+   performance
    migration

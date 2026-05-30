@@ -1,0 +1,13 @@
+/* Colorized perf table cells: green for faster than fitsio,
+   yellow for ~par, red for slower.  Used by the Performance page
+   via the :perf-fast: / :perf-par: / :perf-slow: inline roles
+   declared at the top of docs/tutorial/_perf_tables.rst.
+   Colors picked to keep contrast in both the light and dark Furo
+   themes (the slow / fast classes are also weight-bumped so the
+   tally jumps out at a glance).  The "yellow" for ~par leans dark
+   gold for readability on white backgrounds without confusing it
+   with the red of "slow". */
+
+.perf-fast { color: #1a9641; font-weight: 600; }
+.perf-par  { color: #b8860b; font-weight: 600; }
+.perf-slow { color: #d7301f; font-weight: 700; }
