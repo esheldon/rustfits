@@ -2383,7 +2383,10 @@ wrapper around cfitsio).  Headline wins:
 | Uncompressed image write (post byteswap fix) | 1.40× faster |
 | Uncompressed table read (post chunked VLA reader) | 1.23–2.56× faster |
 | Uncompressed table write | 2.60× faster |
+| Uncompressed table append (fixed, vs fitsio append) | 2.7–3.1× faster |
+| Uncompressed table append (VLA, vs fitsio append) | **188–229× faster** (fitsio per-call HDU close/reopen) |
 | Image extend (peak RSS) | up to 16× less RAM than write-once |
+| Table append (VLA, peak RSS) | 1.3× less RAM than write-once |
 
 ZTABLE (compressed BINTABLE) is a rustfits self-comparison —
 fitsio's Python API can't decompress it.

@@ -249,25 +249,8 @@ Five things to take away:
    On the fixed-only variant rustfits append is ~2.7–3.0×
    faster than fitsio append (in line with the write-once
    ratio).  On VLA the gap blows out to **229× faster** at
-   chunk=1k and **188× faster** at chunk=10k.
-
-   Root cause: fitsio's ``write_var_column`` Python wrapper
-   calls ``fits_flush_file`` after every call
-   (`fitsio_pywrap.c
-   <https://github.com/esheldon/fitsio/blob/master/fitsio/fitsio_pywrap.c>`_),
-   and cfitsio's ``fits_flush_file`` (``ffflus`` in
-   ``buffers.c``) is ``close-current-HDU + flush-buffers +
-   re-open-current-HDU``.  In our bench (3 VLA columns × 100
-   appends at chunk=1k) that's 300 HDU close-and-reopen
-   cycles, each of which re-walks the header and re-parses
-   the column descriptors.  This is in fitsio's Python
-   wrapper, not in cfitsio itself — the underlying C
-   ``fits_write_col`` for VLA columns doesn't need the
-   flush.  rustfits' ``TableHDU.append`` writes descriptors +
-   heap bytes once and updates NAXIS2/PCOUNT once, no
-   close-and-reopen.  For incremental VLA catalog builds,
-   this is the largest single rustfits advantage in this
-   bench.
+   chunk=1k and **188× faster** at chunk=10k.  See the note
+   below for the root cause.
 
 4. **VLA append wins on peak RSS.**  The rustfits whole-table
    write holds ~216 MB resident; the append loop holds
@@ -287,6 +270,23 @@ Five things to take away:
    that can hold the data, ``write_table`` (one shot) is the
    faster path.  Improving the small-chunk path is tracked in
    ``CLAUDE.md`` under Performance TODO #10.
+
+.. note::
+
+   **Known fitsio issue behind the 200× VLA-append gap.**
+   fitsio's ``write_var_column`` Python wrapper calls
+   ``fits_flush_file`` after every per-column write
+   (`fitsio_pywrap.c
+   <https://github.com/esheldon/fitsio/blob/master/fitsio/fitsio_pywrap.c>`_,
+   line 2710), and cfitsio's ``fits_flush_file`` (``ffflus``
+   in ``buffers.c``) is *close-current-HDU + flush-buffers +
+   re-open-current-HDU*.  Each reopen re-walks the header
+   and re-parses column descriptors.  With 3 VLA columns and
+   100 appends at chunk=1k that's 300 close-and-reopen
+   cycles — about 40 s of overhead unrelated to the actual
+   data write.  The fix is in fitsio (the underlying cfitsio
+   ``fits_write_col`` doesn't need the flush); the gap will
+   close once that wrapper is patched.
 
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
