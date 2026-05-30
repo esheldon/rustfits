@@ -4592,39 +4592,62 @@ not its compression ratio.  Scripts:
 - `perf-compressed-2d-isolation.py` — the codec isolation sweep below.
 
 **2-D RICE decode rewrite (2026-05-29).**  The DES-like 2-D lossy
-workload originally showed rustfits RICE decode at 0.38× (~2.6× slower
-than cfitsio); the isolation sweep (`perf-compressed-2d-isolation.py`)
-pinned the cost to the decoder itself, not quantization or tile
-assembly.  Rewrote `src/zimage/rice.rs::decode_rice` to match
-cfitsio's `fits_rdecomp` shape — single 32-bit bit buffer + `nbits`
-counter, `u32::leading_zeros` (LZCNT) for unary counting in place of
-the per-bit `read_bits(1)` loop, direct index-write into a typed `i32`
-scratch instead of `Vec<i64> + push` + cast pass.  Before/after on the
-isolation sweep:
+workload originally showed rustfits RICE decode at 0.38× (~2.6×
+slower than cfitsio); the isolation sweep
+(`perf-compressed-2d-isolation.py`) pinned the cost to the decoder
+itself, not quantization or tile assembly.  Three iterative fixes
+landed (each its own commit), arriving at **rustfits faster than
+cfitsio across the board**:
 
-| isolation case | before | after |
-|---|---|---|
-| rice i4 lossless [whole]  | 0.39× SLOW (271 ms) | **0.91×** (115 ms) |
-| rice f4 quant [whole]     | 0.39× SLOW (305 ms) | **0.83×** (142 ms) |
-| rice i4 lossless [stamps] | 0.62× SLOW (184 ms) | **1.42× FASTER** (80 ms) |
-| rice f4 quant [stamps]    | 0.62× SLOW (207 ms) | **1.22× FASTER** (105 ms) |
-| gzip2 f4 unquant [whole]  | 1.29× (unchanged)  | 1.29× (unchanged)  |
-| gzip2 f4 quant [whole]    | 1.10× (unchanged)  | 1.10× (unchanged)  |
+| isolation case | original | cfitsio-port | direct-bytes | **u64 buffer (current)** |
+|---|---|---|---|---|
+| rice i4 lossless [whole]  | 0.39× SLOW | 0.91× | 0.95× | **1.30× FASTER** |
+| rice f4 quant [whole]     | 0.39× SLOW | 0.83× | 0.87× | **1.11× FASTER** |
+| rice i4 lossless [stamps] | 0.62× SLOW | 1.42× | 1.46× | **1.94× FASTER** |
+| rice f4 quant [stamps]    | 0.62× SLOW | 1.22× | 1.29× | **1.58× FASTER** |
+| rice f4 quant t=1000 [whole] | 0.42× SLOW | 0.77× | 0.81× | **1.01× (~par)** |
 
-RICE i4 decode throughput: ~236 MB/s → ~556 MB/s (2.4× faster).
-Stamps now beat fitsio outright; whole-file reads near par (0.83–
-0.91×).  The remaining whole-file gap may be in the
-`cast_i32_to_target_bytes` pass — a future direct-to-bytes output
-shape could shave it but isn't worth the surface churn today.
+RICE i4 decode throughput: ~236 MB/s → **~791 MB/s** (3.3× faster
+than the original; ~1.3× cfitsio's ~615 MB/s).  The DES bench (the
+original workload that surfaced the slowdown) now reports **1.12×
+FASTER** on whole reads and **1.58× FASTER** on stamps.
 
-Implementation lives in `decode_rice_int_u32buf` (the fast core for
-BYTEPIX in {1, 2, 4} — 99% of real RICE files) with a slow path
-`decode_rice_slow_i64` for the BYTEPIX=8 case (which no canonical
-writer produces; we accept it on read for completeness).  The
-high-entropy branch uses a `u64` staging buffer because 32-bit raw
-diffs + up to 7 leftover bits is 39 bits — wouldn't fit in u32.
-Byte-exact tested by the existing RICE round-trip suite (all
-algorithms × all dtypes × encoder cross-check with fitsio).
+The three fixes:
+
+1. **cfitsio-style 32-bit bit buffer + LZCNT unary** (commit
+   `97cfbc1`).  Replaced our generic BitReader (per-bit
+   `read_bits(1)` for unary, byte_pos+bit_pos+byte-spanning
+   `read_bits` loop) with cfitsio's `fits_rdecomp` shape: single
+   u32 bit buffer + `nbits` counter refilled 8 bits at a time,
+   `u32::leading_zeros` (LZCNT on x86-64-v2) for unary counting.
+   Output written directly to a typed `i32` scratch by index
+   instead of `Vec<i64>::push` + cast.
+
+2. **Direct-to-bytes output** (commit `6122d2d`).  Made the
+   decoder generic over a `PixelWrite` trait with zero-sized
+   witness types (`I8Out`/`I16Out`/`I32Out`/`I64Out`); dispatch
+   on ZBITPIX at the outer layer.  Compiler monomorphizes the
+   inner loop's per-pixel store to the exact target width — no
+   intermediate `Vec<i32>` alloc, no cast pass.
+
+3. **u64 bit buffer + 32-bit refills** (current).  Replaced the
+   u32 buffer with an MSB-aligned u64 buffer that refills 32 bits
+   at a time via `u32::from_be_bytes` when nbits ≤ 32 AND ≥ 4
+   bytes remain.  4× fewer refill ops, and unary counting becomes
+   a single `u64::leading_zeros` across up to 64 bits in one shot
+   (vs cfitsio's per-byte refill + 256-entry LUT).  Bit-buffer
+   invariant: `buf` has `nbits` valid bits in positions
+   `63..(64-nbits)`; positions below are zero.  This makes
+   take_bits a single shift.
+
+Implementation lives in `decode_rice_int_u32buf` (the fast core
+for BYTEPIX in {1, 2, 4} — 99% of real RICE files) and a `refill`
+helper.  BYTEPIX=8 (no canonical writer produces it; we accept on
+read for completeness) falls through to `decode_rice_slow_i64`
+because 64-bit raw diffs don't fit in a 64-bit bit buffer with any
+useful headroom for refills.  Byte-exact tested by the existing
+RICE round-trip suite (all algorithms × all dtypes × encoder
+cross-check with fitsio).
 
 **Write/encode benchmarks (2026-05-29).**  The write side
 (`perf-compressed-image-write-healsparse.py` for 1-D GZIP_2,
@@ -4635,7 +4658,7 @@ the encode/decode × GZIP/RICE matrix:
 |---|---|
 | GZIP_2 decode (1-D healsparse) | 1.8–45× faster |
 | GZIP_2 encode (matched level 1) | **2.32× faster** |
-| RICE decode (2-D)  | 0.83–0.91× whole / 1.22–1.42× FASTER stamps (rewritten 2026-05-29) |
+| RICE decode (2-D)  | **1.11–1.30× FASTER** whole / **1.58–1.94× FASTER** stamps (rewritten 2026-05-29) |
 | RICE encode        | 0.99× (≈ par) |
 
 - **GZIP_2 encode is rustfits-faster once the level is matched.**  A

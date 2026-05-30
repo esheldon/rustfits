@@ -251,14 +251,14 @@ impl PixelWrite for I64Out {
     }
 }
 
-// Fast core: BYTEPIX in {1, 2, 4}.  Direct port of cfitsio's
-// `fits_rdecomp` (and its _short / _byte variants — the inner
-// algorithm is identical, only the bbits/fsbits/fsmax constants
-// differ).  Uses a single u32 bit buffer `b` carrying `nbits`
-// valid bits, refilled 8 bits at a time from the input slice.
-// Unary counting uses `u32::leading_zeros` (LZCNT on x86-64-v2)
-// in place of cfitsio's 256-entry nonzero_count LUT.  Output
-// written directly to `out[i]` instead of pushed onto a Vec.
+// Fast core: BYTEPIX in {1, 2, 4}.  Algorithm follows cfitsio's
+// `fits_rdecomp`, but with a wider MSB-aligned u64 bit buffer that
+// can refill 32 bits at a time (4x fewer refill ops than cfitsio's
+// 8-bit refill of a u32 buffer).  Bit-buffer invariant: `buf` has
+// `nbits` valid bits in positions 63..(64-nbits); positions below
+// 64-nbits are zero.  This makes take_bits a single shift and
+// makes unary counting a single `u64::leading_zeros` (LZCNT on
+// x86-64-v2) across up to 64 bits in one shot.
 fn decode_rice_int_u32buf<T: PixelWrite>(
     c: &[u8],
     nx: usize,
@@ -290,30 +290,30 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
         seed_u as i32
     };
 
-    let bbits_mask: u32 = if bbits == 32 { u32::MAX } else { (1u32 << bbits) - 1 };
-
+    // Bit buffer state.  We refill before reading whenever fewer
+    // than `n` bits are buffered; the refill helper prefers 32-bit
+    // reads when there's room (4 bytes available AND nbits <= 32)
+    // and falls back to 8-bit reads near the stream tail.
+    let mut buf: u64 = 0;
+    let mut nbits: u32 = 0;
     let mut pos = seed_bytes;
-    let mut b: u32 = c[pos] as u32;
-    pos += 1;
-    let mut nbits: i32 = 8;
-    let mut i: usize = 0;
+    refill(&mut buf, &mut nbits, c, &mut pos);
 
+    let mut i: usize = 0;
     while i < nx {
-        // Read fsbits to get stored_fs (1..fsmax+1, or 0 = low-entropy run).
-        nbits -= fsbits as i32;
-        while nbits < 0 {
-            if pos >= c.len() {
+        // Need fsbits.  fsbits in {3, 4, 5} ≤ 32 so refill suffices.
+        if nbits < fsbits {
+            refill(&mut buf, &mut nbits, c, &mut pos);
+            if nbits < fsbits {
                 return Err(PyValueError::new_err(
                     "RICE decode: unexpected end of stream reading fs"
                 ));
             }
-            b = (b << 8) | (c[pos] as u32);
-            pos += 1;
-            nbits += 8;
         }
-        let stored_fs: i32 = (b >> nbits) as i32 & ((1i32 << fsbits) - 1);
-        let fs: i32 = stored_fs - 1;
-        b &= (1u32 << nbits).wrapping_sub(1);
+        let stored_fs: u32 = (buf >> (64 - fsbits)) as u32;
+        buf <<= fsbits;
+        nbits -= fsbits;
+        let fs: i32 = stored_fs as i32 - 1;
 
         let imax = (i + nblock as usize).min(nx);
 
@@ -323,30 +323,20 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
                 T::write_at(out, k, lastpix);
             }
         } else if (fs as u32) == fsmax {
-            // High-entropy: each diff is bbits raw bits, ZigZag-
-            // decoded.  Use a u64 staging buffer because bbits=32 +
-            // up to 7 leftover bits = 39 bits, doesn't fit in u32.
+            // High-entropy: each diff is bbits raw bits.  bbits ≤
+            // 32, so a single ensure-then-take suffices per pixel.
             for k in i..imax {
-                let mut wide: u64 = b as u64;
-                let mut have: u32 = nbits as u32;
-                while have < bbits {
-                    if pos >= c.len() {
+                if nbits < bbits {
+                    refill(&mut buf, &mut nbits, c, &mut pos);
+                    if nbits < bbits {
                         return Err(PyValueError::new_err(
                             "RICE decode: unexpected end of stream (raw)"
                         ));
                     }
-                    wide = (wide << 8) | (c[pos] as u64);
-                    pos += 1;
-                    have += 8;
                 }
-                let leftover = have - bbits;
-                let diff: u32 = ((wide >> leftover) & bbits_mask as u64) as u32;
-                b = if leftover == 0 {
-                    0
-                } else {
-                    (wide & ((1u64 << leftover) - 1)) as u32
-                };
-                nbits = leftover as i32;
+                let diff: u32 = (buf >> (64 - bbits)) as u32;
+                buf <<= bbits;
+                nbits -= bbits;
                 let zz: i32 = if (diff & 1) == 0 {
                     (diff >> 1) as i32
                 } else {
@@ -356,50 +346,64 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
                 T::write_at(out, k, lastpix);
             }
         } else {
-            // Normal Rice with parameter k = fs.  Unary high bits +
-            // k low bits → ZigZag → diff.  This is the hot path.
+            // Normal Rice with parameter k = fs.  Unary count of
+            // leading zeros (up to 64 in one shot via leading_zeros
+            // on the u64), then fs trailing bits.  This is the hot
+            // path.  fs in 0..fsmax (fsmax ≤ 25), and nzero in
+            // practice is small, so refill 32 at a time covers
+            // every typical pixel with one bounds check.
             let fs_u = fs as u32;
             for k in i..imax {
-                // Count leading zero bits: refill 8 at a time while
-                // b is exactly zero (each refill adds 8 to nbits, so
-                // the final `nbits - bit_pos` accounts for ALL the
-                // skipped zero bytes — don't separately accumulate
-                // into nzero).  Matches cfitsio exactly.
-                while b == 0 {
-                    nbits += 8;
-                    if pos >= c.len() {
-                        return Err(PyValueError::new_err(
-                            "RICE decode: unexpected end of stream (unary)"
-                        ));
+                // Make sure buf has at least one 1 bit somewhere
+                // (and enough bits beyond it for fs).  Worst-case
+                // unary run for typical files is small; we cap
+                // refills at 1024 zero bits to detect corrupt
+                // streams.
+                let mut nzero: u32 = 0;
+                loop {
+                    if buf == 0 {
+                        nzero += nbits;
+                        nbits = 0;
+                        if nzero > 1024 {
+                            return Err(PyValueError::new_err(
+                                "RICE decode: unary code exceeded 1024 \
+                                 zeros (corrupt stream)"
+                            ));
+                        }
+                        refill(&mut buf, &mut nbits, c, &mut pos);
+                        if nbits == 0 {
+                            return Err(PyValueError::new_err(
+                                "RICE decode: unexpected end of stream (unary)"
+                            ));
+                        }
+                        continue;
                     }
-                    b = c[pos] as u32;
-                    pos += 1;
+                    let lz = buf.leading_zeros();
+                    nzero += lz;
+                    // Consume the lz zeros + the terminating 1 bit.
+                    buf <<= lz + 1;
+                    nbits -= lz + 1;
+                    break;
                 }
-                // Position of highest set bit in b (1-indexed from
-                // LSB).  After the refill above, b is in 1..=255 so
-                // this is 1..=8 — equivalent to cfitsio's
-                // `nonzero_count[b]` LUT.
-                let bit_pos = (32 - b.leading_zeros()) as i32;
-                let nzero: i32 = nbits - bit_pos;
-                nbits = bit_pos - 1;
-                // Flip the leading one bit (consume it).
-                b ^= 1u32 << nbits;
 
-                // Read fs more low-order bits.
-                nbits -= fs as i32;
-                while nbits < 0 {
-                    if pos >= c.len() {
+                // Read fs more trailing bits.
+                if nbits < fs_u {
+                    refill(&mut buf, &mut nbits, c, &mut pos);
+                    if nbits < fs_u {
                         return Err(PyValueError::new_err(
                             "RICE decode: unexpected end of stream (rice tail)"
                         ));
                     }
-                    b = (b << 8) | (c[pos] as u32);
-                    pos += 1;
-                    nbits += 8;
                 }
-                let diff: u32 = ((nzero as u32) << fs_u) | (b >> nbits);
-                b &= (1u32 << nbits).wrapping_sub(1);
-
+                let bottom: u32 = if fs_u == 0 {
+                    0
+                } else {
+                    let v = (buf >> (64 - fs_u)) as u32;
+                    buf <<= fs_u;
+                    nbits -= fs_u;
+                    v
+                };
+                let diff: u32 = (nzero << fs_u) | bottom;
                 let zz: i32 = if (diff & 1) == 0 {
                     (diff >> 1) as i32
                 } else {
@@ -413,6 +417,33 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
     }
 
     Ok(())
+}
+
+// Refill the MSB-aligned bit buffer.  Reads 32 bits at a time when
+// nbits <= 32 AND at least 4 bytes are available; falls back to
+// 8 bits near the tail.  Stops when nbits > 56 (no room for another
+// full byte) or when input is exhausted.
+#[inline(always)]
+fn refill(buf: &mut u64, nbits: &mut u32, c: &[u8], pos: &mut usize) {
+    // Fast path: pull a 32-bit big-endian word when buffer has room
+    // and input has enough bytes.  Most refills hit this branch.
+    while *nbits <= 32 && *pos + 4 <= c.len() {
+        let w = u32::from_be_bytes([
+            c[*pos],
+            c[*pos + 1],
+            c[*pos + 2],
+            c[*pos + 3],
+        ]) as u64;
+        *buf |= w << (32 - *nbits);
+        *pos += 4;
+        *nbits += 32;
+    }
+    // Tail: byte-at-a-time refill for the last few bytes.
+    while *nbits <= 56 && *pos < c.len() {
+        *buf |= (c[*pos] as u64) << (56 - *nbits);
+        *pos += 1;
+        *nbits += 8;
+    }
 }
 
 // Slow path retained for BYTEPIX=8: 64-bit diffs don't fit in a
