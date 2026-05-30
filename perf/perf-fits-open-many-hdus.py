@@ -52,6 +52,8 @@ Scratch files go to CWD as perf-tmp-* and are removed on exit.
 from __future__ import annotations
 
 import argparse
+import os
+import os.path
 import time
 
 import numpy as np
@@ -189,6 +191,24 @@ def main():
         if args.cold:
             title += " [COLD CACHE: iter-0 worst-case]"
         h.report(title, results, stat=stat)
+
+        # When PERF_KEEP=1 the harness preserves the fixtures.
+        # Print where they landed so the user can come back later
+        # (after the FS / metadata cache has actually evicted)
+        # and time a true archive-cold open via perf-fits-open-one.py.
+        if os.environ.get("PERF_KEEP"):
+            print("\nFixtures retained (PERF_KEEP=1):")
+            for n, fname in fixtures.items():
+                abs_path = os.path.abspath(fname)
+                print(f"  {abs_path}  ({n:,} HDUs)")
+            print(
+                "\nFor true archive-cold timing, wait until FS metadata"
+                " cache evicts (hours / a reboot), then run:"
+            )
+            print(
+                "  python perf/perf-fits-open-one.py "
+                f"{os.path.abspath(next(iter(fixtures.values())))}"
+            )
 
 
 if __name__ == "__main__":
