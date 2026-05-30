@@ -151,12 +151,12 @@ faster / lighter than the one-shot rustfits write.
      - rustfits append C=1k (K=100)
      - 63.1 ms
      - 163 MB
-     - :perf-par:`1.27× time, ≈ RAM`
+     - 1.27× time, ≈ RAM
    * -
      - rustfits append C=10k (K=10)
      - 50.5 ms
      - 163 MB
-     - :perf-par:`1.02× time, ≈ RAM`
+     - 1.02× time, ≈ RAM
    * - uncompressed, with VLA
      - rustfits write-once
      - 174.8 ms
@@ -166,12 +166,12 @@ faster / lighter than the one-shot rustfits write.
      - rustfits append C=1k (K=100)
      - 199.9 ms
      - 165 MB
-     - :perf-fast:`1.14× time, 1.3× less RAM`
+     - 1.14× time, 1.3× less RAM
    * -
      - rustfits append C=10k (K=10)
      - 156.4 ms
      - 165 MB
-     - :perf-fast:`0.89× time, 1.3× less RAM`
+     - 0.89× time, 1.3× less RAM
    * - ZTABLE, fixed-only
      - rustfits write-once
      - 2.03 s
@@ -181,12 +181,12 @@ faster / lighter than the one-shot rustfits write.
      - rustfits append C=1k (K=100)
      - 31.07 s
      - 187 MB
-     - :perf-slow:`15.3× time, ≈ RAM`
+     - 15.3× time, ≈ RAM
    * -
      - rustfits append C=10k (K=10)
      - 28.89 s
      - 188 MB
-     - :perf-slow:`14.3× time, ≈ RAM`
+     - 14.3× time, ≈ RAM
    * - ZTABLE, with VLA
      - rustfits write-once
      - 5.62 s
@@ -196,12 +196,12 @@ faster / lighter than the one-shot rustfits write.
      - rustfits append C=1k (K=100)
      - 37.73 s
      - 230 MB
-     - :perf-slow:`6.7× time, ≈ RAM`
+     - 6.7× time, ≈ RAM
    * -
      - rustfits append C=10k (K=10)
      - 35.25 s
      - 228 MB
-     - :perf-slow:`6.3× time, ≈ RAM`
+     - 6.3× time, ≈ RAM
 
 Cross-tool comparison on the uncompressed variants, paired
 row-by-row (``vs fitsio`` = ``fitsio_time / rustfits_time``;
@@ -304,6 +304,142 @@ Five things to take away:
    data write.  The fix is in fitsio (the underlying cfitsio
    ``fits_write_col`` doesn't need the flush); the gap will
    close once that wrapper is patched.
+
+2-D image extend — uncompressed mosaic build
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The mosaic / strip-build pattern: append per-detector frames
+(or per-night strips) to a growing image via
+``hdu.extend(strip)`` (rustfits) or
+``hdu.write(strip, start=(row, 0))`` (fitsio).  Both grow the
+slowest-varying axis — same primitive, two APIs.  Unlike
+ZTABLE/ZIMAGE, fitsio CAN extend uncompressed images, so this
+is a true cross-tool comparison.
+``perf/perf-image-extend-2d.py`` measures wall + peak RSS for
+write-once vs extend at two chunk sizes (100 rows and 1000
+rows) on a (20,000 × 4,000) ``f4`` image (~320 MB).
+
+.. list-table:: Uncompressed 2-D image extend (20 k × 4 k f4) — N=320 MB
+   :widths: 38 12 12 22
+   :header-rows: 1
+
+   * - regime
+     - build
+     - peak RSS
+     - vs rf write-once
+   * - fitsio write-once
+     - 174.7 ms
+     - 440 MB
+     - :perf-slow:`1.48× time, 1.2× more RAM` (fitsio)
+   * - rustfits write-once
+     - 117.9 ms
+     - 363 MB
+     - (ref)
+   * - rustfits extend C=100 rows (K=200)
+     - 119.0 ms
+     - 70 MB
+     - 1.01× time, 5.2× less RAM
+   * - fitsio extend C=100 rows (K=200)
+     - 231.4 ms
+     - 70 MB
+     - :perf-slow:`1.96× time` (fitsio), 5.2× less RAM
+   * - rustfits extend C=1000 rows (K=20)
+     - 117.1 ms
+     - 74 MB
+     - 0.99× time, 4.9× less RAM
+   * - fitsio extend C=1000 rows (K=20)
+     - 239.7 ms
+     - 74 MB
+     - :perf-slow:`2.03× time` (fitsio), 4.9× less RAM
+
+Three takeaways:
+
+1. **Bounded memory works in both tools.**  Either ``extend``
+   path keeps peak RSS at ~70–75 MB regardless of the final
+   image size (dominated by Python + numpy baseline; the
+   actual chunk's data is only 1.6–16 MB).  write-once needs
+   the whole image resident, plus per-tool overhead.  Both
+   tools deliver the same ~5× RAM win.
+
+2. **rustfits extend ≈ rustfits write-once on time.**  Both
+   chunk sizes match the write-once baseline within 2 %.  No
+   per-call overhead worth worrying about — for uncompressed
+   incremental builds the only cost vs write-once is the
+   bookkeeping for the NAXIS2 header update.
+
+3. **fitsio extend is ~2× slower than rustfits extend.**  At
+   both chunk sizes fitsio's per-extend cost is roughly double
+   rustfits' — same ratio as the write-once gap (1.48×), so
+   this is a general fitsio per-call overhead rather than
+   something specific to ``start=`` writes.  fitsio also holds
+   ~80 MB more RAM during write-once (440 vs 363 MB) —
+   suggesting it keeps an extra byteswapped copy that rustfits
+   avoids.
+
+2-D compressed image extend — mosaic build with GZIP_2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Same shape as the uncompressed bench (20,000 × 4,000 f4,
+~320 MB raw) but tile-compressed with GZIP_2 and tile shape
+``(100, cols)`` so the chunk-row axis maps directly to
+"tile-rows per append".  fitsio cannot extend a compressed
+image (cfitsio returns ``status = 107: tried to move past end
+of file`` on the second write), so the extend rows are
+rustfits-only; fitsio appears only as a write-once reference.
+``perf/perf-compressed-image-extend-2d.py``.
+
+.. list-table:: Compressed 2-D image extend (20 k × 4 k f4, GZIP_2 tile=(100, cols))
+   :widths: 44 12 12 22
+   :header-rows: 1
+
+   * - regime
+     - build
+     - peak RSS
+     - vs rf write-once
+   * - fitsio write-once
+     - 6.35 s
+     - 440 MB
+     - :perf-slow:`2.97× time` (fitsio)
+   * - rustfits write-once
+     - 2.14 s
+     - 625 MB
+     - (ref)
+   * - rustfits extend C=50 rows (K=400, sub-tile)
+     - 46.18 s
+     - 455 MB
+     - 21.6× time, 1.4× less RAM
+   * - rustfits extend C=100 rows (K=200, exact tile)
+     - 16.27 s
+     - 321 MB
+     - 7.6× time, 2.0× less RAM
+   * - rustfits extend C=1000 rows (K=20, 10 tiles)
+     - 3.27 s
+     - 338 MB
+     - 1.5× time, 1.8× less RAM
+
+Three takeaways:
+
+1. **Multi-tile chunks are nearly free.**  At chunk=1000 rows
+   (10 tiles per call) extend is only 1.5× write-once — the
+   per-extend overhead is one heap-relocate-forward and a
+   PCOUNT bump, amortized across the 10 tiles' encode work.
+   For mosaic builds that can buffer multi-tile strips, this
+   is the regime to aim for.
+
+2. **Exact-tile chunks are moderate.**  At chunk=100 rows (1
+   tile per call) extend costs 7.6× write-once — the per-call
+   overhead dominates because there's only one tile's worth
+   of "real" encode work per call but the same bookkeeping.
+
+3. **Sub-tile chunks pay heavily.**  At chunk=50 rows (½ tile)
+   every append decompresses + merges into the partial last
+   tile then re-encodes it: 21.6× write-once — the same
+   mirror-pattern as the ZTABLE small-chunk re-encode finding
+   in the table-append section above.  For compressed 2-D
+   mosaic builds, **align chunks to a multiple of tile-rows**
+   (or buffer to that size in user code) to skip the
+   re-encode tax.  Improving the partial-tile path is tracked
+   in ``CLAUDE.md`` under Performance TODO #10.
 
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

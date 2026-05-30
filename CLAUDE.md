@@ -2387,6 +2387,8 @@ wrapper around cfitsio).  Headline wins:
 | Uncompressed table append (VLA, vs fitsio append) | **200–210× faster** (fitsio per-call HDU close/reopen) |
 | Image extend (peak RSS) | up to 16× less RAM than write-once |
 | Table append (VLA, peak RSS) | 1.3× less RAM than write-once |
+| 2-D image extend, uncompressed (vs fitsio extend) | ~2× faster, ~5× less RAM than write-once |
+| 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
 
 ZTABLE (compressed BINTABLE) is a rustfits self-comparison —
 fitsio's Python API can't decompress it.
@@ -2658,15 +2660,46 @@ worth checking comes up; cross items off as they ship.
    Documented in `docs/tutorial/performance.rst` under
    "Incremental table builds".
 
-4. **2-D image extend (uncompressed + compressed).**  We have
-   1-D extend benches (healsparse-like + the uncompressed 1-D
-   case); the 2-D mosaic-build pattern (append per-detector
-   frames to a growing image) isn't benched.  How to check:
-   build a `(R, C)` image by stacking `R/K` frames via `extend`,
-   compare to write-once; both uncompressed and a compressed
-   algorithm (HCOMPRESS_1 or GZIP_2).  Bench targets:
-   `perf/perf-image-extend-2d.py`,
-   `perf/perf-compressed-image-extend-2d.py`.
+4. ✅ **2-D image extend (uncompressed + compressed).**  Done.
+   `perf/perf-image-extend-2d.py` and
+   `perf/perf-compressed-image-extend-2d.py` cover the mosaic /
+   strip-build pattern on a (20,000 × 4,000) f4 image.
+
+   **Findings (uncompressed):** rustfits extend matches rustfits
+   write-once on time (~117 ms either way) and achieves a ~5×
+   peak-RSS win at chunk=100 rows (70 MB chunk vs 363 MB
+   whole-array).  fitsio CAN extend uncompressed images via
+   `f[0].write(strip, start=(row, 0))`, and fitsio extend gets
+   the same bounded-memory benefit; rustfits extend is ~2×
+   faster than fitsio extend (same ratio as write-once, so it's
+   general per-call overhead in fitsio).  fitsio also holds
+   ~80 MB more RAM during write-once (440 vs 363 MB) — likely
+   an extra byteswapped copy rustfits avoids.
+
+   **Findings (compressed, GZIP_2, tile=(100, cols)):**
+   - multi-tile chunks (10 tiles per call): 1.5× write-once, 1.8× less RAM
+   - exact-tile chunks (1 tile per call): 7.6× write-once
+   - sub-tile chunks (½ tile per call): **21.6× write-once** —
+     same partial-last-tile re-encode pattern as the ZTABLE
+     small-chunk append finding.  For mosaic builds align chunks
+     to a multiple of tile-rows to avoid the re-encode tax.
+     Tracked in TODO #10.
+
+   **Bench methodology note:** `_data.des_array` was rewritten to
+   generate in row-strips because the naive
+   `rng.standard_normal((R, C))` + `rng.random((R, C)) < zero_frac`
+   pattern allocates two full-image temporaries before freeing
+   them, inflating peak RSS by ~2× for the write-once row and
+   making the bounded-memory win look better than it is.  After
+   the fix, peak RSS reflects "the user's array + FITS handle
+   overhead", not "the user's array + numpy data-gen churn".
+
+   fitsio cannot extend compressed images
+   (`fits status = 107: tried to move past end of file`), so the
+   compressed bench is rustfits-only on the extend rows.
+
+   Documented in `docs/tutorial/performance.rst` under
+   "2-D image extend".
 
 5. **`repack()` timing on a large heap.**  Both
    `TableHDU.repack()` (VLA orphan reclaim) and

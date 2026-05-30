@@ -288,6 +288,8 @@ def _cell(text: str, width: int, align: str) -> str:
 # stdout reporting and for any consumer that aggregates everything.
 SCRIPTS_WITH_NARRATIVE: set[str] = {
     "perf-table-append.py",
+    "perf-image-extend-2d.py",
+    "perf-compressed-image-extend-2d.py",
 }
 
 
@@ -411,6 +413,23 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "Same shape as the compressed healsparse benches; "
         "``CompressedImageHDU.extend`` appends chunks.  fitsio cannot "
         "append compressed.",
+    ),
+    "perf-image-extend-2d.py": (
+        "Uncompressed 2-D image build — mosaic / strip extend vs write-once",
+        "(20 k × 4 k) ``f4`` image, ~320 MB.  Builds the image by "
+        "appending row-strips via ``hdu.extend(strip)`` (rustfits) "
+        "or ``hdu.write(strip, start=(row, 0))`` (fitsio); both "
+        "grow the slowest-varying axis.  Cross-tool extend "
+        "comparison (fitsio CAN extend uncompressed images via "
+        "``start=``).",
+    ),
+    "perf-compressed-image-extend-2d.py": (
+        "Compressed 2-D image build — mosaic extend vs write-once",
+        "Same shape as the uncompressed 2-D extend bench, GZIP_2 with "
+        "``(100, cols)`` tiles.  Chunk sweep covers sub-tile (re-encodes "
+        "partial trailing tile), exact-tile, and multi-tile alignments. "
+        "fitsio cannot extend compressed images, so this is a rustfits "
+        "self-comparison.",
     ),
 }
 

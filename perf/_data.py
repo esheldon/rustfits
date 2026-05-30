@@ -39,12 +39,24 @@ def des_array(rows, cols, zero_frac, seed=0):
     2-D f4 noise with a fraction ``zero_frac`` of exact-zero (masked)
     pixels; pixel [0, 0] is always zeroed as a known check point for the
     dither2 zero-preservation guarantee.
+
+    Generated in row-strips so peak working set stays near the output
+    array's own size rather than 2-3x (the naive ``rng.standard_normal`` +
+    ``rng.random < zero_frac`` allocates two full-image temporaries
+    before freeing them, which on a 320 MB output blew the peak RSS up
+    to ~720 MB before the bench had touched any FITS code).  Strip
+    generation keeps the temporaries at ~strip-size; the only persistent
+    allocation is the output array itself.
     """
     rng = np.random.default_rng(seed)
-    data = rng.standard_normal((rows, cols), dtype=np.float32)
-    if zero_frac > 0:
-        mask = rng.random((rows, cols), dtype=np.float32) < zero_frac
-        data[mask] = 0.0
+    data = np.empty((rows, cols), dtype=np.float32)
+    strip = 256
+    for i in range(0, rows, strip):
+        h = min(strip, rows - i)
+        data[i : i + h] = rng.standard_normal((h, cols), dtype=np.float32)
+        if zero_frac > 0:
+            m = rng.random((h, cols), dtype=np.float32) < zero_frac
+            data[i : i + h][m] = 0.0
     data[0, 0] = 0.0
     return data
 
