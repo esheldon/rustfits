@@ -2622,16 +2622,34 @@ worth checking comes up; cross items off as they ship.
      above (A / B / C, plus the shared iterator refactor) is
      ready to pick from.
 
-3. **Table append (uncompressed + compressed).**  Incremental
-   catalog builds are a real workflow but `TableHDU.append` /
-   `CompressedTableHDU.append` aren't benched.  The 1-D image
-   extend bench surfaced a bounded-memory win that's likely to
-   recur here.  How to check: build a table of N rows by N/K calls
-   to `append(K rows)` vs one `write` of all N; compare wall +
-   peak RSS for both uncompressed and ZTABLE.  Bench target:
-   `perf/perf-table-append.py` (parallel to `perf-image-extend-1d.py`).
-   Especially worth covering VLA columns (the append path's
-   heap-relocate-forward is the most complex case).
+3. ✅ **Table append (uncompressed + compressed).**  Done.
+   `perf/perf-table-append.py` covers all four variants
+   {uncompressed, ZTABLE} × {fixed-only, with VLA}, building
+   N rows by N/K calls to `append(K rows)` vs one `write_table`
+   of all N.  Each build runs in a subprocess for a clean
+   `ru_maxrss`; fitsio write-once appears as a reference on the
+   uncompressed variants only (no fitsio ZTABLE writer).
+
+   **Smoke-run findings (N=20 k, chunks 500/5000):**
+   - Uncompressed fixed-only: 1.13×–1.50× slower than write-once
+     (expected; just per-call overhead, linear in K).
+   - Uncompressed VLA: 0.90×–1.15× — at chunk=5k the append loop
+     was actually *faster* than write-once.  Hypothesis: the
+     write-once path plans the whole 20 k-row VLA heap layout up
+     front (one big allocation + walk); the append loop pays it
+     incrementally and lets allocator pressure even out.  Worth
+     a flamegraph at larger N to confirm.
+   - ZTABLE fixed-only: **14.3×–14.7× SLOWER** at both chunk
+     sizes — the merge-into-partial-last-tile re-encode dominates
+     when chunks << ZTILELEN.  Surfaced as a follow-up item
+     (#10 below).
+   - ZTABLE VLA: 6.3×–6.5× slower — same merge-tile cost but the
+     write-once baseline is 3× the fixed-only case so the ratio
+     is softer.
+
+   Peak-RSS comparisons need N ≥ 100 k to be interesting (at
+   N=20 k everything fits and the differences are noise).  Run
+   `--nrows 500000` to see the bounded-memory story properly.
 
 4. **2-D image extend (uncompressed + compressed).**  We have
    1-D extend benches (healsparse-like + the uncompressed 1-D
@@ -2700,6 +2718,28 @@ worth checking comes up; cross items off as they ship.
    download-then-open overhead from the parse cost.  Lowest
    priority of this batch; only worth doing if remote-read
    usage comes up.
+
+10. **ZTABLE small-chunk append: partial-last-tile re-encode
+    cost.**  Surfaced by perf-table-append.py (#3 above): with
+    `chunk << ZTILELEN` (default ZTILELEN ≈ 10 MB / row_width,
+    which is ~16 k rows for the test catalog) every append
+    decompresses + merges into the same partial trailing tile
+    and re-encodes it.  Measured 14× slower than write-once on
+    the fixed-only smoke run (N=20 k, chunks 500/5000 — every
+    chunk touched the trailing tile).  Real-world streaming
+    pipelines (per-frame source extraction, per-file harvest)
+    tend to deliver small batches, so this is the typical use
+    case, not a corner.  Possible optimizations: (a) buffer
+    in-RAM until the partial tile fills, then encode once;
+    (b) skip the re-decode by keeping the trailing tile's raw
+    bytes in a per-HDU "pending tile" buffer and growing it in
+    place.  (a) is simpler but adds a user-visible "what if I
+    close without flushing" question; (b) is invisible to the
+    user but more invasive.  Decide approach after measuring on
+    a realistic streaming workload (e.g. simulate
+    per-detector-frame catalog writes).  Could pair with #4
+    (2-D image extend) since the same pattern applies to
+    compressed-image extend.
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache

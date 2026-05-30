@@ -383,6 +383,19 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "RSS comparison is rustfits-self plus fitsio's write-once "
         "as a reference.",
     ),
+    "perf-table-append.py": (
+        "Table append — incremental catalog build vs write-once",
+        "Type-exhaustive catalog (same as the BINTABLE read/write "
+        "benches); four variants pair {uncompressed, ZTABLE} × "
+        "{fixed-only, with VLA}.  Builds N rows by N/K calls to "
+        "``hdu.append(K rows)`` against the one-shot "
+        "``f.write_table(N rows)`` reference; fitsio write-once on "
+        "the uncompressed variants only (it has no ZTABLE writer). "
+        "ZTABLE small-chunk rows pay a per-call partial-tile "
+        "re-encode; VLA rows additionally exercise the heap "
+        "relocate-forward (uncompressed) or dual-descriptor heap "
+        "(ZTABLE).",
+    ),
     "perf-compressed-image-extend-healsparse.py": (
         "Compressed 1-D image build — bounded-memory extend vs write-once",
         "Same shape as the compressed healsparse benches; "
