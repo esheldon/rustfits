@@ -167,6 +167,7 @@ def main():
         header = "  ".join(h._cell(c, w, a) for c, w, a in cols)
         print(header)
         print("-" * len(header))
+        title = f"Uncompressed 1-D image extend / RSS (N={n:,} f8)"
         for name, (t, r) in rows:
             if name.startswith("rustfits extend"):
                 note = f"{t / ref_t:.2f}x time, {ref_r / r:.1f}x less RAM"
@@ -181,6 +182,18 @@ def main():
                 (note, 26, "l"),
             ]
             print("  ".join(h._cell(x, w, a) for x, w, a in cells))
+            h.emit_record(
+                {
+                    "kind": "rss",
+                    "suite": title,
+                    "op": name,
+                    "build_s": t,
+                    "peak_rss_mb": r / 1024,
+                    "ref_build_s": ref_t,
+                    "ref_peak_rss_mb": ref_r / 1024,
+                    "nbytes": n * 8,
+                }
+            )
 
 
 if __name__ == "__main__":

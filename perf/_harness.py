@@ -309,32 +309,47 @@ def report(title: str, results, *, stat: str = "median") -> None:
             row.append((_note(r, stat), 26, "l"))
         print("  ".join(_cell(t, w, a) for t, w, a in row))
 
-    _emit_json(title, results, stat)
+    for r in results:
+        emit_record(
+            {
+                "kind": "cross_tool",
+                "suite": title,
+                "op": r.op,
+                "stat": stat,
+                "rustfits_s": r.rustfits.stat(stat),
+                "fitsio_s": (r.fitsio.stat(stat) if r.fitsio else None),
+                "astropy_s": (r.astropy.stat(stat) if r.astropy else None),
+                "nbytes": r.nbytes,
+                "target_s": r.target_s,
+                "note": r.note,
+            }
+        )
 
 
-def _emit_json(title: str, results, stat: str) -> None:
+def emit_record(record: dict) -> None:
+    """
+    Append a free-form record (as JSON line) to ``$PERF_JSON`` if set.
+
+    Used both by ``report()`` automatically (one record per Result)
+    and by scripts that bypass ``report()`` -- the RSS extend
+    benches and the ZTABLE self-comparisons -- so a runner like
+    ``perf-all.py`` can aggregate every script's results uniformly.
+
+    Records SHOULD include a ``"kind"`` field categorizing the
+    record (``"cross_tool"`` for vs-fitsio, ``"self_comparison"``
+    for ZTABLE-style self-vs-self, ``"rss"`` for the RSS extend
+    benches, etc.) so the runner can sort them into the right
+    output table.  A ``"script"`` field is auto-filled from the
+    ``PERF_SCRIPT`` env var when the runner is active, so callers
+    don't need to repeat it.  No-op when ``PERF_JSON`` is not set,
+    so scripts work standalone too.
+    """
     out = os.environ.get("PERF_JSON")
     if not out:
         return
+    if "script" not in record:
+        script = os.environ.get("PERF_SCRIPT")
+        if script:
+            record = {"script": script, **record}
     with open(out, "a") as fh:
-        for r in results:
-            fh.write(
-                json.dumps(
-                    {
-                        "suite": title,
-                        "op": r.op,
-                        "stat": stat,
-                        "rustfits_s": r.rustfits.stat(stat),
-                        "fitsio_s": (
-                            r.fitsio.stat(stat) if r.fitsio else None
-                        ),
-                        "astropy_s": (
-                            r.astropy.stat(stat) if r.astropy else None
-                        ),
-                        "nbytes": r.nbytes,
-                        "target_s": r.target_s,
-                        "note": r.note,
-                    }
-                )
-                + "\n"
-            )
+        fh.write(json.dumps(record) + "\n")

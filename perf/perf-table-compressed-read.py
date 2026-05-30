@@ -151,6 +151,18 @@ def main():
                 (h.fmt_rate(nbytes, zt.median), 13, "r"),
             ]
             print("  ".join(h._cell(x, w, a) for x, w, a in cells))
+            h.emit_record(
+                {
+                    "kind": "self_comparison",
+                    "suite": title,
+                    "op": label,
+                    "primary_label": "ZTABLE",
+                    "primary_s": zt.median,
+                    "secondary_label": "uncompressed",
+                    "secondary_s": un.median,
+                    "nbytes": nbytes,
+                }
+            )
 
 
 if __name__ == "__main__":
