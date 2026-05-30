@@ -2630,26 +2630,30 @@ worth checking comes up; cross items off as they ship.
    `ru_maxrss`; fitsio write-once appears as a reference on the
    uncompressed variants only (no fitsio ZTABLE writer).
 
-   **Smoke-run findings (N=20 k, chunks 500/5000):**
-   - Uncompressed fixed-only: 1.13×–1.50× slower than write-once
-     (expected; just per-call overhead, linear in K).
-   - Uncompressed VLA: 0.90×–1.15× — at chunk=5k the append loop
-     was actually *faster* than write-once.  Hypothesis: the
-     write-once path plans the whole 20 k-row VLA heap layout up
-     front (one big allocation + walk); the append loop pays it
-     incrementally and lets allocator pressure even out.  Worth
-     a flamegraph at larger N to confirm.
-   - ZTABLE fixed-only: **14.3×–14.7× SLOWER** at both chunk
-     sizes — the merge-into-partial-last-tile re-encode dominates
-     when chunks << ZTILELEN.  Surfaced as a follow-up item
-     (#10 below).
-   - ZTABLE VLA: 6.3×–6.5× slower — same merge-tile cost but the
-     write-once baseline is 3× the fixed-only case so the ratio
-     is softer.
+   **Findings (N=100 k, chunks 1000/10000; default ZTILELEN
+   ≈ 16 k rows):**
+   - Uncompressed fixed-only: 1.03×–1.27× slower than write-once
+     (essentially flat at chunk=10 k).  Linear scaling, RSS
+     identical to write-once.
+   - Uncompressed VLA: 0.93×–1.19× — chunk=10 k is actually
+     *faster* than write-once, AND peak RSS drops from 216 MB
+     (write-once) to ~166 MB (append, either chunk size) =
+     **1.3× less peak RSS**.  The write-once path plans the
+     whole heap layout in RAM up front; the append loop pays it
+     incrementally.  The real bounded-memory win on the table
+     side.
+   - ZTABLE fixed-only: **14.3×–15.4× SLOWER** — the
+     merge-into-partial-last-tile re-encode dominates when
+     chunks << ZTILELEN.  Both chunk sizes (1 k and 10 k) are
+     below ZTILELEN so every append touches the trailing tile.
+     RSS comparable to write-once.  Surfaced as a follow-up
+     item (#10 below).
+   - ZTABLE VLA: 6.3×–6.7× slower — same merge-tile cost in
+     absolute terms, but the write-once baseline is 3× the
+     fixed-only case so the relative ratio is softer.
 
-   Peak-RSS comparisons need N ≥ 100 k to be interesting (at
-   N=20 k everything fits and the differences are noise).  Run
-   `--nrows 500000` to see the bounded-memory story properly.
+   Documented in `docs/tutorial/performance.rst` under
+   "Incremental table builds".
 
 4. **2-D image extend (uncompressed + compressed).**  We have
    1-D extend benches (healsparse-like + the uncompressed 1-D
