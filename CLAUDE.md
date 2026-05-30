@@ -5107,10 +5107,45 @@ worth checking comes up; cross items off as they ship.
    a GPFS mount (the user's HPC has access) to quantify the
    per-seek penalty.  If a 1000-HDU file's eager open is e.g.
    1 s on GPFS vs 4 ms on SSD, the case for shipping at least
-   C (and maybe A) is concrete.  Add a
-   `perf-fits-read-one-hdu-lazy.py` alongside that compares
-   lazy vs eager for the "read just HDU N" pattern (which would
-   be needed to show A's pay-per-HDU win beyond just deferral).
+   C (and maybe A) is concrete.  The companion
+   `perf-fits-open-one.py` script times a single open against a
+   pre-existing path (build a fixture today with `PERF_KEEP=1`,
+   come back days later when the FS metadata cache has actually
+   evicted, time the cold open) — see its docstring for the
+   archive-cold workflow.
+
+   **Bench findings (2026-05-30) — shelved pending user
+   complaint.**  Ran `perf-fits-open-many-hdus.py` on local SSD,
+   a local HDD `/tmp`, and a GPFS mount; also ran with `--cold`
+   (no warmup, worst-sample) and against `vmtouch -e`-evicted
+   fixtures on GPFS.
+
+   - **rustfits scales linearly on every filesystem tested**
+     (per-HDU time flat across 100×–10000× range in N): 3.6–4.1
+     µs/HDU on SSD, 10–11 µs/HDU on HDD /tmp, 11–14 µs/HDU on
+     GPFS.  No quadratic-on-open bug.
+   - **rustfits is 1.2×–1.6× FASTER than fitsio** on the
+     apples-to-apples walk across every regime.
+   - **Eager-open absolute cost on GPFS** (warm + OS-evicted
+     are equivalent here): 1.3 ms at N=100, 11 ms at N=1000,
+     111–148 ms at N=10000.  Tolerable for any interactive use.
+   - **OS page cache eviction (`vmtouch -e`) had no effect** —
+     the GPFS pagepool is the dominant cache layer and isn't
+     reachable from userspace.  We could not measure a
+     *truly* archive-cold open (file untouched for days +
+     pagepool evicted under memory pressure); that's the regime
+     that would make lazy a clear win, but we lack a test path
+     to it without waiting days or finding a real archive
+     fixture.
+   - **Verdict**: no smoking gun.  Within everything we can
+     measure, eager open is fast on GPFS.  Shelved pending
+     either (a) a real user complaint about slow open on a
+     cold-archive file, or (b) future opportunity to time a
+     genuinely cold archive fixture (multi-week-old multi-HDU
+     survey file) — the unmeasured regime that could still
+     surprise us.  When either of those lands, the design space
+     above (A / B / C, plus the shared iterator refactor) is
+     ready to pick from.
 
 **Status: all five phases shipped.  Some write-side paths still
 re-parse; deferred until measured to be hot.**
