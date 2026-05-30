@@ -596,14 +596,85 @@ pub(crate) fn parse_string_keyword(cards: &[String], key: &str) -> Option<String
 
 // Reverse each `itemsize`-byte chunk in place.  Used to convert FITS
 // big-endian numeric data to native little-endian after a raw read on
-// little-endian hosts.  No-op when itemsize <= 1.
+// little-endian hosts.  No-op when itemsize <= 1; callers also guard
+// with `cfg!(target_endian = "big")` so this never runs on BE hosts
+// (FITS is already native).
+//
+// Dispatched on itemsize so each branch can use primitive `swap_bytes`
+// (a portable intrinsic LLVM lowers to BSWAP on x86-64, REV on ARM64,
+// `rev8` on RISC-V Zbb, etc.).  Modern LLVM auto-vectorizes the
+// resulting chunks_exact_mut::<uN> loop with the platform's byte-
+// shuffle SIMD (PSHUFB on SSSE3/AVX2, NEON REV/TBL on ARM, V on
+// RISC-V).  The fallback `chunk.reverse()` for unknown widths is
+// ~5x slower because per-byte swap with a dynamic chunk length
+// doesn't vectorize.
+//
+// itemsize=16 covers complex doubles (c16 = 2 × f8 components); the
+// byteswap is *per 8-byte component*, NOT a full 16-byte reversal
+// (which would swap real/imag).  Same for itemsize=8 vs c8 (2 × f4
+// components) — but c8 callers pass itemsize=4 explicitly via
+// byteswap_unit, so the 8-byte branch handles plain f8/i8 only.
 pub(crate) fn byteswap_in_place(buf: &mut [u8], itemsize: usize) {
-    if itemsize <= 1 {
-        return;
+    match itemsize {
+        0 | 1 => {}
+        2 => swap_chunks_2(buf),
+        4 => swap_chunks_4(buf),
+        8 => swap_chunks_8(buf),
+        16 => {
+            // c16 = 2 × f8 components.  Swap each component, NOT the
+            // whole 16-byte unit (which would flip real <-> imag).
+            swap_chunks_8(buf);
+        }
+        _ => {
+            // Should never fire for FITS data (no other itemsize is
+            // legal).  Kept as a safety net.
+            for chunk in buf.chunks_exact_mut(itemsize) {
+                chunk.reverse();
+            }
+        }
     }
-    for chunk in buf.chunks_exact_mut(itemsize) {
-        chunk.reverse();
+}
+
+// Specialized helpers — `chunks_exact_mut::<u16/u32/u64>` returns
+// aligned chunks the compiler vectorizes cleanly.  Each chunk's
+// `swap_bytes` is a single BSWAP instruction; LLVM coalesces
+// consecutive BSWAPs into PSHUFB on AVX2 / SSSE3 hosts.
+#[inline]
+fn swap_chunks_2(buf: &mut [u8]) {
+    let (head, body, tail) = unsafe { buf.align_to_mut::<u16>() };
+    for x in body {
+        *x = x.swap_bytes();
     }
+    debug_assert!(head.is_empty() && tail.is_empty(),
+        "byteswap_in_place(itemsize=2): expected u16-aligned buffer");
+    // numpy buffers are always primitive-aligned; head/tail handle
+    // the pathological case for safety.
+    for chunk in head.chunks_exact_mut(2) { chunk.reverse(); }
+    for chunk in tail.chunks_exact_mut(2) { chunk.reverse(); }
+}
+
+#[inline]
+fn swap_chunks_4(buf: &mut [u8]) {
+    let (head, body, tail) = unsafe { buf.align_to_mut::<u32>() };
+    for x in body {
+        *x = x.swap_bytes();
+    }
+    debug_assert!(head.is_empty() && tail.is_empty(),
+        "byteswap_in_place(itemsize=4): expected u32-aligned buffer");
+    for chunk in head.chunks_exact_mut(4) { chunk.reverse(); }
+    for chunk in tail.chunks_exact_mut(4) { chunk.reverse(); }
+}
+
+#[inline]
+fn swap_chunks_8(buf: &mut [u8]) {
+    let (head, body, tail) = unsafe { buf.align_to_mut::<u64>() };
+    for x in body {
+        *x = x.swap_bytes();
+    }
+    debug_assert!(head.is_empty() && tail.is_empty(),
+        "byteswap_in_place(itemsize=8): expected u64-aligned buffer");
+    for chunk in head.chunks_exact_mut(8) { chunk.reverse(); }
+    for chunk in tail.chunks_exact_mut(8) { chunk.reverse(); }
 }
 
 // ===== RawBuffer: raw Py_buffer wrapper =====
