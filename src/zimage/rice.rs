@@ -143,15 +143,16 @@ fn sign_extend(val: u64, nbits: u32) -> i64 {
 }
 
 // Decode one RICE_1-compressed tile to target-dtype bytes in
-// numpy native byte order.  The raw decode produces `n_pixels`
-// values widened to i64 in the order the encoder consumed them
-// (row-major FITS order within the tile); we then cast each
-// value down to the storage dtype (matching ZBITPIX) and write
-// it out in native byte order.
+// numpy native byte order.  Hot path (BYTEPIX in {1, 2, 4}) uses a
+// cfitsio-shaped 32-bit bit buffer + u32::leading_zeros for unary
+// counting + direct index-write into a typed scratch.  BYTEPIX=8
+// (no canonical writer produces it; we accept it on read for
+// completeness) falls through to a slow general-purpose path
+// because the 64-bit raw diffs don't fit in a 32-bit bit buffer.
 //
-// `zbitpix` must be one of 8/16/32/64 — float ZBITPIX is rejected
-// upstream because the decompressor needs the quantization
-// (ZSCALE/ZZERO) layer that Phase 5 will add.
+// `zbitpix` is the final output bit-depth (8/16/32/64); float
+// ZBITPIX is rejected upstream because the decompressor needs the
+// quantization (ZSCALE/ZZERO) layer applied separately.
 pub(crate) fn decode_rice(
     compressed: &[u8],
     n_pixels: usize,
@@ -168,12 +169,196 @@ pub(crate) fn decode_rice(
         ));
     }
     let (bbits, fsbits, fsmax) = rice_params(bytepix)?;
+    if bytepix == 8 {
+        return decode_rice_slow_i64(
+            compressed, n_pixels, bbits, fsbits, fsmax, blocksize, zbitpix,
+        );
+    }
+    let mut decoded: Vec<i32> = vec![0; n_pixels];
+    decode_rice_int_u32buf(
+        compressed, n_pixels, bbits, fsbits, fsmax, blocksize, &mut decoded,
+    )?;
+    Ok(cast_i32_to_target_bytes(&decoded, zbitpix))
+}
 
+// Fast core: BYTEPIX in {1, 2, 4}.  Direct port of cfitsio's
+// `fits_rdecomp` (and its _short / _byte variants — the inner
+// algorithm is identical, only the bbits/fsbits/fsmax constants
+// differ).  Uses a single u32 bit buffer `b` carrying `nbits`
+// valid bits, refilled 8 bits at a time from the input slice.
+// Unary counting uses `u32::leading_zeros` (LZCNT on x86-64-v2)
+// in place of cfitsio's 256-entry nonzero_count LUT.  Output
+// written directly to `out[i]` instead of pushed onto a Vec.
+fn decode_rice_int_u32buf(
+    c: &[u8],
+    nx: usize,
+    bbits: u32,
+    fsbits: u32,
+    fsmax: u32,
+    nblock: u32,
+    out: &mut [i32],
+) -> PyResult<()> {
+    debug_assert!(out.len() == nx);
+    debug_assert!(bbits == 8 || bbits == 16 || bbits == 32);
+
+    let seed_bytes = (bbits / 8) as usize;
+    if c.len() < seed_bytes + 1 {
+        return Err(PyValueError::new_err(
+            "RICE decode: input shorter than seed + 1 byte"
+        ));
+    }
+
+    // Seed: bbits-bit big-endian, sign-extended to i32.
+    let mut seed_u: u32 = 0;
+    for k in 0..seed_bytes {
+        seed_u = (seed_u << 8) | (c[k] as u32);
+    }
+    let mut lastpix: i32 = if bbits < 32 {
+        let shift = 32 - bbits;
+        ((seed_u << shift) as i32) >> shift
+    } else {
+        seed_u as i32
+    };
+
+    let bbits_mask: u32 = if bbits == 32 { u32::MAX } else { (1u32 << bbits) - 1 };
+
+    let mut pos = seed_bytes;
+    let mut b: u32 = c[pos] as u32;
+    pos += 1;
+    let mut nbits: i32 = 8;
+    let mut i: usize = 0;
+
+    while i < nx {
+        // Read fsbits to get stored_fs (1..fsmax+1, or 0 = low-entropy run).
+        nbits -= fsbits as i32;
+        while nbits < 0 {
+            if pos >= c.len() {
+                return Err(PyValueError::new_err(
+                    "RICE decode: unexpected end of stream reading fs"
+                ));
+            }
+            b = (b << 8) | (c[pos] as u32);
+            pos += 1;
+            nbits += 8;
+        }
+        let stored_fs: i32 = (b >> nbits) as i32 & ((1i32 << fsbits) - 1);
+        let fs: i32 = stored_fs - 1;
+        b &= (1u32 << nbits).wrapping_sub(1);
+
+        let imax = (i + nblock as usize).min(nx);
+
+        if fs < 0 {
+            // Low-entropy: every pixel in the block equals lastpix.
+            for k in i..imax {
+                out[k] = lastpix;
+            }
+        } else if (fs as u32) == fsmax {
+            // High-entropy: each diff is bbits raw bits, ZigZag-
+            // decoded.  Use a u64 staging buffer because bbits=32 +
+            // up to 7 leftover bits = 39 bits, doesn't fit in u32.
+            for k in i..imax {
+                let mut wide: u64 = b as u64;
+                let mut have: u32 = nbits as u32;
+                while have < bbits {
+                    if pos >= c.len() {
+                        return Err(PyValueError::new_err(
+                            "RICE decode: unexpected end of stream (raw)"
+                        ));
+                    }
+                    wide = (wide << 8) | (c[pos] as u64);
+                    pos += 1;
+                    have += 8;
+                }
+                let leftover = have - bbits;
+                let diff: u32 = ((wide >> leftover) & bbits_mask as u64) as u32;
+                b = if leftover == 0 {
+                    0
+                } else {
+                    (wide & ((1u64 << leftover) - 1)) as u32
+                };
+                nbits = leftover as i32;
+                let zz: i32 = if (diff & 1) == 0 {
+                    (diff >> 1) as i32
+                } else {
+                    !(diff >> 1) as i32
+                };
+                lastpix = lastpix.wrapping_add(zz);
+                out[k] = lastpix;
+            }
+        } else {
+            // Normal Rice with parameter k = fs.  Unary high bits +
+            // k low bits → ZigZag → diff.  This is the hot path.
+            let fs_u = fs as u32;
+            for k in i..imax {
+                // Count leading zero bits: refill 8 at a time while
+                // b is exactly zero (each refill adds 8 to nbits, so
+                // the final `nbits - bit_pos` accounts for ALL the
+                // skipped zero bytes — don't separately accumulate
+                // into nzero).  Matches cfitsio exactly.
+                while b == 0 {
+                    nbits += 8;
+                    if pos >= c.len() {
+                        return Err(PyValueError::new_err(
+                            "RICE decode: unexpected end of stream (unary)"
+                        ));
+                    }
+                    b = c[pos] as u32;
+                    pos += 1;
+                }
+                // Position of highest set bit in b (1-indexed from
+                // LSB).  After the refill above, b is in 1..=255 so
+                // this is 1..=8 — equivalent to cfitsio's
+                // `nonzero_count[b]` LUT.
+                let bit_pos = (32 - b.leading_zeros()) as i32;
+                let nzero: i32 = nbits - bit_pos;
+                nbits = bit_pos - 1;
+                // Flip the leading one bit (consume it).
+                b ^= 1u32 << nbits;
+
+                // Read fs more low-order bits.
+                nbits -= fs as i32;
+                while nbits < 0 {
+                    if pos >= c.len() {
+                        return Err(PyValueError::new_err(
+                            "RICE decode: unexpected end of stream (rice tail)"
+                        ));
+                    }
+                    b = (b << 8) | (c[pos] as u32);
+                    pos += 1;
+                    nbits += 8;
+                }
+                let diff: u32 = ((nzero as u32) << fs_u) | (b >> nbits);
+                b &= (1u32 << nbits).wrapping_sub(1);
+
+                let zz: i32 = if (diff & 1) == 0 {
+                    (diff >> 1) as i32
+                } else {
+                    !(diff >> 1) as i32
+                };
+                lastpix = lastpix.wrapping_add(zz);
+                out[k] = lastpix;
+            }
+        }
+        i = imax;
+    }
+
+    Ok(())
+}
+
+// Slow path retained for BYTEPIX=8: 64-bit diffs don't fit in a
+// 32-bit bit buffer.  Uses the generic BitReader.  Rarely exercised
+// in practice — neither cfitsio nor fitsio nor astropy produce
+// BYTEPIX=8 RICE files (rustfits's encoder also rejects it).
+fn decode_rice_slow_i64(
+    compressed: &[u8],
+    n_pixels: usize,
+    bbits: u32,
+    fsbits: u32,
+    fsmax: u32,
+    blocksize: u32,
+    zbitpix: i32,
+) -> PyResult<Vec<u8>> {
     let mut br = BitReader::new(compressed);
-
-    // Seed: first pixel as `bbits` bits, sign-extended.  For
-    // BYTEPIX=8 we read 64 bits which fills u64; sign_extend
-    // returns it as-is via the early-out.
     let seed_raw = br.read_bits(bbits)?;
     let mut lastpix: i64 = sign_extend(seed_raw, bbits);
 
@@ -185,15 +370,10 @@ pub(crate) fn decode_rice(
         let block_pixels = (blocksize as usize).min(n_pixels - i);
 
         if fs < 0 {
-            // Low-entropy run — every pixel in this block equals
-            // the previous decoded value.  No further bits.
             for _ in 0..block_pixels {
                 out.push(lastpix);
             }
         } else if (fs as u32) >= fsmax {
-            // Raw branch.  Each diff is `bbits` bits, ZigZag-
-            // decoded, added to lastpix.  In practice this rarely
-            // fires — only when the encoder gave up on Rice.
             for _ in 0..block_pixels {
                 let raw = br.read_bits(bbits)?;
                 let diff = unzigzag(raw);
@@ -201,8 +381,6 @@ pub(crate) fn decode_rice(
                 out.push(lastpix);
             }
         } else {
-            // Standard Rice with parameter k = fs.  Unary high
-            // bits + k low bits → ZigZag code → diff.
             let k = fs as u32;
             for _ in 0..block_pixels {
                 let top = br.read_unary()? as u64;
@@ -477,6 +655,44 @@ pub(crate) fn encode_rice(
     }
 
     Ok(writer.finish())
+}
+
+// Cast a Vec<i32> of decoded pixel values (from the BYTEPIX in
+// {1, 2, 4} fast path) to bytes in the target (stored) dtype,
+// numpy-native byte order.  Like the i64 cousin, but lets the fast
+// path stay in i32 throughout — narrower scratch, simpler code.
+fn cast_i32_to_target_bytes(values: &[i32], zbitpix: i32) -> Vec<u8> {
+    match zbitpix {
+        8 => {
+            let mut out = Vec::with_capacity(values.len());
+            for &v in values {
+                out.push(v as u8);
+            }
+            out
+        }
+        16 => {
+            let mut out = Vec::with_capacity(values.len() * 2);
+            for &v in values {
+                out.extend_from_slice(&(v as i16).to_ne_bytes());
+            }
+            out
+        }
+        32 => {
+            let mut out = Vec::with_capacity(values.len() * 4);
+            for &v in values {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            out
+        }
+        64 => {
+            let mut out = Vec::with_capacity(values.len() * 8);
+            for &v in values {
+                out.extend_from_slice(&(v as i64).to_ne_bytes());
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 // Cast a Vec<i64> of decoded pixel values to bytes in the target

@@ -4591,33 +4591,40 @@ not its compression ratio.  Scripts:
   `_compread.py` the shared 1-D runner.
 - `perf-compressed-2d-isolation.py` — the codec isolation sweep below.
 
-**2-D RICE decode is ~2.5–3× SLOWER than cfitsio (open optimization
-target, 2026-05-29).**  The DES-like 2-D lossy workload (RICE_1 +
-quantize, SUBTRACTIVE_DITHER_2 so masked zeros survive) reads SLOWER in
-rustfits than fitsio — the opposite of the GZIP_2 result below.  The
-isolation sweep (`perf-compressed-2d-isolation.py`, 4000×4000 f4,
-whole-file band walk) pinned the cause to the **RICE decoder itself**,
-not quantization, float, or 2-D tile assembly:
+**2-D RICE decode rewrite (2026-05-29).**  The DES-like 2-D lossy
+workload originally showed rustfits RICE decode at 0.38× (~2.6× slower
+than cfitsio); the isolation sweep (`perf-compressed-2d-isolation.py`)
+pinned the cost to the decoder itself, not quantization or tile
+assembly.  Rewrote `src/zimage/rice.rs::decode_rice` to match
+cfitsio's `fits_rdecomp` shape — single 32-bit bit buffer + `nbits`
+counter, `u32::leading_zeros` (LZCNT) for unary counting in place of
+the per-bit `read_bits(1)` loop, direct index-write into a typed `i32`
+scratch instead of `Vec<i64> + push` + cast pass.  Before/after on the
+isolation sweep:
 
-| isolation case | rustfits vs fitsio |
-|---|---|
-| gzip2 f4 unquantized | 1.28× (faster) |
-| gzip2 f4 quantized   | 1.09× (faster) |
-| rice  i4 lossless    | **0.38× (SLOWER)** |
-| rice  f4 quantized   | **0.38× (SLOWER)** |
+| isolation case | before | after |
+|---|---|---|
+| rice i4 lossless [whole]  | 0.39× SLOW (271 ms) | **0.91×** (115 ms) |
+| rice f4 quant [whole]     | 0.39× SLOW (305 ms) | **0.83×** (142 ms) |
+| rice i4 lossless [stamps] | 0.62× SLOW (184 ms) | **1.42× FASTER** (80 ms) |
+| rice f4 quant [stamps]    | 0.62× SLOW (207 ms) | **1.22× FASTER** (105 ms) |
+| gzip2 f4 unquant [whole]  | 1.29× (unchanged)  | 1.29× (unchanged)  |
+| gzip2 f4 quant [whole]    | 1.10× (unchanged)  | 1.10× (unchanged)  |
 
-- GZIP_2 is rustfits-faster in 2-D too, so 2-D tile assembly is fine.
-- Dequant is free — gzip2-quant ≥ gzip2-unquant (quantized i32 is
-  smaller to inflate), so lossy quantization is not the cost.
-- `rice i4 lossless` is slow with NO quantization at all → the cost is
-  in `src/zimage/rice.rs` decode: cfitsio RICE ~615 MB/s vs rustfits
-  ~235 MB/s.  `rice.rs` is a correct, byte-exact port but its
-  `BitReader` decode loop has not had the profile-and-fix treatment the
-  GZIP_2 slice path got ("How the gap closed" below).  **Optimizing the
-  RICE decoder is the next perf lead.**  (Bonus oddity from the sweep:
-  with large tiles + scattered 32×32 stamp reads, fitsio re-decodes a
-  full tile per stamp and is catastrophically slow — rustfits ~17×
-  faster there.)
+RICE i4 decode throughput: ~236 MB/s → ~556 MB/s (2.4× faster).
+Stamps now beat fitsio outright; whole-file reads near par (0.83–
+0.91×).  The remaining whole-file gap may be in the
+`cast_i32_to_target_bytes` pass — a future direct-to-bytes output
+shape could shave it but isn't worth the surface churn today.
+
+Implementation lives in `decode_rice_int_u32buf` (the fast core for
+BYTEPIX in {1, 2, 4} — 99% of real RICE files) with a slow path
+`decode_rice_slow_i64` for the BYTEPIX=8 case (which no canonical
+writer produces; we accept it on read for completeness).  The
+high-entropy branch uses a `u64` staging buffer because 32-bit raw
+diffs + up to 7 leftover bits is 39 bits — wouldn't fit in u32.
+Byte-exact tested by the existing RICE round-trip suite (all
+algorithms × all dtypes × encoder cross-check with fitsio).
 
 **Write/encode benchmarks (2026-05-29).**  The write side
 (`perf-compressed-image-write-healsparse.py` for 1-D GZIP_2,
@@ -4628,7 +4635,7 @@ the encode/decode × GZIP/RICE matrix:
 |---|---|
 | GZIP_2 decode (1-D healsparse) | 1.8–45× faster |
 | GZIP_2 encode (matched level 1) | **2.32× faster** |
-| RICE decode (2-D)  | 0.38× (~2.6× slower — the one tall pole) |
+| RICE decode (2-D)  | 0.83–0.91× whole / 1.22–1.42× FASTER stamps (rewritten 2026-05-29) |
 | RICE encode        | 0.99× (≈ par) |
 
 - **GZIP_2 encode is rustfits-faster once the level is matched.**  A
@@ -4715,11 +4722,11 @@ healsparse/random distinction.  A clear split:
   chunk size (no compressed heap to relocate → O(N) linear), unlike
   the compressed extend's ~quadratic chunk penalty.
 
-So uncompressed write is no longer a tall pole; the remaining
-optimization leads are **RICE decode** (~0.38× — the only big gap
-left) and **uncompressed bulk read** (~0.84×).  GZIP_2 read+encode,
-RICE encode, uncompressed table write, uncompressed extend, and now
-uncompressed image write all favor rustfits.
+So uncompressed write is no longer a tall pole; the only remaining
+optimization lead is **uncompressed bulk read** (~0.84×).  GZIP_2
+read+encode, RICE read (post-rewrite) + encode, uncompressed table
+write, uncompressed extend, and uncompressed image write all favor
+rustfits.
 
 **Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py` reads
 a deliberately type-exhaustive 34-column catalog (every scalar type, f4/f8
