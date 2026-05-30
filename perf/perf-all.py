@@ -364,6 +364,17 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "Same catalog.  Self-comparison (no other Python library "
         "writes ZTABLE).",
     ),
+    # FITS container
+    "perf-fits-open-many-hdus.py": (
+        "Open file with many HDUs",
+        "Synthetic files with N empty image HDUs (N=100/1000/10000). "
+        "Two regimes per N: ``bare open`` (rustfits eager parse vs "
+        "fitsio lazy noop -- different constructor contracts, "
+        "rustfits looks slower) and ``open + walk all`` "
+        "(apples-to-apples; both walk every HDU).  The note column "
+        "carries per-HDU normalized time -- flat across N confirms "
+        "linear scaling (cfitsio had a quadratic-on-open bug here).",
+    ),
     # Extend (RSS)
     "perf-image-extend-1d.py": (
         "Uncompressed 1-D image build — bounded-memory extend vs write-once",

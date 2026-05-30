@@ -4952,20 +4952,165 @@ Open perf investigations not yet measured.  Add to this list (with
 a one-line "why we suspect" and a "how to check") when something
 worth checking comes up; cross items off as they ship.
 
-1. **Opening a file with many HDUs.**  Real-world surveys often
-   produce files with hundreds to thousands of HDUs (per-exposure
-   detector mosaics, per-tile catalogs, sliced cubes).  fitsio had
-   to fix a quadratic-on-open bug here historically — every HDU's
-   header parse re-walked from the file start, so 1000 HDUs ≈ 1M
-   card reads.  rustfits's `FITS::new` builds an `HduOffsets` per
-   HDU during `parse_hdus_from_file`; check that it's linear in
-   the HDU count and not accidentally quadratic in cards read.
-   How to check: build a synthetic file with N empty image HDUs
-   (N ∈ {100, 1000, 10_000}), time `FITS(fname, "r")`, plot
-   open time vs N.  fitsio is the cross-tool reference.  If
-   rustfits is comparable or faster: write the bench as
-   `perf/perf-fits-open-many-hdus.py` and we're done.  If it's
-   worse: profile + fix.
+1. ✅ **Opening a file with many HDUs.**  Done 2026-05-30.
+   `perf/perf-fits-open-many-hdus.py` sweeps N ∈ {100, 1000, 10000},
+   builds a fixture with N minimal image HDUs (1-byte u1), and
+   times fresh open per iter in two regimes.
+
+   **Result: both rustfits and fitsio scale linearly** (per-HDU
+   time flat across the 100× range in N — rustfits 3.6–4.1 µs/HDU,
+   fitsio 5.7–6.1 µs/HDU on the apples-to-apples walk).  No
+   quadratic-on-open bug.  On the apples-to-apples comparison
+   (rustfits eager parse vs fitsio open + `update_hdu_list()`),
+   **rustfits is ~1.6× FASTER** at every N.
+
+   Two regimes per N because the constructors have different
+   contracts: rustfits is EAGER (`parse_hdus_from_file` runs at
+   open), fitsio is LAZY at construction (no HDU list built until
+   first access — at which point fitsio also walks every HDU, not
+   just the requested one).  The "bare open" row therefore shows
+   rustfits "slower" — it's honestly doing real work fitsio is
+   deferring; the "open + walk all HDUs" row is the truthful
+   comparison and the one that would show a quadratic bug if
+   there was one.
+
+2. **Discuss: should rustfits be lazy on open like fitsio?**  The
+   bench above (item 1) showed rustfits's eager `parse_hdus_from_file`
+   is fast on a local SSD — ~4 µs/HDU, so even a 10 k-HDU file opens
+   in ~40 ms.  But the cost scales linearly with N, and on slow /
+   high-latency filesystems (GPFS / Lustre / network-mounted
+   archives) where every seek is a network round trip, that
+   ~4 µs/HDU could explode to milliseconds/HDU — a 10 k-HDU file
+   would take seconds to open even before the user has touched any
+   HDU.
+
+   The benefit of fitsio's model is NOT "skip the HDUs you don't
+   read" — once you touch ANY HDU it walks them all (`fits[0]`,
+   `__repr__`, `len(fits)` after touch all trigger
+   `update_hdu_list()`).  The benefit is purely REPL ergonomics:
+   `f = fitsio.FITS(fname)` returns immediately so the prompt comes
+   back fast, even on a slow filesystem.  Total parse cost is the
+   same — just shifted from the constructor to the first access.
+
+   Reasons to stay eager (what the codebase assumes today):
+   simpler invariants (`fits[i]` is O(1), never raises a parse
+   error after construction); `len(fits)` works immediately;
+   the shared `Arc<FileLayout>` model in `common.rs` relies on
+   knowing every HDU's offset up front so cross-HDU growth (header
+   grow, image extend, table append) can atomically bump later
+   offsets — every mutation site would need a "walk before shift"
+   guard, which is a wide cross-cutting surface easy to miss.
+
+   **Scope cut: lazy is read-only only.**  Reject `lazy=True` with
+   `mode != "r"` in the constructor and the entire mutation guard
+   surface disappears (mutation pymethods are unreachable when
+   lazy=True).  This collapses the change from "audit every
+   shift_file_tail_and_update_offsets caller" to "wire one new
+   cursor into the read-side getters."  Read-only is also the
+   workload where slow-filesystem latency actually matters — write
+   workflows tend to be local-scratch.
+
+   **Three options — NOT mutually exclusive.**  These can ship
+   independently and a future state could combine multiple
+   (e.g. C provides fitsio-feel for the REPL while A provides the
+   top-level batch-script form; both address different use cases
+   and don't conflict).
+
+   **Option A — top-level `rustfits.read(fname, ext=N, lazy=True)`.**
+   Smallest viable form for the batch case.  Bypasses the `FITS`
+   pyclass entirely: open the file, walk HDUs 0..N-1 parsing just
+   enough header to compute each one's data extent + advance the
+   cursor, then call the existing per-HDU read code on the matched
+   offset.  Returns the array (and optionally header, like the
+   existing `rustfits.read`).  No warm handle, no `FITS` object
+   lifecycle, no offset cache — two calls = two walks.  Pros: tiny
+   code change (~150 lines), zero invariant changes, ships
+   immediate value for batch scripts on archive filesystems (the
+   dominant slow-FS case).  Cons: doesn't help the REPL / multi-HDU
+   workflow.
+
+   **Option B — `FITS(fname, "r", lazy=True)` per-HDU cursor.**
+   Warm-handle form with genuine pay-per-HDU.  Constructor parses
+   only HDU 0; subsequent `fits[i]` triggers
+   `ensure_parsed_through(i)` which walks the cursor forward,
+   pushing new `HduOffsets` as it goes.  `len(fits)` and
+   `__iter__` trigger a full walk (forced eager).  `__repr__`
+   shows only the parsed HDUs plus a "(lazy; N additional HDUs
+   not yet inspected)" banner.  Pros: matches fitsio's REPL
+   ergonomics PLUS genuine pay-per-HDU for partial-walk patterns
+   (`fits[0]`, `fits[1]` = 2 HDUs parsed, not all N).  Cons:
+   `FileLayout` grows a parse cursor + `complete: AtomicBool`;
+   ~100-200 lines including repr tweak; lazy mode adds one new
+   user-visible kwarg with its own test surface.
+
+   **Option C — `FITS(fname, "r", lazy=True)` defer-the-full-walk
+   (fitsio's model).**  Smallest of the three, ~50-100 lines.
+   Constructor skips `parse_hdus_from_file` entirely; the FIRST
+   access to anything that needs offsets (`fits[i]`, `__len__`,
+   `__iter__`, `__repr__`) triggers the walk all at once,
+   identical to today's eager parse just deferred.  After first
+   touch the FileLayout is identical to today's at-construction
+   state — every subsequent access is O(1).  Mechanics:
+   `FileLayout` gets a `walked: AtomicBool`; a small
+   `ensure_walked()` helper runs the walk under a mutex + Acquire
+   load, idempotent on subsequent calls.  A handful of `FITS`
+   pymethods that touch offsets prepend `self.ensure_walked()?;`.
+   HDU pymethods don't change (once you have an HDU object via
+   `fits[i]`, the walk already happened).  Pros: smallest LOC of
+   the three; no shared refactor needed; total parse cost
+   unchanged (just deferred) so steady-state behavior is
+   identical.  Cons: only buys REPL feel — first access still
+   walks every HDU; strictly weaker than B for partial-walk
+   patterns.
+
+   **Default vs opt-in for B and C.**  fitsio's lazy IS the
+   default — there's no opt-in kwarg.  Two routes for rustfits:
+   - **`lazy=True` opt-in kwarg (default eager).**  Backwards
+     compatible: existing user code keeps today's "construct =
+     parse" semantics including the error timing (corrupt-HDU
+     errors surface at the `FITS(fname)` call).  Explicit signal
+     that the user is opting into the deferred model.  This is
+     the safer default for a library that already shipped with
+     eager semantics.
+   - **Lazy by default (matching fitsio).**  Migration-friendly;
+     no kwarg discovery burden.  But shifts error timing —
+     corrupt HDU 17 fails at `fits[i]` or `len()` instead of
+     `FITS(fname)`.  Existing test code that does `try:
+     FITS(fname) except IOError:` would need to move the except
+     to the first access.
+
+   Recommendation: start with `lazy=True` opt-in to avoid
+   silently changing error semantics for existing users.  Flip
+   the default later if real-world usage shows the opt-in form
+   is awkward.
+
+   **Shared enabling refactor (only needed for A + B; C doesn't
+   need it; ~50 lines).**  Pull the per-HDU walk step (parse
+   header at offset, compute data extent, advance cursor) out of
+   `parse_hdus_from_file` into a stand-alone iterator/primitive.
+   Then today's `parse_hdus_from_file` consumes it to completion,
+   Option A drives it until match, Option B holds it and consumes
+   on demand.  No code duplication between A and B.  Option C
+   reuses `parse_hdus_from_file` verbatim under the
+   `ensure_walked()` guard — no refactor needed.
+
+   **Composition.**  The realistic shipping shape is probably
+   **C + A**: C gives fitsio-feel for interactive / REPL use of
+   the `FITS` handle (cheapest to build, matches the model
+   migrating users already understand); A gives the genuine
+   one-shot read-this-HDU shortcut that bypasses the handle
+   entirely.  B is the most powerful but also the most code;
+   defer until C + A are in the wild and there's evidence the
+   warm-handle-with-partial-walk pattern matters.
+
+   **How to validate.**  Bench `perf-fits-open-many-hdus.py` on
+   a GPFS mount (the user's HPC has access) to quantify the
+   per-seek penalty.  If a 1000-HDU file's eager open is e.g.
+   1 s on GPFS vs 4 ms on SSD, the case for shipping at least
+   C (and maybe A) is concrete.  Add a
+   `perf-fits-read-one-hdu-lazy.py` alongside that compares
+   lazy vs eager for the "read just HDU N" pattern (which would
+   be needed to show A's pay-per-HDU win beyond just deferral).
 
 **Status: all five phases shipped.  Some write-side paths still
 re-parse; deferred until measured to be hot.**
