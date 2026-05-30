@@ -5147,6 +5147,95 @@ worth checking comes up; cross items off as they ship.
      above (A / B / C, plus the shared iterator refactor) is
      ready to pick from.
 
+3. **Table append (uncompressed + compressed).**  Incremental
+   catalog builds are a real workflow but `TableHDU.append` /
+   `CompressedTableHDU.append` aren't benched.  The 1-D image
+   extend bench surfaced a bounded-memory win that's likely to
+   recur here.  How to check: build a table of N rows by N/K calls
+   to `append(K rows)` vs one `write` of all N; compare wall +
+   peak RSS for both uncompressed and ZTABLE.  Bench target:
+   `perf/perf-table-append.py` (parallel to `perf-image-extend-1d.py`).
+   Especially worth covering VLA columns (the append path's
+   heap-relocate-forward is the most complex case).
+
+4. **2-D image extend (uncompressed + compressed).**  We have
+   1-D extend benches (healsparse-like + the uncompressed 1-D
+   case); the 2-D mosaic-build pattern (append per-detector
+   frames to a growing image) isn't benched.  How to check:
+   build a `(R, C)` image by stacking `R/K` frames via `extend`,
+   compare to write-once; both uncompressed and a compressed
+   algorithm (HCOMPRESS_1 or GZIP_2).  Bench targets:
+   `perf/perf-image-extend-2d.py`,
+   `perf/perf-compressed-image-extend-2d.py`.
+
+5. **`repack()` timing on a large heap.**  Both
+   `TableHDU.repack()` (VLA orphan reclaim) and
+   `CompressedImageHDU.repack()` / `CompressedTableHDU.repack()`
+   ship as streaming + staging implementations that should be
+   bounded-memory, but neither has been timed against a large
+   heap.  How to check: build a fixture with K cycles of
+   `(write_vla / __setitem__) → repack` to grow heap orphans,
+   then time the repack pass at increasing heap sizes (10 MB,
+   100 MB, 1 GB).  Verify peak RSS stays bounded.  Bench
+   targets: `perf/perf-table-repack.py`,
+   `perf/perf-compressed-image-repack.py`,
+   `perf/perf-table-compressed-repack.py`.
+
+6. **Compressed-image `__setitem__` cost.**  Decode → modify →
+   re-encode per touched tile.  A "patch a few pixels" workflow
+   (interactive masking, bad-pixel fix-up) pays full tile
+   re-encode for every tile the selection touches.  Could be
+   surprisingly slow per call; we don't know.  How to check:
+   time a single-pixel write on a tile-aligned vs tile-spanning
+   selection, across all 5 algorithms; compare to uncompressed
+   `__setitem__` (which is a memcpy).  Bench target:
+   `perf/perf-compressed-image-setitem.py`.  Likely outcome:
+   per-call cost is dominated by re-encode of one tile; report
+   it in ms/pixel-write so users have a number to budget
+   against.
+
+7. **Fix: compressed-image checksum still materializes the
+   full ndarray.**  This is a FIX, not a measurement.
+   `read_uncompressed_image_be_bytes` in
+   `hdu_image_compressed/checksum.rs` builds the whole
+   equivalent-uncompressed image in RAM before feeding the
+   checksum stream — predates the [[feedback_stream_large_data]]
+   rule.  Every other large-data path in the codebase is
+   chunked; the compressed-table checksum already streams
+   per-tile and is the model.  Should be chunked per-tile (the
+   natural decode unit) so peak RSS is bounded at one tile of
+   bytes instead of full-image bytes.  Documented but never
+   closed.
+
+8. **Random/scattered access on compressed 1-D.**  Covered for
+   2-D RICE (stamps in the DES bench); no equivalent for 1-D
+   GZIP_2.  Tile cache behavior may differ when stamps land on
+   1-D strip tiles.  How to check: read 1000 random 1k-row
+   chunks from a 50M-row GZIP_2 file; compare rustfits vs
+   fitsio; vary the tile cache size to expose the cache-hit-
+   rate dependency.  Bench target:
+   `perf/perf-compressed-image-read-1d-scattered.py`.
+
+9. **Remote read perf (http/https/ftp/ftps).**  Shipped but not
+   benched.  Network IO dominates total time so the comparison
+   is probably uninteresting until / unless a user asks.  How
+   to check: serve a fixture via local `http.server`, time
+   `rustfits.FITS("http://localhost/...")` end-to-end; compare
+   to local-file open of the same file to isolate the
+   download-then-open overhead from the parse cost.  Lowest
+   priority of this batch; only worth doing if remote-read
+   usage comes up.
+
+**Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
+- Write-side header-meta cache extension (the read-side cache
+  Phases 1–5 are shipped; write paths still re-parse — deferred
+  until measured to be hot).  See "Header-derived metadata
+  caching" below.
+- Byte-exact heap agreement with cfitsio on quantized floats —
+  correctness/parity item, not perf.  Decoded values are
+  bit-exact; raw heap bytes differ by qsort tie-breaking.  Not
+  worth fixing absent a specific need.
+
 **Status: all five phases shipped.  Some write-side paths still
 re-parse; deferred until measured to be hot.**
 
