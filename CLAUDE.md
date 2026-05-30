@@ -4762,32 +4762,44 @@ That lead is now closed; all uncompressed image read regimes are
 
 So uncompressed write is no longer a tall pole.  Every uncompressed
 image read+write regime now favors rustfits.  GZIP_2 read+encode,
-RICE read (post-rewrite) + encode, uncompressed table write,
+RICE read (post-rewrite) + encode, uncompressed table read+write,
 uncompressed extend, and uncompressed image read+write all favor
-rustfits.  The one remaining sub-par bench is **uncompressed table
-BULK read** (~0.83× whole, 0.88× row slice) — column subset and
-scattered rows already win.  Bulk likely needs a similar per-column
-strip-walk optimization.
+rustfits.  No remaining sub-par bench in the matrix.
 
-**Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py` reads
-a deliberately type-exhaustive 34-column catalog (every scalar type, f4/f8
-fixed sub-arrays 1-D & 2-D, both S and U fixed + VLA strings, an f4 VLA;
-see `_data.catalog_arrays`).  Same selective-vs-bulk split as the image
-reads:
+**Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py`
+reads a deliberately type-exhaustive 34-column catalog (every scalar
+type, f4/f8 fixed sub-arrays 1-D & 2-D, both S and U fixed + VLA
+strings, an f4 VLA; see `_data.catalog_arrays`).  After the VLA
+heap-batching fix, all four regimes win:
 
 | regime | rustfits vs fitsio |
 |---|---|
-| whole table          | 0.84× (slower) |
-| column subset (3/34) | **1.77× faster** |
-| row slice            | 0.88× (slower) |
-| scattered rows       | **2.23× faster** |
+| whole table          | **1.23× FASTER** |
+| column subset (3/34) | **2.04× FASTER** |
+| row slice            | **1.32× FASTER** |
+| scattered rows       | **2.56× FASTER** |
 
-- **Selective access favors rustfits** — column projection (1.77×) and
-  scattered object lookups (2.23×), the dominant catalog patterns.
-- **Bulk read trails** (0.84–0.88×) — same byteswap/copy tall pole as the
-  uncompressed image bulk read.
-- A 290 MB (500k-row) file gives the same ratios as a 1.1 GB (2M-row)
-  one, so the smaller file is representative for iteration.
+**The fix (2026-05-29).**  Pre-fix, whole-table and row-slice both
+trailed fitsio (~0.83-0.88×).  Isolating with VLA columns excluded
+showed the VLA path was the bottleneck — fixed-column-only reads
+were already 1.23× FASTER than fitsio.  `heap_pass` in
+`src/hdu_table/read.rs` was doing one `seek + read_exact` per VLA
+cell (1.5M cells in the test = 1.5M syscalls).  Replaced with a
+chunked heap reader: cells are sorted by heap_offset, the
+contiguous extent containing each cell is loaded in bounded chunks
+of 1 MiB (the same convention every other large-data path uses —
+see `common.rs::CHUNK`), and each refill greedy-extends to cover
+as many following cells as fit in the budget.  Sparse cells
+(scattered-row reads with cells far apart) naturally collapse to
+~per-cell reads of just what's needed; dense reads (whole-table /
+contiguous slice) collapse to ~1 syscall per 1 MiB of heap.  Peak
+per-call memory bounded at the chunk size regardless of heap size.
+
+- **Selective access still favors rustfits strongly** — column
+  projection (2.04×) and scattered object lookups (2.56×), the
+  dominant catalog patterns.
+- A 290 MB (500k-row) file gives the same ratios as a 1.1 GB
+  (2M-row) one, so the smaller file is representative for iteration.
 - Cross-tool VLA caveat: fitsio reads VLA columns padded-to-max by
   default (`vstorage="fixed"`); the benchmark reads fitsio with
   `vstorage="object"` to match rustfits's object cells.  The timing

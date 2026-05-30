@@ -729,11 +729,10 @@ fn heap_pass(
     let heap_base_file = data_offset + theap;
     var_cells.sort_by_key(|c| c.heap_offset);
 
-    let mut guard = lock_file(file_handle)?;
-    let f = guard.as_mut()
-        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-
-    let mut buf: Vec<u8> = Vec::new();
+    // Validate descriptors + compute per-cell read length up-front.
+    let mut cell_lens: Vec<usize> = Vec::with_capacity(var_cells.len());
+    let mut min_off: u64 = u64::MAX;
+    let mut max_end: u64 = 0;
     for cell in &var_cells {
         if cell.nelements < 0 || cell.heap_offset < 0 {
             return Err(PyIOError::new_err(format!(
@@ -743,28 +742,112 @@ fn heap_pass(
             )));
         }
         let n = cell.nelements as usize;
-        let col = &columns[cell.col_idx];
-        let inner = col.tform_letter;
-        // X (bit-packed) VLA: descriptor `nelements` is the BIT count
-        // (per the FITS spec), and the on-disk heap holds
-        // ceil(nelements/8) bytes per cell.  All other inner letters
-        // have a fixed element width on disk.
+        let inner = columns[cell.col_idx].tform_letter;
         let read_len = if inner == 'X' {
             n.div_ceil(8)
         } else {
             let elem_size = bytes_per_element(inner).unwrap();
             n * elem_size
         };
-        let abs_offset = heap_base_file + cell.heap_offset as u64;
-        f.seek(SeekFrom::Start(abs_offset))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        buf.resize(read_len, 0);
-        if read_len > 0 {
-            f.read_exact(&mut buf)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        cell_lens.push(read_len);
+        let off = cell.heap_offset as u64;
+        if off < min_off {
+            min_off = off;
         }
+        let end = off + read_len as u64;
+        if end > max_end {
+            max_end = end;
+        }
+    }
+
+    // Stream the heap in bounded-size chunks.  Cells are sorted by
+    // heap_offset; for each cell, ensure a chunk covering it is
+    // resident in `heap_buf`, then slice into it.  Each (re)load
+    // greedily extends to cover as many following cells as fit in
+    // HEAP_CHUNK_BYTES, so densely-packed cells collapse to one
+    // syscall per chunk while sparse cells read only what they need.
+    //
+    // The chunk budget caps peak per-call memory at ~1 MiB
+    // regardless of heap size — rustfits files are GB-scale and we
+    // never unconditionally load a whole heap (it could exceed
+    // available RAM).  1 MiB matches the established streaming
+    // convention used by every other large-data path (image strip
+    // I/O, compressed-table append/repack, byteswap scratch — see
+    // `common.rs::CHUNK` and friends).  For VLA cells averaging a
+    // few tens of bytes, a 1 MiB chunk covers tens of thousands of
+    // cells per syscall, which is plenty to amortize the per-chunk
+    // overhead.  Numpy output for the cells already processed
+    // accumulates separately — the user opted into that memory by
+    // calling read() on a VLA table.
+    let _ = max_end;
+    let _ = min_off;
+    const HEAP_CHUNK_BYTES: usize = 1 << 20;
+
+    let mut heap_buf: Vec<u8> = Vec::new();
+    let mut chunk_start: u64 = 0;
+
+    let read_chunk = |buf: &mut Vec<u8>, start_off: u64, end_off: u64,
+                      file_handle: &FileHandle, base: u64|
+     -> PyResult<()> {
+        let len = (end_off - start_off) as usize;
+        buf.clear();
+        buf.resize(len, 0);
+        if len == 0 {
+            return Ok(());
+        }
+        let mut guard = lock_file(file_handle)?;
+        let f = guard.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(base + start_off))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(buf)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    };
+
+    for (i, cell) in var_cells.iter().enumerate() {
+        let n = cell.nelements as usize;
+        let col = &columns[cell.col_idx];
+        let read_len = cell_lens[i];
+        let cell_off = cell.heap_offset as u64;
+
+        // Refill the chunk if this cell falls outside the resident
+        // range.  Greedy-extend within the HEAP_CHUNK_BYTES budget
+        // so densely-packed cells share one read.  A single oversize
+        // cell (rare; > 16 MiB) still gets exactly its own bytes.
+        let chunk_end = chunk_start + heap_buf.len() as u64;
+        if heap_buf.is_empty()
+            || cell_off < chunk_start
+            || cell_off + read_len as u64 > chunk_end
+        {
+            let mut take_end = cell_off + read_len as u64;
+            let mut j = i + 1;
+            while j < var_cells.len() {
+                let next_off = var_cells[j].heap_offset as u64;
+                let next_end = next_off + cell_lens[j] as u64;
+                if next_end - cell_off > HEAP_CHUNK_BYTES as u64
+                    && j > i + 1
+                {
+                    break;
+                }
+                take_end = take_end.max(next_end);
+                if take_end - cell_off > HEAP_CHUNK_BYTES as u64 {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            read_chunk(
+                &mut heap_buf, cell_off, take_end, file_handle,
+                heap_base_file,
+            )?;
+            chunk_start = cell_off;
+        }
+
+        let rel = (cell_off - chunk_start) as usize;
+        let src = &heap_buf[rel..rel + read_len];
         let value = build_var_cell_value(
-            py, col, &buf, n, cell.output_row, as_bytes,
+            py, col, src, n, cell.output_row, as_bytes,
             scaling_kinds[cell.col_idx],
         )?;
         if single_column {
