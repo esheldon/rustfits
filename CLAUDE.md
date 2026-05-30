@@ -4946,7 +4946,26 @@ plus the header-meta cache:
   LRU tile cache — sequential reads wouldn't get the same
   cache amplification.
 
-## Header-derived metadata caching (shipped, 2026-05-26)
+## Performance TODO
+
+Open perf investigations not yet measured.  Add to this list (with
+a one-line "why we suspect" and a "how to check") when something
+worth checking comes up; cross items off as they ship.
+
+1. **Opening a file with many HDUs.**  Real-world surveys often
+   produce files with hundreds to thousands of HDUs (per-exposure
+   detector mosaics, per-tile catalogs, sliced cubes).  fitsio had
+   to fix a quadratic-on-open bug here historically — every HDU's
+   header parse re-walked from the file start, so 1000 HDUs ≈ 1M
+   card reads.  rustfits's `FITS::new` builds an `HduOffsets` per
+   HDU during `parse_hdus_from_file`; check that it's linear in
+   the HDU count and not accidentally quadratic in cards read.
+   How to check: build a synthetic file with N empty image HDUs
+   (N ∈ {100, 1000, 10_000}), time `FITS(fname, "r")`, plot
+   open time vs N.  fitsio is the cross-tool reference.  If
+   rustfits is comparable or faster: write the bench as
+   `perf/perf-fits-open-many-hdus.py` and we're done.  If it's
+   worse: profile + fix.
 
 **Status: all five phases shipped.  Some write-side paths still
 re-parse; deferred until measured to be hot.**
