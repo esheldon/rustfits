@@ -46,24 +46,29 @@ def main():
     import fitsio
 
     nrows = args.nrows
-    fname = h.path("wtable.fits")
     data, vd = _data.catalog_arrays(nrows)
 
     def rf_write():
+        fname = h.fresh_path("wtable-rf")
         with rustfits.FITS(fname, "w+") as f:
             f.write_table(data, var_dtypes=vd)
 
     def fi_write():
+        fname = h.fresh_path("wtable-fi")
         with fitsio.FITS(fname, "rw", clobber=True) as f:
             f.write(data)
 
     with h.scratch():
         # Correctness gate: each tool's write round-trips.
-        rf_write()
-        with rustfits.FITS(fname) as f:
+        gate_rf = h.fresh_path("wtable-gate-rf")
+        gate_fi = h.fresh_path("wtable-gate-fi")
+        with rustfits.FITS(gate_rf, "w+") as f:
+            f.write_table(data, var_dtypes=vd)
+        with rustfits.FITS(gate_rf) as f:
             _data.compare_catalog(f[1].read(), data, vd)
-        fi_write()
-        with fitsio.FITS(fname) as f:
+        with fitsio.FITS(gate_fi, "rw", clobber=True) as f:
+            f.write(data)
+        with fitsio.FITS(gate_fi) as f:
             _data.compare_catalog(f[1].read(vstorage="object"), data, vd)
 
         import os
@@ -71,7 +76,8 @@ def main():
         itemsize = data.dtype.itemsize
         print(
             f"table: {nrows:,} rows x {len(data.dtype.names)} cols, "
-            f"row={itemsize} B, {os.path.getsize(fname) / 1e6:,.0f} MB on disk"
+            f"row={itemsize} B, "
+            f"{os.path.getsize(gate_rf) / 1e6:,.0f} MB on disk"
         )
 
         result = h.bench(

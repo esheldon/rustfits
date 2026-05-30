@@ -40,28 +40,33 @@ def main():
     args = ap.parse_args()
 
     nrows = args.nrows
-    fz = h.path("ztable.fits.fz")
-    uc = h.path("utable.fits")
     data, vd = _data.catalog_arrays(nrows)
 
     def write_z():
-        with rustfits.FITS(fz, "w+") as f:
+        fname = h.fresh_path("ztable") + ".fz"
+        with rustfits.FITS(fname, "w+") as f:
             f.write_table(data, var_dtypes=vd, compress=True)
 
     def write_u():
-        with rustfits.FITS(uc, "w+") as f:
+        fname = h.fresh_path("utable")
+        with rustfits.FITS(fname, "w+") as f:
             f.write_table(data, var_dtypes=vd)
 
     with h.scratch():
-        # Gate: both writes round-trip.
-        write_z()
-        with rustfits.FITS(fz) as f:
+        # Gate: both writes round-trip.  Also gives us a stable
+        # file for the size-on-disk report below.
+        gate_z = h.fresh_path("ztable-gate") + ".fz"
+        gate_u = h.fresh_path("utable-gate")
+        with rustfits.FITS(gate_z, "w+") as f:
+            f.write_table(data, var_dtypes=vd, compress=True)
+        with rustfits.FITS(gate_z) as f:
             _data.compare_catalog(f[1].read(), data, vd)
-        write_u()
-        with rustfits.FITS(uc) as f:
+        with rustfits.FITS(gate_u, "w+") as f:
+            f.write_table(data, var_dtypes=vd)
+        with rustfits.FITS(gate_u) as f:
             _data.compare_catalog(f[1].read(), data, vd)
 
-        zsize, usize = os.path.getsize(fz), os.path.getsize(uc)
+        zsize, usize = os.path.getsize(gate_z), os.path.getsize(gate_u)
         itemsize = data.dtype.itemsize
         print(
             f"table: {nrows:,} rows x {len(data.dtype.names)} cols, "

@@ -1668,17 +1668,39 @@ impl FITS {
         self.filename.clone()
     }
 
-    /// Close the file handle and sync pending writes to disk.
+    /// Close the file handle.
     ///
     /// Called automatically when the :class:`FITS` is used as a
     /// context manager (``with rustfits.FITS(...) as fits:``).
     /// Safe to call multiple times.  After closing, attempting
     /// any read or write through the FITS object or its HDUs
     /// raises ``IOError``.
+    ///
+    /// Does NOT fsync: data is left in the OS page cache, which
+    /// persists across normal program exit (matches fitsio and
+    /// astropy).  Power-loss or kernel-panic safety requires an
+    /// explicit :meth:`sync` call before :meth:`close`.
     fn close(&mut self) -> PyResult<()> {
         let mut guard = lock_file(&self.file)?;
-        if let Some(file) = guard.take() {
-            let _ = file.sync();
+        // Drop the handle without fsync; rely on the page cache.
+        let _ = guard.take();
+        Ok(())
+    }
+
+    /// Force pending writes to disk (``fsync(2)``).
+    ///
+    /// Optional durability for callers who must survive power loss
+    /// or kernel panic between the last :meth:`write` and program
+    /// exit.  Normal program crashes (``SIGSEGV``, ``SIGKILL``,
+    /// uncaught exception) do NOT lose data without this call --
+    /// the kernel's page cache persists across process death.
+    /// Expensive: blocks until the storage device confirms the
+    /// write.  Cheap to call repeatedly when there are no new
+    /// dirty pages.  No-op on already-closed files.
+    fn sync(&self) -> PyResult<()> {
+        let guard = lock_file(&self.file)?;
+        if let Some(file) = guard.as_ref() {
+            file.sync().map_err(|e| PyIOError::new_err(e.to_string()))?;
         }
         Ok(())
     }

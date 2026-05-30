@@ -54,9 +54,9 @@ def main():
     rows, cols, tile = args.rows, args.cols, args.tile
     q, seed = args.q, args.seed
     data = _data.des_array(rows, cols, args.zero_frac)
-    fname = h.path("wcomp2d.fits.fz")
 
     def rf_write():
+        fname = h.fresh_path("wcomp2d-rf")
         with rustfits.FITS(fname, "w+") as f:
             f.write_image(
                 data,
@@ -67,6 +67,7 @@ def main():
             )
 
     def fi_write():
+        fname = h.fresh_path("wcomp2d-fi")
         with fitsio.FITS(fname, "rw", clobber=True) as f:
             f.write(
                 data,
@@ -79,13 +80,30 @@ def main():
 
     with h.scratch():
         # Correctness gate: lossy round-trip within tolerance, zero exact.
-        rf_write()
-        with rustfits.FITS(fname) as f:
+        gate_rf = h.fresh_path("wcomp2d-gate-rf")
+        gate_fi = h.fresh_path("wcomp2d-gate-fi")
+        with rustfits.FITS(gate_rf, "w+") as f:
+            f.write_image(
+                data,
+                compress=rustfits.Rice1(tile_shape=(tile, tile)),
+                quantize=rustfits.Quantize(
+                    level=q, method="dither2", seed=seed
+                ),
+            )
+        with rustfits.FITS(gate_rf) as f:
             r = f[1].read()
         assert np.allclose(r, data, atol=0.1), "rustfits round-trip off"
         assert r[0, 0] == 0.0, "masked zero not preserved"
-        fi_write()
-        with fitsio.FITS(fname) as f:
+        with fitsio.FITS(gate_fi, "rw", clobber=True) as f:
+            f.write(
+                data,
+                compress="RICE",
+                qlevel=q,
+                qmethod="SUBTRACTIVE_DITHER_2",
+                dither_seed=seed,
+                tile_dims=(tile, tile),
+            )
+        with fitsio.FITS(gate_fi) as f:
             assert np.allclose(f[1].read(), data, atol=0.1)
 
         raw = rows * cols * 4

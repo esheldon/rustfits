@@ -39,24 +39,33 @@ def main():
     import fitsio
 
     n = args.n
-    fname = h.path("wimg1d.fits")
     # Content is irrelevant for a raw write; use plain noise.
     data = np.random.default_rng(0).standard_normal(n)
 
+    # Fresh fname per iter avoids the kernel page-cache penalty for
+    # overwriting a same-named large file in a tight loop.  See
+    # h.fresh_path docstring.
     def rf_write():
+        fname = h.fresh_path("wimg1d-rf")
         with rustfits.FITS(fname, "w+") as f:
             f.write_image(data)
 
     def fi_write():
+        fname = h.fresh_path("wimg1d-fi")
         with fitsio.FITS(fname, "rw", clobber=True) as f:
             f.write(data)
 
     with h.scratch():
-        rf_write()
-        with rustfits.FITS(fname) as f:
+        # Correctness gate -- one fresh file per tool.
+        gate_rf = h.fresh_path("wimg1d-gate-rf")
+        gate_fi = h.fresh_path("wimg1d-gate-fi")
+        with rustfits.FITS(gate_rf, "w+") as f:
+            f.write_image(data)
+        with rustfits.FITS(gate_rf) as f:
             np.testing.assert_array_equal(f[0].read(), data)
-        fi_write()
-        with fitsio.FITS(fname) as f:
+        with fitsio.FITS(gate_fi, "rw", clobber=True) as f:
+            f.write(data)
+        with fitsio.FITS(gate_fi) as f:
             np.testing.assert_array_equal(f[0].read(), data)
 
         result = h.bench(

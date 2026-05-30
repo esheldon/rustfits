@@ -53,6 +53,24 @@ def path(name: str) -> str:
     return PREFIX + name
 
 
+_fresh_counter: int = 0
+
+
+def fresh_path(stem: str) -> str:
+    """
+    Return a fresh CWD-relative scratch path carrying the perf prefix.
+
+    Each call returns a unique path (monotonically incremented
+    counter); the ``scratch()`` cleanup catches them all.  Use this
+    in a write-bench closure so each timed iteration writes a fresh
+    file rather than overwriting the same one, which avoids a kernel
+    page-cache artifact that penalizes overwrites of large files.
+    """
+    global _fresh_counter
+    _fresh_counter += 1
+    return f"{PREFIX}{stem}-{_fresh_counter}.fits"
+
+
 @contextmanager
 def scratch():
     """

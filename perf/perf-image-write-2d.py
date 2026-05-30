@@ -39,25 +39,31 @@ def main():
     import fitsio
 
     rows, cols = args.rows, args.cols
-    fname = h.path("wimg2d.fits")
     data = np.random.default_rng(0).standard_normal(
         (rows, cols), dtype=np.float32
     )
 
+    # Fresh fname per iter: see h.fresh_path docstring.
     def rf_write():
+        fname = h.fresh_path("wimg2d-rf")
         with rustfits.FITS(fname, "w+") as f:
             f.write_image(data)
 
     def fi_write():
+        fname = h.fresh_path("wimg2d-fi")
         with fitsio.FITS(fname, "rw", clobber=True) as f:
             f.write(data)
 
     with h.scratch():
-        rf_write()
-        with rustfits.FITS(fname) as f:
+        gate_rf = h.fresh_path("wimg2d-gate-rf")
+        gate_fi = h.fresh_path("wimg2d-gate-fi")
+        with rustfits.FITS(gate_rf, "w+") as f:
+            f.write_image(data)
+        with rustfits.FITS(gate_rf) as f:
             np.testing.assert_array_equal(f[0].read(), data)
-        fi_write()
-        with fitsio.FITS(fname) as f:
+        with fitsio.FITS(gate_fi, "rw", clobber=True) as f:
+            f.write(data)
+        with fitsio.FITS(gate_fi) as f:
             np.testing.assert_array_equal(f[0].read(), data)
 
         raw = rows * cols * 4

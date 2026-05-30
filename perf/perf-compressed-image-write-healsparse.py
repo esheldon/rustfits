@@ -59,13 +59,13 @@ def main():
     tile, level = args.tile, args.level
     n = args.ntiles * tile
     data = _data.healsparse_array(n, args.run_len, args.cov, args.quant)
-    fname = h.path("wcomp1d.fits.fz")
 
     def rf_write():
         # Match cfitsio's gzip level (Z_BEST_SPEED=1) for a fair
         # encode-SPEED comparison: rustfits defaults to level 6, which
         # compresses ~18% smaller but does more work, so leaving it would
         # measure compression effort, not encoder speed.
+        fname = h.fresh_path("wcomp1d-rf")
         with rustfits.FITS(fname, "w+") as f:
             f.write_image(
                 data,
@@ -80,16 +80,26 @@ def main():
         # comparison (rustfits's Gzip2 without a Quantize is lossless, as
         # is the healsparse read benchmark and the real file).  cfitsio's
         # gzip level is fixed at Z_BEST_SPEED=1 (zcompress.c), matched above.
+        fname = h.fresh_path("wcomp1d-fi")
         with fitsio.FITS(fname, "rw", clobber=True) as f:
             f.write(data, compress="GZIP_2", tile_dims=(tile,), qlevel=0)
 
     with h.scratch():
         # Correctness gate: each tool's write round-trips bit-exact.
-        rf_write()
-        with rustfits.FITS(fname) as f:
+        gate_rf = h.fresh_path("wcomp1d-gate-rf")
+        gate_fi = h.fresh_path("wcomp1d-gate-fi")
+        with rustfits.FITS(gate_rf, "w+") as f:
+            f.write_image(
+                data,
+                compress=rustfits.Gzip2(
+                    tile_shape=(tile,), heap_format="Q", level=level
+                ),
+            )
+        with rustfits.FITS(gate_rf) as f:
             np.testing.assert_array_equal(f[1].read(), data)
-        fi_write()
-        with fitsio.FITS(fname) as f:
+        with fitsio.FITS(gate_fi, "rw", clobber=True) as f:
+            f.write(data, compress="GZIP_2", tile_dims=(tile,), qlevel=0)
+        with fitsio.FITS(gate_fi) as f:
             np.testing.assert_array_equal(f[1].read(), data)
 
         result = h.bench(

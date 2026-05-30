@@ -455,6 +455,26 @@ to signal "test plumbing, not API."  Used by `tests/test_header_taint.py`
 to verify rejection semantics without needing to produce a real I/O
 failure on the host filesystem.
 
+## Durability contract: close does NOT fsync
+
+`FITS.close()` drops the file handle without calling `fsync(2)`.  Data
+is left in the OS page cache, which persists across normal program
+exit (process death by `SIGSEGV`/`SIGKILL`/uncaught exception/etc.
+all keep the cache intact — only power loss or kernel panic loses
+unflushed data).  This matches fitsio and astropy.
+
+For callers who need power-loss durability, `FITS.sync()` is the
+explicit opt-in: it calls `fsync` on the underlying file.  Cheap to
+call repeatedly when there are no new dirty pages; expensive when
+there are (it blocks until the storage device confirms).
+
+Prior to 2026-05-29 `close()` unconditionally fsynced.  Removed
+because: (1) ecosystem parity (no other Python FITS library does it);
+(2) on a single-write-then-exit pattern the user paid ~200 ms for a
+512 MB fsync they didn't ask for; (3) doesn't actually improve
+steady-state throughput in a write loop — the kernel ends up
+flushing either way, fsync just changes when.
+
 ## Header overflow: in-place file grow
 
 When a header mutation would push past the currently reserved header
@@ -4554,6 +4574,11 @@ as the loser); a fresh handle is opened inside every timed iteration
 (so fitsio's forever-cache can't masquerade as decode speed against
 rustfits's bounded LRU); and the harness warmup pass primes the OS
 page (FS) cache so timing measures decode, not cold disk I/O.
+**Write benches use a fresh FILE per iter** (via `h.fresh_path`,
+not just a fresh handle to the same path) — overwriting the same
+large file in a tight loop triggers a kernel page-cache penalty that
+masks rustfits's actual speed (one-time finding 2026-05-29; flipped
+the 1-D image write from 0.64× SLOW to 1.07× FASTER).
 Synthetic data is tuned to reproduce a real file's *timing ratios*,
 not its compression ratio.  Scripts:
 - `perf-compressed-image-read-healsparse.py` — 1-D GZIP_2 lossless
@@ -4668,25 +4693,33 @@ healsparse/random distinction.  A clear split:
 **Uncompressed image writes + extend (2026-05-29).**
 `perf-image-write-1d.py` / `-2d.py` and `perf-image-extend-1d.py`.
 
-- **Uncompressed write is a tall pole — slower AND 2× memory.**  rustfits
-  is ~2.3× slower than fitsio (1-D f8 0.44×, 2-D f4 0.41×), and its
-  write-once peak RSS is **2,101 MB for a 1 GB array** vs fitsio's
-  1,204 MB: rustfits byteswaps the WHOLE array into a big-endian copy
-  (`ascontiguousarray(..., ">f8")`), doubling memory, where fitsio
-  byteswaps in bounded chunks.  Fix: byteswap streaming/in-place in the
-  uncompressed write path (the read path already streams).
-- **Uncompressed extend is a big bounded-memory win and confirms the
-  predicted contrast.**  Building a 1 GB map: extend uses **30.5× less
-  RAM** (69 MB vs 2,101 MB) and is even faster than rustfits's own
-  write-once (0.58×, by sidestepping the full-array copy).  Time is
-  ~flat across chunk size (no compressed heap to relocate → O(N)
-  linear), unlike the compressed extend's ~quadratic chunk penalty.
-  (fitsio's raw write-once is still faster in wall-time but uses ~17×
-  more RAM than extend.)
+| regime | rustfits vs fitsio |
+|---|---|
+| 1-D f8 write (512 MB) | **1.07× FASTER** (2,282 vs 2,127 MB/s) |
+| 2-D f4 write (64 MB)  | 0.85× (the per-call overhead dominates at small N) |
 
-So the open optimization leads are: **RICE decode**, **uncompressed bulk
-read**, and **uncompressed write (speed + the 2× byteswap copy)**.  GZIP_2
-read+encode, RICE encode, and both extend paths favor rustfits.
+- **Two fixes landed together to get here, both important.**  (1) The
+  byteswap-copy in `write_image_data` was capped at 1 MiB scratch and
+  chunked within each strip — peak RSS for a 1 GB build dropped from
+  2,101 MB to 1,078 MB, and the bench-time effect was also material.
+  (2) The bench methodology was flipped to **fresh file per iter**
+  (via `h.fresh_path`) instead of overwriting the same path in a tight
+  loop.  Overwriting the same large file repeatedly turned out to
+  trigger a kernel page-cache penalty that was masking rustfits's
+  actual speed — the realistic single-file-per-program-run pattern was
+  always faster, the loop pattern was the artifact.
+- **Uncompressed extend is a bounded-memory win.**  Building a 1 GB
+  map: extend uses **16× less RAM** (67 MB vs 1,078 MB) at C=1 MiB
+  chunks, and is **0.54× the wall time of write-once** (it sidesteps
+  the whole-array byteswap copy entirely).  Time is ~flat across
+  chunk size (no compressed heap to relocate → O(N) linear), unlike
+  the compressed extend's ~quadratic chunk penalty.
+
+So uncompressed write is no longer a tall pole; the remaining
+optimization leads are **RICE decode** (~0.38× — the only big gap
+left) and **uncompressed bulk read** (~0.84×).  GZIP_2 read+encode,
+RICE encode, uncompressed table write, uncompressed extend, and now
+uncompressed image write all favor rustfits.
 
 **Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py` reads
 a deliberately type-exhaustive 34-column catalog (every scalar type, f4/f8
@@ -4715,12 +4748,11 @@ reads:
 
 **Uncompressed BINTABLE write (2026-05-29).**  `perf-table-write.py`
 writes the same catalog (fitsio writes the VLA object columns as true
-1PA/1PE, like rustfits).  rustfits is **2.24× FASTER** (1.04 s vs 2.33 s;
-295 vs 132 MB/s).  Note the asymmetry with the uncompressed *image*
-write, where rustfits is ~2.3× slower: the image f8 whole-array
-byteswap-copy tall pole doesn't dominate the per-column table write, and
-fitsio's table write (mixed types + VLA heap) is comparatively slow
-(132 MB/s vs its ~1870 MB/s image write).
+1PA/1PE, like rustfits).  rustfits is **2.60× FASTER** (0.94 s vs
+2.44 s; 326 vs 125 MB/s).  fitsio's table write (mixed types + VLA
+heap) is comparatively slow at 132 MB/s vs its ~1870 MB/s image
+write rate — the per-column / per-VLA-cell overhead in cfitsio's
+table writer is the bottleneck on that side.
 
 **Compressed BINTABLE (ZTABLE) read (2026-05-29).**
 `perf-table-compressed-read.py` is a rustfits SELF-comparison —
