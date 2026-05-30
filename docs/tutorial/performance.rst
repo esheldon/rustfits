@@ -120,19 +120,19 @@ that pattern against the equivalent one-shot
 build runs in its own subprocess for a clean per-build
 ``ru_maxrss``.
 
-fitsio appears as a write-once reference on the uncompressed
+fitsio appears as a cross-tool reference on the uncompressed
 variants only (its Python API cannot write ZTABLE).  ``vs rf
-write-once`` reports the append loop's measurement divided by
-the rustfits write-once measurement (so values < 1 mean the
-append loop was faster than the one-shot write); fitsio rows
-show the fitsio/rustfits ratio in the same column.
+write-once`` reports each row's wall time / RSS divided by the
+rustfits write-once measurement for that variant; values < 1
+mean the row was faster / lighter than the one-shot rustfits
+write.
 
 Sample numbers from the reference machine
 (N=100,000 rows, 34-column type-exhaustive catalog at
 ~600 B/row, ZTILELEN ≈ 16 k rows):
 
 .. list-table:: Table append (N=100,000) — wall + peak RSS
-   :widths: 24 24 12 12 18
+   :widths: 24 26 12 12 20
    :header-rows: 1
 
    * - variant
@@ -142,96 +142,140 @@ Sample numbers from the reference machine
      - vs rf write-once
    * - uncompressed, fixed-only
      - fitsio write-once
-     - 164.3 ms
+     - 166.7 ms
      - 163 MB
-     - :perf-slow:`3.35× time` (fitsio)
+     - :perf-slow:`3.36× time` (fitsio)
    * -
      - rustfits write-once
-     - 49.1 ms
+     - 49.6 ms
      - 163 MB
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 62.6 ms
+     - 63.1 ms
      - 163 MB
-     - :perf-par:`1.27× time, 1.0× RAM`
+     - :perf-par:`1.27× time, ≈ RAM`
+   * -
+     - fitsio append C=1k (K=100)
+     - 171.0 ms
+     - 163 MB
+     - :perf-slow:`3.45× time` (fitsio)
    * -
      - rustfits append C=10k (K=10)
      - 50.5 ms
      - 163 MB
-     - :perf-par:`1.03× time, 1.0× RAM`
+     - :perf-par:`1.02× time, ≈ RAM`
+   * -
+     - fitsio append C=10k (K=10)
+     - 153.9 ms
+     - 163 MB
+     - :perf-slow:`3.10× time` (fitsio)
    * - uncompressed, with VLA
      - fitsio write-once
-     - 488.5 ms
+     - 495.3 ms
      - 186 MB
-     - :perf-slow:`2.87× time` (fitsio)
+     - :perf-slow:`2.83× time` (fitsio)
    * -
      - rustfits write-once
-     - 170.5 ms
+     - 174.8 ms
      - 216 MB
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 203.1 ms
+     - 199.9 ms
+     - 165 MB
+     - :perf-fast:`1.14× time, 1.3× less RAM`
+   * -
+     - fitsio append C=1k (K=100)
+     - **40.08 s**
      - 166 MB
-     - :perf-fast:`1.19× time, 1.3× less RAM`
+     - :perf-slow:`229× time` (fitsio)
    * -
      - rustfits append C=10k (K=10)
-     - 157.8 ms
+     - 156.4 ms
      - 165 MB
-     - :perf-fast:`0.93× time, 1.3× less RAM`
+     - :perf-fast:`0.89× time, 1.3× less RAM`
+   * -
+     - fitsio append C=10k (K=10)
+     - **32.79 s**
+     - 165 MB
+     - :perf-slow:`188× time` (fitsio)
    * - ZTABLE, fixed-only
      - rustfits write-once
-     - 2.02 s
+     - 2.03 s
      - 174 MB
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 31.08 s
+     - 31.07 s
      - 187 MB
-     - :perf-slow:`15.4× time, 0.9× RAM`
+     - :perf-slow:`15.3× time, ≈ RAM`
    * -
      - rustfits append C=10k (K=10)
-     - 28.85 s
-     - 207 MB
-     - :perf-slow:`14.3× time, 0.8× RAM`
+     - 28.89 s
+     - 188 MB
+     - :perf-slow:`14.3× time, ≈ RAM`
    * - ZTABLE, with VLA
      - rustfits write-once
-     - 5.61 s
+     - 5.62 s
      - 213 MB
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 37.71 s
-     - 229 MB
-     - :perf-slow:`6.7× time, 0.9× RAM`
+     - 37.73 s
+     - 230 MB
+     - :perf-slow:`6.7× time, ≈ RAM`
    * -
      - rustfits append C=10k (K=10)
      - 35.25 s
      - 228 MB
-     - :perf-slow:`6.3× time, 0.9× RAM`
+     - :perf-slow:`6.3× time, ≈ RAM`
 
-Four things to take away:
+Five things to take away:
 
 1. **Uncompressed write-once: rustfits is ~3× fitsio.**  The
    one-shot ``write_table`` call beats fitsio's equivalent by
-   3.35× on the fixed-only variant and 2.87× on the VLA
-   variant.  (The fitsio rows above are write-once only; fitsio
-   doesn't write ZTABLE.)
+   3.36× on the fixed-only variant and 2.83× on the VLA
+   variant.  (fitsio doesn't write ZTABLE.)
 
 2. **Uncompressed append is essentially free.**  At chunk=10 k
-   the fixed-only append loop runs within 3 % of the one-shot
-   write, and the VLA append loop is *faster* than the one-shot
-   write (the write-once path plans the whole VLA heap layout
-   in RAM up front; the append loop pays it incrementally).
+   the fixed-only rustfits append loop runs within 3 % of the
+   one-shot rustfits write, and the VLA append loop is
+   *faster* than the one-shot write (the write-once path plans
+   the whole VLA heap layout in RAM up front; the append loop
+   pays it incrementally).
 
-3. **VLA append wins on peak RSS.**  The whole-table write
-   holds ~216 MB resident; the append loop holds ~166 MB.
-   That's the bounded-memory story repeating from the image
-   side — incremental write keeps live memory near the chunk
-   size instead of the full output.
+3. **rustfits append crushes fitsio append on VLA — ~200×.**
+   On the fixed-only variant rustfits append is ~2.7–3.0×
+   faster than fitsio append (in line with the write-once
+   ratio).  On VLA the gap blows out to **229× faster** at
+   chunk=1k and **188× faster** at chunk=10k.
 
-4. **ZTABLE small-chunk append is expensive.**  With chunk
+   Root cause: fitsio's ``write_var_column`` Python wrapper
+   calls ``fits_flush_file`` after every call
+   (`fitsio_pywrap.c
+   <https://github.com/esheldon/fitsio/blob/master/fitsio/fitsio_pywrap.c>`_),
+   and cfitsio's ``fits_flush_file`` (``ffflus`` in
+   ``buffers.c``) is ``close-current-HDU + flush-buffers +
+   re-open-current-HDU``.  In our bench (3 VLA columns × 100
+   appends at chunk=1k) that's 300 HDU close-and-reopen
+   cycles, each of which re-walks the header and re-parses
+   the column descriptors.  This is in fitsio's Python
+   wrapper, not in cfitsio itself — the underlying C
+   ``fits_write_col`` for VLA columns doesn't need the
+   flush.  rustfits' ``TableHDU.append`` writes descriptors +
+   heap bytes once and updates NAXIS2/PCOUNT once, no
+   close-and-reopen.  For incremental VLA catalog builds,
+   this is the largest single rustfits advantage in this
+   bench.
+
+4. **VLA append wins on peak RSS.**  The rustfits whole-table
+   write holds ~216 MB resident; the append loop holds
+   ~165 MB.  That's the bounded-memory story repeating from
+   the image side — incremental write keeps live memory near
+   the chunk size instead of the full output.
+
+5. **ZTABLE small-chunk append is expensive.**  With chunk
    sizes (1 k, 10 k rows) well below the default ZTILELEN
    (~16 k rows here, set by cfitsio's
    ``max(1, min(nrows, 10 MB / row_width))`` rule), every

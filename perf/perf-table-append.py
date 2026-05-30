@@ -110,6 +110,31 @@ def build_worker(mode, variant_key, n, chunk):
                 hdu.append(data[done : done + c])
                 t += time.perf_counter() - t0
                 done += c
+    elif mode == "append_fi":
+        # Apples-to-apples with append_rf: seed the table schema
+        # untimed, then time every per-chunk append.  fitsio cannot
+        # write ZTABLE so the caller should only invoke this mode
+        # for uncompressed variants.  fitsio can't write a 0-row
+        # table with object columns (its array2tabledef inspects
+        # data[name][0] to infer the VLA inner dtype), so we seed
+        # with one row.  The bias is one row out of N being timed
+        # in the seed rather than the append loop -- invisible at
+        # N=100 k.
+        import fitsio
+
+        if compressed:
+            raise ValueError("append_fi: fitsio cannot write ZTABLE")
+        t = 0.0
+        with fitsio.FITS(fname, "rw", clobber=True) as f:
+            f.write(data[:1])
+            hdu = f[1]
+            done = 1
+            while done < n:
+                c = min(chunk, n - done)
+                t0 = time.perf_counter()
+                hdu.append(data[done : done + c])
+                t += time.perf_counter() - t0
+                done += c
     else:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -242,16 +267,36 @@ def main():
             ref_t, ref_r = rows[-1][1]
             for c in chunks:
                 k_chunks = -(-n // c)
-                op_label = f"rustfits append C={c:,} (K={k_chunks})"
+                rf_label = f"rustfits append C={c:,} (K={k_chunks})"
                 rows.append(
-                    (op_label, run_build("append_rf", variant_key, c, args))
+                    (rf_label, run_build("append_rf", variant_key, c, args))
                 )
+                # fitsio append also only works on uncompressed (no
+                # ZTABLE writer), so gate per variant.
+                if not compressed:
+                    fi_label = f"fitsio append C={c:,} (K={k_chunks})"
+                    rows.append(
+                        (
+                            fi_label,
+                            run_build("append_fi", variant_key, c, args),
+                        )
+                    )
 
             for name, (t, r) in rows:
-                if name.startswith("rustfits append"):
-                    note = f"{t / ref_t:.2f}x time, {ref_r / r:.1f}x less RAM"
-                elif name == "rustfits write-once":
+                if name == "rustfits write-once":
                     note = "(ref)"
+                elif name.startswith("rustfits") or name.startswith("fitsio"):
+                    # Any non-ref row gets compared back to the
+                    # rustfits write-once reference: time ratio +
+                    # RSS ratio (smaller-is-better, reported as
+                    # "X less RAM" or "X more RAM" depending on
+                    # direction).
+                    rss_ratio = ref_r / r
+                    if rss_ratio >= 1.0:
+                        rss_note = f"{rss_ratio:.1f}x less RAM"
+                    else:
+                        rss_note = f"{1 / rss_ratio:.1f}x more RAM"
+                    note = f"{t / ref_t:.2f}x time, {rss_note}"
                 else:
                     note = ""
                 cells = [
