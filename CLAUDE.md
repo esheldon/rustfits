@@ -4701,43 +4701,58 @@ each build in its own subprocess).  Building a **1 GB** map:
 **Uncompressed image reads (2026-05-29).**  `perf-image-read-1d.py`
 (1-D f8) and `perf-image-read-2d.py` (2-D f4) benchmark plain
 (uncompressed) reads — data content is irrelevant (raw bytes), so no
-healsparse/random distinction.  A clear split:
+healsparse/random distinction.  After the byteswap fix (see below),
+all cases ≥ par:
 
 | regime | rustfits vs fitsio |
 |---|---|
-| 1-D chunk 1000 (partial) | 1.28× faster |
-| 1-D chunk 50000 (whole)  | **0.56× (slower)** |
-| 1-D whole `.read()`      | **0.83× (slower)** |
-| 2-D stamps 32×32 (x1000) | 2.40× faster |
-| 2-D whole `.read()`      | **0.70× (slower)** |
+| 1-D chunk 1000 (partial) | **1.90× FASTER** |
+| 1-D chunk 50000 (whole)  | **1.17× FASTER** (9,133 MB/s) |
+| 1-D whole `.read()`      | **1.01× ≈par** (2,379 MB/s) |
+| 2-D stamps 32×32 (x1000) | **2.43× FASTER** |
+| 2-D whole `.read()`      | **1.02× ≈par** |
 
-- **Small / scattered reads favor rustfits** (lower per-call overhead:
-  1.28× and 2.40×).
-- **Bulk reads are slower** (0.56–0.83×): fitsio's whole-array read +
-  byteswap path beats rustfits's strip-walk + byteswap.  So
-  **uncompressed bulk read is a third optimization lead**, alongside
-  RICE decode.  (Both tools read faster in 50k chunks than in one
-  `.read()` — a big-allocation/page-fault effect — but rustfits trails
-  on bulk either way.)
+**The fix (2026-05-29):** `byteswap_in_place` (in `src/common.rs`)
+used `chunks_exact_mut(itemsize)` + `chunk.reverse()`, which has a
+dynamic chunk length and doesn't auto-vectorize — the per-byte
+reverse loop emits scalar code.  Specialized it to dispatch on
+itemsize and use `chunks_exact_mut::<uN>` + primitive `swap_bytes`
+(a portable intrinsic LLVM lowers to BSWAP on x86-64, REV on ARM64,
+`rev8` on RISC-V Zbb).  Modern LLVM auto-vectorizes the resulting
+fixed-stride loop to the platform's byte-shuffle SIMD (PSHUFB on
+AVX2, NEON REV/TBL, etc.).
+
+Cost dropped from ~75 ms to ~16 ms for a 512 MB f8 byteswap (~5×).
+Every call site benefits — image read/write, table read/write,
+compressed read/write all picked up a measurable gain from this one
+function.  itemsize=16 (c16 = 2× f8 complex) routes through the
+8-byte path because the swap is *per-component*, NOT a full 16-byte
+reversal (which would swap real and imag).
+
+Pre-fix history (committed `3e21d03`): bulk reads were 0.56–0.83×,
+documented as "a third optimization lead alongside RICE decode."
+That lead is now closed; all uncompressed image read regimes are
+≥ par.
 
 **Uncompressed image writes + extend (2026-05-29).**
 `perf-image-write-1d.py` / `-2d.py` and `perf-image-extend-1d.py`.
 
 | regime | rustfits vs fitsio |
 |---|---|
-| 1-D f8 write (512 MB) | **1.07× FASTER** (2,282 vs 2,127 MB/s) |
-| 2-D f4 write (64 MB)  | 0.85× (the per-call overhead dominates at small N) |
+| 1-D f8 write (512 MB) | **1.40× FASTER** (3,029 vs 2,166 MB/s) |
+| 2-D f4 write (64 MB)  | **1.40× FASTER** (2,709 vs 1,937 MB/s) |
 
-- **Two fixes landed together to get here, both important.**  (1) The
-  byteswap-copy in `write_image_data` was capped at 1 MiB scratch and
-  chunked within each strip — peak RSS for a 1 GB build dropped from
-  2,101 MB to 1,078 MB, and the bench-time effect was also material.
-  (2) The bench methodology was flipped to **fresh file per iter**
-  (via `h.fresh_path`) instead of overwriting the same path in a tight
+- **Three fixes landed to get here.**  (1) The byteswap-copy in
+  `write_image_data` was capped at 1 MiB scratch and chunked within
+  each strip — peak RSS for a 1 GB build dropped from 2,101 MB to
+  1,078 MB, and the bench-time effect was also material.  (2) The
+  bench methodology was flipped to **fresh file per iter** (via
+  `h.fresh_path`) instead of overwriting the same path in a tight
   loop.  Overwriting the same large file repeatedly turned out to
   trigger a kernel page-cache penalty that was masking rustfits's
-  actual speed — the realistic single-file-per-program-run pattern was
-  always faster, the loop pattern was the artifact.
+  actual speed.  (3) `byteswap_in_place` was specialized on itemsize
+  (commit `3e21d03`; ~5× faster), flipping the 2-D write from 0.85×
+  to 1.40× and bumping the 1-D from 1.07× to 1.40×.
 - **Uncompressed extend is a bounded-memory win.**  Building a 1 GB
   map: extend uses **16× less RAM** (67 MB vs 1,078 MB) at C=1 MiB
   chunks, and is **0.54× the wall time of write-once** (it sidesteps
@@ -4745,11 +4760,14 @@ healsparse/random distinction.  A clear split:
   chunk size (no compressed heap to relocate → O(N) linear), unlike
   the compressed extend's ~quadratic chunk penalty.
 
-So uncompressed write is no longer a tall pole; the only remaining
-optimization lead is **uncompressed bulk read** (~0.84×).  GZIP_2
-read+encode, RICE read (post-rewrite) + encode, uncompressed table
-write, uncompressed extend, and uncompressed image write all favor
-rustfits.
+So uncompressed write is no longer a tall pole.  Every uncompressed
+image read+write regime now favors rustfits.  GZIP_2 read+encode,
+RICE read (post-rewrite) + encode, uncompressed table write,
+uncompressed extend, and uncompressed image read+write all favor
+rustfits.  The one remaining sub-par bench is **uncompressed table
+BULK read** (~0.83× whole, 0.88× row slice) — column subset and
+scattered rows already win.  Bulk likely needs a similar per-column
+strip-walk optimization.
 
 **Uncompressed BINTABLE reads (2026-05-29).**  `perf-table-read.py` reads
 a deliberately type-exhaustive 34-column catalog (every scalar type, f4/f8
