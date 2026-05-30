@@ -27,12 +27,24 @@ Per N the bench reports total wall time AND per-HDU normalized time
 scaling is linear; growth proportional to N would indicate the
 fitsio-style quadratic bug.
 
+**Cold-cache mode** (``--cold``): on slow / network filesystems the
+real concern is the FIRST open of a file the OS / metadata daemon
+hasn't touched recently -- every header read becomes an uncached
+disk seek (or network round trip on GPFS / Lustre / NFS).  The
+default mode warmups the FS cache before timing, so the reported
+numbers are steady-state; ``--cold`` disables warmup and reports
+the WORST sample per fixture (iter 0, cold cache).  Iters 1..N-1
+are still measured but they hit the now-warm cache, so only the
+first-iter cold cost is meaningful in cold mode.  For a true
+cold-only run set ``--repeat 1``.
+
 REQUIRES a release build: ``maturin develop --release``.
 
 Run::
 
     python perf/perf-fits-open-many-hdus.py
     python perf/perf-fits-open-many-hdus.py --n 100 1000 10000 50000
+    python perf/perf-fits-open-many-hdus.py --cold     # GPFS / Lustre
 
 Scratch files go to CWD as perf-tmp-* and are removed on exit.
 """
@@ -73,7 +85,20 @@ def main():
         help="N values to test (default: 100 1000 10000)",
     )
     ap.add_argument("--repeat", type=int, default=5)
+    ap.add_argument(
+        "--cold",
+        action="store_true",
+        help="cold-cache mode: disable warmup and report the worst "
+        "(iter-0, cold) sample per fixture.  Use on slow / network "
+        "filesystems to measure the first-open penalty.",
+    )
     args = ap.parse_args()
+
+    # In cold mode iter 0 sees uncached metadata; iters 1+ are warm
+    # because the OS / GPFS metadata cache picked up the offsets
+    # during iter 0.  Reporting "worst" picks out the cold one.
+    warmup = 0 if args.cold else 1
+    stat = "worst" if args.cold else "median"
 
     if not h.HAVE_FITSIO:
         raise SystemExit("fitsio not installed; this comparison needs it")
@@ -140,9 +165,10 @@ def main():
                 open_rf(fname),
                 run_fitsio=open_fi(fname),
                 repeat=args.repeat,
+                warmup=warmup,
             )
-            us_rf = r1.rustfits.median / n * 1e6
-            us_fi = r1.fitsio.median / n * 1e6
+            us_rf = r1.rustfits.stat(stat) / n * 1e6
+            us_fi = r1.fitsio.stat(stat) / n * 1e6
             r1.note = f"rf {us_rf:.1f} us/HDU, fi {us_fi:.1f} us/HDU"
             results.append(r1)
 
@@ -151,14 +177,18 @@ def main():
                 open_walk_rf(fname),
                 run_fitsio=open_walk_fi(fname),
                 repeat=args.repeat,
+                warmup=warmup,
             )
-            us_rf = r2.rustfits.median / n * 1e6
-            us_fi = r2.fitsio.median / n * 1e6
+            us_rf = r2.rustfits.stat(stat) / n * 1e6
+            us_fi = r2.fitsio.stat(stat) / n * 1e6
             r2.note = f"rf {us_rf:.1f} us/HDU, fi {us_fi:.1f} us/HDU"
             results.append(r2)
 
         h.print_env()
-        h.report("Open file with many HDUs", results)
+        title = "Open file with many HDUs"
+        if args.cold:
+            title += " [COLD CACHE: iter-0 worst-case]"
+        h.report(title, results, stat=stat)
 
 
 if __name__ == "__main__":

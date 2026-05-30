@@ -123,6 +123,13 @@ class Timing:
     def mean(self) -> float:
         return sum(self.samples) / len(self.samples)
 
+    @property
+    def worst(self) -> float:
+        # samples sorted ascending -> last is slowest.  Useful in
+        # cold-cache benches where iter 0 is cold and the median /
+        # best would silently report a warm-cache hit.
+        return self.samples[-1]
+
     def stat(self, which: str) -> float:
         return getattr(self, which)
 
