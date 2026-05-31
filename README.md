@@ -152,8 +152,7 @@ requests or issues at https://github.com/esheldon/rustfits
 `rustfits` is mostly written in rust.  If you don't know rust, you can
 still make contributions.  The extensive CLAUDE.md file can be used
 by claude code or other agents to help you fix bugs or add features.
-Just start the agent, ask it to load from CLAUDE.md, and ask the agent
-to help you make changes or find the source of bugs. 
+Just start the agent, ask it to load from CLAUDE.md, and start working.
 
 ## License
 

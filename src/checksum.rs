@@ -215,13 +215,6 @@ pub(crate) fn set_or_insert_string_card(
 
 // ---------- DATASUM / CHECKSUM computation against an HDU ----------
 
-// Compute DATASUM from `data_bytes` (the padded data section as
-// it lives on disk, in FITS big-endian order).  Returns the u32
-// sum ready for format_datasum.
-pub(crate) fn compute_datasum_of(data_bytes: &[u8]) -> u32 {
-    compute_checksum_bytes(0, data_bytes)
-}
-
 // Streaming accumulator over the cfitsio-byte-exact checksum.
 // `compute_checksum_bytes` requires every intermediate call's
 // bytes to be a multiple of 4 (its tail-handling zero-pads

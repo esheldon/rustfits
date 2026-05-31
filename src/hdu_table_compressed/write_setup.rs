@@ -24,9 +24,14 @@ use super::write::{grow_file_to_at_least};
 
 fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
     match letter {
-        'B' | 'L' | 'A' | 'X' => CompressionAlgorithm::Gzip1,
+        // Complex (C/M) defaults to GZIP_1, not GZIP_2: cfitsio's table
+        // compressor defaults complex to GZIP_2 but can't read its own
+        // GZIP_2-complex output (funpack errors with "error
+        // uncompressing image"), so GZIP_2-complex is non-interoperable.
+        // GZIP_1-complex round-trips in both rustfits and cfitsio.
+        'B' | 'L' | 'A' | 'X' | 'C' | 'M' => CompressionAlgorithm::Gzip1,
         'J' => CompressionAlgorithm::Rice1,
-        'I' | 'K' | 'E' | 'D' | 'C' | 'M' => CompressionAlgorithm::Gzip2,
+        'I' | 'K' | 'E' | 'D' => CompressionAlgorithm::Gzip2,
         // Unknown letters land at Gzip1 (universally allowed).
         // parse_columns would have rejected anything truly bad
         // upstream; this is a safety net.
@@ -195,13 +200,20 @@ fn check_table_algorithm_allowed(
 
 // Default ZTILELEN, picked the way cfitsio's fits_compress_table
 // does (imcompress.c line 8135ish): rowspertile = max(1,
-// min(nrows, 10_000_000 / row_width)).
+// min(nrows, 10_000_000 / row_width)).  For the streaming-create
+// pattern (`create_table_hdu(nrows=0, compress=True)` + repeated
+// `append(chunk)`), nrows=0 means "no rows yet, more coming":
+// return the ~10 MB cap so the first append fills full-size
+// tiles rather than collapsing every row into its own tile (each
+// independently gzip-compressed -- catastrophic per-row syscall
+// + gzip-header overhead).
 pub(crate) fn default_ztilelen(nrows: usize, row_width: usize) -> usize {
+    let cap = (10_000_000usize / row_width.max(1)).max(1);
     if nrows == 0 {
-        return 1;
+        cap
+    } else {
+        cap.min(nrows)
     }
-    let cap = 10_000_000usize / row_width.max(1);
-    cap.max(1).min(nrows)
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +333,13 @@ pub(crate) fn prepare_fixed_column<'py>(
     // elem_size = slab.len()` for the byte-shuffle / RICE arithmetic
     // (only GZIP_1 is actually allowed for X per the table-allowed
     // matrix, and GZIP_1 ignores both fields).
-    let (inner_elem_size, per_row_pixels) = if col.tform_letter == 'X' {
+    let (inner_elem_size, per_row_pixels) = if matches!(
+        col.tform_letter, 'X' | 'C' | 'M'
+    ) {
+        // Byte-flat: X is bit-packed; complex (C/M) is NOT byte-shuffled
+        // by cfitsio (its GZIP_2 shuffle skips complex), so encode it
+        // unshuffled too -- bytepix 1 makes GZIP_2's shuffle a no-op and
+        // keeps the on-disk form cfitsio/funpack-readable (issue #8).
         (1usize, col.byte_width)
     } else {
         let n = bytes_per_element(col.tform_letter)

@@ -400,5 +400,80 @@ def test_funpack_decompresses_our_file():
             np.testing.assert_array_equal(decompressed[col], src[col])
 
 
+# ---------------------------------------------------------------------
+# Complex columns (regression for issue #8: real/imag swap + c16)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("col_dtype", ["c8", "c16"])
+@pytest.mark.parametrize("compress", [True, {"z": "GZIP_1"}, {"z": "GZIP_2"}])
+def test_complex_round_trip(col_dtype, compress):
+    """
+    Complex columns round-trip through ZTABLE with no real/imag swap,
+    for the default algorithm and explicit GZIP_1/GZIP_2.  rustfits
+    treats complex as byte-flat (no shuffle), matching cfitsio's write
+    side.  Regression for issue #8.
+    """
+    n = 2000
+    dt = np.dtype([("z", col_dtype)])
+    src = np.zeros(n, dtype=dt)
+    src["z"] = (np.arange(n) + 1j * np.arange(100, 100 + n)).astype(col_dtype)
+    with tempfile.TemporaryDirectory() as td:
+        got = _write_and_reread(
+            os.path.join(td, "t.fits"), src, dt, compress=compress
+        )
+    np.testing.assert_array_equal(got["z"], src["z"])
+
+
+def test_complex_default_algorithm_is_gzip1():
+    """
+    Complex columns default to GZIP_1, not GZIP_2: cfitsio's GZIP_2 table
+    decompressor errors on complex (a read-side default-case bug), so
+    GZIP_1 is the interoperable default.  See issue #8.
+    """
+    n = 1000
+    dt = np.dtype([("z", "c8"), ("w", "c16")])
+    src = np.zeros(n, dtype=dt)
+    src["z"] = (np.arange(n) + 1j).astype("c8")
+    src["w"] = (np.arange(n) + 2j).astype("c16")
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _write_and_reread(fname, src, dt, compress=True)
+        with rustfits.FITS(fname) as f:
+            comp = f[1].compression
+    assert comp["z"] == "GZIP_1"
+    assert comp["w"] == "GZIP_1"
+
+
+@pytest.mark.skipif(
+    not _have_funpack(),
+    reason="funpack (cfitsio CLI) required for cross-tool verification",
+)
+def test_funpack_reads_complex():
+    """
+    cfitsio's funpack reads a complex-column ZTABLE we wrote (default
+    GZIP_1) and reconstructs the values bit-exactly -- the interop the
+    GZIP_1 default exists to preserve.  Issue #8.
+    """
+    import fitsio
+
+    n = 3000
+    dt = np.dtype([("z", "c8"), ("w", "c16")])
+    src = np.zeros(n, dtype=dt)
+    src["z"] = (np.arange(n) + 1j * np.arange(n)).astype("c8")
+    src["w"] = (np.arange(n) + 2j * np.arange(n)).astype("c16")
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        _write_and_reread(fname, src, dt, compress=True)
+        out = os.path.join(td, "out.fits")
+        subprocess.run(
+            ["funpack", "-O", out, fname], check=True, capture_output=True
+        )
+        with fitsio.FITS(out, "r") as f:
+            decompressed = f[1].read()
+    np.testing.assert_array_equal(decompressed["z"], src["z"])
+    np.testing.assert_array_equal(decompressed["w"], src["w"])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])

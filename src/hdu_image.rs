@@ -1370,11 +1370,22 @@ fn write_image_data(
         .map(|k| start_vec[k] * hdu_strides[k])
         .sum();
 
-    let mut scratch: Vec<u8> = if needs_swap {
-        vec![0u8; strip_bytes]
+    // Cap the swap scratch at ~1 MiB so a bulk write of a large array
+    // (where compute_strip_layout returns one strip = the whole array)
+    // doesn't allocate a full big-endian copy alongside the input -- it
+    // chunks within each strip instead.  Bounded peak RAM at ~input +
+    // 1 MiB instead of 2x input.  MAX_CHUNK_BYTES (1 MiB) is a multiple
+    // of every BITPIX byte-width (1/2/4/8/16), keeping each chunk an
+    // integral number of elements for byteswap_in_place.  Chunk size
+    // was swept across 64 KiB .. 64 MiB; throughput is flat from 64 KiB
+    // through 1 MiB and gently declines above 4 MiB.
+    const MAX_CHUNK_BYTES: usize = 1 << 20;
+    let scratch_cap = if needs_swap {
+        strip_bytes.min(MAX_CHUNK_BYTES)
     } else {
-        Vec::new()
+        0
     };
+    let mut scratch: Vec<u8> = vec![0u8; scratch_cap];
 
     let outer_count: u64 = data_shape[..outer_axes].iter().product();
     let mut idx = vec![0u64; outer_axes];
@@ -1397,10 +1408,15 @@ fn write_image_data(
         file.seek(SeekFrom::Start(file_pos))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         if needs_swap {
-            scratch.copy_from_slice(src);
-            byteswap_in_place(&mut scratch, bpp as usize);
-            file.write_all(&scratch)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let mut off = 0;
+            while off < strip_bytes {
+                let n = (strip_bytes - off).min(scratch.len());
+                scratch[..n].copy_from_slice(&src[off..off + n]);
+                byteswap_in_place(&mut scratch[..n], bpp as usize);
+                file.write_all(&scratch[..n])
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                off += n;
+            }
         } else {
             file.write_all(src)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;

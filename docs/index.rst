@@ -1,11 +1,13 @@
 rustfits
 ========
 
-A Rust + PyO3 implementation of a FITS reader/writer for Python.
+A FITS reader/writer for python implemented in Rust + PyO3.
 
-Open a file, read or write HDUs, or do tile-compressed I/O — the
-API mirrors astropy and fitsio conventions but with a leaner
-surface and Rust-side performance.
+The API mirrors fitsio and astropy conventions but with a leaner surface and
+Rust-side performance.  ``rustfits`` has the features of those libraries, as
+well as additional capabilities such as compressed table HDUs and memory bound
+guarantees.  Performance equals or exceeds fitsio and astropy in all
+of our benchmarks.
 
 Quick example
 -------------
@@ -37,6 +39,11 @@ API reference
    api/header
    api/compression
    api/convenience
+
+Source code
+-----------
+
+The source code can be found at https://github.com/esheldon/rustfits
 
 Indices
 -------

@@ -51,3 +51,7 @@ intersphinx_mapping = {
 
 html_theme = "furo"
 html_title = f"rustfits {release}"
+# Used by the auto-generated Performance tables to colorize
+# vs-fitsio ratio cells.
+html_static_path = ["_static"]
+html_css_files = ["perf.css"]
