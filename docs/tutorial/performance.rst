@@ -343,7 +343,7 @@ rows) on a (20,000 × 4,000) ``f4`` image (~320 MB).
    * - fitsio write-once
      - 174.7 ms
      - 440 MB
-     - :perf-slow:`1.48× time, 1.2× more RAM` (fitsio)
+     - :perf-fast:`1.48× time, 1.2× more RAM` (fitsio)
    * - rustfits write-once
      - 117.9 ms
      - 363 MB
@@ -355,7 +355,7 @@ rows) on a (20,000 × 4,000) ``f4`` image (~320 MB).
    * - fitsio extend C=100 rows (K=200)
      - 231.4 ms
      - 70 MB
-     - :perf-slow:`1.96× time` (fitsio), 5.2× less RAM
+     - :perf-fast:`1.96× time` (fitsio), 5.2× less RAM
    * - rustfits extend C=1000 rows (K=20)
      - 117.1 ms
      - 74 MB
@@ -363,7 +363,7 @@ rows) on a (20,000 × 4,000) ``f4`` image (~320 MB).
    * - fitsio extend C=1000 rows (K=20)
      - 239.7 ms
      - 74 MB
-     - :perf-slow:`2.03× time` (fitsio), 4.9× less RAM
+     - :perf-fast:`2.03× time` (fitsio), 4.9× less RAM
 
 Three takeaways:
 
@@ -420,27 +420,27 @@ rustfits-only; fitsio appears only as a write-once reference.
    * - rustfits extend C=50 rows (K=400, sub-tile)
      - 48.30 s
      - 454 MB
-     - 22.3× time, 1.4× less RAM
+     - :perf-slow:`22.3× time`, 1.4× less RAM
    * - rustfits extending() C=50 rows (K=400, sub-tile)
      - 2.73 s
      - 364 MB
-     - 1.26× time, 1.7× less RAM
+     - :perf-fast:`1.26× time, 1.7× less RAM`
    * - rustfits extend C=100 rows (K=200, exact tile)
      - 16.68 s
      - 321 MB
-     - 7.7× time, 1.9× less RAM
+     - :perf-slow:`7.7× time`, 1.9× less RAM
    * - rustfits extending() C=100 rows (K=200, exact tile)
      - 2.74 s
      - 365 MB
-     - 1.26× time, 1.7× less RAM
+     - :perf-fast:`1.26× time, 1.7× less RAM`
    * - rustfits extend C=1000 rows (K=20, 10 tiles)
      - 3.34 s
      - 338 MB
-     - 1.54× time, 1.8× less RAM
+     - :perf-slow:`1.54× time`, 1.8× less RAM
    * - rustfits extending() C=1000 rows (K=20, 10 tiles)
      - 2.49 s
      - 394 MB
-     - 1.15× time, 1.6× less RAM
+     - :perf-fast:`1.15× time, 1.6× less RAM`
 
 Four takeaways:
 
