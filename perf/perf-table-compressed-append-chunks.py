@@ -76,7 +76,8 @@ def make_data(n, seed=0):
 def time_build(mode, n, chunk, ztilelen, compress):
     """
     Build one fixture, return wall seconds.  GC paused during the
-    timed window.  ``mode`` is ``"write_once"`` or ``"append"``.
+    timed window.  ``mode`` is ``"write_once"``, ``"append"``, or
+    ``"appending"`` (the buffered-context variant, ZTABLE only).
     """
     data = make_data(n)
     fname = h.fresh_path(f"ztappend-{mode}-{chunk}-{ztilelen}")
@@ -98,6 +99,22 @@ def time_build(mode, n, chunk, ztilelen, compress):
                     c = min(chunk, n - done)
                     hdu.append(data[done : done + c])
                     done += c
+        elif mode == "appending":
+            # Buffered context: collapses N partial-trailing-tile
+            # merge-and-re-encodes into 1.  The whole `with` block
+            # (per-call appends + __exit__ drain) is timed so the
+            # comparison is end-to-end.  ZTABLE only — uncompressed
+            # append doesn't have the re-encode tax this fixes.
+            with rustfits.FITS(fname, "w+") as f:
+                kw = dict(compress=True, ztilelen=ztilelen) if compress else {}
+                f.create_table_hdu(DTYPE, nrows=0, **kw)
+                hdu = f[1]
+                with hdu.appending():
+                    done = 0
+                    while done < n:
+                        c = min(chunk, n - done)
+                        hdu.append(data[done : done + c])
+                        done += c
         else:
             raise ValueError(mode)
         return time.perf_counter() - t0
@@ -199,6 +216,41 @@ def run_regime(label, n, ztilelen, chunks, repeat):
                     "ratio_to_writeonce": ratio,
                 }
             )
+        # ZTABLE buffered-context variant: same chunk size, wrapped
+        # in `with hdu.appending():`.  Should collapse to ~ZTABLE
+        # write-once cost at sub-tile chunks where the unbuffered
+        # append paid the merge-tile tax.
+        t_buf = median_of(
+            lambda ch=chunk: time_build("appending", n, ch, ztilelen, True),
+            repeat,
+        )
+        ratio_buf = t_buf / ref["ZTABLE"]
+        per_app_ms_buf = t_buf / n_appends * 1000
+        cells = [
+            ("ZTABLE", 10, "l"),
+            (f"appending() C={chunk}", 18, "l"),
+            (f"{chunk:,}", 8, "r"),
+            (f"{n_appends:,}", 8, "r"),
+            (f"{chunk_ratio:.2g}", 11, "r"),
+            (h.fmt_time(t_buf), 11, "r"),
+            (f"{ratio_buf:.2f}×", 16, "r"),
+            (f"{per_app_ms_buf:.2f} ms", 12, "r"),
+        ]
+        print("  ".join(h._cell(x, w, a) for x, w, a in cells))
+        h.emit_record(
+            {
+                "kind": "self_comparison",
+                "suite": title,
+                "op": f"ZTABLE appending() C={chunk}",
+                "storage": "ZTABLE",
+                "chunk": chunk,
+                "n_appends": n_appends,
+                "chunk_per_tile": chunk_ratio,
+                "total_s": t_buf,
+                "ref_writeonce_s": ref["ZTABLE"],
+                "ratio_to_writeonce": ratio_buf,
+            }
+        )
 
 
 def main():

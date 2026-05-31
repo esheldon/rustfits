@@ -1686,13 +1686,14 @@ impl FITS {
     /// astropy).  Power-loss or kernel-panic safety requires an
     /// explicit :meth:`sync` call before :meth:`close`.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        // Refuse to close if any HDU is mid-extending() context.
-        // The natural nested-with pattern never triggers this
-        // (Python guarantees inner __exit__ runs first); this
-        // catches forgotten __exit__ in manual-handling code,
-        // where silently flushing would hide the bug.  See
-        // CLAUDE.md TODO #12 / hdu_image_compressed/extending.rs
-        // for the design.
+        // Refuse to close if any HDU is mid-extending() (ZIMAGE)
+        // or mid-appending() (ZTABLE) context.  The natural
+        // nested-with pattern never triggers this (Python
+        // guarantees inner __exit__ runs first); this catches
+        // forgotten __exit__ in manual-handling code, where
+        // silently flushing would hide the bug.  See CLAUDE.md
+        // TODO #12 / hdu_image_compressed/extending.rs +
+        // hdu_table_compressed/extending.rs for the design.
         for (i, hdu) in self.hdus.iter().enumerate() {
             let hdu_bound = hdu.bind(py);
             if hdu_bound.is_instance_of::<CompressedImageHDU>() {
@@ -1704,6 +1705,19 @@ impl FITS {
                     return Err(PyValueError::new_err(format!(
                         "cannot close FITS while HDU at index {} is \
                          inside extending() context; exit the context \
+                         first",
+                        i,
+                    )));
+                }
+            } else if hdu_bound.is_instance_of::<CompressedTableHDU>() {
+                let ctbl = hdu_bound.cast::<CompressedTableHDU>()?.borrow();
+                let in_ctx = ctbl.pending.lock().map_err(|_| {
+                    PyIOError::new_err("pending buffer lock poisoned")
+                })?.is_some();
+                if in_ctx {
+                    return Err(PyValueError::new_err(format!(
+                        "cannot close FITS while HDU at index {} is \
+                         inside appending() context; exit the context \
                          first",
                         i,
                     )));

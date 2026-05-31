@@ -107,14 +107,69 @@ here are rustfits vs rustfits, so the headline is the
 trade-off (compression cost, append overhead) rather than a
 tool ranking.
 
-Incremental table builds (``append`` vs ``write_table``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Incremental table builds (``append`` and the ``appending()`` context)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Building a catalog by ``N/K`` calls to ``hdu.append(K rows)``
 is the natural pattern for streaming pipelines (per-frame
 source extraction, per-file harvest).
+
+**TL;DR for ZTABLE streaming pipelines: use the
+:meth:`CompressedTableHDU.appending` context manager.**  It
+makes the append-chunk size irrelevant — every chunk size
+lands within ~1-7% of the one-shot ``write_table`` cost::
+
+    with hdu.appending():
+        for batch in batches:
+            hdu.append(batch)
+
+``perf/perf-table-compressed-append-chunks.py`` (4×f4 schema,
+N=100,000 rows, ZTILELEN=10,000) shows the win directly:
+
+====================  ========  =========================  =================================
+regime                  chunk    unbuffered ``append``      ``appending()`` context
+====================  ========  =========================  =================================
+1% of tile                100   :perf-slow:`48.91× time`   :perf-fast:`1.07× time` (46× win)
+10% of tile             1,000   :perf-slow:`5.40× time`    :perf-fast:`1.00× time` (5.4× win)
+50% of tile             5,000   :perf-slow:`1.53× time`    :perf-fast:`0.99× time`
+exact tile             10,000    1.02× time                :perf-fast:`1.00× time`
+2 tiles                20,000    1.01× time                :perf-fast:`0.99× time`
+====================  ========  =========================  =================================
+
+Without the context, ZTABLE ``append`` pays a partial-trailing-
+tile decode + merge + re-encode on every call — fine when the
+chunk is at least one ZTILELEN, expensive when it's smaller.
+The context buffers row batches in RAM and drains them in
+ZTILELEN-aligned bursts (cap at 32 MB,
+``MAX_PENDING_BYTES`` in
+``src/hdu_table_compressed/extending.rs``), collapsing N
+partial-tile re-encodes into 1.  For a 16-byte row schema the
+cap allows 2 M rows per drain — a typical streaming pipeline
+does 0-1 mid-context drains plus one residual drain at
+``__exit__``.
+
+``extending()`` is a symmetric alias for ``appending()``;
+``extend()`` is the same alias on the append call itself.
+Strict context semantics (the same as
+:meth:`CompressedImageHDU.extending`): only :meth:`append` /
+:meth:`extend` is permitted inside the ``with`` block; any
+:meth:`read` / ``__getitem__`` / :meth:`write` / ``__setitem__``
+/ :meth:`repack` / :meth:`add_checksum` /
+:meth:`verify_checksum` raises ``ValueError`` (exit the
+context first).  Uncompressed ``TableHDU.append`` doesn't need
+the context — no merge tax — but a no-op ``appending()`` /
+``extending()`` on the uncompressed types is on the roadmap
+so generic code that doesn't know the HDU type works
+uniformly.
+
+The rest of this section is the underlying behavior: how
+``append`` itself performs across the four variants (the
+context wraps it, so understanding the per-call cost is still
+useful when ZTILELEN is small or the streaming-loop budget is
+tight).
+
 ``perf/perf-table-append.py`` measures wall time + peak RSS of
-that pattern against the equivalent one-shot
+the per-call ``append`` loop against the equivalent one-shot
 ``write_table(N rows)`` across four variants:
 ``{uncompressed, ZTABLE} × {fixed-only, with VLA}``.  Each
 build runs in its own subprocess for a clean per-build
@@ -247,7 +302,9 @@ row-by-row (``vs fitsio`` = ``fitsio_time / rustfits_time``;
      - **32.79 s**
      - :perf-fast:`210×` (see note)
 
-Five things to take away:
+Five things to take away from the per-call ``append`` numbers
+above (the ``appending()`` context wraps these, so it inherits
+the wins and erases the losses):
 
 1. **Uncompressed write-once: rustfits is ~3× fitsio.**  The
    one-shot ``write_table`` call beats fitsio's equivalent by
@@ -275,16 +332,16 @@ Five things to take away:
    the image side — incremental write keeps live memory near
    the chunk size instead of the full output.
 
-5. **ZTABLE append is now competitive at chunk ≥ ZTILELEN.**
-   At chunk=10 k (≈ default ZTILELEN of ~17 k for this 588 B
-   row width), append is only 1.8× the rustfits ZTABLE
-   write-once for fixed-only and 1.4× for VLA — close enough
-   that streaming pipelines can use it without a meaningful
-   speed penalty.  At chunk=1 k (well below ZTILELEN), the
-   partial-last-tile re-encode tax kicks in: every append
-   decompresses + merges into the trailing tile and re-encodes
-   it, costing 10× for fixed-only and 5× for VLA.  Recommendation:
-   **prefer chunks ≥ ZTILELEN** to skip the merge tax entirely.
+5. **ZTABLE ``append`` (without the context) has a chunk-size
+   cliff at ZTILELEN.**  At chunk=10 k (≈ default ZTILELEN of
+   ~17 k for this 588 B row width), append is only 1.8× the
+   rustfits ZTABLE write-once for fixed-only and 1.4× for VLA.
+   At chunk=1 k (well below ZTILELEN), the partial-last-tile
+   re-encode tax kicks in: every append decompresses + merges
+   into the trailing tile and re-encodes it, costing 10× for
+   fixed-only and 5× for VLA.  The fix is the ``appending()``
+   context (lead of this section); the alternative is to pick
+   chunks that are an integer multiple of ZTILELEN.
 
    .. note::
 

@@ -26,6 +26,10 @@ use super::checksum::{
     compressed_table_add_checksum, compressed_table_add_datasum,
     compressed_table_verify_checksum, compressed_table_verify_datasum,
 };
+use super::extending::{
+    append_to_buffer, check_not_in_context, CompressedTableAppendContext,
+    PendingBuffer,
+};
 use super::meta::{CompressedTableMeta, parse_compressed_table_meta};
 use super::read::{read_compressed_table};
 use super::repack::{repack_compressed_table_heap};
@@ -157,6 +161,14 @@ pub(crate) struct CompressedTableHDU {
     // the same version return an Arc clone.  Invalidates on every
     // cards mutation via the version bump in CardsWriteGuard.
     meta_cache: MetaCache,
+    // Pending-buffer slot for the `appending()` context manager
+    // (mirrors CompressedImageHDU's `pending` field).  `None`
+    // outside a context; `Some(buffer)` while a `with` block is
+    // open.  Mutating data-touching methods refuse to run while
+    // `Some` (see `extending::check_not_in_context`); `append()`
+    // / `extend()` route to the buffer when `Some` and to the
+    // direct on-disk path when `None`.  See `extending.rs`.
+    pub(crate) pending: Arc<Mutex<Option<PendingBuffer>>>,
 }
 
 impl CompressedTableHDU {
@@ -182,6 +194,7 @@ impl CompressedTableHDU {
                 )),
                 compress_configs: Arc::new(Mutex::new(compress_configs)),
                 meta_cache: Arc::new(Mutex::new(None)),
+                pending: Arc::new(Mutex::new(None)),
             })
     }
 
@@ -448,6 +461,7 @@ impl CompressedTableHDU {
         scale: bool,
         mask_null: bool,
     ) -> PyResult<Py<PyAny>> {
+        check_not_in_context(&slf.pending)?;
         if mask_null {
             return Err(PyNotImplementedError::new_err(
                 "CompressedTableHDU.read(mask_null=True): TNULL masking \
@@ -475,6 +489,7 @@ impl CompressedTableHDU {
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        check_not_in_context(&slf.borrow().pending)?;
         let kind = classify_table_key(key)?;
         match kind {
             TableKey::Rows => {
@@ -564,6 +579,7 @@ impl CompressedTableHDU {
         key: &Bound<'_, PyAny>,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let cfgs = slf.compress_configs.lock()
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
@@ -695,6 +711,7 @@ impl CompressedTableHDU {
         data: &Bound<'_, PyAny>,
         names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let cfgs = slf.compress_configs.lock()
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
@@ -765,17 +782,30 @@ impl CompressedTableHDU {
     /// stays consistent.
     #[pyo3(signature = (data, *, names=None))]
     fn append(
-        slf: PyRef<'_, Self>,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let cfgs = slf.compress_configs.lock()
+        // Inside an `appending()` context: buffer the input,
+        // possibly trigger a ZTILELEN-aligned mid-context drain
+        // if the buffer crossed the RAM cap.  Outside the
+        // context: existing on-disk append path.  See
+        // `extending.rs` for the buffer semantics.
+        let in_ctx = {
+            let pyref = slf.borrow();
+            super::extending::is_in_context(&pyref.pending)?
+        };
+        if in_ctx {
+            return append_to_buffer(py, slf, data, names);
+        }
+        let pyref = slf.borrow();
+        let cfgs = pyref.compress_configs.lock()
             .map_err(|_| PyIOError::new_err(
                 "compress_configs lock poisoned"))?
             .clone();
-        let cache = Arc::clone(&slf.cache);
-        let super_ = slf.into_super().into_super();
+        let cache = Arc::clone(&pyref.cache);
+        let super_ = pyref.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let virtual_cards = synthesize_uncompressed_cards(&cards);
         let columns = parse_columns(&virtual_cards)?;
@@ -816,12 +846,67 @@ impl CompressedTableHDU {
     /// iterating HDUs and calling ``.extend(...)`` keeps working.
     #[pyo3(signature = (data, *, names=None))]
     fn extend(
-        slf: PyRef<'_, Self>,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         Self::append(slf, py, data, names)
+    }
+
+    /// Open a batched-append context manager.
+    ///
+    /// Inside the ``with`` block every :meth:`append` (and
+    /// :meth:`extend`, its alias) call buffers its input in RAM
+    /// rather than encoding into the trailing partial tile on
+    /// every call.  The buffer drains in ZTILELEN-aligned bursts
+    /// when it crosses a 32 MB soft cap, and the residual drains
+    /// at ``__exit__`` (normal or exceptional), collapsing N
+    /// merge-with-partial-tile re-encodes into 1.
+    ///
+    /// Pattern::
+    ///
+    ///     with hdu.appending():
+    ///         for batch in batches:
+    ///             hdu.append(batch)
+    ///         # __exit__ here: drains the buffer
+    ///
+    /// Performance: a sub-ZTILELEN-chunk append loop costs
+    /// roughly ``write_table`` total instead of ``N × merge-tile
+    /// cost``; see the user-facing performance docs for the
+    /// measured numbers.
+    ///
+    /// Restrictions inside the context (raise ``ValueError``):
+    /// :meth:`read`, ``__getitem__``, :meth:`write`,
+    /// ``__setitem__``, :meth:`repack`, :meth:`add_checksum`,
+    /// :meth:`add_datasum`, :meth:`verify_checksum`,
+    /// :meth:`verify_datasum`.  Exit the context first.
+    /// :meth:`FITS.close` also raises while a context is open
+    /// (the natural nested-``with`` pattern never triggers this;
+    /// it fires only for forgotten ``__exit__``).
+    fn appending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<CompressedTableAppendContext>> {
+        // Bound::clone bumps the Python refcount only — the
+        // context and the user's `hdu` variable refer to the
+        // same Python object, so a buffered append inside the
+        // `with` mutates the same `pending` Mutex the context
+        // will drain at __exit__.
+        let hdu_py: Py<CompressedTableHDU> = slf.clone().unbind();
+        Py::new(py, CompressedTableAppendContext { hdu: hdu_py })
+    }
+
+    /// Alias for :meth:`appending`.  Mirrors the
+    /// :meth:`CompressedImageHDU.extending` method on the image
+    /// side, so generic code that iterates HDUs and writes
+    /// ``with hdu.extending(): ...`` works uniformly across
+    /// every HDU type that supports the batched-context pattern.
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<CompressedTableAppendContext>> {
+        Self::appending(slf, py)
     }
 
     /// Rebuild the heap, reclaiming orphan blobs.
@@ -839,6 +924,7 @@ impl CompressedTableHDU {
     /// backward in lockstep).  No-op for an already-compact
     /// heap.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
         repack_compressed_table_heap(&super_, &cache)
@@ -893,6 +979,7 @@ impl CompressedTableHDU {
     /// :meth:`TableHDU.add_datasum` — re-run after :meth:`write`
     /// / :meth:`append` / ``__setitem__`` / :meth:`repack`.
     fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.into_super().into_super();
         compressed_table_add_datasum(&super_)
     }
@@ -902,6 +989,7 @@ impl CompressedTableHDU {
     /// Same equivalent-uncompressed convention as
     /// :meth:`add_datasum`.  This is the call most users want.
     fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.into_super().into_super();
         compressed_table_add_checksum(&super_)
     }
@@ -912,6 +1000,7 @@ impl CompressedTableHDU {
     /// Returns ``True`` / ``False`` / ``None`` (``None`` means
     /// the card is absent).
     fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.into_super().into_super();
         compressed_table_verify_datasum(&super_)
     }
@@ -921,6 +1010,7 @@ impl CompressedTableHDU {
     /// Returns ``True`` / ``False`` / ``None`` (``None`` means
     /// the card is absent).
     fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.into_super().into_super();
         compressed_table_verify_checksum(&super_)
     }

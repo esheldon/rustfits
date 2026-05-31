@@ -34,7 +34,8 @@ use crate::hdu_image_compressed::{
 };
 use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU, TableIter};
 use crate::hdu_table_compressed::{
-    CompressedColumnSubset, CompressedSingleColumnSubset, CompressedTableHDU,
+    CompressedColumnSubset, CompressedSingleColumnSubset,
+    CompressedTableAppendContext, CompressedTableHDU,
 };
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::fits::FITS;
@@ -51,6 +52,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompressedImageExtendContext>()?;
     m.add_class::<TableHDU>()?;
     m.add_class::<CompressedTableHDU>()?;
+    m.add_class::<CompressedTableAppendContext>()?;
     m.add_class::<CompressedSingleColumnSubset>()?;
     m.add_class::<CompressedColumnSubset>()?;
     m.add_class::<ColumnSubset>()?;

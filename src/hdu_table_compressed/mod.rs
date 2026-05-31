@@ -15,6 +15,7 @@
 
 mod append;
 mod checksum;
+mod extending;
 mod hdu;
 mod meta;
 mod read;
@@ -24,6 +25,7 @@ mod subset;
 mod write;
 mod write_setup;
 
+pub(crate) use extending::CompressedTableAppendContext;
 pub(crate) use hdu::{header_has_ztable, CompressedTableHDU};
 pub(crate) use subset::{CompressedColumnSubset, CompressedSingleColumnSubset};
 pub(crate) use write_setup::{

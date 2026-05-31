@@ -2403,6 +2403,7 @@ wrapper around cfitsio).  Headline wins:
 | 2-D image extend, uncompressed (vs fitsio extend) | ~2× faster, ~5× less RAM than write-once |
 | 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
 | 2-D compressed image `extending()` context (sub-tile chunks) | **18× faster** than unbuffered extend (22.3× → 1.26× write-once); 1.7× less RAM than write-once |
+| ZTABLE `appending()` context (sub-tile chunks, realistic streaming) | **45× faster** than unbuffered append at C=1% of ZTILELEN (48.9× → 1.07× write-once); flattens the chunk-size curve to ≤1.07× at every chunk size |
 | ZTABLE repack (1 GB heap, vs whole-heap impls) | **bounded ~50 MB RSS** vs 1–1.5× PCOUNT for table/ZIMAGE repack |
 | ZTABLE streaming append (`create(nrows=0)` + `append`, post ZTILELEN-bug fix) | **61× faster** at chunk = ZTILELEN; now matches write_once within 2% |
 
@@ -3036,16 +3037,46 @@ worth checking comes up; cross items off as they ship.
     setitem/repack/checksum/nested/close), cross-tool astropy
     round-trip, unsigned-int trick.
 
-    **ZTABLE follow-up.**  Same pattern can apply to
-    `CompressedTableHDU` to close the residual sub-tile cost
-    from post-#10 (5-10× at chunks << ZTILELEN).  Method name
-    on the table side would be `appending()` (with `extending()`
-    as a symmetric alias).  Not done yet; landable as a
-    follow-up commit using the ZIMAGE extension as a model.
-    The uncompressed `ImageHDU` / `TableHDU` could also expose
-    no-op `extending()` / `appending()` context managers so
-    generic code that iterates HDUs of mixed types can use
-    `with hdu.extending():` uniformly.
+    **ZTABLE follow-up shipped 2026-05-31** in a separate
+    commit.  Same pattern, same 32 MB cap (now ZTILELEN-aligned
+    drains), same strict semantics.  Method names on the table
+    side are `appending()` (primary, mirrors the `append` verb)
+    and `extending()` (symmetric alias for cross-type generic
+    code).  Implementation in
+    `src/hdu_table_compressed/extending.rs`; routing in
+    `hdu_table_compressed/hdu.rs::append`; guards in every
+    other public data-touching pymethod; `FITS.close()` check
+    extended to also scan `CompressedTableHDU::pending`.
+
+    Bench result (`perf/perf-table-compressed-append-chunks.py`,
+    4×f4 schema, N=100,000, ZTILELEN=10,000):
+
+    | chunk           | unbuffered `append` | `appending()` |
+    |-----------------|---------------------|---------------|
+    | 1% of tile      | 48.91× write-once   | **1.07×**     |
+    | 10% of tile     | 5.40× write-once    | **1.00×**     |
+    | 50% of tile     | 1.53× write-once    | 0.99×         |
+    | 1 tile (exact)  | 1.02× write-once    | 1.00×         |
+    | 2 tiles         | 1.01× write-once    | 0.99×         |
+
+    The cap (a 16-byte row schema → 2 M rows per drain) means
+    typical streaming pipelines do 0-1 mid-context drains plus
+    one final residual drain at `__exit__`.
+
+    Tests: `tests/test_table_compressed_appending.py` (18
+    cases) — round-trip equivalence at sub-tile / exact-tile
+    chunks across structured ndarray + dict + list+names input
+    forms, `extending()` alias correctness, auto-flush on
+    exception, mid-context drain firing under load, empty
+    context no-op, all rejection paths.
+
+    Remaining low-priority follow-up: uncompressed `ImageHDU`
+    / `TableHDU` could expose no-op `extending()` /
+    `appending()` context managers so generic code that
+    iterates HDUs of mixed types can use `with hdu.extending():`
+    uniformly.  Pure API symmetry; no functional benefit on
+    uncompressed paths (they don't have a partial-trailing-
+    tile cost).
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache
