@@ -441,6 +441,287 @@ Three takeaways:
    re-encode tax.  Improving the partial-tile path is tracked
    in ``CLAUDE.md`` under Performance TODO #10.
 
+Compressed-image ``__setitem__`` — per-tile re-encode tax
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``hdu[selection] = value`` on a tile-compressed image decodes
+every tile the selection touches, modifies it in numpy, and
+re-encodes / appends to the heap.  A "patch a few pixels"
+workflow (interactive masking, bad-pixel fix-up, hot-pixel
+flagging) therefore pays a full tile re-encode for every tile
+the selection covers — even a single-pixel write.
+``perf/perf-compressed-image-setitem.py`` measures that per-call
+cost across all five algorithms + the unquantized / quantized
+float paths, with an uncompressed memcpy floor for reference.
+
+Setup: (256 × 256) image with (32, 32) tiles (an 8×8 tile grid).
+Four selection shapes:
+
+* **single pixel** — one ``int`` per axis (touches 1 tile)
+* **1 tile aligned** — a 32×32 slice on a tile boundary (1 tile)
+* **4 tiles spanning** — an 8×8 slice straddling a tile corner
+  (touches 4 tiles)
+* **16 tiles aligned** — a 4×4 block of tiles (16 tiles)
+
+Per-call costs span 3 µs to 200 µs, which at the low end is
+below scheduler / cache / IRQ jitter on a typical Linux box
+(early prototypes of this bench wobbled 55% run-to-run on the
+3 µs uncompressed-single-pixel row).  The bench mitigates by
+auto-calibrating the inner loop size per (algo, sel): a 20-call
+probe estimates per-call cost, then the timed loop is sized so
+each window takes at least 100 ms.  Result: 30 000 inner calls
+for the cheap rows down to 200 for the expensive ones, every
+row stable to within 1% run-to-run.  GC is disabled during
+each timed window; reported value is the median across 5
+windows.  PCOUNT grows monotonically across iters but per-call
+cost is constant (``__setitem__`` just appends new tile bytes
+to the heap; it doesn't repack).
+
+.. list-table:: Compressed-image ``__setitem__`` cost (256×256, tile 32×32)
+   :widths: 26 18 7 12 12 13
+   :header-rows: 1
+
+   * - algorithm
+     - selection
+     - tiles
+     - per call
+     - per tile
+     - per pixel
+   * - uncompressed i4
+     - single pixel
+     - 1
+     - 3.0 µs
+     - 3.0 µs
+     - 3.0 µs
+   * - uncompressed i4
+     - 1 tile aligned
+     - 1
+     - 17.5 µs
+     - 17.5 µs
+     - 0.0 µs
+   * - uncompressed i4
+     - 4 tiles spanning
+     - 4
+     - 6.7 µs
+     - 1.7 µs
+     - 0.1 µs
+   * - uncompressed i4
+     - 16 tiles aligned
+     - 16
+     - 64.8 µs
+     - 4.0 µs
+     - 0.0 µs
+   * - GZIP_1 i4
+     - single pixel
+     - 1
+     - 99.5 µs
+     - 99.5 µs
+     - 99.5 µs
+   * - GZIP_1 i4
+     - 1 tile aligned
+     - 1
+     - 37.6 µs
+     - 37.6 µs
+     - 0.0 µs
+   * - GZIP_1 i4
+     - 4 tiles spanning
+     - 4
+     - 361.6 µs
+     - 90.4 µs
+     - 5.7 µs
+   * - GZIP_1 i4
+     - 16 tiles aligned
+     - 16
+     - 401.4 µs
+     - 25.1 µs
+     - 0.0 µs
+   * - GZIP_2 i4
+     - single pixel
+     - 1
+     - 81.5 µs
+     - 81.5 µs
+     - 81.5 µs
+   * - GZIP_2 i4
+     - 1 tile aligned
+     - 1
+     - 40.8 µs
+     - 40.8 µs
+     - 0.0 µs
+   * - GZIP_2 i4
+     - 4 tiles spanning
+     - 4
+     - 263.0 µs
+     - 65.8 µs
+     - 4.1 µs
+   * - GZIP_2 i4
+     - 16 tiles aligned
+     - 16
+     - 452.4 µs
+     - 28.3 µs
+     - 0.0 µs
+   * - RICE_1 i4
+     - single pixel
+     - 1
+     - 39.3 µs
+     - 39.3 µs
+     - 39.3 µs
+   * - RICE_1 i4
+     - 1 tile aligned
+     - 1
+     - 22.8 µs
+     - 22.8 µs
+     - 0.0 µs
+   * - RICE_1 i4
+     - 4 tiles spanning
+     - 4
+     - 103.2 µs
+     - 25.8 µs
+     - 1.6 µs
+   * - RICE_1 i4
+     - 16 tiles aligned
+     - 16
+     - 139.4 µs
+     - 8.7 µs
+     - 0.0 µs
+   * - HCOMPRESS_1 i4
+     - single pixel
+     - 1
+     - 139.8 µs
+     - 139.8 µs
+     - 139.8 µs
+   * - HCOMPRESS_1 i4
+     - 1 tile aligned
+     - 1
+     - 31.0 µs
+     - 31.0 µs
+     - 0.0 µs
+   * - HCOMPRESS_1 i4
+     - 4 tiles spanning
+     - 4
+     - 461.4 µs
+     - 115.4 µs
+     - 7.2 µs
+   * - HCOMPRESS_1 i4
+     - 16 tiles aligned
+     - 16
+     - 275.3 µs
+     - 17.2 µs
+     - 0.0 µs
+   * - PLIO_1 i4
+     - single pixel
+     - 1
+     - 18.8 µs
+     - 18.8 µs
+     - 18.8 µs
+   * - PLIO_1 i4
+     - 1 tile aligned
+     - 1
+     - 20.1 µs
+     - 20.1 µs
+     - 0.0 µs
+   * - PLIO_1 i4
+     - 4 tiles spanning
+     - 4
+     - 40.5 µs
+     - 10.1 µs
+     - 0.6 µs
+   * - PLIO_1 i4
+     - 16 tiles aligned
+     - 16
+     - 124.2 µs
+     - 7.8 µs
+     - 0.0 µs
+   * - GZIP_1 f4 unquantized
+     - single pixel
+     - 1
+     - 93.2 µs
+     - 93.2 µs
+     - 93.2 µs
+   * - GZIP_1 f4 unquantized
+     - 1 tile aligned
+     - 1
+     - 37.4 µs
+     - 37.4 µs
+     - 0.0 µs
+   * - GZIP_1 f4 unquantized
+     - 4 tiles spanning
+     - 4
+     - 281.3 µs
+     - 70.4 µs
+     - 4.4 µs
+   * - GZIP_1 f4 unquantized
+     - 16 tiles aligned
+     - 16
+     - 402.6 µs
+     - 25.2 µs
+     - 0.0 µs
+   * - GZIP_1 f4 quantized
+     - single pixel
+     - 1
+     - 195.4 µs
+     - 195.4 µs
+     - 195.4 µs
+   * - GZIP_1 f4 quantized
+     - 1 tile aligned
+     - 1
+     - 51.2 µs
+     - 51.2 µs
+     - 0.0 µs
+   * - GZIP_1 f4 quantized
+     - 4 tiles spanning
+     - 4
+     - 680.7 µs
+     - 170.2 µs
+     - 10.6 µs
+   * - GZIP_1 f4 quantized
+     - 16 tiles aligned
+     - 16
+     - 560.9 µs
+     - 35.1 µs
+     - 0.0 µs
+
+Four takeaways:
+
+1. **Per-call cost is dominated by per-tile re-encode.**  A
+   single-pixel write costs 19–200 µs depending on algorithm —
+   30–60× the uncompressed memcpy (3 µs).  The user's budget
+   for "patch one pixel" is the per-tile cost of their chosen
+   algorithm; touching N tiles costs roughly N × the per-tile
+   rate plus a small constant.
+
+2. **PLIO_1 is fastest, quantized float is slowest.**  At one
+   tile touched, PLIO costs ~20 µs / tile (it's encoded as
+   ``(value, run-length)`` pairs so decode + re-encode are
+   trivial); quantized f4 costs ~200 µs / tile because every
+   touched tile has to re-quantize against its existing
+   per-tile bscale/bzero/seed.  RICE_1 and HCOMPRESS_1 fall
+   between (40–145 µs single-pixel).
+
+3. **Full-tile-aligned writes are CHEAPER than single-pixel
+   writes.**  Counterintuitive but real: a "1 tile aligned"
+   selection that covers the whole tile (32×32) is 20–50 µs
+   across all algorithms, where a single-pixel write on the
+   same tile is 40–200 µs.  The reason is that an aligned
+   full-tile write doesn't need to decode the existing tile
+   first — every pixel is being replaced, so the
+   read-modify-write collapses to just write.  Single-pixel
+   writes pay the full decode + modify + encode cycle.
+
+4. **Per-pixel rate amortizes with selection size.**  For
+   batched writes (the 16-tile column) the per-pixel rate
+   drops to <0.1 µs / pixel — comparable to uncompressed.  If
+   you can buffer your patches into rectangular tile-aligned
+   blocks, the per-tile re-encode tax amortizes away.  For
+   true scattered single-pixel workflows there's no shortcut
+   (use PLIO_1 if your data fits its non-negative integer
+   constraint).
+
+Practical guidance: for interactive masking on a compressed
+image, budget ~50–200 µs per single-pixel touch (algorithm-
+dependent), so up to a few thousand single-pixel patches per
+second.  For bulk masking, group patches into rectangular
+selections that cover whole tiles where possible.
+
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

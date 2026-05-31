@@ -127,7 +127,12 @@ def fmt_rate(nbytes: int | None, seconds: float | None) -> str:
 
 
 def print_cross_tool(records: list[dict]) -> None:
-    rows = [r for r in records if r.get("kind") == "cross_tool"]
+    rows = [
+        r
+        for r in records
+        if r.get("kind") == "cross_tool"
+        and r.get("script") not in SCRIPTS_WITH_NARRATIVE
+    ]
     if not rows:
         print("\n(no cross-tool records)")
         return
@@ -194,8 +199,18 @@ def print_cross_tool(records: list[dict]) -> None:
 
 
 def print_self_and_rss(records: list[dict]) -> None:
-    self_rows = [r for r in records if r.get("kind") == "self_comparison"]
-    rss_rows = [r for r in records if r.get("kind") == "rss"]
+    self_rows = [
+        r
+        for r in records
+        if r.get("kind") == "self_comparison"
+        and r.get("script") not in SCRIPTS_WITH_NARRATIVE
+    ]
+    rss_rows = [
+        r
+        for r in records
+        if r.get("kind") == "rss"
+        and r.get("script") not in SCRIPTS_WITH_NARRATIVE
+    ]
     if not self_rows and not rss_rows:
         print("\n(no internal/self-comparison records)")
         return
@@ -290,6 +305,7 @@ SCRIPTS_WITH_NARRATIVE: set[str] = {
     "perf-table-append.py",
     "perf-image-extend-2d.py",
     "perf-compressed-image-extend-2d.py",
+    "perf-compressed-image-setitem.py",
 }
 
 
@@ -430,6 +446,16 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "partial trailing tile), exact-tile, and multi-tile alignments. "
         "fitsio cannot extend compressed images, so this is a rustfits "
         "self-comparison.",
+    ),
+    "perf-compressed-image-setitem.py": (
+        "Compressed-image __setitem__ — per-tile re-encode tax",
+        "(256 × 256) i4/f4 image with (32, 32) tiles (8×8 grid).  Four "
+        "selection shapes × 5 algorithms (GZIP_1, GZIP_2, RICE_1, "
+        "HCOMPRESS_1, PLIO_1) plus unquantized + quantized f4 plus the "
+        "uncompressed memcpy floor.  Reports per-call, per-tile, and "
+        "per-pixel cost.  Rustfits-self only -- fitsio's contiguous "
+        "``write(start=)`` equivalent crashes a sweep with a cfitsio "
+        "free() corruption.",
     ),
 }
 

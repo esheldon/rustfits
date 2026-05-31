@@ -2714,18 +2714,49 @@ worth checking comes up; cross items off as they ship.
    `perf/perf-compressed-image-repack.py`,
    `perf/perf-table-compressed-repack.py`.
 
-6. **Compressed-image `__setitem__` cost.**  Decode → modify →
-   re-encode per touched tile.  A "patch a few pixels" workflow
-   (interactive masking, bad-pixel fix-up) pays full tile
-   re-encode for every tile the selection touches.  Could be
-   surprisingly slow per call; we don't know.  How to check:
-   time a single-pixel write on a tile-aligned vs tile-spanning
-   selection, across all 5 algorithms; compare to uncompressed
-   `__setitem__` (which is a memcpy).  Bench target:
-   `perf/perf-compressed-image-setitem.py`.  Likely outcome:
-   per-call cost is dominated by re-encode of one tile; report
-   it in ms/pixel-write so users have a number to budget
-   against.
+6. ✅ **Compressed-image `__setitem__` cost.**  Done 2026-05-30.
+   `perf/perf-compressed-image-setitem.py` sweeps 4 selections
+   {single pixel, 1-tile-aligned, 4-tile-spanning, 16-tile-
+   aligned} × 8 algorithms {uncompressed, GZIP_1, GZIP_2,
+   RICE_1, HCOMPRESS_1, PLIO_1, GZIP_1 unquantized-f4, GZIP_1
+   quantized-f4} on a (256, 256) image with (32, 32) tiles.
+
+   **Findings**:
+   - **Per-call cost is dominated by per-tile re-encode**, as
+     expected.  Single-pixel writes cost 19–197 µs depending on
+     algorithm vs ~3 µs for uncompressed (the memcpy floor).
+   - **PLIO_1 is fastest** at ~19 µs single-pixel
+     (run-length encoding makes decode + re-encode trivial);
+     **quantized f4 is slowest** at ~197 µs (re-quantization
+     against the existing per-tile bscale/bzero/seed dominates).
+     RICE_1 and HCOMPRESS_1 are 40–146 µs; the GZIP variants
+     are 80–104 µs.
+   - **Full-tile-aligned writes are CHEAPER than single-pixel
+     writes** (20–50 µs vs 40–200 µs across all algos): the
+     aligned full-tile write skips the decode step because
+     every pixel is being replaced — read-modify-write
+     collapses to just write.
+   - **Per-pixel rate amortizes with selection size.**  16-tile
+     batched writes drop to <0.1 µs/pixel — comparable to
+     uncompressed.
+
+   **Practical guidance**: budget 50–200 µs per single-pixel
+   touch on a compressed image (algorithm-dependent), so up to
+   a few thousand single-pixel patches per second.  For bulk
+   masking, align patches to whole tiles where possible.
+
+   **Cross-tool dropped** (fitsio's `write(start=)` API can
+   patch compressed images, and works fine standalone, but
+   running it across an algorithm sweep in the same Python
+   process triggers a cfitsio `free(): invalid next size`
+   memory corruption — same shape as the macOS ffbinit issue
+   noted under "Known CI limitations".  Subprocess isolation
+   would work around it but adds complexity for limited
+   value — the rustfits-self per-tile cost is the headline
+   number users need).
+
+   Documented in `docs/tutorial/performance.rst` under
+   "Compressed-image `__setitem__` — per-tile re-encode tax".
 
 7. ✅ **Fix: compressed-image checksum still materializes the
    full ndarray.**  Done.  Replaced `read_uncompressed_image_be_bytes`
