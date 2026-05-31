@@ -200,13 +200,20 @@ fn check_table_algorithm_allowed(
 
 // Default ZTILELEN, picked the way cfitsio's fits_compress_table
 // does (imcompress.c line 8135ish): rowspertile = max(1,
-// min(nrows, 10_000_000 / row_width)).
+// min(nrows, 10_000_000 / row_width)).  For the streaming-create
+// pattern (`create_table_hdu(nrows=0, compress=True)` + repeated
+// `append(chunk)`), nrows=0 means "no rows yet, more coming":
+// return the ~10 MB cap so the first append fills full-size
+// tiles rather than collapsing every row into its own tile (each
+// independently gzip-compressed -- catastrophic per-row syscall
+// + gzip-header overhead).
 pub(crate) fn default_ztilelen(nrows: usize, row_width: usize) -> usize {
+    let cap = (10_000_000usize / row_width.max(1)).max(1);
     if nrows == 0 {
-        return 1;
+        cap
+    } else {
+        cap.min(nrows)
     }
-    let cap = 10_000_000usize / row_width.max(1);
-    cap.max(1).min(nrows)
 }
 
 // ---------------------------------------------------------------------------

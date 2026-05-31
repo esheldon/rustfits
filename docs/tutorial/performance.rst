@@ -179,29 +179,29 @@ faster / lighter than the one-shot rustfits write.
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 31.07 s
-     - 187 MB
-     - 15.3× time, ≈ RAM
+     - 20.45 s
+     - 163 MB
+     - 10.1× time, ≈ RAM
    * -
      - rustfits append C=10k (K=10)
-     - 28.89 s
-     - 188 MB
-     - 14.3× time, ≈ RAM
+     - 3.73 s
+     - 163 MB
+     - 1.8× time, ≈ RAM
    * - ZTABLE, with VLA
      - rustfits write-once
-     - 5.62 s
+     - 5.63 s
      - 213 MB
      - (ref)
    * -
      - rustfits append C=1k (K=100)
-     - 37.73 s
-     - 230 MB
-     - 6.7× time, ≈ RAM
+     - 29.70 s
+     - 170 MB
+     - 5.3× time, 1.3× less RAM
    * -
      - rustfits append C=10k (K=10)
-     - 35.25 s
-     - 228 MB
-     - 6.3× time, ≈ RAM
+     - 7.94 s
+     - 173 MB
+     - 1.4× time, 1.2× less RAM
 
 Cross-tool comparison on the uncompressed variants, paired
 row-by-row (``vs fitsio`` = ``fitsio_time / rustfits_time``;
@@ -275,18 +275,30 @@ Five things to take away:
    the image side — incremental write keeps live memory near
    the chunk size instead of the full output.
 
-5. **ZTABLE small-chunk append is expensive.**  With chunk
-   sizes (1 k, 10 k rows) well below the default ZTILELEN
-   (~16 k rows here, set by cfitsio's
-   ``max(1, min(nrows, 10 MB / row_width))`` rule), every
-   append decompresses + merges into the partial last tile
-   then re-encodes it — a ~14× hit for fixed-only, ~6× for VLA
-   (whose write-once baseline is already higher).  For ZTABLE
-   streaming pipelines, **prefer chunks ≥ ZTILELEN** so each
-   append finishes a tile cleanly; for throughput-focused jobs
-   that can hold the data, ``write_table`` (one shot) is the
-   faster path.  Improving the small-chunk path is tracked in
-   ``CLAUDE.md`` under Performance TODO #10.
+5. **ZTABLE append is now competitive at chunk ≥ ZTILELEN.**
+   At chunk=10 k (≈ default ZTILELEN of ~17 k for this 588 B
+   row width), append is only 1.8× the rustfits ZTABLE
+   write-once for fixed-only and 1.4× for VLA — close enough
+   that streaming pipelines can use it without a meaningful
+   speed penalty.  At chunk=1 k (well below ZTILELEN), the
+   partial-last-tile re-encode tax kicks in: every append
+   decompresses + merges into the trailing tile and re-encodes
+   it, costing 10× for fixed-only and 5× for VLA.  Recommendation:
+   **prefer chunks ≥ ZTILELEN** to skip the merge tax entirely.
+
+   .. note::
+
+      The 1.8× / 1.4× / 10× / 5× numbers above reflect a
+      2026-05-31 fix in ``create_table_hdu``: prior to that
+      commit, the ``nrows=0`` streaming-create pattern
+      (``create_table_hdu(nrows=0, compress=True[, ztilelen=K])``
+      + repeated ``append(chunk)``) silently collapsed
+      ZTILELEN to 1 (regardless of what the user passed),
+      forcing every appended row into its own
+      single-row-per-tile, independently-gzip-compressed tile.
+      The pre-fix numbers were 14–15× for fixed-only and 6–7×
+      for VLA at *any* chunk size, since the bug masked the
+      true per-call cost.  Tracked as Performance TODO #10.
 
 .. note::
 

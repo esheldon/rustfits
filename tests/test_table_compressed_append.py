@@ -332,5 +332,76 @@ def test_znaxis2_updated_after_append():
             assert int(f[1].header["NAXIS2"]) == 3  # ceil(850/400)
 
 
+# ---------- streaming-create (nrows=0) ZTILELEN regressions ---------------
+
+
+def test_explicit_ztilelen_preserved_when_nrows_zero():
+    """
+    Regression for the ZTILELEN-collapses-when-nrows-zero bug:
+    ``create_table_hdu(nrows=0, compress=True, ztilelen=K)`` must
+    record ``ZTILELEN=K`` on disk, NOT cap to 1.  The buggy logic
+    capped the user's value by ``nrows.max(1)`` which collapsed to
+    1 when nrows=0, forcing every subsequent appended row into its
+    own tile (each independently gzipped — catastrophic).
+    """
+    dt = np.dtype([("a", "f4"), ("b", "f4")])
+    for ztilelen in (100, 1000, 10_000):
+        with tempfile.TemporaryDirectory() as td:
+            fname = os.path.join(td, "t.fits")
+            with rustfits.FITS(fname, "w+") as f:
+                f.create_table_hdu(
+                    dt, nrows=0, compress=True, ztilelen=ztilelen
+                )
+                assert int(f[1].header["ZTILELEN"]) == ztilelen
+            # post-reopen check
+            with rustfits.FITS(fname, "r") as f:
+                assert int(f[1].header["ZTILELEN"]) == ztilelen
+
+
+def test_default_ztilelen_sensible_when_nrows_zero():
+    """
+    Regression: ``create_table_hdu(nrows=0, compress=True)`` (no
+    explicit ztilelen) must default to the cfitsio-style ~10 MB
+    cap, NOT 1.  Previously it returned 1 because
+    ``default_ztilelen(nrows=0, ...)`` short-circuited.
+    """
+    dt = np.dtype([("a", "f4"), ("b", "f4"), ("c", "f4"), ("d", "f4")])
+    # row_width = 16 bytes → cap = 10_000_000 / 16 = 625_000
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=0, compress=True)
+            assert int(f[1].header["ZTILELEN"]) == 625_000
+
+
+def test_streaming_create_then_append_uses_user_ztilelen():
+    """
+    End-to-end: ``create_table_hdu(nrows=0, ..., ztilelen=K)``
+    followed by ``append(chunk)`` must produce ``ceil(N/K)`` tiles,
+    not N tiles (one per row).  This is the user-visible symptom of
+    the ZTILELEN-collapses bug.
+    """
+    dt = np.dtype([("x", "f4"), ("y", "f4")])
+    N = 5000
+    K = 1000
+    data = np.empty(N, dtype=dt)
+    data["x"] = np.arange(N, dtype="f4")
+    data["y"] = np.arange(N, dtype="f4") * 2.0
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=0, compress=True, ztilelen=K)
+            f[1].append(data)
+            # Expected: 5 tiles (5000/1000), not 5000 (one per row).
+            assert int(f[1].header["NAXIS2"]) == N // K
+            assert int(f[1].header["ZTILELEN"]) == K
+            assert int(f[1].header["ZNAXIS2"]) == N
+        # round-trip data integrity
+        with rustfits.FITS(fname, "r") as f:
+            rt = f[1].read()
+            np.testing.assert_array_equal(rt["x"], data["x"])
+            np.testing.assert_array_equal(rt["y"], data["y"])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])

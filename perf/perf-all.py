@@ -309,6 +309,7 @@ SCRIPTS_WITH_NARRATIVE: set[str] = {
     "perf-table-repack.py",
     "perf-compressed-image-repack.py",
     "perf-table-compressed-repack.py",
+    "perf-table-compressed-append-chunks.py",
 }
 
 
@@ -476,6 +477,14 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "ZTABLE compressed-table repack — bounded-memory verify",
         "Streaming + staging impl claimed in CLAUDE.md; bench verifies "
         "RSS stays flat at ~50 MB from 10 MB to 1 GB heap.",
+    ),
+    "perf-table-compressed-append-chunks.py": (
+        "ZTABLE append — re-encode tax characterization",
+        "Focused sweep over (chunk_size, ZTILELEN) to characterize the "
+        "partial-last-tile re-encode cost; reports total + per-append + "
+        "vs-write-once across realistic and magnified regimes.  Used to "
+        "validate the 2026-05-31 ZTILELEN-collapses fix that turned "
+        "small-chunk append from 76× slower into 1.01×.",
     ),
 }
 

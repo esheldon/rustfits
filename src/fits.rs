@@ -1453,11 +1453,16 @@ impl FITS {
         ztilelen: Option<i64>,
     ) -> PyResult<()> {
         // Validate ztilelen if user-provided; otherwise pick the
-        // cfitsio default (~10 MB worth of rows).
+        // cfitsio default (~10 MB worth of rows).  For nrows=0
+        // (streaming-create pattern), don't cap the user's value
+        // by nrows -- they're declaring the tile size for the
+        // appends to come.  Capping to nrows would collapse to 1
+        // and force per-row tiles on every subsequent append.
         let ztilelen_u: usize = match ztilelen {
             Some(v) if v <= 0 => return Err(PyValueError::new_err(format!(
                 "ztilelen must be > 0, got {}", v))),
-            Some(v) => (v as usize).min(nrows.max(1) as usize),
+            Some(v) if nrows == 0 => v as usize,
+            Some(v) => (v as usize).min(nrows as usize),
             None => default_ztilelen(nrows as usize, row_width as usize),
         };
 

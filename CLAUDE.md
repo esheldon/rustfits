@@ -2403,6 +2403,7 @@ wrapper around cfitsio).  Headline wins:
 | 2-D image extend, uncompressed (vs fitsio extend) | ~2× faster, ~5× less RAM than write-once |
 | 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
 | ZTABLE repack (1 GB heap, vs whole-heap impls) | **bounded ~50 MB RSS** vs 1–1.5× PCOUNT for table/ZIMAGE repack |
+| ZTABLE streaming append (`create(nrows=0)` + `append`, post ZTILELEN-bug fix) | **61× faster** at chunk = ZTILELEN; now matches write_once within 2% |
 
 ZTABLE (compressed BINTABLE) is a rustfits self-comparison —
 fitsio's Python API can't decompress it.
@@ -2852,27 +2853,74 @@ worth checking comes up; cross items off as they ship.
    priority of this batch; only worth doing if remote-read
    usage comes up.
 
-10. **ZTABLE small-chunk append: partial-last-tile re-encode
-    cost.**  Surfaced by perf-table-append.py (#3 above): with
-    `chunk << ZTILELEN` (default ZTILELEN ≈ 10 MB / row_width,
-    which is ~16 k rows for the test catalog) every append
-    decompresses + merges into the same partial trailing tile
-    and re-encodes it.  Measured 14× slower than write-once on
-    the fixed-only smoke run (N=20 k, chunks 500/5000 — every
-    chunk touched the trailing tile).  Real-world streaming
-    pipelines (per-frame source extraction, per-file harvest)
-    tend to deliver small batches, so this is the typical use
-    case, not a corner.  Possible optimizations: (a) buffer
-    in-RAM until the partial tile fills, then encode once;
-    (b) skip the re-decode by keeping the trailing tile's raw
-    bytes in a per-HDU "pending tile" buffer and growing it in
-    place.  (a) is simpler but adds a user-visible "what if I
-    close without flushing" question; (b) is invisible to the
-    user but more invasive.  Decide approach after measuring on
-    a realistic streaming workload (e.g. simulate
-    per-detector-frame catalog writes).  Could pair with #4
-    (2-D image extend) since the same pattern applies to
-    compressed-image extend.
+10. ✅ **ZTABLE small-chunk append: ZTILELEN-collapses-when-
+    nrows-zero bug.**  Done 2026-05-31.  Discovered the real
+    root cause was NOT the partial-last-tile re-encode tax the
+    TODO was framed around — it was a one-line bug in
+    `create_table_hdu`.
+
+    **The bug**: `create_table_hdu(nrows=0, compress=True[,
+    ztilelen=K])` (the streaming-create pattern: declare an
+    empty compressed table, then `append(chunk)` repeatedly)
+    silently collapsed ZTILELEN to 1 regardless of the user's
+    value.  Two code paths conspired:
+    - `default_ztilelen` (`write_setup.rs`) short-circuited to
+      1 when `nrows == 0`, instead of returning the cfitsio
+      `~10 MB / row_width` cap.
+    - `create_compressed_table_hdu_impl` (`fits.rs`) capped
+      user-provided `ztilelen` by `nrows.max(1)`, which is 1
+      when `nrows == 0`.
+
+    **Impact**: with ZTILELEN=1, every appended row became its
+    own single-row tile, each gzip-compressed independently.
+    A `single_append(100_000 rows)` on a 4-col f4 schema
+    produced **400,026 separate 24-byte gzip-header writes**
+    (one per cell) — observable in `strace -c` as 4900× more
+    `write()` syscalls than `write_table` for identical data.
+    Measured cost: 3.9 s for the streaming-append vs 64 ms
+    for `write_table` — a 61× slowdown that scaled with
+    `N_rows × N_cols`.
+
+    **The fix**: 2 lines.  `default_ztilelen(0, w)` now returns
+    `cap.max(1)` (the cfitsio default for the row width);
+    `create_compressed_table_hdu_impl` doesn't cap by nrows
+    when nrows == 0.  Both file changes ship with 3 regression
+    tests in `tests/test_table_compressed_append.py`
+    (`test_explicit_ztilelen_preserved_when_nrows_zero`,
+    `test_default_ztilelen_sensible_when_nrows_zero`,
+    `test_streaming_create_then_append_uses_user_ztilelen`).
+
+    **Result** (perf-table-compressed-append-chunks.py, 4-col f4
+    schema, ZTILELEN=10_000, N=100_000):
+
+    | chunk | chunk/tile | before | after |
+    |---|---|---|---|
+    | 100 | 0.01 | 112× | 49× |
+    | 1000 | 0.1 | 80× | 5.5× |
+    | 5000 | 0.5 | 77× | 1.6× |
+    | 10000 | 1.0 | 76× | **1.01×** |
+    | 20000 | 2.0 | 76× | 1.00× |
+
+    At chunk ≥ ZTILELEN, append matches write_once exactly.
+    The remaining slowdown at sub-tile chunks IS the original
+    TODO's "partial-last-tile re-encode tax" — but now scoped
+    to its real impact (5-50× at sub-tile sizes) rather than
+    hidden behind the per-cell catastrophe.
+
+    **The original "buffer in RAM" / "shadow raw bytes"
+    approaches are NOT needed.**  The bug fix delivers the
+    bulk of the win; the residual sub-tile re-encode cost is
+    acceptable for typical streaming pipelines (use
+    `ztilelen=` matched to chunk size for the cleanest path).
+    Catalog-style benches (perf-table-append.py with the
+    34-col 588-B-row schema): 14-15× pre-fix → 1.8-10× post-
+    fix.
+
+    Documented in `docs/tutorial/performance.rst` under
+    "Incremental table builds" (existing section, refreshed
+    numbers + post-fix note).  New bench
+    `perf/perf-table-compressed-append-chunks.py` covers the
+    full chunk/ZTILELEN sweep.
 
 11. **Rewrite BINTABLE-VLA + ZIMAGE repack as streaming.**
     Surfaced by perf-table-repack.py + perf-compressed-image-
