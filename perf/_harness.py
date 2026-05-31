@@ -98,6 +98,35 @@ def env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def vm_hwm_kb() -> int:
+    """
+    Peak resident set size in KB for THIS process, from
+    ``/proc/self/status:VmHWM``.
+
+    Use this in subprocess workers instead of
+    ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` for per-build RSS
+    measurement.  On Linux, ``getrusage``'s ``ru_maxrss`` is
+    accumulated in ``signal_struct`` and inherited across
+    ``fork+exec`` -- a child spawned by a heavy parent (e.g. one
+    that built a large numpy fixture before ``subprocess.run``)
+    reports the parent's peak rather than its own, silently
+    inflating the result.  ``VmHWM`` is the kernel's per-task
+    high-water and is reset on exec, so it reflects only the
+    current subprocess's allocation history.
+
+    Returns 0 on platforms without ``/proc/self/status`` (non-Linux);
+    in that case fall back to ``getrusage`` if you must.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
 @dataclass
 class Timing:
     """

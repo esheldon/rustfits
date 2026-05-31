@@ -722,6 +722,116 @@ dependent), so up to a few thousand single-pixel patches per
 second.  For bulk masking, group patches into rectangular
 selections that cover whole tiles where possible.
 
+``repack()`` — peak RSS scaling at large heap
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Three repack flavors clean up heap orphans accumulated by
+``__setitem__`` / ``extend`` calls:
+
+* ``TableHDU.repack()`` for BINTABLE VLA columns,
+* ``CompressedImageHDU.repack()`` for ZIMAGE compressed images,
+* ``CompressedTableHDU.repack()`` for ZTABLE compressed tables.
+
+They share a goal (rebuild the heap with only live bytes, shrink
+the file) but the implementations differ.  This bench measures the
+peak RSS at 10 / 100 / 1000 MB heap sizes for each.  Each fixture
+is built in the parent process; the repack runs in a fresh
+subprocess so the reported peak RSS is the repack alone, read via
+``/proc/self/status:VmHWM`` (the kernel's per-task high-water).
+Using ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` here would
+silently report the parent's peak, because on Linux ``ru_maxrss``
+is accumulated in ``signal_struct`` and inherited across
+``fork+exec``; the shared ``h.vm_hwm_kb`` helper is the immune
+path.
+
+.. list-table:: ``repack()`` peak RSS vs PCOUNT
+   :widths: 36 12 12 14 16
+   :header-rows: 1
+
+   * - flavor
+     - PCOUNT
+     - repack t
+     - peak RSS
+     - notes
+   * - BINTABLE VLA (uncompressed)
+     - 10 MB
+     - 6.8 ms
+     - 59 MB
+     - whole-heap-into-RAM impl
+   * - BINTABLE VLA
+     - 100 MB
+     - 51.2 ms
+     - 149 MB
+     - linear: baseline + heap
+   * - BINTABLE VLA
+     - 1,000 MB
+     - 451.3 ms
+     - 1,049 MB
+     - 1.05× PCOUNT
+   * - ZIMAGE compressed image
+     - 11 MB
+     - 8.3 ms
+     - 64 MB
+     - whole-heap-into-RAM impl
+   * - ZIMAGE compressed image
+     - 119 MB
+     - 83.3 ms
+     - 219 MB
+     - 1.5× PCOUNT (live+orphan coexist)
+   * - ZIMAGE compressed image
+     - 1,215 MB
+     - 818.7 ms
+     - 1,787 MB
+     - 1.54× PCOUNT
+   * - ZTABLE compressed table
+     - 7 MB
+     - 1.8 ms
+     - 50 MB
+     - streaming + staging impl
+   * - ZTABLE compressed table
+     - 102 MB
+     - 18.3 ms
+     - **50 MB**
+     - **flat** — no PCOUNT scaling
+   * - ZTABLE compressed table
+     - 1,049 MB
+     - 160.4 ms
+     - **50 MB**
+     - **flat** at 1 GB heap
+
+Three takeaways:
+
+1. **ZTABLE repack is the standout.**  RSS is constant at
+   ~50 MB (Python + rustfits baseline) regardless of heap size,
+   from 10 MB to 1 GB.  The streaming + staging implementation
+   (a ~1 MiB chunk plus the descriptor table; documented in
+   CLAUDE.md under "Heap repack") pays off — even on a 1 GB
+   compressed heap the working set is small enough to run on
+   memory-constrained machines.  Time scales linearly at
+   ~6 GB/s effective heap throughput.
+
+2. **The uncompressed BINTABLE VLA path is whole-heap-into-RAM.**
+   Repack reads the entire old heap into a ``Vec<u8>``, walks
+   live descriptors copying small live cells to a new ``Vec``,
+   then writes back.  Peak RSS = baseline + old_heap, so RSS
+   scales 1:1 with PCOUNT.  For a 1 GB heap, plan on 1 GB of
+   working memory plus baseline.  In this bench live ≈ 40 KB
+   so new_heap is negligible; a workload with substantial
+   live data would push RSS up by that much more.
+
+3. **The ZIMAGE compressed-image path is also whole-heap-into-
+   RAM, with a 1.5× peak.**  Same shape as BINTABLE VLA, but
+   when ``__setitem__`` overwrites entire tiles (the natural
+   orphan pattern), the live half and orphan half coexist in
+   RAM during the copy loop — old_heap + new_heap together
+   peak around 1.5× PCOUNT.  For a 1 GB heap, plan on ~1.5 GB.
+
+The bounded-memory ZTABLE implementation predates the others;
+the uncompressed and ZIMAGE paths could be rewritten with the
+same streaming + staging approach but haven't been (no real
+user has hit the wall yet).  When they are, this bench will
+show the win directly.
+
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

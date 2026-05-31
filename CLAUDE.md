@@ -616,6 +616,19 @@ repack→setitem→repack).  `tests/test_image_compressed_repack.py`
 shift, algorithm matrix Gzip1/Gzip2/Rice1/Hcompress1, quantized
 float, unquantized float, cache invalidation).
 
+**Peak RSS scaling: 1× to 1.5× PCOUNT.**  Step 1 (read whole old
+heap into a `Vec<u8>`) dominates the working set; for the
+ZIMAGE side, the copy walk in step 2 also keeps both halves in
+RAM at peak (orphan and live coexist briefly).  Measured by
+`perf/perf-table-repack.py` and
+`perf/perf-compressed-image-repack.py`: a 1 GB heap takes
+~1.05 GB peak RSS for BINTABLE-VLA and ~1.5 GB for ZIMAGE.
+The ZTABLE compressed-table side uses a different,
+streaming-staging impl (`repack_compressed_table_heap` in
+`src/hdu_table_compressed/repack.rs`) with constant ~50 MB
+peak RSS at any heap size; tracked as TODO #11 to retrofit
+that pattern here.
+
 ## Feature status: supported and missing
 
 Snapshot of what's implemented across (image | table) × (read | write).
@@ -2389,6 +2402,7 @@ wrapper around cfitsio).  Headline wins:
 | Table append (VLA, peak RSS) | 1.3× less RAM than write-once |
 | 2-D image extend, uncompressed (vs fitsio extend) | ~2× faster, ~5× less RAM than write-once |
 | 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
+| ZTABLE repack (1 GB heap, vs whole-heap impls) | **bounded ~50 MB RSS** vs 1–1.5× PCOUNT for table/ZIMAGE repack |
 
 ZTABLE (compressed BINTABLE) is a rustfits self-comparison —
 fitsio's Python API can't decompress it.
@@ -2701,18 +2715,57 @@ worth checking comes up; cross items off as they ship.
    Documented in `docs/tutorial/performance.rst` under
    "2-D image extend".
 
-5. **`repack()` timing on a large heap.**  Both
-   `TableHDU.repack()` (VLA orphan reclaim) and
-   `CompressedImageHDU.repack()` / `CompressedTableHDU.repack()`
-   ship as streaming + staging implementations that should be
-   bounded-memory, but neither has been timed against a large
-   heap.  How to check: build a fixture with K cycles of
-   `(write_vla / __setitem__) → repack` to grow heap orphans,
-   then time the repack pass at increasing heap sizes (10 MB,
-   100 MB, 1 GB).  Verify peak RSS stays bounded.  Bench
-   targets: `perf/perf-table-repack.py`,
+5. ✅ **`repack()` timing on a large heap.**  Done 2026-05-30.
+   Three benches landed: `perf/perf-table-repack.py`,
    `perf/perf-compressed-image-repack.py`,
-   `perf/perf-table-compressed-repack.py`.
+   `perf/perf-table-compressed-repack.py`.  All sweep 10 / 100 /
+   1000 MB heap; each fixture is built in the parent process and
+   repack runs in a fresh subprocess so the reported peak RSS is
+   repack alone.
+
+   **Findings — only ZTABLE is actually bounded-memory:**
+
+   - **BINTABLE VLA repack**: RSS scales 1:1 with PCOUNT.
+     1 GB heap → 1049 MB peak RSS, 451 ms.  The implementation
+     reads the WHOLE old heap into a `Vec<u8>` under a single
+     file lock (`repack_table_heap` in `write_vla.rs`).  The
+     "streaming + staging" claim in the old TODO #5 was
+     aspirational — it actually doesn't stream.
+   - **ZIMAGE compressed-image repack**: RSS scales at ~1.5×
+     PCOUNT (live and orphan halves of the heap coexist in RAM
+     during the copy walk).  1 GB heap → 1787 MB peak, 819 ms.
+     Same whole-heap-into-RAM pattern as BINTABLE VLA.
+   - **ZTABLE compressed-table repack**: **RSS flat at ~50 MB**
+     regardless of heap size.  10 MB / 100 MB / 1 GB heaps all
+     report 50 MB peak (= baseline).  Time scales linearly at
+     ~6 GB/s effective heap throughput.  The streaming + staging
+     impl really does work (chunked in-file copy + a small move-
+     plan vector; no heap-in-RAM allocation).
+
+   **CLAUDE.md correction**: the "Heap repack" section's claim
+   that all three repacks are streaming was wrong for two of
+   the three.  Updated below in that section.
+
+   **Tooling fix discovered**: the existing extend benches were
+   using `resource.getrusage(RUSAGE_SELF).ru_maxrss` to measure
+   subprocess RSS.  On Linux that value is accumulated in
+   `signal_struct` and inherited across `fork+exec`, so a
+   subprocess spawned by a heavy parent reports the parent's
+   peak rather than its own.  Fixed by adding a shared
+   `h.vm_hwm_kb()` helper in `_harness.py` that reads
+   `/proc/self/status:VmHWM` (the kernel's per-task high-water,
+   reset on exec) and routing all six RSS-measuring perf scripts
+   through it.
+
+   **Practical guidance**: on memory-constrained machines,
+   ZTABLE repack is safe at any heap size; BINTABLE-VLA and
+   ZIMAGE repack require RAM ≈ 1–1.5× the on-disk PCOUNT.
+   The two remaining whole-heap impls could be rewritten in
+   the ZTABLE streaming style but haven't been (no real user
+   has hit the wall yet).
+
+   Documented in `docs/tutorial/performance.rst` under
+   "``repack()`` — peak RSS scaling at large heap".
 
 6. ✅ **Compressed-image `__setitem__` cost.**  Done 2026-05-30.
    `perf/perf-compressed-image-setitem.py` sweeps 4 selections
@@ -2820,6 +2873,37 @@ worth checking comes up; cross items off as they ship.
     per-detector-frame catalog writes).  Could pair with #4
     (2-D image extend) since the same pattern applies to
     compressed-image extend.
+
+11. **Rewrite BINTABLE-VLA + ZIMAGE repack as streaming.**
+    Surfaced by perf-table-repack.py + perf-compressed-image-
+    repack.py (#5 above).  Both currently read the WHOLE old
+    heap into a `Vec<u8>` under a single file lock; peak RSS
+    scales 1:1 (uncompressed) or 1.5× (compressed image, where
+    live and orphan halves coexist during the copy walk) with
+    PCOUNT.  A 1 GB heap → 1–1.5 GB working RAM during repack
+    on a process that may otherwise need only ~100 MB —
+    surprising on memory-constrained machines.  ZTABLE repack
+    (the third flavor) already runs in flat ~50 MB at any heap
+    size via a chunked in-file copy + small move-plan vector
+    (`repack_compressed_table_heap` in
+    `src/hdu_table_compressed/repack.rs`); that's the model.
+
+    Plan: extract the chunked-copy + plan-vector primitive from
+    the ZTABLE side into something usable by the other two.
+    For BINTABLE VLA: walk descriptors once to build a
+    "(old_off, n_bytes, new_off)" plan, then stream-copy live
+    cells in ~1 MiB chunks.  For ZIMAGE: same shape; the
+    descriptor walk is over the COMPRESSED_DATA column (plus
+    GZIP / UNCOMPRESSED fallback columns).
+
+    Defer until a real user hits the wall (e.g. a quantized-
+    float reduction loop on a memory-constrained worker), so
+    the rewrite has a concrete workload to validate against.
+    But it's a real bound on what users can do with rustfits
+    on small machines, and worth fixing.  No bench changes
+    needed when it lands — `perf/perf-table-repack.py` and
+    `perf/perf-compressed-image-repack.py` will show the flat
+    RSS scaling automatically.
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache

@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import resource
 import subprocess
 import sys
 import time
@@ -138,7 +137,7 @@ def build_worker(mode, variant_key, n, chunk):
     else:
         raise ValueError(f"unknown mode: {mode}")
 
-    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_kb = h.vm_hwm_kb()
     try:
         os.remove(fname)
     except OSError:

@@ -306,6 +306,9 @@ SCRIPTS_WITH_NARRATIVE: set[str] = {
     "perf-image-extend-2d.py",
     "perf-compressed-image-extend-2d.py",
     "perf-compressed-image-setitem.py",
+    "perf-table-repack.py",
+    "perf-compressed-image-repack.py",
+    "perf-table-compressed-repack.py",
 }
 
 
@@ -456,6 +459,23 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "per-pixel cost.  Rustfits-self only -- fitsio's contiguous "
         "``write(start=)`` equivalent crashes a sweep with a cfitsio "
         "free() corruption.",
+    ),
+    "perf-table-repack.py": (
+        "BINTABLE VLA repack — peak RSS scaling",
+        "VLA orphan reclaim at 10 / 100 / 1000 MB heap.  Whole-heap-"
+        "into-RAM impl; bench confirms RSS scales 1:1 with PCOUNT.",
+    ),
+    "perf-compressed-image-repack.py": (
+        "ZIMAGE compressed-image repack — peak RSS scaling",
+        "GZIP_1 + setitem(:) orphan pattern at 10 / 100 / 1000 MB "
+        "heap.  Same whole-heap-into-RAM impl as the table side, with "
+        "the additional bump from the live-half new_heap coexisting "
+        "with the orphan-half old_heap during the copy walk.",
+    ),
+    "perf-table-compressed-repack.py": (
+        "ZTABLE compressed-table repack — bounded-memory verify",
+        "Streaming + staging impl claimed in CLAUDE.md; bench verifies "
+        "RSS stays flat at ~50 MB from 10 MB to 1 GB heap.",
     ),
 }
 

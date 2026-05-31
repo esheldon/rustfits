@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import resource
 import subprocess
 import sys
 import time
@@ -96,7 +95,7 @@ def build_worker(mode, n, chunk, tile, level, run_len, cov, quant):
                 f.write(data, compress="GZIP_2", tile_dims=(tile,), qlevel=0)
         t = time.perf_counter() - t0
 
-    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_kb = h.vm_hwm_kb()
     try:
         os.remove(fname)
     except OSError:
