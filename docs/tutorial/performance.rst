@@ -298,7 +298,8 @@ Five things to take away:
       single-row-per-tile, independently-gzip-compressed tile.
       The pre-fix numbers were 14–15× for fixed-only and 6–7×
       for VLA at *any* chunk size, since the bug masked the
-      true per-call cost.  Tracked as Performance TODO #10.
+      true per-call cost.  Resolved in CLAUDE.md TODO #10
+      (commit 957f94a).
 
 .. note::
 
@@ -451,7 +452,7 @@ Three takeaways:
    mosaic builds, **align chunks to a multiple of tile-rows**
    (or buffer to that size in user code) to skip the
    re-encode tax.  Improving the partial-tile path is tracked
-   in ``CLAUDE.md`` under Performance TODO #10.
+   in ``CLAUDE.md`` under Performance TODO #12.
 
 Compressed-image ``__setitem__`` — per-tile re-encode tax
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

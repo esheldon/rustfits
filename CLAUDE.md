@@ -2698,7 +2698,9 @@ worth checking comes up; cross items off as they ship.
      same partial-last-tile re-encode pattern as the ZTABLE
      small-chunk append finding.  For mosaic builds align chunks
      to a multiple of tile-rows to avoid the re-encode tax.
-     Tracked in TODO #10.
+     Tracked in TODO #12 (TODO #10 fixed the table-side
+     ZTILELEN-collapse bug; the compressed-image extend partial-
+     tile cost is genuinely separate and still open).
 
    **Bench methodology note:** `_data.des_array` was rewritten to
    generate in row-strips because the naive
@@ -2952,6 +2954,46 @@ worth checking comes up; cross items off as they ship.
     needed when it lands — `perf/perf-table-repack.py` and
     `perf/perf-compressed-image-repack.py` will show the flat
     RSS scaling automatically.
+
+12. **Compressed-image extend: sub-tile chunk re-encode tax.**
+    Surfaced by `perf/perf-compressed-image-extend-2d.py` (#4
+    above): with `chunk_rows < tile_rows`, every extend call
+    decompresses the partial trailing tile, appends the new
+    rows, and re-encodes the (now-larger) tile back to the
+    heap.  Measured **21.6× slower than write-once** at ½-tile
+    chunks (50-row chunks into 100-row tiles), 7.6× at exact-
+    tile chunks (per-call overhead floor), 1.5× at 10-tile
+    chunks (genuinely competitive).
+
+    This is the same shape as the ZTABLE small-chunk append
+    issue tracked under TODO #10 — but TODO #10's headline
+    fix (the ZTILELEN-collapses-when-nrows-zero bug) was
+    table-specific.  Compressed-image extend uses
+    user-provided `tile_shape` directly with no auto-collapse
+    bug, so the residual sub-tile cost here is the genuine
+    partial-tile re-encode work.
+
+    **Fix approaches** (same as the deferred (a)/(b) from
+    original TODO #10):
+    - (a) Buffer pending rows in RAM until the trailing tile
+      fills, then encode once.  User-visible: pending rows
+      aren't on disk until `hdu.flush()` or `close()`.  Best
+      speedup (matches write-once).
+    - (b) Cache the trailing tile's raw bytes in the HDU so
+      re-extend skips the re-decode (saves the smaller decode
+      cost, still pays the re-encode).  Modest speedup, no
+      API change.
+
+    Workaround in user code: align chunks to a multiple of
+    `tile_rows`.  Documented in performance.rst under the 2-D
+    compressed image extend section.
+
+    Defer until a real workload (e.g. per-detector-frame
+    mosaic builder) measurably hurts.  Could pair with the
+    table-side residual sub-tile cost (~5-10× at chunks <<
+    ZTILELEN per post-#10 measurements) — same approach (a) or
+    (b) would fix both since the merge-tile pattern is
+    structurally identical.
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache
