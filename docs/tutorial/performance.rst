@@ -402,7 +402,7 @@ rustfits-only; fitsio appears only as a write-once reference.
 ``perf/perf-compressed-image-extend-2d.py``.
 
 .. list-table:: Compressed 2-D image extend (20 k × 4 k f4, GZIP_2 tile=(100, cols))
-   :widths: 44 12 12 22
+   :widths: 52 12 12 22
    :header-rows: 1
 
    * - regime
@@ -410,49 +410,98 @@ rustfits-only; fitsio appears only as a write-once reference.
      - peak RSS
      - vs rf write-once
    * - fitsio write-once
-     - 6.35 s
+     - 6.44 s
      - 440 MB
-     - :perf-slow:`2.97× time` (fitsio)
+     - :perf-fast:`2.98× time` (fitsio)
    * - rustfits write-once
-     - 2.14 s
-     - 625 MB
+     - 2.17 s
+     - 626 MB
      - (ref)
    * - rustfits extend C=50 rows (K=400, sub-tile)
-     - 46.18 s
-     - 455 MB
-     - 21.6× time, 1.4× less RAM
+     - 48.30 s
+     - 454 MB
+     - 22.3× time, 1.4× less RAM
+   * - rustfits extending() C=50 rows (K=400, sub-tile)
+     - 2.73 s
+     - 364 MB
+     - 1.26× time, 1.7× less RAM
    * - rustfits extend C=100 rows (K=200, exact tile)
-     - 16.27 s
+     - 16.68 s
      - 321 MB
-     - 7.6× time, 2.0× less RAM
+     - 7.7× time, 1.9× less RAM
+   * - rustfits extending() C=100 rows (K=200, exact tile)
+     - 2.74 s
+     - 365 MB
+     - 1.26× time, 1.7× less RAM
    * - rustfits extend C=1000 rows (K=20, 10 tiles)
-     - 3.27 s
+     - 3.34 s
      - 338 MB
-     - 1.5× time, 1.8× less RAM
+     - 1.54× time, 1.8× less RAM
+   * - rustfits extending() C=1000 rows (K=20, 10 tiles)
+     - 2.49 s
+     - 394 MB
+     - 1.15× time, 1.6× less RAM
 
-Three takeaways:
+Four takeaways:
 
 1. **Multi-tile chunks are nearly free.**  At chunk=1000 rows
-   (10 tiles per call) extend is only 1.5× write-once — the
+   (10 tiles per call) extend is 1.54× write-once — the
    per-extend overhead is one heap-relocate-forward and a
    PCOUNT bump, amortized across the 10 tiles' encode work.
    For mosaic builds that can buffer multi-tile strips, this
    is the regime to aim for.
 
 2. **Exact-tile chunks are moderate.**  At chunk=100 rows (1
-   tile per call) extend costs 7.6× write-once — the per-call
+   tile per call) extend costs 7.7× write-once — the per-call
    overhead dominates because there's only one tile's worth
    of "real" encode work per call but the same bookkeeping.
 
 3. **Sub-tile chunks pay heavily.**  At chunk=50 rows (½ tile)
    every append decompresses + merges into the partial last
-   tile then re-encodes it: 21.6× write-once — the same
+   tile then re-encodes it: 22.3× write-once — the same
    mirror-pattern as the ZTABLE small-chunk re-encode finding
    in the table-append section above.  For compressed 2-D
    mosaic builds, **align chunks to a multiple of tile-rows**
    (or buffer to that size in user code) to skip the
-   re-encode tax.  Improving the partial-tile path is tracked
-   in ``CLAUDE.md`` under Performance TODO #12.
+   re-encode tax — or use the ``extending()`` context (takeaway
+   4) to do the buffering automatically.
+
+4. **The ``extending()`` context manager wins at every
+   chunk size.**  Wrapping the extend loop in ``with
+   hdu.extending():`` buffers chunks in RAM and drains in
+   tile-aligned bursts (triggered by a 32 MB soft cap),
+   collapsing N partial-tile re-encodes into 1::
+
+       with hdu.extending():
+           for batch in batches:
+               hdu.extend(batch)
+
+   At sub-tile chunks the speedup is dramatic: 22.3× → 1.26×
+   write-once (18× faster than the unbuffered extend) AND
+   peak RSS drops to 364 MB — 1.7× *less* RAM than write-once
+   because the cap bounds the buffer below what
+   write-once's whole-array path holds.  Even at exact-tile
+   chunks the context helps (7.7× → 1.26×).  At multi-tile
+   chunks it's a modest win (1.54× → 1.15×).
+
+   **Memory cap.**  The mid-context drain is triggered at
+   ``MAX_PENDING_BYTES = 32 MB`` of accumulated input,
+   chosen as a soft cap that fits many tiles per drain
+   while staying small enough to not balloon RSS during long
+   streaming loops.  Sized as a code constant; not currently
+   user-configurable — if a workload needs a different cap
+   please open an issue.
+
+   **Strict context semantics.**  Inside ``with
+   hdu.extending():`` only :meth:`extend` is permitted; any
+   :meth:`read`, ``__getitem__``, :meth:`write`, ``__setitem__``,
+   :meth:`repack`, :meth:`add_checksum`, or :meth:`verify_checksum`
+   call raises ``ValueError``.  Exit the context first.  The
+   natural nested-``with`` pattern with ``FITS`` composes
+   correctly (Python guarantees the inner ``__exit__`` runs
+   before the outer ``close``), so this restriction only
+   surfaces in mixed-operation loops that should be
+   restructured anyway.
 
 Compressed-image ``__setitem__`` — per-tile re-encode tax
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

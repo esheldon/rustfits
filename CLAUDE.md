@@ -2402,6 +2402,7 @@ wrapper around cfitsio).  Headline wins:
 | Table append (VLA, peak RSS) | 1.3× less RAM than write-once |
 | 2-D image extend, uncompressed (vs fitsio extend) | ~2× faster, ~5× less RAM than write-once |
 | 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
+| 2-D compressed image `extending()` context (sub-tile chunks) | **18× faster** than unbuffered extend (22.3× → 1.26× write-once); 1.7× less RAM than write-once |
 | ZTABLE repack (1 GB heap, vs whole-heap impls) | **bounded ~50 MB RSS** vs 1–1.5× PCOUNT for table/ZIMAGE repack |
 | ZTABLE streaming append (`create(nrows=0)` + `append`, post ZTILELEN-bug fix) | **61× faster** at chunk = ZTILELEN; now matches write_once within 2% |
 
@@ -2698,9 +2699,15 @@ worth checking comes up; cross items off as they ship.
      same partial-last-tile re-encode pattern as the ZTABLE
      small-chunk append finding.  For mosaic builds align chunks
      to a multiple of tile-rows to avoid the re-encode tax.
-     Tracked in TODO #12 (TODO #10 fixed the table-side
-     ZTILELEN-collapse bug; the compressed-image extend partial-
-     tile cost is genuinely separate and still open).
+     **Fixed in TODO #12** via `hdu.extending()` context manager:
+     mid-context tile-aligned drains (triggered by a 32 MB RAM
+     cap) plus one final residual drain at `__exit__` collapses
+     N partial-tile re-encodes into 1.  Sub-tile chunks drop
+     from 22.3× → 1.26× write-once; exact-tile from 7.7× →
+     1.26×; multi-tile from 1.54× → 1.15×.  Peak RSS at sub-
+     tile chunks is 364 MB (1.7× LESS than write-once's 626 MB)
+     because the cap bounds the buffer.  See TODO #12 below
+     for the full numbers + design.
 
    **Bench methodology note:** `_data.des_array` was rewritten to
    generate in row-strips because the naive
@@ -2955,45 +2962,90 @@ worth checking comes up; cross items off as they ship.
     `perf/perf-compressed-image-repack.py` will show the flat
     RSS scaling automatically.
 
-12. **Compressed-image extend: sub-tile chunk re-encode tax.**
-    Surfaced by `perf/perf-compressed-image-extend-2d.py` (#4
-    above): with `chunk_rows < tile_rows`, every extend call
-    decompresses the partial trailing tile, appends the new
-    rows, and re-encodes the (now-larger) tile back to the
-    heap.  Measured **21.6× slower than write-once** at ½-tile
-    chunks (50-row chunks into 100-row tiles), 7.6× at exact-
-    tile chunks (per-call overhead floor), 1.5× at 10-tile
-    chunks (genuinely competitive).
+12. ✅ **Compressed-image extend: sub-tile chunk re-encode tax.**
+    Done 2026-05-31 via the `hdu.extending()` context manager.
 
-    This is the same shape as the ZTABLE small-chunk append
-    issue tracked under TODO #10 — but TODO #10's headline
-    fix (the ZTILELEN-collapses-when-nrows-zero bug) was
-    table-specific.  Compressed-image extend uses
-    user-provided `tile_shape` directly with no auto-collapse
-    bug, so the residual sub-tile cost here is the genuine
-    partial-tile re-encode work.
+    **The problem (surfaced by
+    `perf/perf-compressed-image-extend-2d.py`):** with
+    `chunk_rows < tile_rows`, every extend call decompresses
+    the partial trailing tile, appends the new rows, and
+    re-encodes the (now-larger) tile back to the heap.
+    Measured **22.3× slower than write-once** at ½-tile chunks
+    (50-row chunks into 100-row tiles), 7.7× at exact-tile
+    chunks (per-call overhead floor), 1.5× at 10-tile chunks
+    (genuinely competitive).
 
-    **Fix approaches** (same as the deferred (a)/(b) from
-    original TODO #10):
-    - (a) Buffer pending rows in RAM until the trailing tile
-      fills, then encode once.  User-visible: pending rows
-      aren't on disk until `hdu.flush()` or `close()`.  Best
-      speedup (matches write-once).
-    - (b) Cache the trailing tile's raw bytes in the HDU so
-      re-extend skips the re-decode (saves the smaller decode
-      cost, still pays the re-encode).  Modest speedup, no
-      API change.
+    **The fix: opt-in context manager** (`Path A` strict
+    semantics; designed in conversation with the user — see
+    the `hdu.extending()` discussion log).  Pattern:
 
-    Workaround in user code: align chunks to a multiple of
-    `tile_rows`.  Documented in performance.rst under the 2-D
-    compressed image extend section.
+    ```python
+    with hdu.extending():
+        for batch in batches:
+            hdu.extend(batch)
+    ```
 
-    Defer until a real workload (e.g. per-detector-frame
-    mosaic builder) measurably hurts.  Could pair with the
-    table-side residual sub-tile cost (~5-10× at chunks <<
-    ZTILELEN per post-#10 measurements) — same approach (a) or
-    (b) would fix both since the merge-tile pattern is
-    structurally identical.
+    Inside the `with` block every `extend()` call appends its
+    input to an in-memory buffer rather than touching disk.
+    When the buffer crosses a soft **32 MB cap**
+    (`MAX_PENDING_BYTES` in `hdu_image_compressed/extending.rs`),
+    the largest tile-row-aligned slice drains via the existing
+    extend code; any sub-tile residual stays buffered.  On
+    `__exit__` (normal or exceptional) the residual drains —
+    the only call that pays a partial-trailing-tile re-encode.
+
+    Strict semantics: while in the context, ONLY `extend()` is
+    permitted.  `read` / `__getitem__` / `write` / `__setitem__`
+    / `repack` / `add_checksum` / `verify_checksum` raise
+    `ValueError` (a `check_not_in_context` guard at the entry
+    of each).  `FITS.close()` also raises if any HDU is still
+    in a context — natural nested-with patterns never trigger
+    this (Python guarantees inner `__exit__` runs first), but
+    forgotten `__exit__()` in manual-handling code surfaces as
+    an explicit error.
+
+    **Bench result** (`perf/perf-compressed-image-extend-2d.py`,
+    20 k × 4 k f4 GZIP_2 tile (100, cols)):
+
+    | regime | extend (existing) | extending() | win |
+    |---|---|---|---|
+    | sub-tile (C=50, K=400) | 22.31× time, 454 MB | **1.26× time, 364 MB** | 18× faster, 1.7× LESS RAM than write-once |
+    | exact-tile (C=100, K=200) | 7.70× time | 1.26× time | 6× faster |
+    | multi-tile (C=1000, K=20) | 1.54× time | 1.15× time | 1.3× faster |
+
+    The 32 MB cap is small enough that even a long streaming
+    extend loop stays in a tight RAM budget AND fits many
+    tiles per drain (a 1.6 MB tile → 20 tiles per drain on
+    this bench → 10 drains total), amortizing the per-call
+    extend overhead.  Peak RSS LESS than write-once because
+    the cap bounds the buffer below what write-once needs.
+
+    **Implementation.**  `src/hdu_image_compressed/extending.rs`
+    (the buffer, the drain logic, the `ExtendContext` pyclass);
+    routing in `src/hdu_image_compressed/hdu.rs::extend()`;
+    guards in every other public data-touching pymethod;
+    `FITS.close()` check in `src/fits.rs`.  No changes to
+    `extend_compressed_image_data` itself — the buffer is a
+    pure addition that hands off to existing code.
+
+    **Tests.**  `tests/test_image_compressed_extending.py`
+    (22 cases): round-trip equivalence at sub-tile / exact-tile
+    / multi-tile chunks across Gzip1/Gzip2/Rice1, auto-flush on
+    exception, mid-context drain firing under load, empty
+    context no-op, all rejection paths (read/getitem/write/
+    setitem/repack/checksum/nested/close), cross-tool astropy
+    round-trip, unsigned-int trick.
+
+    **ZTABLE follow-up.**  Same pattern can apply to
+    `CompressedTableHDU` to close the residual sub-tile cost
+    from post-#10 (5-10× at chunks << ZTILELEN).  Method name
+    on the table side would be `appending()` (with `extending()`
+    as a symmetric alias).  Not done yet; landable as a
+    follow-up commit using the ZIMAGE extension as a model.
+    The uncompressed `ImageHDU` / `TableHDU` could also expose
+    no-op `extending()` / `appending()` context managers so
+    generic code that iterates HDUs of mixed types can use
+    `with hdu.extending():` uniformly.
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache

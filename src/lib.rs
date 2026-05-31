@@ -29,7 +29,9 @@ mod checksum;
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
-use crate::hdu_image_compressed::CompressedImageHDU;
+use crate::hdu_image_compressed::{
+    CompressedImageExtendContext, CompressedImageHDU,
+};
 use crate::hdu_table::{ColumnSubset, SingleColumnSubset, TableHDU, TableIter};
 use crate::hdu_table_compressed::{
     CompressedColumnSubset, CompressedSingleColumnSubset, CompressedTableHDU,
@@ -46,6 +48,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HDU>()?;
     m.add_class::<ImageHDU>()?;
     m.add_class::<CompressedImageHDU>()?;
+    m.add_class::<CompressedImageExtendContext>()?;
     m.add_class::<TableHDU>()?;
     m.add_class::<CompressedTableHDU>()?;
     m.add_class::<CompressedSingleColumnSubset>()?;

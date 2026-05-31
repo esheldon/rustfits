@@ -17,6 +17,17 @@ comparison:
                              below ZTILE rows (re-encodes the
                              partial trailing tile every call),
                              exact tile-row, and several tile rows.
+* ``rustfits extending()`` -- same loop wrapped in
+                             ``with hdu.extending():``; buffers
+                             chunks in RAM and drains in tile-
+                             aligned bursts when the buffer
+                             crosses a 32 MB cap, then drains
+                             the residual at __exit__.  The
+                             partial-tile re-encode happens
+                             once total (at __exit__), so
+                             sub-tile chunk loops collapse to
+                             roughly write-once cost while
+                             peak RSS stays bounded.
 
 The chunk-row sweep exposes the same kind of small-chunk re-encode
 cost as the ZTABLE merge-tile append.  Default tile is
@@ -77,6 +88,36 @@ def build_worker(mode, rows, cols, chunk_rows, tile_rows, level):
                 done += c
                 i += 1
                 del data
+    elif mode == "extending_rf":
+        # Same loop as extend_rf but wrapped in extending() so the
+        # mid-context drains are tile-aligned and the final partial-
+        # tile encode happens once at __exit__.  Times only the
+        # extend() calls + the __exit__ drain — data generation is
+        # excluded (matches extend_rf below, and the reference
+        # write rows above, which all keep des_array out of the
+        # timer).  We achieve this by accumulating per-call timings
+        # around hdu.extend() inside the with block and adding the
+        # __exit__ wall time at the end.
+        t = 0.0
+        done = 0
+        i = 0
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_image_hdu("f4", (0, cols), compress=rustfits.Gzip2(**cfg))
+            hdu = f[1]
+            ctx = hdu.extending()
+            ctx.__enter__()
+            while done < rows:
+                c = min(chunk_rows, rows - done)
+                data = _data.des_array(c, cols, zero_frac=0.05, seed=i + 1)
+                t0 = time.perf_counter()
+                hdu.extend(data)
+                t += time.perf_counter() - t0
+                done += c
+                i += 1
+                del data
+            t0 = time.perf_counter()
+            ctx.__exit__(None, None, None)
+            t += time.perf_counter() - t0
     else:
         data = _data.des_array(rows, cols, zero_frac=0.05, seed=0)
         t0 = time.perf_counter()
@@ -232,6 +273,8 @@ def main():
             )
             label = f"rustfits extend C={c} rows (K={k_chunks}, {tag})"
             rows_out.append((label, run_build("extend_rf", c, args)))
+            label2 = f"rustfits extending() C={c} rows (K={k_chunks}, {tag})"
+            rows_out.append((label2, run_build("extending_rf", c, args)))
 
         cols_spec = [
             ("regime", 46, "l"),
