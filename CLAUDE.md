@@ -2553,27 +2553,33 @@ single area: `test_repr.py` (spans `FITS` + every HDU type) and
 When adding a test, name it for the area + feature it exercises, not the
 work item that introduced it (no "phaseN" / dev-stage names).
 
-## Known CI limitations
+## CI: macOS fitsio workaround
 
-**macOS dropped from the test matrix (May 2026).**  The CI
-workflow at `.github/workflows/ci.yml` originally ran
-`{ubuntu-latest, macos-latest} x {python 3.12, 3.14}`.  Every
-macOS leg crashed during the first test that asks fitsio to
-write a compressed-image fixture: libmalloc detected a bad
-free inside cfitsio's `ffbinit`, called from
-`PyFITSObject_create_image_hdu`.  Both py3.12 and py3.14
-hit it, so it's macOS-specific (conda-forge build of fitsio
-or cfitsio), not Python-version specific.  Linux is
-unaffected.
+The test matrix runs `{ubuntu-latest, macos-latest} x
+{python 3.12, 3.14}`.  On macOS, conda-forge's
+fitsio/cfitsio binary crashes with a libmalloc bad-free
+inside cfitsio's `ffbinit` on the first test that writes a
+compressed-image fixture (`PyFITSObject_create_image_hdu`
+path).  Both py3.12 and py3.14 hit it, so it's the
+conda-forge build, not the Python version.  rustfits CI
+works around it by replacing the broken conda binary with
+a pip source build on the macOS legs only:
 
-The repo owner is upstream on fitsio and plans to fix the
-macOS build there.  Once a fixed fitsio is released on
-conda-forge, re-add `macos-latest` to the `test.matrix.os`
-list in `.github/workflows/ci.yml` and delete this note.
-Worth keeping an eye on the failing test
-(`tests/test_image_compressed_accessors.py`'s
-`test_other_compression_types_dispatched` was the first to
-abort) when the time comes.
+```yaml
+- name: Replace conda-forge fitsio with source build (macOS)
+  if: matrix.os == 'macos-latest'
+  shell: bash -el {0}
+  run: |
+    pip install --force-reinstall --no-deps --no-binary=fitsio fitsio
+```
+
+This matches fitsio's own CI (which source-builds on every
+leg — see `~/git/fitsio/.github/workflows/tests.yml`).  Linux
+keeps the fast conda install.  When upstream conda-forge
+fitsio is fixed, the macOS pip step can be removed.  First
+test to abort with the conda binary was
+`tests/test_image_compressed_accessors.py`'s
+`test_other_compression_types_dispatched`.
 
 ## Documentation TODO — tutorial gap audit
 

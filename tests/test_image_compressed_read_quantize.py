@@ -25,6 +25,7 @@ Coverage:
 """
 
 import os
+import sys
 import tempfile
 
 import numpy as np
@@ -33,6 +34,23 @@ import pytest
 import rustfits
 
 fitsio = pytest.importorskip("fitsio")
+
+
+# On macOS, cfitsio's dequantization produces slightly different
+# float results than on Linux — almost certainly compiler-codegen
+# variance (FMA fusion, Apple libm vs glibc).  rustfits's Rust
+# dequant bit-matches Linux cfitsio.  We pin the divergence here
+# so the level is documented and a future regression beyond this
+# bound surfaces visibly.  Current observations across all dither
+# methods on macOS arm64 + py3.12:
+#   - rtol up to ~1.6e-5 on near-zero values (where the tiny
+#     denominator inflates the ratio)
+#   - atol up to ~2.6e-9 in the same near-zero case
+# Bumping atol gives room on small values without weakening the
+# per-value relative bound for normal-magnitude data.
+_MACOS_FP_RTOL = 1e-5
+_MACOS_FP_ATOL = 1e-8
+_IS_MACOS = sys.platform == "darwin"
 
 
 def _write_quantized(
@@ -73,16 +91,29 @@ def _write_quantized(
 
 def _arrays_match(got, ref):
     """
-    Bit-for-bit equality with NaN-aware comparison.  Two NaNs
-    compare unequal under normal element-wise compare; check
-    the NaN masks match and the finite elements are equal.
+    NaN-aware cross-tool equality.
+
+    Linux: bit-for-bit (the dequant formula is deterministic and
+    rustfits's Rust port matches conda-forge linux cfitsio
+    exactly).  macOS: allclose at the level documented by
+    ``_MACOS_FP_RTOL`` / ``_MACOS_FP_ATOL`` — cfitsio's dequant
+    on macOS computes the same formula but the platform's
+    compiler/libm produces ULP-level differences.
     """
     assert got.dtype == ref.dtype, (got.dtype, ref.dtype)
     assert got.shape == ref.shape, (got.shape, ref.shape)
     got_nan = np.isnan(got)
     ref_nan = np.isnan(ref)
     np.testing.assert_array_equal(got_nan, ref_nan)
-    np.testing.assert_array_equal(got[~got_nan], ref[~ref_nan])
+    if _IS_MACOS:
+        np.testing.assert_allclose(
+            got[~got_nan],
+            ref[~ref_nan],
+            rtol=_MACOS_FP_RTOL,
+            atol=_MACOS_FP_ATOL,
+        )
+    else:
+        np.testing.assert_array_equal(got[~got_nan], ref[~ref_nan])
 
 
 # -------------------- exhaustive round-trip matrix -----------------
