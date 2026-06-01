@@ -26,6 +26,12 @@ use super::read::{
     ascii_repr_dtype_str, build_ascii_numpy_dtype, read_ascii_table,
     read_one_column,
 };
+use super::setitem::{
+    classify_ascii_setitem_key, setitem_fancy_rows, setitem_multi_columns,
+    setitem_row_slice, setitem_single_column, setitem_single_row,
+    write_column_subset_at_rows, write_one_column_at_rows,
+    AsciiSetItemKey,
+};
 use super::write_fixed::{
     append_ascii_table, determine_input_nrows, write_ascii_table_full,
 };
@@ -516,6 +522,51 @@ impl AsciiTableHDU {
         }
     }
 
+    // hdu[key] = value: symmetric with __getitem__ — anything readable
+    // is writable.  Dispatches on the same five key shapes:
+    //   bare int                 -> single-row write
+    //   slice                    -> contiguous (step=1) or strided write
+    //   str/bytes column name    -> whole-column write
+    //   iterable of int          -> fancy-row write
+    //   iterable of str/bytes    -> multi-column subset write
+    // No (row, col) tuple form — single-cell writes go through the
+    // symmetric subset form `hdu["col"][row] = v`.  Same surface as
+    // TableHDU.__setitem__ minus the VLA branches.
+    fn __setitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        let kind = classify_ascii_setitem_key(key)?;
+        match kind {
+            AsciiSetItemKey::SingleRow(i) => setitem_single_row(
+                py, super_, &meta.columns, nrows, row_width,
+                i, value, data_offset),
+            AsciiSetItemKey::RowSlice => {
+                let slice_py = key.cast::<PySlice>()?;
+                setitem_row_slice(
+                    py, super_, &meta.columns, nrows, row_width,
+                    slice_py, value, data_offset)
+            }
+            AsciiSetItemKey::SingleColumn(name) => setitem_single_column(
+                py, super_, &meta.columns, nrows, row_width,
+                &name, value, data_offset),
+            AsciiSetItemKey::FancyRows(rows) => setitem_fancy_rows(
+                py, super_, &meta.columns, nrows, row_width,
+                &rows, value, data_offset),
+            AsciiSetItemKey::MultiColumns(names) => setitem_multi_columns(
+                py, super_, &meta.columns, nrows, row_width,
+                &names, value, data_offset),
+        }
+    }
+
     // `for row in hdu:` — yields one row per iteration as a numpy
     // scalar record.  Rows are read in internally-buffered batches;
     // iterating a large table stays memory-bounded.  pyo3 installs
@@ -624,6 +675,46 @@ impl AsciiSingleColumnSubset {
             &self.name, rows, as_bytes, scale, mask_null,
         )
     }
+
+    /// Write this column.
+    ///
+    /// With ``rows=None`` (default) writes every row — equivalent to
+    /// ``hdu["name"] = data``.  With ``rows=<spec>`` writes only the
+    /// named rows — equivalent to ``self[rows] = data`` (the
+    /// ``__setitem__`` form).  Other columns' bytes are untouched
+    /// in both cases.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => self.hdu.bind(py).set_item(&self.name, data),
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
+    // hdu["name"][rows] = value.  Per-cell loop through setitem_cell.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_one_column_at_rows(
+            py, super_, &meta.columns, nrows, row_width,
+            &self.name, rows, value, data_offset)
+    }
 }
 
 /// A deferred handle for a column subset of a :class:`AsciiTableHDU`.
@@ -693,5 +784,48 @@ impl AsciiColumnSubset {
             py, &meta, data_offset, &super_.file,
             rows, Some(self.columns.clone()), scale, mask_null,
         )
+    }
+
+    /// Write these columns.
+    ///
+    /// With ``rows=None`` (default) writes every row — equivalent to
+    /// ``hdu[[names...]] = data`` (the multi-column form).  With
+    /// ``rows=<spec>`` writes only the named rows — equivalent to
+    /// ``self[rows] = data`` (the ``__setitem__`` form).
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => {
+                let key = PyList::new(py, &self.columns)?;
+                self.hdu.bind(py).set_item(&key, data)
+            }
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
+    // hdu[["a","b"]][rows] = value.  Per-row × per-column loop through
+    // setitem_cell.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_column_subset_at_rows(
+            py, super_, &meta.columns, nrows, row_width,
+            &self.columns, rows, value, data_offset)
     }
 }

@@ -219,16 +219,30 @@ else stays private to its file.
     `normalize_and_build_ascii_table_header`.  TBCOL packs
     flush (no inter-column gap — matches cfitsio).
   - `write_fixed.rs` — `extract_per_column_arrays` (structured /
-    dict / list+names input forms) + `format_row` +
-    `write_ascii_table_data` (1 MiB row-chunk budget,
-    ASCII-space final-block pad) + `write_ascii_table_full` +
-    `append_ascii_table` (uses the shared
-    `shift_file_tail_and_update_offsets` for non-last HDU grow).
+    dict / list+names input forms) + `format_one_cell` +
+    `format_row` + `write_ascii_table_data` (1 MiB row-chunk
+    budget, ASCII-space final-block pad) + `write_ascii_table_full`
+    + `append_ascii_table` (uses the shared
+    `shift_file_tail_and_update_offsets` for non-last HDU grow) +
+    `write_ascii_table_strided` (per-row seek+write for stepped/
+    fancy `__setitem__`) + `write_ascii_table_one_column`
+    (per-row write of one column's bytes for whole-column /
+    multi-column `__setitem__`; other columns untouched).
+  - `setitem.rs` — `AsciiSetItemKey` enum + `classify_ascii_setitem_key`
+    + the five setitem dispatchers (`setitem_single_row` /
+    `_row_slice` / `_single_column` / `_fancy_rows` /
+    `_multi_columns`) + `setitem_cell` + `resolve_rows_key` +
+    `write_one_column_at_rows` / `write_column_subset_at_rows`
+    (the subset-object writers).  Mirrors `hdu_table/setitem.rs`
+    minus all VLA + WriteTransform machinery — every partial-write
+    path passes `pad_to_block=false` so the existing trailing
+    block-pad is left untouched.
   - `hdu.rs` — `AsciiTableHDU` pyclass + `#[pymethods]` (read,
-    write, append, extend, `__getitem__`, `__iter__`, iter,
-    accessors, repr), `AsciiTableKey` + `classify_ascii_table_key`
-    classifier, `AsciiSingleColumnSubset` + `AsciiColumnSubset`
-    pyclasses.  Sibling of TableHDU (NOT a subclass): on-disk
+    write, append, extend, `__getitem__`, `__setitem__`,
+    `__iter__`, iter, accessors, repr), `AsciiTableKey` +
+    `classify_ascii_table_key` classifier, `AsciiSingleColumnSubset`
+    + `AsciiColumnSubset` pyclasses with `read` / `write` /
+    `__setitem__`.  Sibling of TableHDU (NOT a subclass): on-disk
     layout differs enough that inheriting would put per-method
     `if ascii` branches throughout BINTABLE methods.
 
@@ -1685,7 +1699,7 @@ astropy/fitsio cross-tool).
 | 1 | Read MVP — whole-table read + accessors + per-letter parsing + TSCAL/TZERO + cross-tool | ✅ Shipped |
 | 2 | Slicing / columns= / rows= / iter / subset objects / mask_null | ✅ Shipped |
 | 3 | `create_ascii_table_hdu` + `write` + `append` + `extend` alias | ✅ Shipped |
-| 4 | `__setitem__` (all forms) + subset writes | ⬜ See pickup notes below |
+| 4 | `__setitem__` (all forms) + subset writes | ✅ Shipped |
 | 5 | `insert_column` + `delete_column` | ⬜ See pickup notes below |
 
 **Code lives in `src/hdu_ascii_table/`** (see "Project structure"
@@ -1699,7 +1713,9 @@ table.  Generic "any tabular HDU" code works via duck typing on
 `tests/test_ascii_table_iter.py` (7),
 `tests/test_ascii_table_create.py` (13),
 `tests/test_ascii_table_write.py` (17),
-`tests/test_ascii_table_append.py` (8) — total 102 cases.
+`tests/test_ascii_table_append.py` (8),
+`tests/test_ascii_table_setitem.py` (30),
+`tests/test_ascii_table_setitem_subset.py` (18) — total 150 cases.
 
 **Dtype rules (per user decision):**
 
@@ -1753,91 +1769,57 @@ Keeps the call site uniform whether the user passes S or U
 arrays for A columns — the per-cell loop in `format_row` checks
 the Python type via `cast::<PyBytes>()` then `cast::<PyString>()`.
 
-### Phase 4 pickup notes — `__setitem__` + subset writes
+### Phase 4 — `__setitem__` + subset writes (shipped)
 
-**Scope.**  Symmetric with the read surface:
+Full BINTABLE-symmetric surface on `AsciiTableHDU` and both
+subset classes:
 
-- `hdu[i] = record` — single-row write (np.void scalar or
-  shape-(1,) structured ndarray)
-- `hdu[a:b] = arr` — slice write (step=1 fast path; step>1
-  strided)
-- `hdu[a:b:s] = arr` — stepped slice (positive step; reject
-  step<=0)
-- `hdu[[i, j, k]] = arr` — fancy-row write (last-write-wins on
+- `hdu[i] = record` — single-row (np.void scalar or shape-(1,)
+  structured ndarray)
+- `hdu[a:b] = arr` — step=1 slice (routes to
+  `write_ascii_table_data` with `pad_to_block=false`)
+- `hdu[a:b:s] = arr` — stepped slice (positive step; step≤0
+  rejected; routes to `write_ascii_table_strided`)
+- `hdu[[i, j, k]] = arr` — fancy-row (last-write-wins on
   duplicates per numpy convention)
-- `hdu["col"] = arr` — whole-column write (per-row direct
-  writes touching only this column's bytes)
-- `hdu[["a", "b"]] = arr` — multi-column subset write
-  (structured ndarray with the named fields)
-- `hdu["col"][rows] = ...` — subset rows-restricted
-- `hdu[["a","b"]][rows] = ...` — multi-column subset
-  rows-restricted
+- `hdu["col"] = arr` — whole-column write via
+  `write_ascii_table_one_column` (per-row direct writes touching
+  only this column's bytes; other columns' bytes preserved by
+  never being touched)
+- `hdu[["a", "b"]] = arr` — multi-column subset, per named
+  column routed through the whole-column writer; field-name
+  match case-insensitive; extras tolerated, missing fields raise
+- `hdu["col"][rows] = ...` — single-column subset rows-
+  restricted (cell / slice / fancy via per-cell loop through
+  `setitem_cell`)
+- `hdu[["a","b"]][rows] = ...` — multi-column subset rows-
+  restricted (same per-cell loop, walking row × col)
 
 NO `(row, col)` cell tuple form — symmetric with the read side
 (`classify_ascii_table_key` has no `Cell` variant).  Single-cell
-writes go through the symmetric subset form
-`hdu["col"][row] = v`.
+writes go through `hdu["col"][row] = v`.
 
-**Reference implementation.**  `src/hdu_table/setitem.rs` (and
-the BINTABLE `__setitem__` dispatch in `src/hdu_table/hdu.rs`
-around line 728).  Copy + adapt:
+**Implementation.**  `src/hdu_ascii_table/setitem.rs` (see the
+file entry in "Project structure" above for the exported
+surface).  Mirrors `hdu_table/setitem.rs` minus all VLA +
+`WriteTransform` machinery — ASCII has no heap, and every cell
+is text-formatted so no fast-path memcpy is possible.  Each
+partial-write path passes `pad_to_block=false` to
+`write_ascii_table_data` so the data section's existing
+trailing block-pad is left untouched.
 
-- Drop every VLA branch (`*_vla_aware`, `setitem_single_column_vla`,
-  `setitem_cell_vla`, `*_vla_aware_inner` helpers) — ASCII has no
-  heap.
-- Drop `WriteTransform` machinery — the per-cell text formatter
-  in `format_row` already handles dispatch.
-- Use the existing `format_row` from `write_fixed.rs` for cell
-  writes; build single-row + slice writers around
-  `write_ascii_table_data` (`pad_to_block=false` for partial
-  writes — only the bulk write or append pads).
-- For whole-column writes: per-row direct text writes at
-  `data_offset + row*row_width + col.byte_offset` for just
-  `col.byte_width` bytes per row.  Other columns' bytes are
-  preserved by not being touched.
+**Shared cell formatter.**  `format_one_cell` (in `write_fixed.rs`)
+was extracted from the existing `format_row` so the per-cell
+dispatch on `tform_letter` (A / I / F / E / D + the unsigned-int
+trick on I) is shared between the bulk write loop, the
+whole-column writer, and the cell writer.
 
-**Files to create / extend:**
-
-- New: `src/hdu_ascii_table/setitem.rs` with `AsciiSetItemKey`
-  enum (mirror of `SetItemKey`, no VLA), `classify_setitem_key`,
-  per-form setitem dispatchers, `resolve_rows_key`,
-  `write_one_column_at_rows`, `write_column_subset_at_rows`.
-- Add: `fn __setitem__` on `AsciiTableHDU` in
-  `src/hdu_ascii_table/hdu.rs` — classify + dispatch.
-- Add: `fn __setitem__` + `fn write` on
-  `AsciiSingleColumnSubset` / `AsciiColumnSubset` in `hdu.rs`.
-  Today they're read-only; symmetric with how BINTABLE's
-  `SingleColumnSubset` / `ColumnSubset` evolved.
-
-**Single-row / fancy / slice write mechanics.**  Reuse
-`extract_per_column_arrays` + `format_row`.  Build a small
-`Vec<Bound<PyAny>>` of per-column arrays from the user's RHS
-(structured ndarray indexed by field name; or for whole-column
-writes a single ndarray), then loop:
-
-  ```rust
-  for (output_row_idx, disk_row) in target_rows.iter().enumerate() {
-      let mut buf = vec![b' '; row_width];
-      format_row(py, &columns, &per_column, output_row_idx, &mut buf)?;
-      seek(data_offset + disk_row * row_width);
-      write_all(&buf);
-  }
-  ```
-
-For contiguous slices (step=1): collect rows into a strip buffer
-the same way `write_ascii_table_data` does, write the strip in
-one `write_all`.  Pad budget = 1 MiB / row_width like the bulk
-path.
-
-**Whole-column writes.**  Per-row directly at the column's
-byte_offset, only `col.byte_width` bytes per row.  Formatter is
-the existing per-cell branch in `format_row` extracted into a
-helper.
-
-**Tests.**  `tests/test_ascii_table_setitem.py` mirroring
-`tests/test_table_setitem.py`.  Add `tests/test_ascii_table_setitem_subset.py` for the
-subset-then-rows forms.  See the existing BINTABLE setitem tests
-for the case matrix; drop the VLA-specific cases.
+Subset classes (`AsciiSingleColumnSubset` / `AsciiColumnSubset`)
+each got `__setitem__` + `write(data, *, rows=None)` — same
+shape as BINTABLE's `SingleColumnSubset` / `ColumnSubset`.  With
+`rows=None` they delegate to the parent's `__setitem__` with
+the column key (so the efficient whole-column writer is used);
+with `rows=<spec>` they route through the per-cell loop.
 
 ### Phase 5 pickup notes — `insert_column` + `delete_column`
 
@@ -2563,10 +2545,11 @@ request flags something.
 3. ✅ **`AsciiTableHDU` note** — section in ``tables.rst``
    documenting the read-stub state and pointing at astropy as
    the fallback.  **Stale as of 2026-06** — ASCII tables now
-   support full read + write + append (Phases 1-3 shipped on
-   branch `ascii`); the tables.rst section needs a rewrite
-   after Phases 4-5 land.  Cross-reference the "ASCII tables
-   (XTENSION='TABLE')" roadmap.
+   support full read + write + append + `__setitem__` + subset
+   writes (Phases 1-4 shipped on branch `ascii`); the
+   tables.rst section needs a rewrite after Phase 5
+   (`insert_column` / `delete_column`) lands.  Cross-reference
+   the "ASCII tables (XTENSION='TABLE')" roadmap.
 4. ✅ **Known limitations** — new ``limitations.rst`` page
    listing gaps tagged ``(not yet)`` vs ``(by design)`` with
    workarounds, plus cross-tool interop caveats.

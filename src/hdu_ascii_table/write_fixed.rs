@@ -84,7 +84,7 @@ pub(crate) fn determine_input_nrows(
 // preserving on-disk column order.  Length is validated against
 // expected_nrows.  Field-name match is case-insensitive (matches the
 // read-side convention); missing or extra fields raise.
-fn extract_per_column_arrays<'py>(
+pub(crate) fn extract_per_column_arrays<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyAny>,
     names: Option<&Bound<'py, PyAny>>,
@@ -250,17 +250,85 @@ fn check_column_len(
 // write side: I letter, TSCAL=1, TZERO=2^63.  cfitsio uses the same
 // 2^63 bias regardless of the user's int width (rustfits always maps
 // Iw -> i8 on read, so the trick targets i8/i64-range).
-fn is_unsigned_trick(col: &AsciiColumn) -> bool {
+pub(crate) fn is_unsigned_trick(col: &AsciiColumn) -> bool {
     col.tform_letter == 'I' && col.tscal == 1.0
         && col.tzero == 9223372036854775808.0
 }
 
+// Format one column's cell from per-column ndarray `arr` at
+// `row_index` into `cell_dst` (length = col.byte_width).  Dispatches
+// on `col.tform_letter`.  For A columns, inspects the cell's Python
+// type (bytes vs str) rather than pre-classifying the input dtype.
+//
+// Shared by `format_row` (bulk write loop) and the Phase 4 single-
+// column / single-cell writers — both walk over rows and need
+// identical per-letter dispatch.
+pub(crate) fn format_one_cell(
+    py: Python<'_>,
+    col: &AsciiColumn,
+    arr: &Bound<'_, PyAny>,
+    row_index: usize,
+    cell_dst: &mut [u8],
+) -> PyResult<()> {
+    let cell = arr.get_item(row_index)?;
+    match col.tform_letter {
+        'A' => {
+            // Accept bytes or str.  numpy.bytes_ is a bytes subclass;
+            // numpy.str_ is a str subclass; both cast cleanly.  Call
+            // format_a_field inside each branch so the bytes / str
+            // borrow lives long enough.
+            if let Ok(b) = cell.cast::<PyBytes>() {
+                format_a_field(
+                    b.as_bytes(), cell_dst, &col.name, row_index,
+                )?;
+            } else if let Ok(s) = cell.cast::<PyString>() {
+                format_a_field(
+                    s.to_str()?.as_bytes(), cell_dst, &col.name,
+                    row_index,
+                )?;
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' row {}: A field cell must be bytes \
+                     or str, got {}",
+                    col.name, row_index,
+                    cell.get_type().name()?,
+                )));
+            }
+            let _ = py;
+        }
+        'I' => {
+            let value: i64 = if is_unsigned_trick(col) {
+                let u: u64 = cell.extract()?;
+                (u ^ (1u64 << 63)) as i64
+            } else {
+                cell.extract()?
+            };
+            format_int_field(value, cell_dst, &col.name, row_index)?;
+        }
+        'F' => {
+            let v: f64 = cell.extract()?;
+            let d = col.decimals.unwrap_or(0);
+            format_f_field(v, d, cell_dst, &col.name, row_index)?;
+        }
+        'E' => {
+            let v: f64 = cell.extract()?;
+            let d = col.decimals.unwrap_or(0);
+            format_e_field(v, d, cell_dst, &col.name, row_index)?;
+        }
+        'D' => {
+            let v: f64 = cell.extract()?;
+            let d = col.decimals.unwrap_or(0);
+            format_d_field(v, d, cell_dst, &col.name, row_index)?;
+        }
+        other => unreachable!(
+            "unsupported ASCII TFORM letter '{}' on write", other,
+        ),
+    }
+    Ok(())
+}
+
 // Format one row's worth of bytes into `dst` (length = row_width).
-// Dispatches per-column on tform_letter; pulls each cell from the
-// per-column ndarray via Python indexing.  For A columns, inspects
-// the cell's Python type (bytes vs str) instead of pre-classifying
-// the input dtype — this keeps the call site uniform whether the
-// user passed S or U arrays.
+// Loops over columns and dispatches each cell to `format_one_cell`.
 fn format_row(
     py: Python<'_>,
     columns: &[AsciiColumn],
@@ -275,60 +343,7 @@ fn format_row(
     for (col, arr) in columns.iter().zip(per_column.iter()) {
         let cell_dst = &mut dst
             [col.byte_offset..col.byte_offset + col.byte_width];
-        let cell = arr.get_item(row_index)?;
-        match col.tform_letter {
-            'A' => {
-                // Accept bytes or str.  numpy.bytes_ is a bytes
-                // subclass; numpy.str_ is a str subclass; both cast
-                // cleanly.  Call format_a_field inside each branch
-                // so the bytes / str borrow lives long enough.
-                if let Ok(b) = cell.cast::<PyBytes>() {
-                    format_a_field(
-                        b.as_bytes(), cell_dst, &col.name, row_index,
-                    )?;
-                } else if let Ok(s) = cell.cast::<PyString>() {
-                    format_a_field(
-                        s.to_str()?.as_bytes(), cell_dst, &col.name,
-                        row_index,
-                    )?;
-                } else {
-                    return Err(PyValueError::new_err(format!(
-                        "column '{}' row {}: A field cell must be bytes \
-                         or str, got {}",
-                        col.name, row_index,
-                        cell.get_type().name()?,
-                    )));
-                }
-                let _ = py;
-            }
-            'I' => {
-                let value: i64 = if is_unsigned_trick(col) {
-                    let u: u64 = cell.extract()?;
-                    (u ^ (1u64 << 63)) as i64
-                } else {
-                    cell.extract()?
-                };
-                format_int_field(value, cell_dst, &col.name, row_index)?;
-            }
-            'F' => {
-                let v: f64 = cell.extract()?;
-                let d = col.decimals.unwrap_or(0);
-                format_f_field(v, d, cell_dst, &col.name, row_index)?;
-            }
-            'E' => {
-                let v: f64 = cell.extract()?;
-                let d = col.decimals.unwrap_or(0);
-                format_e_field(v, d, cell_dst, &col.name, row_index)?;
-            }
-            'D' => {
-                let v: f64 = cell.extract()?;
-                let d = col.decimals.unwrap_or(0);
-                format_d_field(v, d, cell_dst, &col.name, row_index)?;
-            }
-            other => unreachable!(
-                "unsupported ASCII TFORM letter '{}' on write", other,
-            ),
-        }
+        format_one_cell(py, col, arr, row_index, cell_dst)?;
     }
     Ok(())
 }
@@ -530,4 +545,88 @@ pub(crate) fn append_ascii_table(
         py, super_, columns, &per_column, row_width, append_nrows,
         append_offset, /* pad_to_block = */ true,
     )
+}
+
+// Strided per-row writer.  Used by __setitem__ for stepped slices
+// (`hdu[a:b:s] = arr` with s != 1) and fancy-row writes
+// (`hdu[[i,j,k]] = arr`).  For each input row, formats the full row
+// into a temp buffer, seeks to `data_offset + disk_row * row_width`,
+// writes the bytes.  No final-block pad: this is a partial overwrite
+// of an already-padded data section.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_ascii_table_strided(
+    py: Python<'_>,
+    super_: &HDU,
+    columns: &[AsciiColumn],
+    per_column: &[Bound<'_, PyAny>],
+    row_width: usize,
+    row_indices: &[usize],
+    data_offset: u64,
+) -> PyResult<()> {
+    if row_indices.is_empty() {
+        return Ok(());
+    }
+    let mut row_buf = vec![b' '; row_width];
+    let mut guard = lock_file(&super_.file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    let io_err = |e: std::io::Error| PyIOError::new_err(e.to_string());
+
+    for (input_row, &disk_row) in row_indices.iter().enumerate() {
+        for b in row_buf.iter_mut() { *b = b' '; }
+        format_row(py, columns, per_column, input_row, &mut row_buf)?;
+        let file_off = data_offset + (disk_row as u64) * row_width as u64;
+        f.seek(SeekFrom::Start(file_off)).map_err(io_err)?;
+        if let Err(e) = f.write_all(&row_buf) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(io_err(e));
+        }
+    }
+    if let Err(e) = f.flush() {
+        super_.tainted.store(true, Ordering::Release);
+        return Err(io_err(e));
+    }
+    Ok(())
+}
+
+// Whole-column writer.  Per-row seek + write of just this column's
+// byte_width bytes; the other columns' bytes are preserved by virtue
+// of never being touched.  Cost is O(nrows) seek+write syscalls of
+// byte_width each; same trade-off as BINTABLE's write_table_one_column
+// (better than strip RMW when byte_width << row_width, which is
+// typical).
+pub(crate) fn write_ascii_table_one_column(
+    py: Python<'_>,
+    super_: &HDU,
+    col: &AsciiColumn,
+    arr: &Bound<'_, PyAny>,
+    nrows: usize,
+    row_width: usize,
+    data_offset: u64,
+) -> PyResult<()> {
+    if nrows == 0 {
+        return Ok(());
+    }
+    let mut cell_buf = vec![b' '; col.byte_width];
+    let mut guard = lock_file(&super_.file)?;
+    let f = guard.as_mut()
+        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+    let io_err = |e: std::io::Error| PyIOError::new_err(e.to_string());
+
+    for r in 0..nrows {
+        for b in cell_buf.iter_mut() { *b = b' '; }
+        format_one_cell(py, col, arr, r, &mut cell_buf)?;
+        let file_off =
+            data_offset + (r * row_width + col.byte_offset) as u64;
+        f.seek(SeekFrom::Start(file_off)).map_err(io_err)?;
+        if let Err(e) = f.write_all(&cell_buf) {
+            super_.tainted.store(true, Ordering::Release);
+            return Err(io_err(e));
+        }
+    }
+    if let Err(e) = f.flush() {
+        super_.tainted.store(true, Ordering::Release);
+        return Err(io_err(e));
+    }
+    Ok(())
 }

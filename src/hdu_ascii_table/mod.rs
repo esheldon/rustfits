@@ -15,6 +15,7 @@ mod format;
 mod hdu;
 mod meta;
 mod read;
+mod setitem;
 mod write_fixed;
 mod write_setup;
 
