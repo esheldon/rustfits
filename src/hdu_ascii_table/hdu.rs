@@ -1,0 +1,1041 @@
+// AsciiTableHDU pyclass: TABLE extension HDU (ASCII tables).
+// Owns the `#[pymethods]` block (read / write / append / extend /
+// __getitem__ / __setitem__ / insert_column / delete_column /
+// __iter__ / iter / checksum methods / appending+extending
+// contexts / accessors / repr), the `AsciiTableKey` +
+// `classify_ascii_table_key` __getitem__ classifier, and the
+// `AsciiSingleColumnSubset` + `AsciiColumnSubset` pyclasses
+// returned by the column-name forms of __getitem__.
+
+use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyDict, PyList, PySlice, PyTuple};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+use crate::common::{
+    check_not_tainted, parse_string_keyword, FileHandle, FileLayout,
+    HduOffsets, TaintFlag,
+};
+use crate::hdu::HDU;
+use crate::hdu_table::try_extract_column_name;
+use crate::hdu_table::TableIter;
+
+use super::edit::{delete_column_impl, insert_column_impl};
+use super::meta::{parse_ascii_table_meta, AsciiTableMeta};
+use super::read::{
+    ascii_repr_dtype_str, build_ascii_numpy_dtype, read_ascii_table,
+    read_one_column,
+};
+use super::setitem::{
+    classify_ascii_setitem_key, setitem_fancy_rows, setitem_multi_columns,
+    setitem_row_slice, setitem_single_column, setitem_single_row,
+    write_column_subset_at_rows, write_one_column_at_rows,
+    AsciiSetItemKey,
+};
+use super::write_fixed::{
+    append_ascii_table, determine_input_nrows, write_ascii_table_full,
+};
+
+// Version-stamped parsed-metadata cache.  Same shape as TableHDU's
+// `MetaCache`.  See `meta()` for the hot-path accessor.
+type AsciiMetaCache = Arc<Mutex<Option<(u64, Arc<AsciiTableMeta>)>>>;
+
+/// An ASCII-table extension HDU (``XTENSION='TABLE'``).
+///
+/// ASCII tables store row data as fixed-width text, distinct
+/// from binary tables (:class:`TableHDU`).  Returned by indexing
+/// a :class:`FITS` object at a position containing a TABLE HDU.
+///
+/// Reads return a numpy structured array whose dtype reflects
+/// the per-column ``TFORMn`` mapping:
+///
+/// * ``Aw`` (text) → ``U<w>`` (numpy unicode string)
+/// * ``Iw`` (integer) → ``i8``
+/// * ``Fw.d`` / ``Ew.d`` (single-precision float) → ``f4`` when
+///   ``d <= 7``; ``f8`` when ``d > 7`` (cfitsio's E26.17 default
+///   for f8 input is correctly read as f8)
+/// * ``Dw.d`` (double-precision float) → ``f8``
+///
+/// Default ``scale=True`` applies ``TSCAL`` / ``TZERO``: the
+/// unsigned-int trick on ``I`` columns (with ``TZERO=2**63``)
+/// promotes to ``u8``, and other non-trivial scaling produces
+/// ``f8``.  Pass ``scale=False`` for raw stored values.  Default
+/// ``mask_null=False`` returns a plain ndarray; pass ``True`` for
+/// a :class:`numpy.ma.MaskedArray` with cells matching ``TNULLn``
+/// masked.
+///
+/// Indexing supports the same forms as :class:`TableHDU`:
+///
+///     arr = hdu[5]               # one row as a np.void record
+///     arr = hdu[10:20]           # 10 rows as a structured ndarray
+///     arr = hdu[[1, 3, 5]]       # fancy row select
+///     col = hdu["RA"]            # SingleColumnSubset (deferred read)
+///     sub = hdu[["RA", "DEC"]]   # ColumnSubset (deferred read)
+///
+/// ASCII tables are rare in modern FITS files; most data
+/// pipelines use binary tables instead.  Both round-trip
+/// bit-exactly with astropy and fitsio.
+#[pyclass(extends = HDU)]
+pub(crate) struct AsciiTableHDU {
+    meta_cache: AsciiMetaCache,
+}
+
+impl AsciiTableHDU {
+    pub(crate) fn new(
+        header: Vec<String>,
+        index: usize,
+        filename: String,
+        offsets: Arc<HduOffsets>,
+        layout: Arc<FileLayout>,
+        file: FileHandle,
+        tainted: TaintFlag,
+    ) -> (Self, HDU) {
+        (
+            AsciiTableHDU {
+                meta_cache: Arc::new(Mutex::new(None)),
+            },
+            HDU::new(header, index, filename, offsets, layout, file, tainted),
+        )
+    }
+
+    // Return the parsed-once metadata for this HDU.  Hot-path accessor:
+    // one Mutex lock + Acquire version load + (on hit) an Arc clone.
+    // On miss, re-parses outside the lock.  Same shape as
+    // TableHDU::meta and CompressedImageHDU::meta.
+    pub(crate) fn meta(
+        &self, super_: &HDU,
+    ) -> PyResult<Arc<AsciiTableMeta>> {
+        let cur_version = super_.cards_version.load(Ordering::Acquire);
+        {
+            let cache = self.meta_cache.lock()
+                .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+            if let Some((v, m)) = &*cache {
+                if *v == cur_version {
+                    return Ok(Arc::clone(m));
+                }
+            }
+        }
+        let cards = super_.header_snapshot()?;
+        let meta = Arc::new(parse_ascii_table_meta(&cards)?);
+        let mut cache = self.meta_cache.lock()
+            .map_err(|_| PyIOError::new_err("meta cache poisoned"))?;
+        *cache = Some((cur_version, Arc::clone(&meta)));
+        Ok(meta)
+    }
+}
+
+// What kind of selection the user passed to AsciiTableHDU.__getitem__.
+// Mirrors hdu_table::TableKey exactly (subset of forms — VLA-cell
+// dispatch doesn't exist for ASCII tables since they have no heap).
+enum AsciiTableKey {
+    Rows,
+    SingleRow(i64),
+    SingleColumn(String),
+    MultiColumns(Vec<String>),
+}
+
+fn classify_ascii_table_key(
+    key: &Bound<'_, PyAny>,
+) -> PyResult<AsciiTableKey> {
+    if key.is_instance_of::<PySlice>() {
+        return Ok(AsciiTableKey::Rows);
+    }
+    if let Some(name) = try_extract_column_name(key)? {
+        return Ok(AsciiTableKey::SingleColumn(name));
+    }
+    if !key.is_instance_of::<PyBool>() {
+        if let Ok(idx) = key.extract::<i64>() {
+            return Ok(AsciiTableKey::SingleRow(idx));
+        }
+    }
+    let iter = key.try_iter().map_err(|_| PyValueError::new_err(
+        "AsciiTableHDU[key] requires a slice, an int (row index), a \
+         str/bytes column name, an iterable of ints (rows), or an \
+         iterable of str/bytes (columns)"
+    ))?;
+    let items: Vec<Bound<'_, PyAny>> = iter.collect::<PyResult<_>>()?;
+    if items.is_empty() {
+        return Err(PyValueError::new_err(
+            "AsciiTableHDU[key] received an empty sequence (ambiguous: rows \
+             or columns?); pass a non-empty selection or use read() with \
+             explicit rows=/columns="
+        ));
+    }
+    let first = &items[0];
+    if try_extract_column_name(first)?.is_some() {
+        let names: Vec<String> = items.iter()
+            .map(|i| try_extract_column_name(i)?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "AsciiTableHDU[key] sequence mixes column names and \
+                     non-string elements; pass all str/bytes (columns) \
+                     or all int (rows)"
+                )
+            }))
+            .collect::<PyResult<_>>()?;
+        Ok(AsciiTableKey::MultiColumns(names))
+    } else if !first.is_instance_of::<PyBool>() && first.extract::<i64>().is_ok() {
+        Ok(AsciiTableKey::Rows)
+    } else {
+        Err(PyValueError::new_err(
+            "AsciiTableHDU[key] sequence elements must be all int (rows) or \
+             all str/bytes (columns)"
+        ))
+    }
+}
+
+#[pymethods]
+impl AsciiTableHDU {
+    /// Compute and store the ``DATASUM`` checksum card.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_datasum`: manual
+    /// refresh, no auto-update on mutation.  Call after
+    /// :meth:`write` / :meth:`append` / ``__setitem__``.
+    fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_datasum(&super_, "DATASUM")
+    }
+
+    /// Compute and store both ``DATASUM`` and ``CHECKSUM`` cards.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_checksum`.  This is
+    /// the call most users want — writes both cards atomically.
+    fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_checksum(
+            &super_, "CHECKSUM", "DATASUM",
+        )
+    }
+
+    /// Verify the stored ``DATASUM`` against the current data.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
+    fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_datasum(&super_, "DATASUM")
+    }
+
+    /// Verify the stored ``CHECKSUM`` over the full HDU.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
+    fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_checksum(&super_, "CHECKSUM")
+    }
+
+    // Multi-line, fitsio-style repr.  Shows file, extension, type,
+    // EXTNAME (if present), row count, and per-column dtype.
+    fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
+        let super_ = slf.as_super();
+        let cached = slf.meta(super_).ok();
+        let cards = super_.header_snapshot()?;
+        let nrows = cached.as_ref()
+            .map(|m| m.nrows as i64)
+            .unwrap_or_else(|| crate::common::parse_keyword(&cards, "NAXIS2")
+                .unwrap_or(0).max(0));
+        let extname = parse_string_keyword(&cards, "EXTNAME");
+
+        let mut out = String::new();
+        out.push_str(&format!("  file: {}\n", super_.filename));
+        out.push_str(&format!("  extension: {}\n", super_.index));
+        out.push_str("  type: ASCII_TBL\n");
+        if let Some(name) = extname {
+            out.push_str(&format!("  extname: {}\n", name));
+        }
+        out.push_str(&format!("  rows: {}\n", nrows));
+
+        if let Some(meta) = &cached {
+            if !meta.columns.is_empty() {
+                out.push_str("  column info:\n");
+                let max_name_len = meta.columns.iter()
+                    .map(|c| c.name.len()).max().unwrap_or(0);
+                let name_w = max_name_len + 4;
+                for col in &meta.columns {
+                    let dtype_str = ascii_repr_dtype_str(col);
+                    out.push_str(&format!(
+                        "    {:<w$}{}", col.name, dtype_str, w = name_w,
+                    ));
+                    if let Some(unit) = &col.tunit {
+                        out.push_str(&format!("  ({})", unit));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The numpy structured dtype the table reads into.
+    #[getter]
+    fn dtype(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        build_ascii_numpy_dtype(py, &meta.columns, /* scale = */ true)
+    }
+
+    /// Per-column units (``TUNITn``), as a dict.
+    #[getter]
+    fn units(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dict = PyDict::new(py);
+        for col in &meta.columns {
+            dict.set_item(&col.name, col.tunit.as_deref())?;
+        }
+        Ok(dict.unbind())
+    }
+
+    /// Per-column FITS format strings, as a dict.
+    ///
+    /// Reconstructs the on-disk ``TFORMn`` for every column in
+    /// the same shape :meth:`~rustfits.FITS.create_ascii_table_hdu`
+    /// accepts via its ``formats=`` kwarg.  Round-trips:
+    ///
+    /// .. code-block:: python
+    ///
+    ///     with rustfits.FITS("dest.fits", "w+") as f:
+    ///         f.create_ascii_table_hdu(
+    ///             src_hdu.dtype,
+    ///             formats=src_hdu.formats,
+    ///             nrows=src_hdu.nrows,
+    ///         )
+    ///
+    /// Format shapes: ``A<w>`` and ``I<w>`` for string / integer
+    /// columns; ``F<w>.<d>``, ``E<w>.<d>``, ``D<w>.<d>`` for the
+    /// fixed / single-exponent / double-exponent floats.
+    #[getter]
+    fn formats(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dict = PyDict::new(py);
+        for col in &meta.columns {
+            let tform = match (col.tform_letter, col.decimals) {
+                ('A' | 'I', _) => format!("{}{}", col.tform_letter, col.byte_width),
+                (_, Some(d)) => format!("{}{}.{}", col.tform_letter, col.byte_width, d),
+                (_, None) => format!("{}{}", col.tform_letter, col.byte_width),
+            };
+            dict.set_item(&col.name, &tform)?;
+        }
+        Ok(dict.unbind())
+    }
+
+    /// Number of rows in the table (``NAXIS2``).
+    #[getter]
+    fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
+    }
+
+    /// Number of columns in the table (``TFIELDS``).
+    #[getter]
+    fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.columns.len())
+    }
+
+    /// Column names in on-disk order, as a tuple.
+    #[getter]
+    fn colnames(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let names: Vec<&str> =
+            meta.columns.iter().map(|c| c.name.as_str()).collect();
+        Ok(PyTuple::new(py, &names)?.unbind())
+    }
+
+    fn __len__(slf: PyRef<'_, Self>) -> PyResult<usize> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(meta.nrows as usize)
+    }
+
+    /// Read rows from the table into a numpy structured array.
+    ///
+    /// Parameters
+    /// ----------
+    /// rows : slice, int, or iterable of int, optional
+    ///     Rows to read.  ``None`` (default) reads every row in
+    ///     file order.  A slice or iterable selects a subset;
+    ///     negative indices supported.  Iterables are deduped
+    ///     with first-occurrence-wins ordering.
+    /// columns : list of str, optional
+    ///     Column names to read (case-insensitive against the
+    ///     table's column names).  ``None`` (default) reads every
+    ///     column in file order.  A list selects + reorders.
+    /// scale : bool, optional
+    ///     If ``True`` (default), apply ``TSCAL`` / ``TZERO``
+    ///     scaling.  See the class docstring for per-letter rules.
+    /// mask_null : bool, optional
+    ///     If ``True``, return a :class:`numpy.ma.MaskedArray`
+    ///     with cells masked where the trimmed field text equals
+    ///     the trimmed ``TNULLn`` string.  Compare is on stored
+    ///     text (pre-scaling).  Columns without ``TNULLn`` stay
+    ///     unmasked.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray or numpy.ma.MaskedArray
+    ///     Structured array of shape ``(n_selected,)`` with one
+    ///     field per selected column.
+    #[pyo3(signature = (*, rows=None, columns=None, scale=true, mask_null=false))]
+    fn read(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        columns: Option<Vec<String>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_ascii_table(
+            py, &meta, data_offset, &super_.file,
+            rows, columns, scale, mask_null,
+        )
+    }
+
+    /// Read one column into a plain (non-structured) ndarray.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name (case-insensitive).
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  ``None`` (default) reads every row.
+    /// as_bytes : bool, optional
+    ///     For ``A`` columns only.  If ``True``, return raw on-disk
+    ///     bytes in an ``S<width>`` ndarray (no trim, no ASCII
+    ///     validation) — escape hatch for non-ASCII content the
+    ///     default ``U`` decode would reject.
+    /// scale : bool, optional
+    ///     Apply ``TSCAL`` / ``TZERO`` scaling.  Default ``True``.
+    /// mask_null : bool, optional
+    ///     Return a :class:`numpy.ma.MaskedArray` with cells
+    ///     matching ``TNULLn`` masked.  Default ``False``.
+    #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true, mask_null=false))]
+    fn read_column(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        rows: Option<&Bound<'_, PyAny>>,
+        as_bytes: bool,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_one_column(
+            py, &meta, data_offset, &super_.file, name, rows, as_bytes,
+            scale, mask_null,
+        )
+    }
+
+    /// Bulk-write data into the table's data section.
+    ///
+    /// Overwrites all ``NAXIS2`` rows in the table; for appending
+    /// new rows instead use :meth:`append`.  Accepts three input
+    /// forms (matching :meth:`TableHDU.write`):
+    ///
+    /// * **Structured ndarray** — field names must match the HDU's
+    ///   columns (case-insensitive); extras / missing rejected.
+    ///   ``len(data)`` must equal ``NAXIS2``.
+    /// * **Dict** ``{name: ndarray}`` — one entry per HDU column;
+    ///   extras / missing rejected.
+    /// * **List or tuple of ndarrays** with ``names=[...]`` —
+    ///   parallel sequences; same per-column model as dict.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    /// names : list of str, optional
+    ///     Required only when ``data`` is a list/tuple.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: dtype / length errors are raised
+    /// before any file bytes are touched.  Mid-write I/O failures
+    /// taint the file (close + reopen to recover).
+    #[pyo3(signature = (data, *, names=None))]
+    fn write(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_ascii_table_full(
+            py, super_, &meta.columns, data, names,
+            nrows, row_width, data_offset,
+        )
+    }
+
+    /// Append rows to the end of the table.
+    ///
+    /// Grows ``NAXIS2`` and the data section.  For non-last HDUs,
+    /// the file tail shifts forward and later-HDU offsets are
+    /// bumped in lockstep; previously-issued handles remain valid.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    ///     Same three input forms as :meth:`write`.  Length
+    ///     defines the number of new rows.
+    /// names : list of str, optional
+    ///     Required for the list/tuple form; ignored otherwise.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: dtype / shape errors are raised
+    /// before any file bytes are touched.  Mid-write I/O failures
+    /// taint the file.
+    #[pyo3(signature = (data, *, names=None))]
+    fn append(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let current_nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let append_nrows = determine_input_nrows(data, names)?;
+        if append_nrows == 0 {
+            return Ok(());
+        }
+        let new_nrows = current_nrows + append_nrows;
+        let data_offset = super_.offsets.data_offset();
+        append_ascii_table(
+            py, super_, &meta.columns, data, names,
+            current_nrows, append_nrows, new_nrows, row_width, data_offset,
+        )
+    }
+
+    /// Alias for :meth:`append`.
+    ///
+    /// Mirrors :meth:`TableHDU.extend` so generic code that
+    /// iterates HDUs and calls ``.extend(...)`` keeps working.
+    #[pyo3(signature = (data, *, names=None))]
+    fn extend(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Self::append(slf, py, data, names)
+    }
+
+    /// Insert a new column into the table at the given position.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name (case-insensitive on subsequent lookup).
+    /// data : numpy.ndarray
+    ///     1-D ndarray of length ``NAXIS2``.  Supported dtype kinds:
+    ///     ``i?`` (any signed-int width) → ``I20``; ``u?`` → ``I20``
+    ///     + ``TZERO=2**63`` (unsigned-int trick); ``f4`` → ``E15.7``;
+    ///     ``f8`` → ``D25.17``; ``S<w>`` / ``U<w>`` → ``A<w>``.
+    ///     Object-dtype (VLA) is rejected — ASCII tables have no
+    ///     heap.
+    /// position : int, optional
+    ///     0-based slot for the new column (0..=ncols).  Default
+    ///     appends at the end.  At most one of ``position`` /
+    ///     ``after`` / ``before`` may be set.
+    /// after : str or int, optional
+    ///     Insert just after this column (name case-insensitive, or
+    ///     0-based integer index with negative wrap-around).
+    /// before : str or int, optional
+    ///     Insert just before this column.
+    /// unit : str, optional
+    ///     ``TUNITn`` informational unit string.
+    /// format : str, optional
+    ///     Override the auto-picked ``TFORM`` string (e.g. ``"I10"``,
+    ///     ``"F12.4"``, ``"E15.7"``, ``"D25.17"``, ``"A20"``).
+    ///     Letter must be compatible with the input dtype kind.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: the input is fully validated before any
+    /// file or header bytes are touched.  Mid-write I/O failures
+    /// taint the file (close + reopen to recover).
+    ///
+    /// For non-last HDUs the file tail shifts forward to make room
+    /// for the wider rows; previously-issued HDU handles transparently
+    /// see the new offsets via the shared layout.
+    ///
+    /// Every column at or after the new column's position has its
+    /// ``TBCOLn`` byte-position bumped by the new column's width.
+    #[pyo3(signature = (name, data, *, position=None, after=None, before=None, unit=None, format=None))]
+    fn insert_column(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+        position: Option<i64>,
+        after: Option<&Bound<'_, PyAny>>,
+        before: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        format: Option<&str>,
+    ) -> PyResult<()> {
+        let super_ = slf.into_super();
+        insert_column_impl(
+            py, &super_, name, data, position, after, before, unit, format,
+        )
+    }
+
+    /// Delete a column from the table.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str or int
+    ///     Column name (case-insensitive) or 0-based integer index
+    ///     (negative wraps).
+    ///
+    /// Notes
+    /// -----
+    /// Every column after the deleted slot has its ``TBCOLn``
+    /// byte-position reduced by the deleted column's width.  The
+    /// data section shrinks accordingly; for non-last HDUs the
+    /// file tail is shifted backward and previously-issued HDU
+    /// handles transparently see the new offsets.
+    ///
+    /// Mid-write I/O failures taint the file (close + reopen to
+    /// recover).
+    fn delete_column(
+        slf: PyRef<'_, Self>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_ = slf.into_super();
+        delete_column_impl(&super_, key)
+    }
+
+    // hdu[key] dispatches based on what `key` looks like:
+    //   slice or iterable-of-int        -> reads rows now -> ndarray
+    //   bare int                        -> reads + unwraps to np.void
+    //   single str/bytes column name    -> AsciiSingleColumnSubset
+    //   iterable of str/bytes           -> AsciiColumnSubset
+    // Specifying a column alone never invokes I/O — only rows do.
+    fn __getitem__(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let kind = classify_ascii_table_key(key)?;
+        match kind {
+            AsciiTableKey::Rows => {
+                let pyref = slf.borrow();
+                let super_ = pyref.as_super();
+                check_not_tainted(&super_.tainted)?;
+                let meta = pyref.meta(super_)?;
+                let data_offset = super_.offsets.data_offset();
+                read_ascii_table(
+                    py, &meta, data_offset, &super_.file,
+                    Some(key), None,
+                    /* scale = */ true, /* mask_null = */ false,
+                )
+            }
+            AsciiTableKey::SingleRow(idx) => {
+                let pyref = slf.borrow();
+                let super_ = pyref.as_super();
+                check_not_tainted(&super_.tainted)?;
+                let meta = pyref.meta(super_)?;
+                let data_offset = super_.offsets.data_offset();
+                let one = PyList::new(py, [idx])?;
+                let arr_py = read_ascii_table(
+                    py, &meta, data_offset, &super_.file,
+                    Some(one.as_any()), None,
+                    /* scale = */ true, /* mask_null = */ false,
+                )?;
+                let arr_bound = arr_py.bind(py);
+                Ok(arr_bound.get_item(0)?.unbind())
+            }
+            AsciiTableKey::SingleColumn(name) => {
+                let hdu_py: Py<AsciiTableHDU> = slf.clone().unbind();
+                Ok(Py::new(
+                    py,
+                    AsciiSingleColumnSubset { hdu: hdu_py, name },
+                )?.into())
+            }
+            AsciiTableKey::MultiColumns(names) => {
+                let hdu_py: Py<AsciiTableHDU> = slf.clone().unbind();
+                Ok(Py::new(
+                    py,
+                    AsciiColumnSubset { hdu: hdu_py, columns: names },
+                )?.into())
+            }
+        }
+    }
+
+    // hdu[key] = value: symmetric with __getitem__ — anything readable
+    // is writable.  Dispatches on the same five key shapes:
+    //   bare int                 -> single-row write
+    //   slice                    -> contiguous (step=1) or strided write
+    //   str/bytes column name    -> whole-column write
+    //   iterable of int          -> fancy-row write
+    //   iterable of str/bytes    -> multi-column subset write
+    // No (row, col) tuple form — single-cell writes go through the
+    // symmetric subset form `hdu["col"][row] = v`.  Same surface as
+    // TableHDU.__setitem__ minus the VLA branches.
+    fn __setitem__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        let kind = classify_ascii_setitem_key(key)?;
+        match kind {
+            AsciiSetItemKey::SingleRow(i) => setitem_single_row(
+                py, super_, &meta.columns, nrows, row_width,
+                i, value, data_offset),
+            AsciiSetItemKey::RowSlice => {
+                let slice_py = key.cast::<PySlice>()?;
+                setitem_row_slice(
+                    py, super_, &meta.columns, nrows, row_width,
+                    slice_py, value, data_offset)
+            }
+            AsciiSetItemKey::SingleColumn(name) => setitem_single_column(
+                py, super_, &meta.columns, nrows, row_width,
+                &name, value, data_offset),
+            AsciiSetItemKey::FancyRows(rows) => setitem_fancy_rows(
+                py, super_, &meta.columns, nrows, row_width,
+                &rows, value, data_offset),
+            AsciiSetItemKey::MultiColumns(names) => setitem_multi_columns(
+                py, super_, &meta.columns, nrows, row_width,
+                &names, value, data_offset),
+        }
+    }
+
+    // `for row in hdu:` — yields one row per iteration as a numpy
+    // scalar record.  Rows are read in internally-buffered batches;
+    // iterating a large table stays memory-bounded.  pyo3 installs
+    // this as the `tp_iter` slot (no per-method docstring).
+    fn __iter__(slf: Bound<'_, Self>) -> PyResult<TableIter> {
+        crate::hdu_table::make_table_iter(slf.into_any(), None, None, true)
+    }
+
+    /// Iterate over table rows or row-chunks.
+    ///
+    /// ``hdu.iter()`` is equivalent to ``for row in hdu`` — one row
+    /// per iteration as a numpy scalar record.  Passing ``chunksize``
+    /// switches to yielding structured arrays instead.
+    ///
+    /// Parameters
+    /// ----------
+    /// chunksize : int, optional
+    ///     ``None`` (default) yields one row per iteration as a numpy
+    ///     scalar record.  A positive integer yields a structured
+    ///     ndarray of up to ``chunksize`` rows per iteration.
+    /// columns : list of str, optional
+    ///     Restrict iteration to these columns (case-insensitive),
+    ///     forwarded to :meth:`read`.
+    /// scale : bool, default True
+    ///     Apply scaling, forwarded to :meth:`read`.
+    #[pyo3(signature = (*, chunksize=None, columns=None, scale=true))]
+    fn iter(
+        slf: Bound<'_, Self>,
+        chunksize: Option<usize>,
+        columns: Option<Py<PyAny>>,
+        scale: bool,
+    ) -> PyResult<TableIter> {
+        crate::hdu_table::make_table_iter(
+            slf.into_any(), chunksize, columns, scale,
+        )
+    }
+
+    /// No-op batched-append context manager.
+    ///
+    /// ASCII-table appends go straight to disk (no partial-trailing-
+    /// tile re-encode tax to amortize), so this context does nothing
+    /// on enter or exit — it exists for API symmetry with
+    /// :meth:`CompressedTableHDU.appending`, where the context does
+    /// meaningful work.  Generic code that iterates HDUs of mixed
+    /// types can use the pattern uniformly::
+    ///
+    ///     for hdu in fits:
+    ///         with hdu.appending():
+    ///             for batch in batches:
+    ///                 hdu.append(batch)
+    fn appending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Py::new(
+            py,
+            crate::common::NoopExtendContext {
+                hdu: slf.clone().into_any().unbind(),
+            },
+        )
+    }
+
+    /// Alias for :meth:`appending`.  Mirrors :meth:`TableHDU.extending`
+    /// so generic code that iterates HDUs of any type can use
+    /// ``with hdu.extending():`` uniformly.
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Self::appending(slf, py)
+    }
+}
+
+/// A deferred handle for one column of a :class:`AsciiTableHDU`.
+///
+/// Returned by ``hdu["name"]`` (a single str/bytes column name).
+/// Carries a reference to the parent table and the column name;
+/// no I/O happens at construction.  Add ``[rows]`` to trigger
+/// the read::
+///
+///     col = hdu["RA"]          # no I/O, returns a subset handle
+///     all_ra  = col[:]         # read every row
+///     subset  = col[100:200]   # read 100 rows
+///     fancy   = col[[7, 3, 9]] # read three rows in that order
+///
+/// Writing to ``[rows]`` mutates only that column::
+///
+///     hdu["FLAG"][bad_rows] = -99
+///
+/// Equivalent to :meth:`AsciiTableHDU.read_column` for reads and
+/// to the cell / slice forms of ``AsciiTableHDU.__setitem__`` for
+/// writes; the subset object exists so the ``hdu["name"][...]``
+/// idiom composes naturally.
+#[pyclass]
+pub(crate) struct AsciiSingleColumnSubset {
+    hdu: Py<AsciiTableHDU>,
+    name: String,
+}
+
+#[pymethods]
+impl AsciiSingleColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        Ok(format!(
+            "<AsciiTableColumn '{}' of HDU #{}>",
+            self.name, super_.index(),
+        ))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_one_column(
+            py, &meta, data_offset, &super_.file,
+            &self.name, Some(rows), /* as_bytes = */ false,
+            /* scale = */ true, /* mask_null = */ false,
+        )
+    }
+
+    /// Read this column.
+    #[pyo3(signature = (*, rows=None, as_bytes=false, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        as_bytes: bool,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_one_column(
+            py, &meta, data_offset, &super_.file,
+            &self.name, rows, as_bytes, scale, mask_null,
+        )
+    }
+
+    /// Write this column.
+    ///
+    /// With ``rows=None`` (default) writes every row — equivalent to
+    /// ``hdu["name"] = data``.  With ``rows=<spec>`` writes only the
+    /// named rows — equivalent to ``self[rows] = data`` (the
+    /// ``__setitem__`` form).  Other columns' bytes are untouched
+    /// in both cases.
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => self.hdu.bind(py).set_item(&self.name, data),
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
+    // hdu["name"][rows] = value.  Per-cell loop through setitem_cell.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_one_column_at_rows(
+            py, super_, &meta.columns, nrows, row_width,
+            &self.name, rows, value, data_offset)
+    }
+}
+
+/// A deferred handle for a column subset of a :class:`AsciiTableHDU`.
+///
+/// Returned by ``hdu[[name1, name2, ...]]`` (an iterable of
+/// str/bytes column names).  Carries a reference to the parent
+/// table and the column list; no I/O happens at construction.
+/// Add ``[rows]`` to trigger the read::
+///
+///     pos = hdu[["RA", "DEC"]]
+///     all_pos = pos[:]              # structured ndarray w/ 2 fields
+///     subset  = pos[100:200]
+///
+/// Writing to ``[rows]`` mutates only those columns; the value
+/// must be a structured ndarray with the matching field names
+/// (extras tolerated for forward compatibility)::
+///
+///     hdu[["RA", "DEC"]][bad_rows] = corrected
+///
+/// Equivalent to :meth:`AsciiTableHDU.read` with ``columns=`` for
+/// reads, and to the multi-column form of
+/// ``AsciiTableHDU.__setitem__`` for writes.  The subset object
+/// exists so the ``hdu[[...]][...]`` idiom composes naturally.
+#[pyclass]
+pub(crate) struct AsciiColumnSubset {
+    hdu: Py<AsciiTableHDU>,
+    columns: Vec<String>,
+}
+
+#[pymethods]
+impl AsciiColumnSubset {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.into_super();
+        Ok(format!(
+            "<AsciiTableColumns {:?} of HDU #{}>",
+            self.columns, super_.index(),
+        ))
+    }
+
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_ascii_table(
+            py, &meta, data_offset, &super_.file,
+            Some(rows), Some(self.columns.clone()),
+            /* scale = */ true, /* mask_null = */ false,
+        )
+    }
+
+    /// Read these columns.
+    #[pyo3(signature = (*, rows=None, scale=true, mask_null=false))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        rows: Option<&Bound<'_, PyAny>>,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let data_offset = super_.offsets.data_offset();
+        read_ascii_table(
+            py, &meta, data_offset, &super_.file,
+            rows, Some(self.columns.clone()), scale, mask_null,
+        )
+    }
+
+    /// Write these columns.
+    ///
+    /// With ``rows=None`` (default) writes every row — equivalent to
+    /// ``hdu[[names...]] = data`` (the multi-column form).  With
+    /// ``rows=<spec>`` writes only the named rows — equivalent to
+    /// ``self[rows] = data`` (the ``__setitem__`` form).
+    #[pyo3(signature = (data, *, rows=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        rows: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        match rows {
+            None => {
+                let key = PyList::new(py, &self.columns)?;
+                self.hdu.bind(py).set_item(&key, data)
+            }
+            Some(rows_key) => self.__setitem__(py, rows_key, data),
+        }
+    }
+
+    // hdu[["a","b"]][rows] = value.  Per-row × per-column loop through
+    // setitem_cell.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bound = self.hdu.bind(py);
+        let pyref = bound.borrow();
+        let super_ = pyref.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = pyref.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_column_subset_at_rows(
+            py, super_, &meta.columns, nrows, row_width,
+            &self.columns, rows, value, data_offset)
+    }
+}

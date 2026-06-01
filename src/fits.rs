@@ -471,6 +471,7 @@ fn parse_hdus_from_file(
 enum HduKind {
     Image,
     Table,
+    AsciiTable,
     CompressedImage {
         quantize: Option<crate::zimage::compression_config::Quantize>,
         compress_config: Option<CompressionConfigKind>,
@@ -890,6 +891,11 @@ impl FITS {
                 Arc::clone(&self.file), Arc::clone(&self.tainted),
             ))?.into(),
             HduKind::Table => Py::new(py, TableHDU::new(
+                trimmed, index, self.filename.clone(),
+                offsets, Arc::clone(&self.layout),
+                Arc::clone(&self.file), Arc::clone(&self.tainted),
+            ))?.into(),
+            HduKind::AsciiTable => Py::new(py, AsciiTableHDU::new(
                 trimmed, index, self.filename.clone(),
                 offsets, Arc::clone(&self.layout),
                 Arc::clone(&self.file), Arc::clone(&self.tainted),
@@ -2188,6 +2194,101 @@ impl FITS {
         let offsets = append_header_and_data_to_file(
             &self.file, &table_cards, data_padded)?;
         self.finalize_hdu(py, &table_cards, offsets, HduKind::Table)
+    }
+
+    /// Create a new ASCII-table (``XTENSION='TABLE'``) HDU and
+    /// append it to the file.
+    ///
+    /// Allocates the data section as ASCII spaces — call
+    /// :meth:`AsciiTableHDU.write` (or the returned HDU via
+    /// ``fits[-1]``) to write row data.
+    ///
+    /// ASCII tables are rare in modern FITS files; most data
+    /// pipelines use binary tables (:meth:`create_table_hdu`).
+    /// The ASCII form is provided for compatibility with tools
+    /// that emit it (e.g. legacy pipelines, hand-edited files).
+    ///
+    /// If the file has no HDUs yet, an empty primary image
+    /// (``SIMPLE=T``, ``NAXIS=0``) is written first — ASCII
+    /// tables can't be primary HDUs per the FITS standard.
+    ///
+    /// Parameters
+    /// ----------
+    /// dtype : numpy.dtype or list of tuples
+    ///     Structured dtype describing the table schema.
+    ///     Supported field dtypes (auto-mapped to TFORM):
+    ///
+    ///     * ``i2`` / ``i4`` / ``i8`` → ``I20``
+    ///     * ``u1`` / ``u2`` / ``u4`` / ``u8`` → ``I20`` +
+    ///       ``TZERO=2^63`` (unsigned-int trick)
+    ///     * ``f4`` → ``E15.7``
+    ///     * ``f8`` → ``D25.17``
+    ///     * ``S<n>`` / ``U<n>`` → ``A<n>``
+    ///
+    ///     ``b1`` (bool) and ``i1`` are rejected — neither has a
+    ///     native ASCII-table TFORM letter.  Subarray fields and
+    ///     Object (VLA) dtypes are not supported (use BINTABLE).
+    /// nrows : int, optional
+    ///     Initial row count.  Default ``0``.
+    /// extname : str, optional
+    /// extver : int, optional
+    /// units : dict, optional
+    ///     ``{column_name: unit_string}`` for ``TUNITn`` cards.
+    /// formats : dict, optional
+    ///     Per-column TFORM override, e.g.
+    ///     ``{"FLUX": "F12.4"}``.  Keys are case-insensitive;
+    ///     unmatched keys raise.  Values are FITS TFORM strings
+    ///     (``A<w>`` / ``I<w>`` / ``F<w>.<d>`` / ``E<w>.<d>`` /
+    ///     ``D<w>.<d>``).  Override letter must be compatible
+    ///     with the input dtype kind.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     Negative ``nrows``; unsupported field dtype; subarray
+    ///     or Object field; ``formats=`` override incompatible
+    ///     with the input dtype.
+    ///
+    /// See Also
+    /// --------
+    /// create_table_hdu : Binary-table counterpart (preferred).
+    /// AsciiTableHDU.write : Write data into the created table.
+    #[pyo3(signature = (
+        dtype, nrows=0, *,
+        extname=None, extver=None, units=None, formats=None,
+    ))]
+    fn create_ascii_table_hdu(
+        &mut self,
+        py: Python<'_>,
+        dtype: &Bound<'_, PyAny>,
+        nrows: i64,
+        extname: Option<String>,
+        extver: Option<i64>,
+        units: Option<&Bound<'_, PyDict>>,
+        formats: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        if nrows < 0 {
+            return Err(PyValueError::new_err(format!(
+                "create_ascii_table_hdu: nrows must be >= 0, got {}",
+                nrows,
+            )));
+        }
+        let (cards, row_width, _write_columns) =
+            crate::hdu_ascii_table::normalize_and_build_ascii_table_header(
+                py, dtype, nrows, extname.as_deref(), extver, units, formats,
+            )?;
+
+        let data_size = (nrows as u64).saturating_mul(row_width);
+        let data_padded = data_section_padded(data_size);
+
+        // ASCII tables can't be primary; ensure_primary writes an
+        // empty image first if needed.
+        self.ensure_primary(py)?;
+
+        let offsets = append_header_and_data_to_file(
+            &self.file, &cards, data_padded,
+        )?;
+        self.finalize_hdu(py, &cards, offsets, HduKind::AsciiTable)
     }
 
     /// Create an image HDU from ``data`` and write the pixels.

@@ -182,8 +182,93 @@ else stays private to its file.
   codecs, ...) and `crate::zimage::tile_io::DEFAULT_TILE_CACHE_BYTES`.
   Full feature status + phase history is in the "Tile-compressed
   tables (ZTABLE)" roadmap below.
-- `src/hdu_ascii_table.rs` — `AsciiTableHDU` (TABLE) pyclass stub
-  (read returns header only; no column read/write yet).
+- `src/hdu_ascii_table/` — `AsciiTableHDU` (TABLE) pyclass +
+  read + create + write + append + iteration + column subsets,
+  split (2026-06) across a directory module mirroring
+  `hdu_table/`:
+  - `mod.rs` — wires + re-exports the external surface
+    (`AsciiTableHDU`, `AsciiSingleColumnSubset`, `AsciiColumnSubset`,
+    `normalize_and_build_ascii_table_header` for `fits.rs`).
+  - `columns.rs` — `AsciiColumn` struct + `parse_ascii_columns`
+    (TBCOLn / TFORMn / TTYPEn / TUNITn / TSCALn / TZEROn / TNULLn),
+    `AsciiScalingKind` classifier, overlap rejection.  ASCII
+    tables have no VLA, no X, no TDIM, no complex.
+  - `format.rs` — `&[u8]`-based parsers (`trim_ascii`,
+    `parse_int_field`, `parse_float_field` with FORTRAN 'D'
+    exponent handling, `matches_tnull`) AND value->text formatters
+    (`format_int_field` / `format_f_field` / `format_e_field` /
+    `format_d_field` / `format_a_field` — emits cfitsio-shape
+    `"1.5000E+03"` with explicit `+` sign + 2-digit exponent +
+    round-up renormalization on mantissa overflow).
+  - `meta.rs` — `AsciiTableMeta` cache struct + parser, keyed
+    off `cards_version` via the standard `meta()` accessor.
+  - `read.rs` — `read_ascii_table(rows=, columns=, scale=,
+    mask_null=)`, `read_one_column`, `RunPlan` + `plan_runs` +
+    `process_runs` (duplicated from BINTABLE — generalizing via
+    traits would have lifted virtual dispatch into hot per-cell
+    loops).  Reuses `crate::hdu_table::resolve_rows` directly.
+    MaskedArray support for `mask_null=True` (TNULL string
+    sentinel compared on trimmed field text).  TNULL
+    short-circuit: cells matching the sentinel skip the
+    `parse_int_field`/`parse_float_field` call (which would
+    raise on non-numeric sentinels like `"NA"`) and default to
+    the dtype's zero.
+  - `write_setup.rs` — `AsciiWriteColumn` create-time struct +
+    `dtype_to_ascii_write_columns` + `parse_format_override` +
+    `build_ascii_table_header_cards` +
+    `normalize_and_build_ascii_table_header`.  TBCOL packs
+    flush (no inter-column gap — matches cfitsio).
+  - `write_fixed.rs` — `extract_per_column_arrays` (structured /
+    dict / list+names input forms) + `format_one_cell` +
+    `format_row` + `write_ascii_table_data` (1 MiB row-chunk
+    budget, ASCII-space final-block pad) + `write_ascii_table_full`
+    + `append_ascii_table` (uses the shared
+    `shift_file_tail_and_update_offsets` for non-last HDU grow) +
+    `write_ascii_table_strided` (per-row seek+write for stepped/
+    fancy `__setitem__`) + `write_ascii_table_one_column`
+    (per-row write of one column's bytes for whole-column /
+    multi-column `__setitem__`; other columns untouched).
+  - `setitem.rs` — `AsciiSetItemKey` enum + `classify_ascii_setitem_key`
+    + the five setitem dispatchers (`setitem_single_row` /
+    `_row_slice` / `_single_column` / `_fancy_rows` /
+    `_multi_columns`) + `setitem_cell` + `resolve_rows_key` +
+    `write_one_column_at_rows` / `write_column_subset_at_rows`
+    (the subset-object writers).  Mirrors `hdu_table/setitem.rs`
+    minus all VLA + WriteTransform machinery — every partial-write
+    path passes `pad_to_block=false` so the existing trailing
+    block-pad is left untouched.
+  - `edit.rs` — `insert_column_impl` + `delete_column_impl` schema-
+    edit machinery.  Strip-based row shuffle (back-to-front for
+    insert / front-to-back for delete, ~1 MiB per buffer), header
+    card mutation including the ASCII-specific TBCOL VALUE shift
+    (every column at/after the slot has its `TBCOLn` byte position
+    shifted by ±new_col_width — separate from the keyword-index
+    renumber that BINTABLE also does), grow/shrink data extent.
+    Mirrors `hdu_table/edit.rs` minus the heap / VLA / WriteTransform
+    machinery — ASCII has no heap so there's no `relocate_region_*`
+    step; the new column's cell bytes are formatted directly via
+    `format_one_cell`.  Same `validate-then-mutate` + taint
+    discipline.
+  - `hdu.rs` — `AsciiTableHDU` pyclass + `#[pymethods]`
+    (`add_datasum` / `add_checksum` / `verify_datasum` /
+    `verify_checksum` — delegate to the shared `checksum_hdu_*`
+    helpers in `hdu_image.rs`; the helpers stream the padded
+    data section and are HDU-type-agnostic, so ASCII works with
+    the same wiring as Image + BINTABLE); read, write, append,
+    extend, `__getitem__`, `__setitem__`, `insert_column`,
+    `delete_column`, `__iter__`, iter, `appending` / `extending`
+    (no-op contexts via `NoopExtendContext`, for API symmetry
+    with the compressed types — generic code that iterates HDUs
+    of any type can use `with hdu.extending():` uniformly),
+    accessors, repr.  `AsciiTableKey` + `classify_ascii_table_key`
+    classifier; `AsciiSingleColumnSubset` + `AsciiColumnSubset`
+    pyclasses with `read` / `write` / `__setitem__`.  Sibling of
+    TableHDU (NOT a subclass): on-disk layout differs enough that
+    inheriting would put per-method `if ascii` branches
+    throughout BINTABLE methods.
+
+  See the "ASCII tables" roadmap below for the full surface
+  status and Phase 4/5 pickup notes.
 - `src/fits.rs` — `FITS` pyclass + `parse_hdus_from_file` +
   `validate_header` + `calculate_data_size`.  Owns the per-file
   `Arc<FileLayout>` and pushes a new `Arc<HduOffsets>` into it for every
@@ -705,8 +790,15 @@ FITS standard), and `has_data` (True iff NAXIS > 0 AND every NAXISn > 0
 `unit` (BUNIT, informational), and `__len__` (== shape[0]).
 `TableHDU` adds `nrows`, `ncols`, `colnames` (tuple, case preserved),
 `units` (dict, informational), and `__len__` (== nrows).
-`AsciiTableHDU` has `nrows` and `__len__` so generic code can iterate
-any HDU type uniformly.
+`AsciiTableHDU` matches `TableHDU`'s accessor surface (`nrows`,
+`ncols`, `colnames`, `units`, `dtype`, `__len__`) so generic code
+can iterate any HDU type uniformly via duck typing.  Plus one
+ASCII-only accessor: `formats` returns a `{col_name: tform_string}`
+dict in the same shape `create_ascii_table_hdu`'s `formats=` kwarg
+accepts (`'I20'`, `'E15.7'`, `'F12.4'`, `'D25.17'`, `'A10'`, ...),
+covering EVERY column.  Round-trips: feed `src_hdu.formats` straight
+back into `create_ascii_table_hdu(..., formats=...)` to recreate
+the same layout.
 
 ### Image read
 
@@ -1195,8 +1287,12 @@ dtype mismatch, name collision, `inner_dtype=`/`heap_format=` on
 non-Object input).
 
 **Missing (low priority / niche):**
-- **ASCII tables (creating, writing)** — rare in modern files.
 - **`TDISPn` on write** — informational, low priority.
+
+(ASCII tables — creating, writing, appending — are now supported
+via `FITS.create_ascii_table_hdu` + `AsciiTableHDU.write` +
+`.append`.  See the "ASCII tables (XTENSION='TABLE')" roadmap
+below for the surface status and Phase 4/5 pickup notes.)
 
 ### Bit-packed `X` columns
 
@@ -1435,11 +1531,12 @@ shipped; the next compressed-table work item is open-ended
 prompts).  See the dedicated "Tile-compressed tables (ZTABLE)"
 roadmap below for the full status table.
 
-**Phase 6 — out of scope for now.**  ASCII tables (rare in modern
-files; create / write missing, read returns header only).  `X`
-(bit-packed) BINTABLE columns — both fixed and VLA PX/QX — are
-fully supported on both read and write (opt-in via `bit_columns=`;
-see the "Bit-packed `X` columns" section).
+**Phase 6 — out of scope of THIS roadmap.**  ASCII tables landed
+as a separate roadmap (see "ASCII tables (XTENSION='TABLE')"
+below — Phases 1-3 shipped, 4-5 remaining).  `X` (bit-packed)
+BINTABLE columns — both fixed and VLA PX/QX — are fully
+supported on both read and write (opt-in via `bit_columns=`; see
+the "Bit-packed `X` columns" section).
 
 **Phase 1 — `create_table_hdu` + bulk `TableHDU.write()`.**  Foundation
 for everything else.
@@ -1607,9 +1704,217 @@ under the Table write Supported section above for the API + heap
 model (always-append-and-orphan).  19 tests in
 `tests/test_table_vla_setitem.py`.
 
-**Phase 6 — out of scope.**  ASCII tables (rare in modern files);
-adding / removing columns from existing tables (header rewriting
-+ byte shuffling).
+**Phase 6 — out of scope.**  ASCII tables landed as a separate
+roadmap (see "ASCII tables (XTENSION='TABLE')" below — Phases 1-3
+shipped, 4-5 remaining); adding / removing columns from existing
+BINTABLEs (header rewriting + byte shuffling).
+
+## ASCII tables (XTENSION='TABLE')
+
+ASCII tables store row data as fixed-width text (distinct from
+BINTABLE's binary layout): per-column TBCOLn / TFORMn + FORTRAN-
+style format strings (A / I / F / E / D), one row of NAXIS1 bytes
+per record, no row delimiter, no heap.  Rare in modern files —
+most pipelines use BINTABLE — but supported for compatibility
+with tools that emit it (legacy pipelines, hand-edited files,
+astropy/fitsio cross-tool).
+
+**Status as of 2026-06 (branch `ascii`, before merge):**
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Read MVP — whole-table read + accessors + per-letter parsing + TSCAL/TZERO + cross-tool | ✅ Shipped |
+| 2 | Slicing / columns= / rows= / iter / subset objects / mask_null | ✅ Shipped |
+| 3 | `create_ascii_table_hdu` + `write` + `append` + `extend` alias | ✅ Shipped |
+| 4 | `__setitem__` (all forms) + subset writes | ✅ Shipped |
+| 5 | `insert_column` + `delete_column` | ✅ Shipped |
+
+Plus BINTABLE-parity additions outside the original phase plan: the
+4 checksum methods (`add_datasum` / `add_checksum` / `verify_datasum`
+/ `verify_checksum`) and the `appending()` / `extending()` no-op
+context managers.  ASCII now has the full BINTABLE-symmetric public
+surface minus VLA (which the format doesn't allow).
+
+**Code lives in `src/hdu_ascii_table/`** (see "Project structure"
+above for the per-file breakdown).  Sibling class to TableHDU, NOT
+a subclass — `isinstance(hdu, TableHDU)` is False for an ASCII
+table.  Generic "any tabular HDU" code works via duck typing on
+`nrows` / `colnames` / `dtype` / `__iter__` (matching signatures).
+
+**Tests:** `tests/test_ascii_table_read.py` (25),
+`tests/test_ascii_table_read_slice.py` (32),
+`tests/test_ascii_table_iter.py` (7),
+`tests/test_ascii_table_create.py` (13),
+`tests/test_ascii_table_write.py` (17),
+`tests/test_ascii_table_append.py` (8),
+`tests/test_ascii_table_setitem.py` (30),
+`tests/test_ascii_table_setitem_subset.py` (18),
+`tests/test_ascii_table_checksum.py` (8),
+`tests/test_ascii_table_edit_columns.py` (33) — total 191 cases.
+Plus 4 ASCII-specific cases in
+`tests/test_hdu_extending_noop.py` for `appending` / `extending`.
+
+**Dtype rules (per user decision):**
+
+| TFORM | Read dtype | Write dtype acceptance |
+|---|---|---|
+| `Aw` | `U<w>` (Python str; `as_bytes=True` -> `S<w>`) | `S<w>` or `U<w>` (ASCII-validated) |
+| `Iw` | always `i8` | any `i?` |
+| `Iw` + `TZERO=2^63` (unsigned-int trick) | `u8` | any `u?` |
+| `Fw.d` / `Ew.d` with `d <= 7` | `f4` | (write picks `E15.7` for `f4` input) |
+| `Fw.d` / `Ew.d` with `d > 7` | `f8` | — |
+| `Dw.d` (any `d`) | `f8` | (write picks `D25.17` for `f8` input) |
+
+The `d <= 7` / `d > 7` split on `F/E` accommodates cfitsio's
+default of writing both `f4` and `f8` as `E26.17` (NOT `E15.7` +
+`D25.17` as one might expect from the spec).  Astropy's narrower
+`E10.4` reads as `f4`; fitsio's wider `E26.17` reads as `f8`.
+See `F_E_F4_MAX_DECIMALS` in `src/hdu_ascii_table/read.rs`.
+
+**TNULL short-circuit (Phase 2 design call worth remembering).**
+The ASCII-table TNULL sentinel is a STRING (unlike BINTABLE's
+integer pattern) and may be non-numeric (`"NA"`, `"NULL"`).
+Without short-circuiting, `parse_int_field` / `parse_float_field`
+would raise `ValueError` on matching cells BEFORE `mask_null`
+masking gets a chance to run.  Fix: when `col.tnull` is set and
+the trimmed field text matches, skip the per-cell parse and leave
+the dtype's zero default.  With `mask_null=True` the mask bit is
+set; without it the user silently gets zero — matches BINTABLE
+TNULL semantics where stored sentinels pass through.
+
+**Layout decisions (write side):**
+
+- **TBCOL packs flush** (no inter-column gap byte).  Matches
+  cfitsio's `fits_create_ascii_tbl` convention so files rustfits
+  writes and cfitsio writes share the same TBCOL scheme.
+- **Final-block pad is ASCII space (0x20), NOT NUL** — per the
+  FITS standard for TABLE extensions specifically (BINTABLE pads
+  with NUL).  Mistake-prone area for new reviewers; see
+  `write_ascii_table_data`'s `pad_to_block` branch.
+- **Unsigned-int trick uses `TZERO=2^63` regardless of input
+  width** (u1/u2/u4/u8 all map to I20 + TZERO=2^63).  Read side
+  always returns u8 for that combination — matches the rustfits
+  convention that Iw → i8 always (width-independent).
+
+**Design decision — drive write off the on-disk `AsciiColumn`
+list, not the user's input dtype.**  `AsciiWriteColumn` is a
+create-time-only struct.  After create, `write` and `append`
+pull the schema from `AsciiTableMeta.columns` and dispatch
+per-cell on `tform_letter` + `is_unsigned_trick(col)` (which
+checks `tform_letter == 'I' && tscal == 1.0 && tzero == 2^63`).
+Keeps the call site uniform whether the user passes S or U
+arrays for A columns — the per-cell loop in `format_row` checks
+the Python type via `cast::<PyBytes>()` then `cast::<PyString>()`.
+
+### Phase 4 — `__setitem__` + subset writes (shipped)
+
+Full BINTABLE-symmetric surface on `AsciiTableHDU` and both
+subset classes:
+
+- `hdu[i] = record` — single-row (np.void scalar or shape-(1,)
+  structured ndarray)
+- `hdu[a:b] = arr` — step=1 slice (routes to
+  `write_ascii_table_data` with `pad_to_block=false`)
+- `hdu[a:b:s] = arr` — stepped slice (positive step; step≤0
+  rejected; routes to `write_ascii_table_strided`)
+- `hdu[[i, j, k]] = arr` — fancy-row (last-write-wins on
+  duplicates per numpy convention)
+- `hdu["col"] = arr` — whole-column write via
+  `write_ascii_table_one_column` (per-row direct writes touching
+  only this column's bytes; other columns' bytes preserved by
+  never being touched)
+- `hdu[["a", "b"]] = arr` — multi-column subset, per named
+  column routed through the whole-column writer; field-name
+  match case-insensitive; extras tolerated, missing fields raise
+- `hdu["col"][rows] = ...` — single-column subset rows-
+  restricted (cell / slice / fancy via per-cell loop through
+  `setitem_cell`)
+- `hdu[["a","b"]][rows] = ...` — multi-column subset rows-
+  restricted (same per-cell loop, walking row × col)
+
+NO `(row, col)` cell tuple form — symmetric with the read side
+(`classify_ascii_table_key` has no `Cell` variant).  Single-cell
+writes go through `hdu["col"][row] = v`.
+
+**Implementation.**  `src/hdu_ascii_table/setitem.rs` (see the
+file entry in "Project structure" above for the exported
+surface).  Mirrors `hdu_table/setitem.rs` minus all VLA +
+`WriteTransform` machinery — ASCII has no heap, and every cell
+is text-formatted so no fast-path memcpy is possible.  Each
+partial-write path passes `pad_to_block=false` to
+`write_ascii_table_data` so the data section's existing
+trailing block-pad is left untouched.
+
+**Shared cell formatter.**  `format_one_cell` (in `write_fixed.rs`)
+was extracted from the existing `format_row` so the per-cell
+dispatch on `tform_letter` (A / I / F / E / D + the unsigned-int
+trick on I) is shared between the bulk write loop, the
+whole-column writer, and the cell writer.
+
+Subset classes (`AsciiSingleColumnSubset` / `AsciiColumnSubset`)
+each got `__setitem__` + `write(data, *, rows=None)` — same
+shape as BINTABLE's `SingleColumnSubset` / `ColumnSubset`.  With
+`rows=None` they delegate to the parent's `__setitem__` with
+the column key (so the efficient whole-column writer is used);
+with `rows=<spec>` they route through the per-cell loop.
+
+### Phase 5 — `insert_column` + `delete_column` (shipped)
+
+API on `AsciiTableHDU`:
+
+- `insert_column(name, data, *, position=None, after=None,
+  before=None, unit=None, format=None)`
+- `delete_column(name_or_index)`
+
+`data` must be a 1-D ndarray of length `NAXIS2` with a supported
+ASCII dtype kind (i? / u? / f4 / f8 / S? / U?).  Object dtype is
+rejected — ASCII has no heap.  The auto-pick format follows the
+same rules as `create_ascii_table_hdu` (I20 / E15.7 / D25.17 /
+A<w> + unsigned-int trick), or `format=` overrides per-letter.
+
+**Implementation.**  `src/hdu_ascii_table/edit.rs`.  Order of
+operations matches BINTABLE:
+1. Build new card list (renumber per-column keyword suffixes
+   + shift TBCOL values in one pass; insert / drop the target
+   column's cards; update TFIELDS + NAXIS1).  Header rewrite to
+   disk via the shared `rewrite_header_to_disk`.
+2. Grow / shrink data extent (may shift later HDUs via the
+   forward / backward tail-shift primitives in
+   `crate::common`).
+3. Strip-walk main rows back-to-front (insert) or front-to-back
+   (delete), ~1 MiB per buffer.  The insert path formats the
+   new column's cell via `format_one_cell` inline; no separate
+   pass to materialize new column bytes.
+
+**TBCOL value shift** (the ASCII-specific bit).  Distinct from
+BINTABLE's per-column keyword renumber, ASCII edit also has to
+update each surviving column's TBCOLn VALUE (the byte position
+within each row) by `±new_col_width`.  Both the renumber and
+the value shift are folded into one pass
+(`renumber_and_shift_per_column_cards`); TBCOL gets the value
+update via `shift_tbcol_value` + `build_tbcol_card`, other
+prefixes go through the same `rebuild_per_column_card` BINTABLE
+uses.
+
+**Tests.**  `tests/test_ascii_table_edit_columns.py` (33 cases):
+all 7 insert positioning forms (default-append / position / after /
+before, by name + by index + negative), unsigned-int trick,
+`format=` override, `unit=`, TBCOL value-shift verification for
+both insert and delete, all 4 delete forms, case-insensitive
+lookup, round-trip insert→delete restoring layout exactly, non-
+last-HDU shifts both directions, astropy cross-tool, and 10
+rejection paths.
+
+### Open questions / out-of-scope for ASCII roadmap
+
+- **Compressed ASCII tables.**  Not a standard.  Will never exist.
+- **`X` (bit-packed) on ASCII.**  Not in the ASCII-table spec.
+- **VLA on ASCII.**  Not in the ASCII-table spec.
+- **Subarray fields.**  Not in the ASCII-table spec.  Caller can
+  flatten manually and use BINTABLE instead.
+- **CONTINUE-card TTYPE/TUNIT on ASCII.**  Inherited from the
+  standard `FITSHeader` machinery — no special handling needed,
+  but worth a one-line test to confirm.
 
 ## Tile-compressed images (ZIMAGE)
 
@@ -2287,9 +2592,16 @@ request flags something.
 2. ✅ **Walking HDUs / picking the right one** — section in
    ``quickstart.rst`` showing the realistic ``hdu.has_data +
    isinstance(hdu, ImageHDU)`` pattern.
-3. ✅ **`AsciiTableHDU` note** — section in ``tables.rst``
-   documenting the read-stub state and pointing at astropy as
-   the fallback.
+3. ✅ **`AsciiTableHDU` documentation** — section in
+   ``tables.rst`` (rewritten 2026-06 once the full ASCII
+   parity surface shipped) documents ASCII as a first-class
+   HDU type with a brief creation example, a parity pointer to
+   the BINTABLE sections, and a "what's different" list (no
+   VLA, no X, no subarray, no complex, no compression; narrower
+   I/F/E/D/A dtype mapping; TBCOL packs flush).  The
+   complementary lines in ``limitations.rst`` ("ASCII writes
+   not yet") and ``migration.rst`` ("read-stub only") were
+   deleted in the same pass.
 4. ✅ **Known limitations** — new ``limitations.rst`` page
    listing gaps tagged ``(not yet)`` vs ``(by design)`` with
    workarounds, plus cross-tool interop caveats.

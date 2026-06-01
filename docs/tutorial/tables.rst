@@ -353,36 +353,70 @@ Lightweight metadata without reading any rows:
    hdu.extname         # EXTNAME or None
    len(hdu)            # == nrows
 
-ASCII tables (read-stub)
-------------------------
+ASCII tables
+------------
 
-FITS also defines an older ASCII-table extension
+FITS defines an older text-based table extension
 (``XTENSION='TABLE'``, distinct from the binary
-``XTENSION='BINTABLE'`` that everything above uses).  ASCII tables
-store row data as fixed-width text and are rare in modern files —
-nearly every pipeline uses binary tables instead.
-
-rustfits surfaces an ASCII table as :class:`~rustfits.AsciiTableHDU`
-but the read/write surface isn't yet implemented.  Inspection
-accessors work:
+``XTENSION='BINTABLE'`` everything else on this page uses).
+ASCII tables store row data as fixed-width text and are rare
+in modern files; pipelines almost always pick binary tables
+instead.  rustfits supports them as a first-class HDU type:
 
 .. code-block:: python
 
-   with rustfits.FITS("legacy.fits") as fits:
-       for hdu in fits:
-           if isinstance(hdu, rustfits.AsciiTableHDU):
-               print(hdu.nrows, hdu.extname, hdu.header.keys())
+   import numpy as np
+   import rustfits
 
-Calling ``hdu.read()`` on an :class:`~rustfits.AsciiTableHDU`
-raises ``NotImplementedError``.  Until the read path lands, fall
-back to astropy or fitsio for the specific ASCII-table HDU:
+   cat = np.zeros(100, dtype=[
+       ("id", "i8"), ("flux", "f4"), ("name", "S8"),
+   ])
+   cat["id"] = np.arange(100, dtype="i8")
+   cat["flux"] = np.random.uniform(size=100).astype("f4")
+   cat["name"] = [f"obj{i:04d}".encode() for i in range(100)]
 
-.. code-block:: python
+   with rustfits.FITS("cat.fits", "w+") as fits:
+       fits.create_ascii_table_hdu(cat.dtype, nrows=len(cat))
+       fits[1].write(cat)
 
-   import astropy.io.fits as afits
-   with afits.open("legacy.fits") as f:
-       ascii_data = f[i].data        # i = the ASCII table's index
+After construction, the access surface matches binary tables
+one-for-one: ``read()`` with ``rows=`` / ``columns=``,
+``hdu[rows]`` / ``hdu["col"]`` / ``hdu[["a","b"]]`` and their
+``__setitem__`` counterparts, the column-subset objects,
+``append()`` / ``extend()``, ``insert_column`` /
+``delete_column``, ``add_checksum`` / ``verify_checksum``,
+``iter()`` / ``for row in hdu``, and the
+``appending()`` / ``extending()`` context managers.  Read the
+sections above; just substitute
+:meth:`~rustfits.FITS.create_ascii_table_hdu` for
+:meth:`~rustfits.FITS.create_table_hdu` at construction.
+Files written by rustfits round-trip bit-exactly through
+astropy and fitsio.
 
-The rest of the file (primary HDU, image extensions, binary
-tables) is unaffected — rustfits opens and reads those normally
-in the same session.
+What's different from binary tables:
+
+* **Narrower dtype mapping.**  Signed / unsigned ints map to
+  ``I20`` (unsigned via the ``TZERO=2**63`` trick); ``f4`` →
+  ``E15.7``, ``f8`` → ``D25.17``; ``S<w>`` / ``U<w>`` →
+  ``A<w>``.  Other numpy dtypes (``b1``, ``i1``, complex) are
+  rejected.  Per-column overrides via
+  ``formats={"col": "F12.4"}`` on create or ``format="..."``
+  on :meth:`~rustfits.AsciiTableHDU.insert_column`.  Read back
+  the current per-column TFORM strings via
+  :attr:`~rustfits.AsciiTableHDU.formats` (mirrors the
+  ``formats=`` create kwarg, so it round-trips through
+  :meth:`~rustfits.FITS.create_ascii_table_hdu`).
+
+* **No variable-length (VLA / Object dtype) columns.**  The
+  format has no heap, so VLAs aren't representable.
+
+* **No bit-packed (``X``) columns, no subarray cells, no
+  complex (``C`` / ``M``) columns.**  The FITS standard's
+  ASCII-table letters are only ``A`` / ``I`` / ``F`` / ``E`` /
+  ``D``.
+
+* **No tile compression.**  ASCII tables can't be compressed;
+  no FITS convention exists for it.
+
+* **TBCOL packs flush.**  rustfits matches cfitsio's
+  convention of no inter-column space byte.

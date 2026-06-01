@@ -9,6 +9,8 @@ from ._rust import (
     CompressedSingleColumnSubset,
     CompressedColumnSubset,
     AsciiTableHDU,
+    AsciiSingleColumnSubset,
+    AsciiColumnSubset,
     FITSHeader,
     FITSHeaderEdit,
     Gzip1,

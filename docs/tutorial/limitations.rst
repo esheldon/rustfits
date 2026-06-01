@@ -22,9 +22,9 @@ Tables
   ``1PE`` shape (one descriptor per row) is fully supported.
 * **Variable-length columns with TDIMn** *(not yet)* — TDIMn on
   a P/Q column would reshape each heap cell to the declared
-  dims, useful for VLA-of-images.  Note the spec only allows
-  ONE variable axis per cell, so fully variable ``(n, m)``
-  shapes aren't expressible in FITS without padding.
+  dims, useful for VLA-of-images, but with a quirk: the spec only allows ONE
+  variable axis per cell, so fully variable ``(n, m)`` shapes aren't
+  expressible in FITS without padding.
 * **TNULL masking on VLA columns** *(not yet)* — ``mask_null=True``
   works for fixed B/I/J/K columns but raises on VLA columns with
   a TNULL card in the header.  Read with ``mask_null=False`` and
@@ -34,10 +34,6 @@ Tables
   cell's length and returns a fixed-size N-D array.  Not
   supported; rustfits returns one ndarray per row (Object dtype).
   Build the padded array yourself if you need it.
-* **ASCII table writes** *(not yet)* — :class:`~rustfits.AsciiTableHDU`
-  is read-stub only (inspection accessors work; ``read()`` raises).
-  Modern files use BINTABLE; if you need ASCII output, write
-  through astropy.
 * **``TDISPn`` on write** *(not yet)* — the display-format hint
   isn't emitted by rustfits's writers.  Add it by hand via
   ``header["TDISP1"] = ...`` if you need it; it's informational

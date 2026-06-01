@@ -24,9 +24,10 @@ pub(crate) use columns::{
 pub(crate) use hdu::{
     classify_table_key, ColumnSubset, SingleColumnSubset, TableHDU, TableKey,
 };
-pub(crate) use iter::TableIter;
+pub(crate) use iter::{make_table_iter, TableIter};
 pub(crate) use setitem::{
-    classify_setitem_key, coerce_to_len1_record, SetItemKey,
+    classify_setitem_key, coerce_to_len1_record, try_extract_column_name,
+    SetItemKey,
 };
 pub(crate) use read::{
     build_numpy_dtype, build_var_cell_value, convert_column_cell,
