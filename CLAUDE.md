@@ -3070,13 +3070,26 @@ worth checking comes up; cross items off as they ship.
     exception, mid-context drain firing under load, empty
     context no-op, all rejection paths.
 
-    Remaining low-priority follow-up: uncompressed `ImageHDU`
-    / `TableHDU` could expose no-op `extending()` /
-    `appending()` context managers so generic code that
-    iterates HDUs of mixed types can use `with hdu.extending():`
-    uniformly.  Pure API symmetry; no functional benefit on
-    uncompressed paths (they don't have a partial-trailing-
-    tile cost).
+    **Uncompressed no-op contexts shipped** (same commit-set,
+    separate commit).  `ImageHDU.extending()`,
+    `TableHDU.appending()`, and `TableHDU.extending()` (alias)
+    all return a `NoopExtendContext` (in `src/common.rs`) that
+    does nothing on enter / exit.  Pure API symmetry — generic
+    code that iterates HDUs of mixed types can now write::
+
+        for hdu in fits:
+            with hdu.extending():
+                for batch in batches:
+                    hdu.extend(batch)
+
+    and get the buffered-batched behavior on compressed HDUs
+    and the no-op on uncompressed (via Python MRO; the
+    `CompressedImageHDU.extending()` and
+    `CompressedTableHDU.appending()` overrides shadow the
+    parent's no-op).  Inside the no-op context, all operations
+    (read, getitem, setitem, etc.) are unrestricted — only the
+    real compressed contexts have the strict Path A semantics.
+    Tests in `tests/test_hdu_extending_noop.py` (11 cases).
 
 **Out of scope of this list but mentioned elsewhere in CLAUDE.md:**
 - Write-side header-meta cache extension (the read-side cache

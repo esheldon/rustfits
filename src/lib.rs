@@ -26,6 +26,7 @@ mod zimage;
 mod fits;
 mod checksum;
 
+use crate::common::NoopExtendContext;
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
 use crate::hdu::HDU;
 use crate::hdu_image::ImageHDU;
@@ -50,6 +51,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImageHDU>()?;
     m.add_class::<CompressedImageHDU>()?;
     m.add_class::<CompressedImageExtendContext>()?;
+    m.add_class::<NoopExtendContext>()?;
     m.add_class::<TableHDU>()?;
     m.add_class::<CompressedTableHDU>()?;
     m.add_class::<CompressedTableAppendContext>()?;
