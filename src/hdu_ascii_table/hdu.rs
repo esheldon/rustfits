@@ -287,6 +287,40 @@ impl AsciiTableHDU {
         Ok(dict.unbind())
     }
 
+    /// Per-column FITS format strings, as a dict.
+    ///
+    /// Reconstructs the on-disk ``TFORMn`` for every column in
+    /// the same shape :meth:`~rustfits.FITS.create_ascii_table_hdu`
+    /// accepts via its ``formats=`` kwarg.  Round-trips:
+    ///
+    /// .. code-block:: python
+    ///
+    ///     with rustfits.FITS("dest.fits", "w+") as f:
+    ///         f.create_ascii_table_hdu(
+    ///             src_hdu.dtype,
+    ///             formats=src_hdu.formats,
+    ///             nrows=src_hdu.nrows,
+    ///         )
+    ///
+    /// Format shapes: ``A<w>`` and ``I<w>`` for string / integer
+    /// columns; ``F<w>.<d>``, ``E<w>.<d>``, ``D<w>.<d>`` for the
+    /// fixed / single-exponent / double-exponent floats.
+    #[getter]
+    fn formats(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        let dict = PyDict::new(py);
+        for col in &meta.columns {
+            let tform = match (col.tform_letter, col.decimals) {
+                ('A' | 'I', _) => format!("{}{}", col.tform_letter, col.byte_width),
+                (_, Some(d)) => format!("{}{}.{}", col.tform_letter, col.byte_width, d),
+                (_, None) => format!("{}{}", col.tform_letter, col.byte_width),
+            };
+            dict.set_item(&col.name, &tform)?;
+        }
+        Ok(dict.unbind())
+    }
+
     /// Number of rows in the table (``NAXIS2``).
     #[getter]
     fn nrows(slf: PyRef<'_, Self>) -> PyResult<usize> {

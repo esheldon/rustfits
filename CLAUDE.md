@@ -792,7 +792,13 @@ FITS standard), and `has_data` (True iff NAXIS > 0 AND every NAXISn > 0
 `units` (dict, informational), and `__len__` (== nrows).
 `AsciiTableHDU` matches `TableHDU`'s accessor surface (`nrows`,
 `ncols`, `colnames`, `units`, `dtype`, `__len__`) so generic code
-can iterate any HDU type uniformly via duck typing.
+can iterate any HDU type uniformly via duck typing.  Plus one
+ASCII-only accessor: `formats` returns a `{col_name: tform_string}`
+dict in the same shape `create_ascii_table_hdu`'s `formats=` kwarg
+accepts (`'I20'`, `'E15.7'`, `'F12.4'`, `'D25.17'`, `'A10'`, ...),
+covering EVERY column.  Round-trips: feed `src_hdu.formats` straight
+back into `create_ascii_table_hdu(..., formats=...)` to recreate
+the same layout.
 
 ### Image read
 

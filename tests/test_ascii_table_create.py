@@ -114,6 +114,45 @@ def test_create_formats_override():
             assert h["NAXIS1"] == 27
 
 
+def test_formats_attr_returns_every_column():
+    """hdu.formats includes every column, defaults + overrides alike."""
+    dtype = np.dtype([
+        ("ID", "i8"), ("FLUX", "f4"), ("MJD", "f8"),
+        ("MASK", "u4"), ("NAME", "S10"),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_ascii_table_hdu(
+                dtype, nrows=0, formats={"FLUX": "F12.4"},
+            )
+            got = dict(f[1].formats)
+        assert got == {
+            "ID": "I20", "FLUX": "F12.4", "MJD": "D25.17",
+            "MASK": "I20", "NAME": "A10",
+        }
+
+
+def test_formats_attr_round_trip_recreate():
+    """hdu.formats can be fed back into create_ascii_table_hdu."""
+    dtype = np.dtype([("X", "f4"), ("Y", "f8"), ("LABEL", "S6")])
+    with tempfile.TemporaryDirectory() as tmp:
+        fn1 = os.path.join(tmp, "src.fits")
+        with rustfits.FITS(fn1, "w+") as f:
+            f.create_ascii_table_hdu(
+                dtype, nrows=2, formats={"X": "F10.5"},
+            )
+            src_formats = dict(f[1].formats)
+
+        fn2 = os.path.join(tmp, "dst.fits")
+        with rustfits.FITS(fn2, "w+") as f:
+            f.create_ascii_table_hdu(
+                dtype, nrows=2, formats=src_formats,
+            )
+            dst_formats = dict(f[1].formats)
+        assert dst_formats == src_formats
+
+
 def test_create_formats_case_insensitive():
     dtype = np.dtype([("X", "f4")])
     with tempfile.TemporaryDirectory() as tmp:

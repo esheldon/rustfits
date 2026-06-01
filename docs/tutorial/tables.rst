@@ -401,7 +401,11 @@ What's different from binary tables:
   ``A<w>``.  Other numpy dtypes (``b1``, ``i1``, complex) are
   rejected.  Per-column overrides via
   ``formats={"col": "F12.4"}`` on create or ``format="..."``
-  on :meth:`~rustfits.AsciiTableHDU.insert_column`.
+  on :meth:`~rustfits.AsciiTableHDU.insert_column`.  Read back
+  the current per-column TFORM strings via
+  :attr:`~rustfits.AsciiTableHDU.formats` (mirrors the
+  ``formats=`` create kwarg, so it round-trips through
+  :meth:`~rustfits.FITS.create_ascii_table_hdu`).
 
 * **No variable-length (VLA / Object dtype) columns.**  The
   format has no heap, so VLAs aren't representable.
