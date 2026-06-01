@@ -129,37 +129,61 @@ jobs:
         shell: bash -el {0}
         run: pytest
 
-      # Phase 1 diagnostic: amplify the macOS-only heap-corruption
-      # flake in the compressed-image extend area (~50% hit rate
-      # across recent runs, both py3.12 and py3.14).  Loop the two
-      # suspect test files 10x under macOS's strict malloc env
-      # vars:
-      #   MallocScribble=1   — fill freed memory with 0x55; any
-      #                        use-after-free reads garbage rather
-      #                        than the still-correct-looking stale
-      #                        contents, surfacing immediately.
-      #   MallocGuardEdges=1 — guard pages around large allocations;
-      #                        an overrun traps at the write site,
-      #                        not at the next unrelated malloc that
-      #                        notices the corrupted heap (which is
-      #                        what we have today — the crash stack
-      #                        ends in card_string's format!() which
-      #                        is downstream of the actual scribble).
-      # `-x` stops at first failure for a clean trace; the full
-      # macOS suite gets restored once we've found + fixed the bug.
-      - name: pytest (macOS — amplifying diagnostic loop)
+      # Phase 1b diagnostic: per-file isolation pass.
+      #
+      # Earlier diagnostic (loop two suspect files in a single
+      # pytest invocation, with MallocScribble + MallocGuardEdges)
+      # never reproduced the crash.  Likely interpretation: the
+      # scribble is in some test that runs BEFORE the compressed-
+      # extend tests in the full suite, and the symptom shows up
+      # downstream because pytest runs the whole session in one
+      # Python process (single heap).
+      #
+      # This step runs every test file in its own pytest
+      # invocation (= fresh process, fresh heap) twice through.
+      # Two outcomes are informative:
+      #   - One or more files crash IN ISOLATION → the bug lives
+      #     in that file's tests; clean reproducer.
+      #   - All files pass in isolation but the full pytest still
+      #     crashes → cross-test state corruption.  We bisect
+      #     next: binary-search which prefix of the alphabetical
+      #     file list (single pytest invocation) reproduces.
+      #
+      # `set +e` so a crashing file doesn't bail the whole loop —
+      # we want the full picture (which files crash, how often).
+      # The summary at the end re-raises if anything failed so CI
+      # still flags red.
+      - name: pytest (macOS — per-file isolation pass)
         if: matrix.os == 'macos-latest'
         shell: bash -el {0}
-        env:
-          MallocScribble: "1"
-          MallocGuardEdges: "1"
         run: |
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            echo "=========== iteration $i ==========="
-            pytest -xv \
-              tests/test_image_compressed_extend.py \
-              tests/test_image_compressed_extending.py
+          set +e
+          FAILURES=()
+          for iter in 1 2; do
+            echo "########## ITERATION $iter ##########"
+            for f in tests/test_*.py; do
+              echo "===== $f ====="
+              pytest -x "$f"
+              rc=$?
+              if [ $rc -ne 0 ]; then
+                echo "!!! FAILED: $f (rc=$rc, iter=$iter) !!!"
+                FAILURES+=("iter${iter}:${f}:rc${rc}")
+              fi
+            done
           done
+
+          echo ""
+          echo "===== SUMMARY ====="
+          if [ ${#FAILURES[@]} -eq 0 ]; then
+            echo "All files passed in isolation across both iterations."
+            echo "Next: bisect cross-test state corruption (some test"
+            echo "earlier in the full suite scribbles the heap)."
+            exit 0
+          else
+            echo "${#FAILURES[@]} failure(s):"
+            printf '  %s\n' "${FAILURES[@]}"
+            exit 1
+          fi
 
   # ----- Coverage (single config) ----------------------------------
   # Python coverage via pytest-cov + Rust coverage via cargo-llvm-cov.
