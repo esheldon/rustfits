@@ -2844,14 +2844,51 @@ worth checking comes up; cross items off as they ship.
    win scales with image size — a (100 k × 4 k) image would
    have gone from ~13 GB old to ~50 MB now.
 
-8. **Random/scattered access on compressed 1-D.**  Covered for
-   2-D RICE (stamps in the DES bench); no equivalent for 1-D
-   GZIP_2.  Tile cache behavior may differ when stamps land on
-   1-D strip tiles.  How to check: read 1000 random 1k-row
-   chunks from a 50M-row GZIP_2 file; compare rustfits vs
-   fitsio; vary the tile cache size to expose the cache-hit-
-   rate dependency.  Bench target:
-   `perf/perf-compressed-image-read-1d-scattered.py`.
+8. ✅ **Random/scattered access on compressed 1-D.**  Done.
+   `perf/perf-compressed-image-read-1d-scattered.py` runs 1000
+   random 1k-row windows against a 64-tile 1-D f8 GZIP_2 file
+   (537 MB raw, 15 MB compressed, healsparse-like data) under
+   two cache regimes.
+
+   **Two regimes (the choice a caller actually faces):**
+
+   | Cache | rustfits | fitsio | rf vs fi | Why |
+   |---|---|---|---|---|
+   | default (rf=32 MB, fi=unbounded) | 5.34 s | 1.73 s | 0.32× SLOW | rf cache holds 4/64 tiles, thrashes on random pattern |
+   | large (rf=528 MB, fi=unbounded) | 483 ms | 1.74 s | **3.60× faster** | both fully cache; rustfits wins on per-read overhead |
+
+   **Findings:**
+   - **rustfits's bounded LRU thrashes on random access when
+     the cache is smaller than the working set.**  At default
+     32 MB / 4 tiles vs 64 tiles touched, ~every read evicts
+     something we still need; the workload becomes pure decode
+     cost, ~1000 tile decodes per iter.
+   - **fitsio's unbounded cache wins on small files** because
+     it implicitly covers the whole working set with no user
+     tuning.  But: there is no knob to bound it.  On a multi-
+     GB compressed image, fitsio's cache would OOM (not
+     induced in the bench — too dependent on machine RAM to
+     reproduce reliably).
+   - **At cache-comfortable, rustfits is 3.60× faster than
+     fitsio** on per-read overhead — same shape as the
+     chunked-read wins.
+   - **There is no universally-good cache size.**  It's a
+     memory-vs-speed knob the caller has to tune for their
+     workload's locality + their RSS budget.  rustfits exposes
+     `hdu.set_tile_cache_size(bytes)` so callers can pick
+     deliberately; fitsio's unbounded default is fast when it
+     fits and OOMs when it doesn't.
+
+   Documented in the bench's docstring AND in
+   `docs/tutorial/performance.rst` under "Scattered reads on
+   compressed images — tune the tile cache".  The user-facing
+   section leads with the two-row table, then explains the
+   bounded-vs-unbounded cache trade-off (rustfits bounded
+   degrades gracefully; fitsio unbounded OOMs on big files),
+   gives the one-line `set_tile_cache_size` fix, and lists
+   tuning rules of thumb (sequential/chunked → default fine;
+   scattered+fits-in-RAM → size to working set; scattered+
+   too-big → pick what you can afford).
 
 9. **Remote read perf (http/https/ftp/ftps).**  Shipped but not
    benched.  Network IO dominates total time so the comparison

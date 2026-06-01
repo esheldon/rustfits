@@ -348,6 +348,13 @@ SCRIPT_GROUPS: dict[str, tuple[str, str]] = {
         "1-D ``f8`` array of pure noise (worst case for any codec); "
         "GZIP_2 with 1 MiB tiles, ~512 MB raw / ~485 MB compressed.",
     ),
+    "perf-compressed-image-read-1d-scattered.py": (
+        "Compressed 1-D image scattered read (GZIP_2, two cache regimes)",
+        "1000 random 1k-row windows against a 64-tile 1-D ``f8`` "
+        "GZIP_2 image; two cache regimes (rustfits default vs sized "
+        "to fit all touched tiles).  Shows the cache-hit-rate "
+        "dependency for scattered access.",
+    ),
     "perf-compressed-image-write-healsparse.py": (
         "Compressed 1-D image write (GZIP_2, healsparse-like)",
         "Same input as the healsparse read bench, lossless GZIP_2 "
