@@ -570,51 +570,84 @@ worries.  Later HDUs' offsets bump DOWN by `delta` via the shared
 `Arc<HduOffsets>` model, so previously-issued handles transparently
 see the post-shrink layout.
 
-Algorithm (same shape on both sides):
-1. Read the whole main table + the whole old heap into RAM under a
-   single file lock.
-2. Walk every row × every descriptor column.  For each live cell
-   (`nelements > 0`) copy its bytes from the old-heap snapshot into
-   a fresh `Vec<u8>` (in row-major × descriptor-order, which matches
-   what the bulk write path emits), record the new offset, and
-   rewrite the in-memory descriptor to point at the new location.
-3. Drop the old heap; if `new_pcount == current_pcount` already
-   (compact), bail out.
-4. Compute new padded extent.  Write the rebuilt main table + new
-   heap back at the same `data_offset`.
-5. If the new padded extent is smaller: shift the file tail
-   backward (non-last) or `set_len` (last).
-6. PCOUNT update via the standard disk-write-before-commit header
-   rewrite + taint discipline.
-7. Compressed side also `cache.clear()`s the tile cache (entries
-   pointed at the old heap layout).
+Algorithm (same shape on all three sides — BINTABLE VLA, ZIMAGE,
+ZTABLE):
+1. Read the descriptor table into RAM (small: bounded by
+   `n_rows * row_width` for BINTABLE / `n_tiles * row_width`
+   for the compressed flavors — typically a few KB to a few MB).
+2. Walk every row × every descriptor column.  For each live
+   cell (`nelements > 0`) record a `MovePlan { old_off,
+   length, new_off }` and rewrite the in-memory descriptor in
+   the descriptor-table buffer to point at the new offset.
+   Skip empty cells (descriptor stays / is canonicalized to
+   `(0, 0)`).
+3. If `new_pcount == current_pcount` (already compact), bail.
+4. Sort plans by `old_off` so the in-place fast path reads
+   sequentially without backtracking.
+5. Decide fast vs slow path.  Fast path needs: for every
+   adjacent `[i, i+1]` pair in sorted-by-old_off order, plan
+   i's write region ends at or before plan i+1's read region
+   (`new_off + length <= next_read_start`).  Holds for the
+   typical post-setitem orphan pattern (orphans before live
+   tail).
+6. Fast path: `stream_copy_in_file` each live cell from
+   `heap_start + old_off` → `heap_start + new_off` in 1 MiB
+   chunks.  Skipping plans where `new_off == old_off`.
+7. Slow path: `grow_file_to_at_least(main_bytes +
+   current_pcount + new_pcount)` to allocate staging room
+   past the current heap end (this shifts later HDUs forward
+   when non-last); copy live cells from `heap_start + old_off`
+   → `staging_start + new_off`; back-copy from staging to
+   `heap_start + new_off`.
+8. Write the updated descriptor table back at `data_offset`.
+9. Shrink the file extent using `effective_current_hdu_end`
+   (post-grow extent in the slow path, original in the fast
+   path): `shift_file_tail_backward_and_update_offsets` for
+   non-last HDUs (also bumps later HDUs' offsets down via the
+   shared `Arc<HduOffsets>` model so previously-issued handles
+   transparently see the post-shrink layout), `set_len` for
+   last HDU.
+10. PCOUNT update via the standard disk-write-before-commit
+    header rewrite + taint discipline.
+11. Compressed-image side also `cache.clear()`s the tile
+    cache (entries pointed at the old heap layout).
 
-**Scope limitations.**  Both sides reject the call up front when
-the file has a non-default `THEAP` (where `THEAP != NAXIS1*NAXIS2`)
-because repack writes the new heap at the default position and
-would corrupt a file with a custom layout.  rustfits never emits
-THEAP itself, so this only blocks repack on files written by other
-tools with a non-standard heap offset — workaround is to clone the
-file through a fresh `create_*` + write.
+**Scope limitations.**  All three sides reject the call up
+front when the file has a non-default `THEAP` (where
+`THEAP != NAXIS1*NAXIS2`) because repack writes the new heap
+at the default position and would corrupt a file with a
+custom layout.  rustfits never emits THEAP itself, so this
+only blocks repack on files written by other tools with a
+non-standard heap offset — workaround is to clone the file
+through a fresh `create_*` + write.
 
 **Implementation.**  `repack_table_heap` in
-`src/hdu_table/write_vla.rs` and `repack_compressed_heap` in
-`hdu_image_compressed.rs`.  Same shape,
-different descriptor-column enumeration: tables iterate every VLA
-column per row; compressed images iterate the primary
-`COMPRESSED_DATA` column plus the optional `GZIP_COMPRESSED_DATA`
-and `UNCOMPRESSED_DATA` fallbacks (each with its own
-`inner_byte_width`).  Validate-then-mutate (descriptor sanity
-checked before any write); mid-write failures taint the file.
-Pre-write failures (THEAP rejection, locks) don't taint.
+`src/hdu_table/write_vla.rs` (BINTABLE VLA);
+`repack_compressed_heap` in
+`src/hdu_image_compressed/repack.rs` (ZIMAGE);
+`repack_compressed_table_heap` in
+`src/hdu_table_compressed/repack.rs` (ZTABLE).  Same
+algorithm shape, different descriptor-column enumeration:
+BINTABLE VLA iterates every VLA column per row; ZIMAGE
+iterates the primary `COMPRESSED_DATA` column plus the
+optional `GZIP_COMPRESSED_DATA` and `UNCOMPRESSED_DATA`
+fallbacks (each with its own `inner_byte_width`); ZTABLE
+iterates per-(tile, col) descriptor positions.
+Validate-then-mutate (descriptor sanity checked before any
+write); mid-write failures taint the file.  Pre-write
+failures (THEAP rejection, locks) don't taint.
 
-**Tests.**  `tests/test_table_vla_repack.py` (9 cases: drop orphans,
-shrink last HDU, no-op compact, no-op non-VLA, multiple VLA
-columns, mixed fixed+VLA, non-last shift, all-empty cells,
-repack→setitem→repack).  `tests/test_image_compressed_repack.py`
-(11 cases: drop orphans, shrink last HDU, no-op compact, non-last
-shift, algorithm matrix Gzip1/Gzip2/Rice1/Hcompress1, quantized
-float, unquantized float, cache invalidation).
+**Tests.**  `tests/test_table_vla_repack.py` (9 cases: drop
+orphans, shrink last HDU, no-op compact, no-op non-VLA,
+multiple VLA columns, mixed fixed+VLA, non-last shift
+exercising slow path, all-empty cells, repack→setitem→repack).
+`tests/test_image_compressed_repack.py` (12 cases: 11 from
+the original test set + 1 new slow-path test exercising the
+non-last-HDU slow-path branch end-to-end, with a setitem
+pattern engineered to force fast-path safety to fail and
+staging to overflow the current padded extent — the test
+that would have caught the slow-path bugs in the original
+ZIMAGE rewrite if it had existed earlier).
 
 **Peak RSS scaling: constant ~50 MB across all three
 flavors** (as of 2026-05-31).  All three repack paths share
@@ -2271,12 +2304,17 @@ request flags something.
    covering the standard-Python-exceptions choice, what raises
    what, the taint flag, recovery via close+reopen, and the
    in-process-mutex / no-OS-lock multi-writer story.
-8. **Performance / chunked reads** — the big-chunk and small-
-   chunk wins vs fitsio (see
-   [docs/internal/perf-history.md](docs/internal/perf-history.md))
-   are unmatched and currently undocumented user-facing.  Worth a
-   short page if we want users to know; deferred because benchmark
-   numbers age fast and invite arguments about methodology.
+8. ✅ **Performance page** — ``docs/tutorial/performance.rst``
+   now covers the user-facing perf surface: cross-tool tables
+   (auto-generated by ``perf-all.py``), 2-D image extend
+   (uncompressed + GZIP_2 + the ``extending()`` context),
+   incremental table builds (uncompressed append + the
+   ZTABLE ``appending()`` context), scattered 1-D compressed
+   reads (with tile-cache tuning guidance + the OOM caveat
+   on fitsio's unbounded cache), compressed-image
+   ``__setitem__``, and ``repack()`` peak RSS for all three
+   flavors.  Methodology pinned by a "How comparisons are
+   timed" section so number-rot is bounded.
 9. ✅ **Migration guide** — ``docs/tutorial/migration.rst``,
    wired into the toctree between ``headers.rst`` and
    ``errors.rst``.  Frames rustfits as the modern successor to
@@ -2307,11 +2345,11 @@ the real logic lives in Rust and the 89.61% is the one
 worth moving.
 
 Plan: **don't chase coverage incrementally** during
-feature work.  Wait until we're past the feature-complete
-threshold for the current phase set (probably some time
-after ZIMAGE Phase 5+6 and image/table write parity is
-done), then do one focused coverage-driven sweep.  Two
-buckets to look at when that happens:
+feature work.  The trigger condition ("past the feature-
+complete threshold — ZIMAGE write parity + image/table
+write parity") is now met (2026-06-01) so the focused
+coverage sweep is unblocked whenever someone has time for
+a 30 min-to-half-day pass.  Two buckets to look at:
 
 - **Cheap wins (the "dishonest" miss bucket)** — branches
   that one extra test would exercise (a specific TFORM
@@ -2458,8 +2496,12 @@ deep doc):
 - 1 MiB chunks for any streaming I/O ([[feedback_chunk_size_convention]]).
 
 **Open perf work** lives in the "Performance TODO" section
-below — coverage gaps, the one fix item (compressed-image
-checksum still materializes full ndarray), etc.
+below.  As of 2026-06-01 only two items remain open, both
+deferred pending a real workload: TODO #2 (lazy file open;
+shelved after a bench survey found no smoking gun on local
+SSD / HDD / GPFS), TODO #9 (remote read perf benching;
+network IO dominates so the comparison is likely
+uninteresting).  Everything else is shipped.
 
 **For the full optimization narrative — every fix
 commit-by-commit, every debugging gotcha, the RICE decode
@@ -2761,28 +2803,32 @@ worth checking comes up; cross items off as they ship.
    repack runs in a fresh subprocess so the reported peak RSS is
    repack alone.
 
-   **Findings — only ZTABLE is actually bounded-memory:**
+   **Findings as of 2026-05-30 — only ZTABLE was bounded-
+   memory at the time of this bench** (state since changed —
+   see TODO #11 closure for the streaming rewrite that
+   brought BINTABLE-VLA and ZIMAGE to the same ~50 MB-flat
+   profile):
 
-   - **BINTABLE VLA repack**: RSS scales 1:1 with PCOUNT.
-     1 GB heap → 1049 MB peak RSS, 451 ms.  The implementation
-     reads the WHOLE old heap into a `Vec<u8>` under a single
-     file lock (`repack_table_heap` in `write_vla.rs`).  The
-     "streaming + staging" claim in the old TODO #5 was
-     aspirational — it actually doesn't stream.
-   - **ZIMAGE compressed-image repack**: RSS scales at ~1.5×
-     PCOUNT (live and orphan halves of the heap coexist in RAM
-     during the copy walk).  1 GB heap → 1787 MB peak, 819 ms.
-     Same whole-heap-into-RAM pattern as BINTABLE VLA.
-   - **ZTABLE compressed-table repack**: **RSS flat at ~50 MB**
-     regardless of heap size.  10 MB / 100 MB / 1 GB heaps all
-     report 50 MB peak (= baseline).  Time scales linearly at
-     ~6 GB/s effective heap throughput.  The streaming + staging
-     impl really does work (chunked in-file copy + a small move-
-     plan vector; no heap-in-RAM allocation).
+   - **BINTABLE VLA repack** (then): RSS scaled 1:1 with PCOUNT.
+     1 GB heap → 1049 MB peak RSS, 451 ms.  Whole-heap-into-RAM.
+   - **ZIMAGE compressed-image repack** (then): RSS scaled at
+     ~1.5× PCOUNT (live and orphan halves of the heap coexist
+     in RAM during the copy walk).  1 GB heap → 1787 MB peak,
+     819 ms.  Whole-heap-into-RAM.
+   - **ZTABLE compressed-table repack** (then and now): **RSS
+     flat at ~50 MB** regardless of heap size.  10 MB / 100 MB
+     / 1 GB heaps all report 50 MB peak (= baseline).  Time
+     scales linearly at ~6 GB/s effective heap throughput.
+     The streaming + staging impl really does work (chunked
+     in-file copy + a small move-plan vector; no heap-in-RAM
+     allocation).
 
-   **CLAUDE.md correction**: the "Heap repack" section's claim
-   that all three repacks are streaming was wrong for two of
-   the three.  Updated below in that section.
+   **What changed since** (2026-05-31, TODO #11): the
+   BINTABLE-VLA and ZIMAGE paths were rewritten to use the
+   same streaming + staging pattern, sharing
+   `stream_copy_in_file` and `grow_file_to_at_least` lifted
+   into `src/common.rs`.  1 GB heap on both now: ~50 MB peak,
+   94 ms (BINTABLE VLA) / 190 ms (ZIMAGE).
 
    **Tooling fix discovered**: the existing extend benches were
    using `resource.getrusage(RUSAGE_SELF).ru_maxrss` to measure
@@ -3325,8 +3371,8 @@ Vec must call `bump_cards_version()` on the HDU's
   card-Vec mutations + header rewrite.
 - Internal structural updates in `hdu_image.rs::ImageHDU::extend`
   (NAXISn card update), `hdu_table::write_*` (NAXIS2/PCOUNT
-  card updates), `hdu_image_compressed.rs` (NAXIS2/PCOUNT/
-  ZNAXIS<last> card updates), `hdu_table_compressed.rs`
+  card updates), `hdu_image_compressed/` (NAXIS2/PCOUNT/
+  ZNAXIS<last> card updates), `hdu_table_compressed/`
   (similar).
 - `checksum.rs::compressed_table_add_*` etc.
 
