@@ -16,20 +16,15 @@ Each item is tagged:
 Tables
 ------
 
+* **TNULL masking on VLA columns** *(not yet)* — ``mask_null=True``
+  works for fixed B/I/J/K columns but raises on VLA columns with
+  a TNULL card in the header.  Read with ``mask_null=False`` and
+  apply the mask yourself for now.
 * **Variable-length columns with TDIMn** *(not yet)* — TDIMn on
   a P/Q column would reshape each heap cell to the declared
   dims, useful for VLA-of-images, but with a quirk: the spec only allows ONE
   variable axis per cell, so fully variable ``(n, m)`` shapes aren't
   expressible in FITS without padding.
-* **TNULL masking on VLA columns** *(not yet)* — ``mask_null=True``
-  works for fixed B/I/J/K columns but raises on VLA columns with
-  a TNULL card in the header.  Read with ``mask_null=False`` and
-  apply the mask yourself for now.
-* **fitsio-style ``max_size=`` for VLA reads** *(by design)* —
-  fitsio offers a mode that pads every VLA cell to the longest
-  cell's length and returns a fixed-size N-D array.  Not
-  supported; rustfits returns one ndarray per row (Object dtype).
-  Build the padded array yourself if you need it.
 * **``TDISPn`` on write** *(not yet)* — the display-format hint
   isn't emitted by rustfits's writers.  Add it by hand via
   ``header["TDISP1"] = ...`` if you need it; it's informational
