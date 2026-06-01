@@ -40,9 +40,9 @@ fitsio = pytest.importorskip("fitsio")
 # variance (FMA fusion, Apple libm vs glibc).  rustfits's Rust
 # dequant bit-matches Linux cfitsio.  Linux remains strictly
 # bit-exact below; macOS allows allclose at the documented level
-# (current observation: max ~4.6e-6 relative on f4 dequant).
+# (rtol up to ~1.6e-5 on near-zero values, atol up to ~2.6e-9).
 _MACOS_FP_RTOL = 1e-5
-_MACOS_FP_ATOL = 1e-10
+_MACOS_FP_ATOL = 1e-8
 _IS_MACOS = sys.platform == "darwin"
 
 

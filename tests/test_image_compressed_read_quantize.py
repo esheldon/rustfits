@@ -40,12 +40,16 @@ fitsio = pytest.importorskip("fitsio")
 # float results than on Linux — almost certainly compiler-codegen
 # variance (FMA fusion, Apple libm vs glibc).  rustfits's Rust
 # dequant bit-matches Linux cfitsio.  We pin the divergence here
-# so the level is documented (current observation: max ~4.6e-6
-# relative on f4, ~3.6e-16 absolute on near-zero values) and a
-# future regression beyond this bound surfaces visibly.  Tighten
-# the rtol/atol if a future fitsio release narrows the gap.
+# so the level is documented and a future regression beyond this
+# bound surfaces visibly.  Current observations across all dither
+# methods on macOS arm64 + py3.12:
+#   - rtol up to ~1.6e-5 on near-zero values (where the tiny
+#     denominator inflates the ratio)
+#   - atol up to ~2.6e-9 in the same near-zero case
+# Bumping atol gives room on small values without weakening the
+# per-value relative bound for normal-magnitude data.
 _MACOS_FP_RTOL = 1e-5
-_MACOS_FP_ATOL = 1e-10
+_MACOS_FP_ATOL = 1e-8
 _IS_MACOS = sys.platform == "darwin"
 
 
