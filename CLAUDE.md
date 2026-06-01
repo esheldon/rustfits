@@ -2581,6 +2581,81 @@ test to abort with the conda binary was
 `tests/test_image_compressed_accessors.py`'s
 `test_other_compression_types_dispatched`.
 
+## macOS CI flakes — resolved 2026-06-01 (fitsio PLIO_1)
+
+Branch `macos-heap-hunt` was opened on a presumed
+rustfits-side heap-corruption bug (~50% hit rate on full
+macOS pytest runs, originally reported with crash sites in
+`rustfits::header::card_string` downstream of
+`FITS::create_compressed_image_hdu_impl`).  The Phase 1b
+diagnostic (per-file isolation pass on macOS — every
+`tests/test_*.py` in its own pytest process, twice through)
+ran on two consecutive commits and surfaced ONE failing file
+both times: `tests/test_image_compressed_accessors.py`, both
+runs crashing at the same exact line
+(`test_other_compression_types_dispatched[PLIO_1-PLIO_1]`,
+line 351 of that file).
+
+Crash signature is bare `Fatal Python error: Aborted` with
+the call stack ENTIRELY inside fitsio (cfitsio C extension
+via `fitsio._fitsio_wrap.create_image_hdu`), not rustfits —
+and NO `nanov2_guard_corruption_detected` line.  So this is
+a **different** bug from the one originally described:
+fitsio's source-built cfitsio crashing intermittently on
+`compress="PLIO_1"` with default qlevel on macOS py3.12 only
+(py3.14 unaffected).  The companion read-side test in
+`tests/test_image_compressed_read_plio.py` uses
+`compress="PLIO"` + explicit `qlevel=None` and works fine,
+suggesting the bug is in fitsio's specific PLIO_1 +
+default-qlevel write path.
+
+**Mitigation shipped.**  `tests/test_image_compressed_accessors.py`
+gained a `_SKIP_FITSIO_PLIO_ON_MACOS` mark on just the PLIO_1
+parametrize case of `test_other_compression_types_dispatched`.
+GZIP_1 and GZIP_2 still run there; PLIO read coverage on
+macOS is preserved by `test_image_compressed_read_plio.py`
+(uses the non-crashing fitsio code path).  The per-file
+isolation diagnostic step in `.github/workflows/ci.yml` was
+reverted to a plain `pytest` after this fix landed — the
+diagnostic was specifically built to hunt this flake and has
+done its job.
+
+**What remains unverified.**  The original
+`nanov2_guard_corruption_detected` signature (with rustfits
+frames) was never reproduced in the diagnostic CI output we
+collected.  Two possibilities: (a) the earlier report was
+actually the same fitsio PLIO_1 crash, misread because the
+crash output was interleaved with neighboring test logs in
+the full-suite run; (b) a separate latent issue that the
+per-file isolation accidentally suppressed by breaking
+cross-test heap state.  If the rustfits-frame signature
+reappears in normal pytest on macOS after this mitigation
+lands, reopen the hunt — code paths worth auditing in that
+case:
+
+- `src/hdu_image_compressed/extending.rs` (the buffered
+  context — Phase 12 of perf work, relatively new code).
+- `src/hdu_image_compressed/write.rs` partial-last-tile
+  merge path (decode → append → re-encode in place, lots
+  of buffer arithmetic).
+- `src/common.rs` `RawBuffer` (Py_buffer wrapper —
+  release-on-drop timing under buffer protocol).
+- Any `unsafe` block in the compressed-image write/extend
+  path doing pointer math or `align_to`.
+
+Escalation if a rustfits-frame crash reappears: sanitizer
+build — Rust nightly + `-Zsanitizer=address`, macOS arm64,
+`maturin develop` with the sanitizer RUSTFLAGS.  Higher
+setup cost; catches use-after-free / heap overrun at the
+write site directly.
+
+**`python-gil` pin in ci.yml is inert but kept.**  Earlier
+ruled out as the cause: failing/passing runs both installed
+`python 3.14.5 h4c637c5_100_cp314` (no `_cp314t` free-
+threading suffix) and the maturin wheel was built
+`cp314-cp314`.  Pin is harmless and explicit about intent;
+leaving in place.
+
 ## Documentation TODO — tutorial gap audit
 
 The Sphinx tutorial under `docs/tutorial/` covers the main

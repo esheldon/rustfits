@@ -11,6 +11,7 @@ dev env).
 """
 
 import os
+import sys
 import tempfile
 
 import numpy as np
@@ -19,6 +20,22 @@ import pytest
 import rustfits
 
 fitsio = pytest.importorskip("fitsio")
+
+# fitsio's source-built cfitsio aborts ~50% of the time inside
+# fits_create_img when called with compress="PLIO_1" on macOS
+# py3.12 (signature: bare "Fatal Python error: Aborted", crash
+# inside fitsio/_fitsio_wrap.create_image_hdu).  The companion
+# read-side test (test_image_compressed_read_plio.py) uses
+# compress="PLIO" + qlevel=None and does not trigger the bug,
+# so the issue is in fitsio's specific PLIO_1 + default-qlevel
+# path, not in cfitsio's PLIO core or rustfits.  Other algorithms
+# (RICE_1, GZIP_1, GZIP_2, HCOMPRESS_1) keep their fitsio-write
+# coverage in this file's RICE_1 fixture builder and in the
+# remaining two parametrize cases below.
+_SKIP_FITSIO_PLIO_ON_MACOS = pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="fitsio's PLIO_1 writer crashes ~50% on macOS",
+)
 
 
 def _write_rice(tmpdir, shape, dtype, tile_dims=None, extname=None):
@@ -336,7 +353,15 @@ def test_iterate_over_mixed_hdus():
 
 @pytest.mark.parametrize(
     "compress,expected",
-    [("GZIP_1", "GZIP_1"), ("GZIP_2", "GZIP_2"), ("PLIO_1", "PLIO_1")],
+    [
+        ("GZIP_1", "GZIP_1"),
+        ("GZIP_2", "GZIP_2"),
+        pytest.param(
+            "PLIO_1",
+            "PLIO_1",
+            marks=_SKIP_FITSIO_PLIO_ON_MACOS,
+        ),
+    ],
 )
 def test_other_compression_types_dispatched(compress, expected):
     """
