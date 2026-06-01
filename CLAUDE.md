@@ -1007,30 +1007,34 @@ empty table, `chunksize=0`/negative rejection, nrows snapshot,
 multi-refill via wide rows, VLA columns.
 
 **Missing (ordered by likely value).**
-1. **Variable-length P/Q with `repeat > 1`** — currently rejected.
-   Rare (most VLA columns are `1Pt`) but legal.  Multi-descriptor
-   means N descriptors per row, each pointing at its own heap cell.
-   Field dtype would need to be an Object array of shape `(repeat,)`
-   per row, or some other reshape — decide before coding.  See
-   `docs/vla-shapes.md` for the per-shape mental-model diagram.
-2. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
+1. **Variable-length P/Q with TDIMn** — currently rejected.  TDIMn on
    a P/Q column would mean "reshape each heap cell to these dims",
    useful for VLA-of-images.  Each cell still uses the inner element
    type; the reshape is just on the ndarray after the heap read.
    FITS only allows ONE variable axis per cell (TDIM has exactly
    one zero) — see `docs/vla-shapes.md` for the limitation note
    and standard workarounds for fully-variable `(n, m)` shapes.
-3. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
+2. **VLA TNULL masking** — fixed-col TNULL is implemented; VLA
    columns with TNULL in the header are rejected when `mask_null=
    True`.  Adding support means a per-row bool ndarray for each
    masked VLA cell (parallel Object dtype mask field, or
    MaskedArrays for each cell — decide representation before coding).
-4. **`max_size`-style read for variable columns** — fitsio offers a
+3. **`max_size`-style read for variable columns** — fitsio offers a
    mode where each variable cell becomes a fixed-size N-D array
    padded to the largest cell.  Explicitly deferred (user request);
    noted here so we don't forget.
-5. **`TDISPn`** — display format hint.  Informational, similar
+4. **`TDISPn`** — display format hint.  Informational, similar
    shape to TUNIT but rarely used.
+
+**Explicit non-goal.**  Variable-length P/Q columns with
+`repeat > 1` (e.g. `2PE` — multiple descriptors per row).  The
+FITS Standard 4.0 §7.3.2 limits the repeat count for P/Q
+columns to 0 or 1 verbatim: *"For fields of type P or Q, the
+only permitted repeat counts are 0 and 1."*  cfitsio is
+permissive enough to parse `rPt` for r > 1, but rustfits
+deliberately rejects it on read rather than extending the
+standard.  Workaround: store N sibling VLA columns instead of
+one repeat-N VLA column.
 
 ### Table write
 

@@ -16,10 +16,6 @@ Each item is tagged:
 Tables
 ------
 
-* **Variable-length columns with ``repeat > 1``** *(not yet)* — a
-  ``2PE`` column (two heap descriptors per row, each pointing at
-  its own variable-length cell) is rejected on read.  The common
-  ``1PE`` shape (one descriptor per row) is fully supported.
 * **Variable-length columns with TDIMn** *(not yet)* — TDIMn on
   a P/Q column would reshape each heap cell to the declared
   dims, useful for VLA-of-images, but with a quirk: the spec only allows ONE
@@ -56,9 +52,6 @@ One narrow gap:
 General
 -------
 
-* **Random groups** (``GROUPS=T``, ``PTYPEn``) *(by design)* —
-  legacy format from the radio-astronomy era; vanishingly rare
-  in new files.  Not on the roadmap.
 * **Multithreaded throughput (GIL release)** *(not yet)* — rustfits
   releases the GIL only during remote (``http`` / ``ftp``) downloads.
   The heavy CPU paths — tile decode/encode, large chunked I/O,
@@ -67,6 +60,8 @@ General
   common case).  Releasing the GIL around the pure-Rust decode/encode
   spans is a targeted future change, gated on a real multithreaded
   workload — file an issue if you have one.
+* **Random groups** (``GROUPS=T``, ``PTYPEn``) *(by design)* — legacy format;
+  vanishingly rare in new files.  Not on the roadmap.
 
 Cross-tool interop caveats
 --------------------------
