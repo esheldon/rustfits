@@ -2495,13 +2495,13 @@ the file's *content* doesn't matter, just its size and tile count.
 2. `rust-test` — installs Python via `setup-python` (needed
    so the wrapper can resolve libpython) and runs
    `tools/cargo-test.sh`.
-3. `test` matrix — ubuntu × {py3.12, py3.14}, full conda env
-   from the requirements files + `maturin develop` + `pytest`.
+3. `test` matrix — {ubuntu-latest, macos-latest} × {py3.12,
+   py3.14}, full conda env from the requirements files +
+   `maturin develop` + `pytest`.  macOS legs additionally
+   source-build fitsio via pip — see "CI: macOS fitsio
+   workaround" below.
 4. `coverage` — single ubuntu/py3.12 leg, uploads Python +
    Rust coverage to codecov via `cargo-llvm-cov`.
-
-macOS is intentionally absent from the matrix — see "Known
-CI limitations" below.
 
 ## Testing conventions
 
@@ -3275,10 +3275,10 @@ worth checking comes up; cross items off as they ship.
    running it across an algorithm sweep in the same Python
    process triggers a cfitsio `free(): invalid next size`
    memory corruption — same shape as the macOS ffbinit issue
-   noted under "Known CI limitations".  Subprocess isolation
-   would work around it but adds complexity for limited
-   value — the rustfits-self per-tile cost is the headline
-   number users need).
+   noted under "CI: macOS fitsio workaround".  Subprocess
+   isolation would work around it but adds complexity for
+   limited value — the rustfits-self per-tile cost is the
+   headline number users need).
 
    Documented in `docs/tutorial/performance.rst` under
    "Compressed-image `__setitem__` — per-tile re-encode tax".
