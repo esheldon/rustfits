@@ -1,7 +1,7 @@
 // Write-side setup: AsciiWriteColumn metadata + dtype-to-format
 // mapping + numpy structured dtype -> ASCII-table header card builder.
 //
-// Phase 3 mappings (per the rustfits ASCII roadmap):
+// dtype -> TFORM letter + width mappings:
 //   - S<w>    -> A<w>
 //   - i? (any signed width)   -> I20
 //   - u? (any unsigned width) -> I20 + TZERO=2^63 (unsigned-int trick)

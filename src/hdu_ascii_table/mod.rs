@@ -4,11 +4,6 @@
 // them together and re-exports the external surface (the items
 // imported by `crate::fits` and `crate::lib`).  See the per-file
 // headers for what each chunk owns.
-//
-// Status (Phase 1): read MVP — whole-table read, accessors, repr.
-// Write / __setitem__ / append / insert_column / delete_column /
-// iteration / subset objects shipped in later phases (see CLAUDE.md
-// "ASCII tables" roadmap).
 
 mod columns;
 mod edit;

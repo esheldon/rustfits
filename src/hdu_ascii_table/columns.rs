@@ -39,13 +39,14 @@ pub(crate) struct AsciiColumn {
     pub(crate) byte_offset: usize,
     pub(crate) byte_width: usize,
     // Decimal places from Fw.d / Ew.d / Dw.d.  Drives the f4-vs-f8
-    // output-dtype decision (see `F_E_F4_MAX_DECIMALS` in read.rs);
-    // also consumed by Phase 3 (write) for output formatting.
+    // output-dtype decision on read (see `F_E_F4_MAX_DECIMALS` in
+    // read.rs) and output formatting on write.
     pub(crate) decimals: Option<usize>,
     pub(crate) tscal: f64,
     pub(crate) tzero: f64,
-    // Phase 2 (mask_null) consumes this for per-cell mask construction.
-    #[allow(dead_code)]
+    // TNULLn string sentinel (ASCII TNULL is a string compared verbatim
+    // against the trimmed cell text, unlike BINTABLE's integer TNULL).
+    // Used by `mask_null=True` on the read side.
     pub(crate) tnull: Option<String>,
     pub(crate) tunit: Option<String>,
 }

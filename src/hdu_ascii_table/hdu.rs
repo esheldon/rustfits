@@ -1,11 +1,11 @@
 // AsciiTableHDU pyclass: TABLE extension HDU (ASCII tables).
-//
-// Phase 2: read(rows=, columns=, scale=, mask_null=), __getitem__
-// (slice / int / list-of-int / str / list-of-str), __iter__ +
-// iter(chunksize=, columns=, scale=), and the read-only subset
-// pyclasses AsciiSingleColumnSubset / AsciiColumnSubset.  Writing
-// (subset and HDU __setitem__, append, insert / delete column) lands
-// in Phases 3-5.
+// Owns the `#[pymethods]` block (read / write / append / extend /
+// __getitem__ / __setitem__ / insert_column / delete_column /
+// __iter__ / iter / checksum methods / appending+extending
+// contexts / accessors / repr), the `AsciiTableKey` +
+// `classify_ascii_table_key` __getitem__ classifier, and the
+// `AsciiSingleColumnSubset` + `AsciiColumnSubset` pyclasses
+// returned by the column-name forms of __getitem__.
 
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;

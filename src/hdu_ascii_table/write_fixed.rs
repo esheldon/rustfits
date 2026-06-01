@@ -260,9 +260,9 @@ pub(crate) fn is_unsigned_trick(col: &AsciiColumn) -> bool {
 // on `col.tform_letter`.  For A columns, inspects the cell's Python
 // type (bytes vs str) rather than pre-classifying the input dtype.
 //
-// Shared by `format_row` (bulk write loop) and the Phase 4 single-
-// column / single-cell writers — both walk over rows and need
-// identical per-letter dispatch.
+// Shared by `format_row` (bulk write loop) and the single-column /
+// single-cell writers in setitem.rs — all three walk over rows and
+// need identical per-letter dispatch.
 pub(crate) fn format_one_cell(
     py: Python<'_>,
     col: &AsciiColumn,

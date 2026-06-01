@@ -2,7 +2,7 @@
 // the requested rows, parse each field's text into the matching numpy
 // slot.
 //
-// Phase 2 surface:
+// Surface:
 //   * read_ascii_table(rows=, columns=, scale=, mask_null=) for the
 //     full structured-ndarray read with optional row + column subsets
 //     and MaskedArray returns.

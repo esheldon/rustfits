@@ -2,9 +2,6 @@
 // owns both directions because the format spec is the seam — every
 // parser has a matching formatter and they evolve together.
 //
-// Phase 1 only ships the parse side (text -> value); Phase 3 (create
-// + write) will add the formatter side here as well.
-//
 // Operations work on `&[u8]` slices (the on-disk bytes of one field
 // in one row) so the hot path doesn't allocate Strings.
 
@@ -31,9 +28,6 @@ pub(crate) fn trim_ascii(src: &[u8]) -> &[u8] {
 // also considered undefined — when TNULL is set we treat empty as
 // null; when TNULL is absent the column's read path handles empty
 // separately (parse-or-zero).
-//
-// Used by Phase 2's mask_null=True path; not exercised in Phase 1.
-#[allow(dead_code)]
 pub(crate) fn matches_tnull(trimmed_field: &[u8], tnull_trimmed: &str) -> bool {
     trimmed_field == tnull_trimmed.as_bytes()
 }
@@ -93,7 +87,7 @@ pub(crate) fn parse_float_field(
 }
 
 // ---------------------------------------------------------------------------
-// Value -> text formatters (write side, Phase 3)
+// Value -> text formatters (write side)
 // ---------------------------------------------------------------------------
 //
 // Each formatter writes `width` bytes into `dst` in the FITS-spec
