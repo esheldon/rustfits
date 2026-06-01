@@ -26,6 +26,9 @@ use super::read::{
     ascii_repr_dtype_str, build_ascii_numpy_dtype, read_ascii_table,
     read_one_column,
 };
+use super::write_fixed::{
+    append_ascii_table, determine_input_nrows, write_ascii_table_full,
+};
 
 // Version-stamped parsed-metadata cache.  Same shape as TableHDU's
 // `MetaCache`.  See `meta()` for the hot-path accessor.
@@ -353,6 +356,107 @@ impl AsciiTableHDU {
             py, &meta, data_offset, &super_.file, name, rows, as_bytes,
             scale, mask_null,
         )
+    }
+
+    /// Bulk-write data into the table's data section.
+    ///
+    /// Overwrites all ``NAXIS2`` rows in the table; for appending
+    /// new rows instead use :meth:`append`.  Accepts three input
+    /// forms (matching :meth:`TableHDU.write`):
+    ///
+    /// * **Structured ndarray** — field names must match the HDU's
+    ///   columns (case-insensitive); extras / missing rejected.
+    ///   ``len(data)`` must equal ``NAXIS2``.
+    /// * **Dict** ``{name: ndarray}`` — one entry per HDU column;
+    ///   extras / missing rejected.
+    /// * **List or tuple of ndarrays** with ``names=[...]`` —
+    ///   parallel sequences; same per-column model as dict.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    /// names : list of str, optional
+    ///     Required only when ``data`` is a list/tuple.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: dtype / length errors are raised
+    /// before any file bytes are touched.  Mid-write I/O failures
+    /// taint the file (close + reopen to recover).
+    #[pyo3(signature = (data, *, names=None))]
+    fn write(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let data_offset = super_.offsets.data_offset();
+        write_ascii_table_full(
+            py, super_, &meta.columns, data, names,
+            nrows, row_width, data_offset,
+        )
+    }
+
+    /// Append rows to the end of the table.
+    ///
+    /// Grows ``NAXIS2`` and the data section.  For non-last HDUs,
+    /// the file tail shifts forward and later-HDU offsets are
+    /// bumped in lockstep; previously-issued handles remain valid.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : numpy.ndarray, dict, or list/tuple of ndarrays
+    ///     Same three input forms as :meth:`write`.  Length
+    ///     defines the number of new rows.
+    /// names : list of str, optional
+    ///     Required for the list/tuple form; ignored otherwise.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: dtype / shape errors are raised
+    /// before any file bytes are touched.  Mid-write I/O failures
+    /// taint the file.
+    #[pyo3(signature = (data, *, names=None))]
+    fn append(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let super_ = slf.as_super();
+        check_not_tainted(&super_.tainted)?;
+        let meta = slf.meta(super_)?;
+        let current_nrows = meta.nrows as usize;
+        let row_width = meta.row_width as usize;
+        let append_nrows = determine_input_nrows(data, names)?;
+        if append_nrows == 0 {
+            return Ok(());
+        }
+        let new_nrows = current_nrows + append_nrows;
+        let data_offset = super_.offsets.data_offset();
+        append_ascii_table(
+            py, super_, &meta.columns, data, names,
+            current_nrows, append_nrows, new_nrows, row_width, data_offset,
+        )
+    }
+
+    /// Alias for :meth:`append`.
+    ///
+    /// Mirrors :meth:`TableHDU.extend` so generic code that
+    /// iterates HDUs and calls ``.extend(...)`` keeps working.
+    #[pyo3(signature = (data, *, names=None))]
+    fn extend(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Self::append(slf, py, data, names)
     }
 
     // hdu[key] dispatches based on what `key` looks like:

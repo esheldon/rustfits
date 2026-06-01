@@ -15,7 +15,10 @@ mod format;
 mod hdu;
 mod meta;
 mod read;
+mod write_fixed;
+mod write_setup;
 
 pub(crate) use hdu::{
     AsciiColumnSubset, AsciiSingleColumnSubset, AsciiTableHDU,
 };
+pub(crate) use write_setup::normalize_and_build_ascii_table_header;
