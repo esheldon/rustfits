@@ -124,66 +124,9 @@ jobs:
         shell: bash -el {0}
         run: maturin develop
 
-      - name: pytest (Linux — full suite)
-        if: matrix.os == 'ubuntu-latest'
+      - name: pytest
         shell: bash -el {0}
         run: pytest
-
-      # Phase 1b diagnostic: per-file isolation pass.
-      #
-      # Earlier diagnostic (loop two suspect files in a single
-      # pytest invocation, with MallocScribble + MallocGuardEdges)
-      # never reproduced the crash.  Likely interpretation: the
-      # scribble is in some test that runs BEFORE the compressed-
-      # extend tests in the full suite, and the symptom shows up
-      # downstream because pytest runs the whole session in one
-      # Python process (single heap).
-      #
-      # This step runs every test file in its own pytest
-      # invocation (= fresh process, fresh heap) twice through.
-      # Two outcomes are informative:
-      #   - One or more files crash IN ISOLATION → the bug lives
-      #     in that file's tests; clean reproducer.
-      #   - All files pass in isolation but the full pytest still
-      #     crashes → cross-test state corruption.  We bisect
-      #     next: binary-search which prefix of the alphabetical
-      #     file list (single pytest invocation) reproduces.
-      #
-      # `set +e` so a crashing file doesn't bail the whole loop —
-      # we want the full picture (which files crash, how often).
-      # The summary at the end re-raises if anything failed so CI
-      # still flags red.
-      - name: pytest (macOS — per-file isolation pass)
-        if: matrix.os == 'macos-latest'
-        shell: bash -el {0}
-        run: |
-          set +e
-          FAILURES=()
-          for iter in 1 2; do
-            echo "########## ITERATION $iter ##########"
-            for f in tests/test_*.py; do
-              echo "===== $f ====="
-              pytest -x "$f"
-              rc=$?
-              if [ $rc -ne 0 ]; then
-                echo "!!! FAILED: $f (rc=$rc, iter=$iter) !!!"
-                FAILURES+=("iter${iter}:${f}:rc${rc}")
-              fi
-            done
-          done
-
-          echo ""
-          echo "===== SUMMARY ====="
-          if [ ${#FAILURES[@]} -eq 0 ]; then
-            echo "All files passed in isolation across both iterations."
-            echo "Next: bisect cross-test state corruption (some test"
-            echo "earlier in the full suite scribbles the heap)."
-            exit 0
-          else
-            echo "${#FAILURES[@]} failure(s):"
-            printf '  %s\n' "${FAILURES[@]}"
-            exit 1
-          fi
 
   # ----- Coverage (single config) ----------------------------------
   # Python coverage via pytest-cov + Rust coverage via cargo-llvm-cov.
