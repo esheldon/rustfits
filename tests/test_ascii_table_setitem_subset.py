@@ -134,8 +134,7 @@ def test_single_column_slice_write():
 
         def check(fits):
             arr = fits[1].read()
-            np.testing.assert_array_equal(
-                arr["ID"][1:4], [100, 200, 300])
+            np.testing.assert_array_equal(arr["ID"][1:4], [100, 200, 300])
             assert arr["ID"][0] == 0
             assert arr["ID"][4] == 4
 
@@ -219,8 +218,7 @@ def test_single_column_write_method_with_rows():
         _create_table(fname, 5)
 
         def mutate(fits):
-            fits[1]["ID"].write(
-                np.array([100, 200], dtype="i8"), rows=[1, 3])
+            fits[1]["ID"].write(np.array([100, 200], dtype="i8"), rows=[1, 3])
 
         def check(fits):
             arr = fits[1].read()
@@ -295,7 +293,8 @@ def test_multi_column_subset_slice_write():
             arr = fits[1].read()
             np.testing.assert_array_equal(arr["ID"][1:4], [11, 22, 33])
             np.testing.assert_allclose(
-                arr["FLUX"][1:4], [1.1, 2.2, 3.3], rtol=1e-6)
+                arr["FLUX"][1:4], [1.1, 2.2, 3.3], rtol=1e-6
+            )
             # MJD column untouched
             assert arr["MJD"][1] == pytest.approx(58001.0)
 

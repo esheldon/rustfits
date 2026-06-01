@@ -85,8 +85,7 @@ def test_insert_appends_at_end_by_default():
             arr = tbl.read()
             np.testing.assert_array_equal(arr["ID"], orig["ID"])
             np.testing.assert_allclose(arr["FLUX"], orig["FLUX"])
-            assert list(arr["NAME"]) == list(
-                orig["NAME"].astype("U6")), tag
+            assert list(arr["NAME"]) == list(orig["NAME"].astype("U6")), tag
             np.testing.assert_allclose(arr["MJD"], new_col)
 
         _check_both(fn, mutate, check)
@@ -141,7 +140,8 @@ def test_insert_after_name():
             f[1].insert_column(
                 "AFTER_ID",
                 np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype="f8"),
-                after="ID")
+                after="ID",
+            )
 
         def check(f, tag):
             assert f[1].colnames == ("ID", "AFTER_ID", "FLUX", "NAME"), tag
@@ -156,9 +156,8 @@ def test_insert_after_index():
 
         def mutate(f):
             f[1].insert_column(
-                "AFTER1",
-                np.array([1, 2, 3, 4, 5], dtype="i4"),
-                after=1)
+                "AFTER1", np.array([1, 2, 3, 4, 5], dtype="i4"), after=1
+            )
 
         def check(f, tag):
             assert f[1].colnames == ("ID", "FLUX", "AFTER1", "NAME"), tag
@@ -175,7 +174,8 @@ def test_insert_before_name():
             f[1].insert_column(
                 "BEFORE_FLUX",
                 np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype="f4"),
-                before="FLUX")
+                before="FLUX",
+            )
 
         def check(f, tag):
             assert f[1].colnames == ("ID", "BEFORE_FLUX", "FLUX", "NAME"), tag
@@ -191,9 +191,8 @@ def test_insert_before_negative_index():
 
         def mutate(f):
             f[1].insert_column(
-                "X",
-                np.array([1, 2, 3, 4, 5], dtype="i4"),
-                before=-1)
+                "X", np.array([1, 2, 3, 4, 5], dtype="i4"), before=-1
+            )
 
         def check(f, tag):
             assert f[1].colnames == ("ID", "FLUX", "X", "NAME"), tag
@@ -208,9 +207,8 @@ def test_insert_case_insensitive_after():
 
         def mutate(f):
             f[1].insert_column(
-                "Z",
-                np.array([1, 2, 3, 4, 5], dtype="i4"),
-                after="id")  # lowercase
+                "Z", np.array([1, 2, 3, 4, 5], dtype="i4"), after="id"
+            )  # lowercase
 
         def check(f, tag):
             assert f[1].colnames == ("ID", "Z", "FLUX", "NAME"), tag
@@ -223,8 +221,9 @@ def test_insert_unsigned_int_trick():
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits")
         _make_table(fn)
-        mask = np.array([0, 1, (1 << 31) - 1, 1 << 31, (1 << 32) - 1],
-                        dtype="u4")
+        mask = np.array(
+            [0, 1, (1 << 31) - 1, 1 << 31, (1 << 32) - 1], dtype="u4"
+        )
 
         def mutate(f):
             f[1].insert_column("MASK", mask)
@@ -271,7 +270,8 @@ def test_insert_with_unit():
             f[1].insert_column(
                 "MJD",
                 np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype="f8"),
-                unit="day")
+                unit="day",
+            )
 
         def check(f, tag):
             assert f[1].units.get("MJD") == "day", tag
@@ -297,8 +297,9 @@ def test_insert_at_zero_shifts_all_tbcols():
 
         def mutate(f):
             # I20 column → 20-byte shift
-            f[1].insert_column("R", np.array([1, 2, 3, 4, 5], dtype="i8"),
-                               position=0)
+            f[1].insert_column(
+                "R", np.array([1, 2, 3, 4, 5], dtype="i8"), position=0
+            )
 
         def check(f, tag):
             # New R column at TBCOL1
@@ -425,18 +426,19 @@ def test_round_trip_insert_then_delete_restores_layout():
         with rustfits.FITS(fn, "r+") as f:
             naxis1_before = f[1].header["NAXIS1"]
             tbcols_before = [
-                f[1].header[f"TBCOL{i+1}"] for i in range(f[1].ncols)
+                f[1].header[f"TBCOL{i + 1}"] for i in range(f[1].ncols)
             ]
             f[1].insert_column(
                 "TMP",
                 np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype="f8"),
-                position=1)
+                position=1,
+            )
             assert f[1].ncols == 4
             f[1].delete_column("TMP")
             assert f[1].ncols == 3
             assert f[1].header["NAXIS1"] == naxis1_before
             tbcols_after = [
-                f[1].header[f"TBCOL{i+1}"] for i in range(f[1].ncols)
+                f[1].header[f"TBCOL{i + 1}"] for i in range(f[1].ncols)
             ]
             assert tbcols_after == tbcols_before
             arr = f[1].read()
@@ -466,16 +468,17 @@ def test_insert_non_last_hdu_shifts_later_hdus():
             f[1].insert_column(
                 "ERR",
                 np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype="f8"),
-                after="FLUX")
+                after="FLUX",
+            )
             # Later HDU still readable + correct
             np.testing.assert_allclose(
-                f[2].read(),
-                (np.arange(16, dtype="f4") * 0.25).reshape(4, 4))
+                f[2].read(), (np.arange(16, dtype="f4") * 0.25).reshape(4, 4)
+            )
         with rustfits.FITS(fn) as f:
             # After reopen
             np.testing.assert_allclose(
-                f[2].read(),
-                (np.arange(16, dtype="f4") * 0.25).reshape(4, 4))
+                f[2].read(), (np.arange(16, dtype="f4") * 0.25).reshape(4, 4)
+            )
             assert f[1].colnames == ("ID", "FLUX", "ERR", "NAME")
 
 
@@ -540,8 +543,7 @@ def test_insert_duplicate_name_rejected():
         _make_table(fn)
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
-                f[1].insert_column(
-                    "ID", np.array([1, 2, 3, 4, 5], dtype="i8"))
+                f[1].insert_column("ID", np.array([1, 2, 3, 4, 5], dtype="i8"))
 
 
 def test_insert_duplicate_name_case_insensitive_rejected():
@@ -550,8 +552,7 @@ def test_insert_duplicate_name_case_insensitive_rejected():
         _make_table(fn)
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
-                f[1].insert_column(
-                    "id", np.array([1, 2, 3, 4, 5], dtype="i8"))
+                f[1].insert_column("id", np.array([1, 2, 3, 4, 5], dtype="i8"))
 
 
 def test_insert_empty_name_rejected():
@@ -560,8 +561,7 @@ def test_insert_empty_name_rejected():
         _make_table(fn)
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
-                f[1].insert_column(
-                    "", np.array([1, 2, 3, 4, 5], dtype="i8"))
+                f[1].insert_column("", np.array([1, 2, 3, 4, 5], dtype="i8"))
 
 
 def test_insert_position_out_of_range_rejected():
@@ -571,8 +571,8 @@ def test_insert_position_out_of_range_rejected():
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
                 f[1].insert_column(
-                    "X", np.array([1, 2, 3, 4, 5], dtype="i8"),
-                    position=99)
+                    "X", np.array([1, 2, 3, 4, 5], dtype="i8"), position=99
+                )
 
 
 def test_insert_multiple_location_kwargs_rejected():
@@ -582,8 +582,11 @@ def test_insert_multiple_location_kwargs_rejected():
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
                 f[1].insert_column(
-                    "X", np.array([1, 2, 3, 4, 5], dtype="i8"),
-                    position=0, after="ID")
+                    "X",
+                    np.array([1, 2, 3, 4, 5], dtype="i8"),
+                    position=0,
+                    after="ID",
+                )
 
 
 def test_insert_object_dtype_rejected():
@@ -606,7 +609,8 @@ def test_insert_wrong_length_rejected():
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
                 f[1].insert_column(
-                    "X", np.array([1, 2, 3], dtype="i8"))  # only 3 rows
+                    "X", np.array([1, 2, 3], dtype="i8")
+                )  # only 3 rows
 
 
 def test_insert_wrong_shape_rejected():
@@ -616,8 +620,7 @@ def test_insert_wrong_shape_rejected():
         _make_table(fn)
         with rustfits.FITS(fn, "r+") as f:
             with pytest.raises(ValueError):
-                f[1].insert_column(
-                    "X", np.zeros((5, 3), dtype="i8"))
+                f[1].insert_column("X", np.zeros((5, 3), dtype="i8"))
 
 
 def test_delete_name_not_found_rejected():

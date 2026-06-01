@@ -26,10 +26,10 @@ import rustfits
 # Five-column schema exercising every supported ASCII TFORM letter.
 DT = np.dtype(
     [
-        ("ID", "i8"),     # -> I20
-        ("FLUX", "f4"),   # -> E15.7
-        ("MJD", "f8"),    # -> D25.17
-        ("MASK", "u4"),   # -> I20 + TZERO=2^63 (unsigned-int trick)
+        ("ID", "i8"),  # -> I20
+        ("FLUX", "f4"),  # -> E15.7
+        ("MJD", "f8"),  # -> D25.17
+        ("MASK", "u4"),  # -> I20 + TZERO=2^63 (unsigned-int trick)
         ("NAME", "S10"),  # -> A10
     ]
 )
@@ -248,8 +248,9 @@ def test_whole_column_write_i8():
             arr = fits[1].read()
             np.testing.assert_array_equal(arr["ID"], new_ids)
             # Other columns untouched
-            np.testing.assert_array_equal(arr["FLUX"],
-                np.array([0.0, 1.5, 3.0, 4.5, 6.0], dtype="f4"))
+            np.testing.assert_array_equal(
+                arr["FLUX"], np.array([0.0, 1.5, 3.0, 4.5, 6.0], dtype="f4")
+            )
 
         _both(fname, mutate, check)
 
@@ -274,8 +275,7 @@ def test_whole_column_write_f8_d_format():
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _create_table(fname, 3)
-        new_mjd = np.array([59000.123456789, 60000.987654321, 0.5],
-                           dtype="f8")
+        new_mjd = np.array([59000.123456789, 60000.987654321, 0.5], dtype="f8")
 
         def mutate(fits):
             fits[1]["MJD"] = new_mjd
@@ -292,8 +292,7 @@ def test_whole_column_write_unsigned_trick_u4():
     with tempfile.TemporaryDirectory() as tmp:
         fname = os.path.join(tmp, "t.fits")
         _create_table(fname, 4)
-        new_mask = np.array([0, 42, (1 << 31) - 1, (1 << 32) - 1],
-                            dtype="u4")
+        new_mask = np.array([0, 42, (1 << 31) - 1, (1 << 32) - 1], dtype="u4")
 
         def mutate(fits):
             fits[1]["MASK"] = new_mask
@@ -301,8 +300,7 @@ def test_whole_column_write_unsigned_trick_u4():
         def check(fits):
             arr = fits[1].read()
             assert arr.dtype["MASK"] == np.dtype("u8")
-            np.testing.assert_array_equal(
-                arr["MASK"], new_mask.astype("u8"))
+            np.testing.assert_array_equal(arr["MASK"], new_mask.astype("u8"))
 
         _both(fname, mutate, check)
 
@@ -455,7 +453,8 @@ def test_multi_column_write_two_columns():
             arr = fits[1].read()
             np.testing.assert_array_equal(arr["ID"], [11, 22, 33, 44])
             np.testing.assert_allclose(
-                arr["FLUX"], [0.5, 1.5, 2.5, 3.5], rtol=1e-6)
+                arr["FLUX"], [0.5, 1.5, 2.5, 3.5], rtol=1e-6
+            )
             # MJD untouched
             assert arr["MJD"][0] == pytest.approx(58000.0)
 

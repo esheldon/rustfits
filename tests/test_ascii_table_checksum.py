@@ -161,11 +161,15 @@ def test_read_astropy_written_checksum():
         cols = astropy_fits.ColDefs(
             [
                 astropy_fits.Column(
-                    name="ID", format="I8",
-                    array=np.array([1, 2, 3], dtype="i8")),
+                    name="ID",
+                    format="I8",
+                    array=np.array([1, 2, 3], dtype="i8"),
+                ),
                 astropy_fits.Column(
-                    name="FLUX", format="F10.4",
-                    array=np.array([0.5, 1.5, 2.5])),
+                    name="FLUX",
+                    format="F10.4",
+                    array=np.array([0.5, 1.5, 2.5]),
+                ),
             ],
             ascii=True,
         )
