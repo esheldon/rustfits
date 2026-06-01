@@ -59,20 +59,20 @@ jobs:
         run: tools/cargo-test.sh
 
   # ----- Test matrix ------------------------------------------------
-  # Linux only for now (Python 3.12 + 3.14).  macOS was originally
-  # included but conda-forge's fitsio/cfitsio build crashes during
-  # the test-fixture write step (libmalloc bad-free in cfitsio's
-  # ffbinit, hit by every test that uses fitsio to write a fixture).
-  # The user is upstream on fitsio and plans to fix it there; once
-  # released, re-add macos-latest to the os matrix and re-enable the
-  # macOS note in CLAUDE.md.  See "Known CI limitations" there.
+  # ubuntu-latest + macos-latest x {python 3.12, 3.14}.  On macOS we
+  # source-build fitsio via pip after the conda install — conda-forge's
+  # macOS fitsio/cfitsio binary has a libmalloc bad-free in cfitsio's
+  # ffbinit that crashes every test writing a compressed-image fixture.
+  # fitsio's own CI (https://github.com/esheldon/fitsio) source-builds
+  # the package on every leg for the same reason; we follow that
+  # pattern only on macOS to keep the linux install fast.
   test:
     name: Test (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest]
         python: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
@@ -100,6 +100,18 @@ jobs:
           micromamba install -y -c conda-forge \
             --file conda-requirements.txt \
             --file conda-test-requirements.txt
+
+      # Replace the broken conda-forge fitsio macOS build with a fresh
+      # source build (cfitsio bundled in the fitsio sdist).  --no-deps
+      # so we don't churn numpy/setuptools that conda already provided;
+      # --no-binary=fitsio forces pip to build from sdist instead of
+      # using a PyPI wheel (which may have been built by the same
+      # toolchain that produces the buggy conda-forge binary).
+      - name: Replace conda-forge fitsio with source build (macOS)
+        if: matrix.os == 'macos-latest'
+        shell: bash -el {0}
+        run: |
+          pip install --force-reinstall --no-deps --no-binary=fitsio fitsio
 
       - name: maturin develop
         shell: bash -el {0}
