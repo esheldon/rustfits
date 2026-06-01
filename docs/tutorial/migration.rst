@@ -26,6 +26,8 @@ The high-level shape is deliberately close to fitsio:
 * Top-level ``rustfits.read(path)`` and
   ``rustfits.read_header(path)`` mirror fitsio's
   ``fitsio.read`` / ``fitsio.read_header``.
+* Accessing column and row subsets on the hdu: ``hdu[rows]``,
+  ``hdu[colnames][rows]``
 
 The big idea — "open, index, read" — translates one-for-one.
 
@@ -120,6 +122,35 @@ the default is now **lossless** float compression — call out
 ``Quantize(level=N)`` explicitly when you want lossy.  fitsio's
 default is the opposite (lossy with cfitsio's defaults); be
 deliberate when porting.
+
+A thin fitsio-style shim
+------------------------
+
+If you want to try out rustfits on an existing codebase, rustfits ships a thin
+shim that might get you started.  It works for basic patterns
+
+.. code-block:: python
+
+   from rustfits import fitsio
+
+   with fitsio.FITS(path, "rw", clobber=True) as fits:
+       fits.write_image(data, extname="sci", compress="RICE_1")
+
+The shim translates fitsio's ``mode='r' | 'rw'`` (plus the
+``'READONLY'`` / ``'READWRITE'`` / ``0`` / ``1`` synonyms) and the
+``clobber=`` kwarg to rustfits's native modes; everything else is
+the real :class:`rustfits.FITS` object, so indexing, iteration,
+``hdu.read()`` / ``hdu.write()``, the ``hdu.header`` accessor and
+so on behave as rustfits-native, *not* as fitsio.
+
+What it does NOT translate: ``vstorage=`` / ``case_sensitive=`` /
+``upper=`` / ``lower=`` / ``where=`` kwargs (use the recipes
+below), and ``hdu.header`` returns a :class:`rustfits.FITSHeader`
+rather than fitsio's ``FITSHDR`` (``hdr[key]`` and ``key in hdr``
+work; ``hdr.records()`` does not — see :doc:`headers`).  The
+shim is deliberately narrow — it gets you past the constructor
+and onto the rustfits surface; the rest of this page covers 
+porting strategies and additional differences.
 
 Common porting recipes
 ----------------------
