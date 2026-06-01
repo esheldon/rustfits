@@ -19,8 +19,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySlice};
 
-use super::hdu::TableHDU;
-
 #[pyclass]
 pub(crate) struct TableIter {
     // The parent HDU, kept as the most-derived Python object so that
@@ -118,13 +116,15 @@ impl TableIter {
     }
 }
 
-// Construct a TableIter for a TableHDU / CompressedTableHDU instance.
-//
-// `nrows` and `itemsize` are read POLYMORPHICALLY (`len()` / `dtype`)
-// so the compressed subclass reports its uncompressed-view schema, not
-// the on-disk `1QB` descriptor layout.
+// Construct a TableIter for any tabular HDU pyclass (TableHDU,
+// CompressedTableHDU, AsciiTableHDU).  All HDU access goes through
+// `call_method` / `getattr` / `len`, so the signature accepts the
+// generic `Bound<'_, PyAny>`.  `nrows` and `itemsize` are read
+// POLYMORPHICALLY (`len()` / `dtype`) so subclasses that override
+// those (e.g. CompressedTableHDU's uncompressed-view schema) get
+// the right values without per-subclass code here.
 pub(crate) fn make_table_iter(
-    slf: Bound<'_, TableHDU>,
+    slf: Bound<'_, PyAny>,
     chunksize: Option<usize>,
     columns: Option<Py<PyAny>>,
     scale: bool,

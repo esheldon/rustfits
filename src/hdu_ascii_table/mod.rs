@@ -16,4 +16,6 @@ mod hdu;
 mod meta;
 mod read;
 
-pub(crate) use hdu::AsciiTableHDU;
+pub(crate) use hdu::{
+    AsciiColumnSubset, AsciiSingleColumnSubset, AsciiTableHDU,
+};

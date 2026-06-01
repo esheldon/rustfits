@@ -1040,7 +1040,7 @@ impl TableHDU {
     // the `tp_iter` slot, whose canonical text overrides any per-
     // method docstring (same as `__len__` / `__getitem__` above).
     fn __iter__(slf: Bound<'_, Self>) -> PyResult<super::iter::TableIter> {
-        super::iter::make_table_iter(slf, None, None, true)
+        super::iter::make_table_iter(slf.into_any(), None, None, true)
     }
 
     /// Iterate over table rows or row-chunks.
@@ -1095,7 +1095,7 @@ impl TableHDU {
         columns: Option<Py<PyAny>>,
         scale: bool,
     ) -> PyResult<super::iter::TableIter> {
-        super::iter::make_table_iter(slf, chunksize, columns, scale)
+        super::iter::make_table_iter(slf.into_any(), chunksize, columns, scale)
     }
 
     /// No-op batched-append context manager.
