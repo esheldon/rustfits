@@ -185,6 +185,45 @@ fn classify_ascii_table_key(
 
 #[pymethods]
 impl AsciiTableHDU {
+    /// Compute and store the ``DATASUM`` checksum card.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_datasum`: manual
+    /// refresh, no auto-update on mutation.  Call after
+    /// :meth:`write` / :meth:`append` / ``__setitem__``.
+    fn add_datasum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_datasum(&super_, "DATASUM")
+    }
+
+    /// Compute and store both ``DATASUM`` and ``CHECKSUM`` cards.
+    ///
+    /// Same semantics as :meth:`TableHDU.add_checksum`.  This is
+    /// the call most users want — writes both cards atomically.
+    fn add_checksum(slf: PyRef<'_, Self>) -> PyResult<()> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_add_checksum(
+            &super_, "CHECKSUM", "DATASUM",
+        )
+    }
+
+    /// Verify the stored ``DATASUM`` against the current data.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
+    fn verify_datasum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_datasum(&super_, "DATASUM")
+    }
+
+    /// Verify the stored ``CHECKSUM`` over the full HDU.
+    ///
+    /// Returns ``True`` / ``False`` / ``None`` (``None`` means
+    /// the card is absent).
+    fn verify_checksum(slf: PyRef<'_, Self>) -> PyResult<Option<bool>> {
+        let super_ = slf.into_super();
+        crate::hdu_image::checksum_hdu_verify_checksum(&super_, "CHECKSUM")
+    }
+
     // Multi-line, fitsio-style repr.  Shows file, extension, type,
     // EXTNAME (if present), row count, and per-column dtype.
     fn __repr__(slf: PyRef<'_, Self>) -> PyResult<String> {
@@ -602,6 +641,41 @@ impl AsciiTableHDU {
         crate::hdu_table::make_table_iter(
             slf.into_any(), chunksize, columns, scale,
         )
+    }
+
+    /// No-op batched-append context manager.
+    ///
+    /// ASCII-table appends go straight to disk (no partial-trailing-
+    /// tile re-encode tax to amortize), so this context does nothing
+    /// on enter or exit — it exists for API symmetry with
+    /// :meth:`CompressedTableHDU.appending`, where the context does
+    /// meaningful work.  Generic code that iterates HDUs of mixed
+    /// types can use the pattern uniformly::
+    ///
+    ///     for hdu in fits:
+    ///         with hdu.appending():
+    ///             for batch in batches:
+    ///                 hdu.append(batch)
+    fn appending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Py::new(
+            py,
+            crate::common::NoopExtendContext {
+                hdu: slf.clone().into_any().unbind(),
+            },
+        )
+    }
+
+    /// Alias for :meth:`appending`.  Mirrors :meth:`TableHDU.extending`
+    /// so generic code that iterates HDUs of any type can use
+    /// ``with hdu.extending():`` uniformly.
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Self::appending(slf, py)
     }
 }
 

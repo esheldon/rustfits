@@ -237,14 +237,23 @@ else stays private to its file.
     minus all VLA + WriteTransform machinery — every partial-write
     path passes `pad_to_block=false` so the existing trailing
     block-pad is left untouched.
-  - `hdu.rs` — `AsciiTableHDU` pyclass + `#[pymethods]` (read,
-    write, append, extend, `__getitem__`, `__setitem__`,
-    `__iter__`, iter, accessors, repr), `AsciiTableKey` +
-    `classify_ascii_table_key` classifier, `AsciiSingleColumnSubset`
-    + `AsciiColumnSubset` pyclasses with `read` / `write` /
-    `__setitem__`.  Sibling of TableHDU (NOT a subclass): on-disk
-    layout differs enough that inheriting would put per-method
-    `if ascii` branches throughout BINTABLE methods.
+  - `hdu.rs` — `AsciiTableHDU` pyclass + `#[pymethods]`
+    (`add_datasum` / `add_checksum` / `verify_datasum` /
+    `verify_checksum` — delegate to the shared `checksum_hdu_*`
+    helpers in `hdu_image.rs`; the helpers stream the padded
+    data section and are HDU-type-agnostic, so ASCII works with
+    the same wiring as Image + BINTABLE); read, write, append,
+    extend, `__getitem__`, `__setitem__`, `__iter__`, iter,
+    `appending` / `extending` (no-op contexts via
+    `NoopExtendContext`, for API symmetry with the compressed
+    types — generic code that iterates HDUs of any type can use
+    `with hdu.extending():` uniformly), accessors, repr.
+    `AsciiTableKey` + `classify_ascii_table_key` classifier;
+    `AsciiSingleColumnSubset` + `AsciiColumnSubset` pyclasses
+    with `read` / `write` / `__setitem__`.  Sibling of TableHDU
+    (NOT a subclass): on-disk layout differs enough that
+    inheriting would put per-method `if ascii` branches
+    throughout BINTABLE methods.
 
   See the "ASCII tables" roadmap below for the full surface
   status and Phase 4/5 pickup notes.
@@ -1715,7 +1724,10 @@ table.  Generic "any tabular HDU" code works via duck typing on
 `tests/test_ascii_table_write.py` (17),
 `tests/test_ascii_table_append.py` (8),
 `tests/test_ascii_table_setitem.py` (30),
-`tests/test_ascii_table_setitem_subset.py` (18) — total 150 cases.
+`tests/test_ascii_table_setitem_subset.py` (18),
+`tests/test_ascii_table_checksum.py` (8) — total 158 cases.
+Plus 4 ASCII-specific cases in
+`tests/test_hdu_extending_noop.py` for `appending` / `extending`.
 
 **Dtype rules (per user decision):**
 

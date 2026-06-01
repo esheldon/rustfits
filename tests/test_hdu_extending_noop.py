@@ -170,6 +170,67 @@ def test_table_extending_alias_is_same_machinery():
             assert type(c1) is type(c2)
 
 
+# ----- AsciiTableHDU.appending() / extending() no-op -----
+
+
+def test_ascii_table_appending_returns_same_hdu():
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu("i4", (10,))  # primary placeholder
+            f.create_ascii_table_hdu(np.dtype([("x", "f4")]), nrows=0)
+            tbl = f[1]
+            with tbl.appending() as h:
+                assert h is tbl
+
+
+def test_ascii_table_extending_alias_returns_same_hdu():
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu("i4", (10,))
+            f.create_ascii_table_hdu(np.dtype([("x", "f4")]), nrows=0)
+            tbl = f[1]
+            with tbl.extending() as h:
+                assert h is tbl
+
+
+def test_ascii_table_appending_is_noop_round_trip():
+    dt = np.dtype([("x", "f4"), ("y", "i4")])
+    chunks = []
+    for v in range(5):
+        a = np.zeros(10, dtype=dt)
+        a["x"] = v
+        a["y"] = v * 100
+        chunks.append(a)
+    expected = np.concatenate(chunks)
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu("i4", (10,))
+            f.create_ascii_table_hdu(dt, nrows=0)
+            tbl = f[1]
+            with tbl.appending():
+                for c in chunks:
+                    tbl.append(c)
+            got = tbl.read()
+            np.testing.assert_array_equal(got["x"], expected["x"])
+            np.testing.assert_array_equal(got["y"], expected["y"])
+
+
+def test_ascii_table_extending_alias_is_same_machinery():
+    """extending() and appending() yield the same context type."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu("i4", (10,))
+            f.create_ascii_table_hdu(np.dtype([("x", "f4")]), nrows=0)
+            tbl = f[1]
+            c1 = tbl.appending()
+            c2 = tbl.extending()
+            assert type(c1) is type(c2)
+
+
 # ----- Generic loop pattern (the actual point of the no-op) -----
 
 
