@@ -247,8 +247,6 @@ Highlights for fitsio users:
 * **fitsio's ``case_sensitive=True`` column lookup.**  rustfits
   is always case-insensitive on column names; case is
   preserved on disk but lookup folds case.
-* **ASCII tables.**  Read-stub only; writes raise.  Use astropy
-  for the rare ASCII-table HDU.
 
 What fitsio doesn't have that rustfits does
 -------------------------------------------

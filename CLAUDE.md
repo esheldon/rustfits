@@ -2586,15 +2586,16 @@ request flags something.
 2. ✅ **Walking HDUs / picking the right one** — section in
    ``quickstart.rst`` showing the realistic ``hdu.has_data +
    isinstance(hdu, ImageHDU)`` pattern.
-3. ✅ **`AsciiTableHDU` note** — section in ``tables.rst``
-   documenting the read-stub state and pointing at astropy as
-   the fallback.  **Stale as of 2026-06** — ASCII tables now
-   have the full BINTABLE-parity public surface (all 5 phases
-   plus checksum + appending/extending; only VLA-specific
-   features are absent because the format doesn't allow them).
-   `tables.rst` should be rewritten to document ASCII as
-   first-class.  Cross-reference the "ASCII tables
-   (XTENSION='TABLE')" roadmap.
+3. ✅ **`AsciiTableHDU` documentation** — section in
+   ``tables.rst`` (rewritten 2026-06 once the full ASCII
+   parity surface shipped) documents ASCII as a first-class
+   HDU type with a brief creation example, a parity pointer to
+   the BINTABLE sections, and a "what's different" list (no
+   VLA, no X, no subarray, no complex, no compression; narrower
+   I/F/E/D/A dtype mapping; TBCOL packs flush).  The
+   complementary lines in ``limitations.rst`` ("ASCII writes
+   not yet") and ``migration.rst`` ("read-stub only") were
+   deleted in the same pass.
 4. ✅ **Known limitations** — new ``limitations.rst`` page
    listing gaps tagged ``(not yet)`` vs ``(by design)`` with
    workarounds, plus cross-tool interop caveats.

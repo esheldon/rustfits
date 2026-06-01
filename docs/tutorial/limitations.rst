@@ -34,10 +34,6 @@ Tables
   cell's length and returns a fixed-size N-D array.  Not
   supported; rustfits returns one ndarray per row (Object dtype).
   Build the padded array yourself if you need it.
-* **ASCII table writes** *(not yet)* — :class:`~rustfits.AsciiTableHDU`
-  is read-stub only (inspection accessors work; ``read()`` raises).
-  Modern files use BINTABLE; if you need ASCII output, write
-  through astropy.
 * **``TDISPn`` on write** *(not yet)* — the display-format hint
   isn't emitted by rustfits's writers.  Add it by hand via
   ``header["TDISP1"] = ...`` if you need it; it's informational
