@@ -5,9 +5,9 @@
 //   hdu            — base HDU pyclass
 //   hdu_image      — ImageHDU + image read/write/slicing
 //   hdu_image_compressed — CompressedImageHDU (ZIMAGE convention)
-//   hdu_table      — TableHDU (BINTABLE) stub
+//   hdu_table      — TableHDU (BINTABLE)
 //   hdu_table_compressed — CompressedTableHDU (ZTABLE convention)
-//   hdu_ascii_table — AsciiTableHDU (TABLE) stub
+//   hdu_ascii_table — AsciiTableHDU (TABLE)
 //   zimage         — per-algorithm tile encoders/decoders + config classes
 //   fits           — FITS pyclass + HDU-list parser
 
