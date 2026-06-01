@@ -801,17 +801,24 @@ impl AsciiTableHDU {
 
 /// A deferred handle for one column of a :class:`AsciiTableHDU`.
 ///
-/// Returned by ``hdu["name"]``.  Carries a reference to the
-/// parent table and the column name; no I/O happens at
-/// construction.  Add ``[rows]`` to trigger the read::
+/// Returned by ``hdu["name"]`` (a single str/bytes column name).
+/// Carries a reference to the parent table and the column name;
+/// no I/O happens at construction.  Add ``[rows]`` to trigger
+/// the read::
 ///
-///     col = hdu["RA"]
-///     all_ra  = col[:]
-///     subset  = col[100:200]
-///     fancy   = col[[7, 3, 9]]
+///     col = hdu["RA"]          # no I/O, returns a subset handle
+///     all_ra  = col[:]         # read every row
+///     subset  = col[100:200]   # read 100 rows
+///     fancy   = col[[7, 3, 9]] # read three rows in that order
 ///
-/// Writing is not yet supported on ASCII subsets (Phase 4 of
-/// the rustfits ASCII-tables roadmap).
+/// Writing to ``[rows]`` mutates only that column::
+///
+///     hdu["FLAG"][bad_rows] = -99
+///
+/// Equivalent to :meth:`AsciiTableHDU.read_column` for reads and
+/// to the cell / slice forms of ``AsciiTableHDU.__setitem__`` for
+/// writes; the subset object exists so the ``hdu["name"][...]``
+/// idiom composes naturally.
 #[pyclass]
 pub(crate) struct AsciiSingleColumnSubset {
     hdu: Py<AsciiTableHDU>,
@@ -913,16 +920,25 @@ impl AsciiSingleColumnSubset {
 
 /// A deferred handle for a column subset of a :class:`AsciiTableHDU`.
 ///
-/// Returned by ``hdu[[name1, name2, ...]]``.  Carries a reference
-/// to the parent table and the column list; no I/O happens at
-/// construction.  Add ``[rows]`` to trigger the read::
+/// Returned by ``hdu[[name1, name2, ...]]`` (an iterable of
+/// str/bytes column names).  Carries a reference to the parent
+/// table and the column list; no I/O happens at construction.
+/// Add ``[rows]`` to trigger the read::
 ///
 ///     pos = hdu[["RA", "DEC"]]
-///     all_pos = pos[:]
+///     all_pos = pos[:]              # structured ndarray w/ 2 fields
 ///     subset  = pos[100:200]
 ///
-/// Writing is not yet supported on ASCII subsets (Phase 4 of
-/// the rustfits ASCII-tables roadmap).
+/// Writing to ``[rows]`` mutates only those columns; the value
+/// must be a structured ndarray with the matching field names
+/// (extras tolerated for forward compatibility)::
+///
+///     hdu[["RA", "DEC"]][bad_rows] = corrected
+///
+/// Equivalent to :meth:`AsciiTableHDU.read` with ``columns=`` for
+/// reads, and to the multi-column form of
+/// ``AsciiTableHDU.__setitem__`` for writes.  The subset object
+/// exists so the ``hdu[[...]][...]`` idiom composes naturally.
 #[pyclass]
 pub(crate) struct AsciiColumnSubset {
     hdu: Py<AsciiTableHDU>,
