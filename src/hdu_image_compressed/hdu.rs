@@ -21,6 +21,10 @@ use super::checksum::{
     compressed_add_checksum, compressed_add_datasum,
     compressed_verify_checksum, compressed_verify_datasum,
 };
+use super::extending::{
+    append_to_buffer, check_not_in_context, CompressedImageExtendContext,
+    PendingBuffer,
+};
 use super::meta::{
     build_compression_config, compression_config_kind_to_py,
     parse_compressed_image_meta, parse_compressed_image_shape, zbitpix_to_native_dtype, CompressedImageMeta,
@@ -113,7 +117,7 @@ pub(crate) struct CompressedImageHDU {
     // disk, not the qlevel).  The write path consults this for the
     // qlevel value — for reopened HDUs it falls back to defaults
     // (level=4.0).
-    quantize_config:
+    pub(crate) quantize_config:
         Arc<Mutex<Option<crate::zimage::compression_config::Quantize>>>,
     // Full compression-config object (Gzip1 / Gzip2 / Rice1 /
     // Hcompress1 / Plio1) as the user passed it to
@@ -138,6 +142,14 @@ pub(crate) struct CompressedImageHDU {
     // briefly serialize on the lock (uncontended in the GIL-held
     // case today, correct for future allow_threads use).
     meta_cache: MetaCache,
+    // Pending-buffer slot for the `extending()` context manager.
+    // `None` outside a context; `Some(buffer)` while a `with`
+    // block is open.  Mutating data-touching methods refuse to
+    // run while `Some` (see `extending::check_not_in_context`);
+    // `extend()` itself routes to the buffer when `Some` and to
+    // the direct on-disk path when `None`.  See `extending.rs`
+    // for the full design.
+    pub(crate) pending: Arc<Mutex<Option<PendingBuffer>>>,
 }
 
 impl CompressedImageHDU {
@@ -166,6 +178,7 @@ impl CompressedImageHDU {
                 quantize_config: Arc::new(Mutex::new(quantize_config)),
                 compress_config: Arc::new(Mutex::new(compress_config)),
                 meta_cache: Arc::new(Mutex::new(None)),
+                pending: Arc::new(Mutex::new(None)),
             })
     }
 
@@ -459,6 +472,7 @@ impl CompressedImageHDU {
     /// :meth:`ImageHDU.add_datasum` — re-run after
     /// :meth:`write` / :meth:`extend` / ``__setitem__``.
     fn add_datasum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         compressed_add_datasum(slf, py)
     }
 
@@ -467,6 +481,7 @@ impl CompressedImageHDU {
     /// Same convention as :meth:`add_datasum`.  This is the call
     /// most users want.
     fn add_checksum(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         compressed_add_checksum(slf, py)
     }
 
@@ -478,12 +493,14 @@ impl CompressedImageHDU {
     fn verify_datasum(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Option<bool>> {
+        check_not_in_context(&slf.pending)?;
         compressed_verify_datasum(slf, py)
     }
 
     fn verify_checksum(
         slf: PyRef<'_, Self>, py: Python<'_>,
     ) -> PyResult<Option<bool>> {
+        check_not_in_context(&slf.pending)?;
         compressed_verify_checksum(slf, py)
     }
 
@@ -515,6 +532,7 @@ impl CompressedImageHDU {
         scale: bool,
         mask_blank: bool,
     ) -> PyResult<Py<PyAny>> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.as_super().as_super();
         let meta = slf.meta(super_)?;
         read_compressed_image_data(
@@ -534,6 +552,7 @@ impl CompressedImageHDU {
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        check_not_in_context(&slf.pending)?;
         let super_ = slf.as_super().as_super();
         let meta = slf.meta(super_)?;
         slice_compressed_image(
@@ -571,6 +590,7 @@ impl CompressedImageHDU {
         data: &Bound<'_, PyAny>,
         start: Option<Vec<i64>>,
     ) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         if start.is_some() {
             return Err(PyNotImplementedError::new_err(
                 "start= is not supported for compressed-image writes; \
@@ -622,14 +642,32 @@ impl CompressedImageHDU {
     /// file.  Old boundary-tile bytes become orphans; call
     /// :meth:`repack` to reclaim them.
     fn extend(
-        slf: PyRef<'_, Self>,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let cache = Arc::clone(&slf.cache);
-        let quantize_config = Arc::clone(&slf.quantize_config);
-        let compress_config = Arc::clone(&slf.compress_config);
-        let super_ = slf.into_super().into_super();
+        // Inside an `extending()` context: buffer the input,
+        // possibly trigger a tile-aligned mid-context drain if
+        // the buffer crossed the RAM cap.  Outside the context:
+        // existing on-disk extend path.  See `extending.rs` for
+        // the buffer semantics.
+        //
+        // The pending check needs a PyRef borrow that must drop
+        // before `append_to_buffer` runs (it takes its own
+        // borrows for the drain logic).  We explicitly scope the
+        // probe borrow so the early-return drops it cleanly.
+        let in_ctx = {
+            let pyref = slf.borrow();
+            super::extending::is_in_context(&pyref.pending)?
+        };
+        if in_ctx {
+            return append_to_buffer(py, slf, data);
+        }
+        let pyref = slf.borrow();
+        let cache = Arc::clone(&pyref.cache);
+        let quantize_config = Arc::clone(&pyref.quantize_config);
+        let compress_config = Arc::clone(&pyref.compress_config);
+        let super_ = pyref.into_super().into_super();
         let cards = super_.header_snapshot()?;
         extend_compressed_image_data(
             py,
@@ -647,6 +685,48 @@ impl CompressedImageHDU {
         )
     }
 
+    /// Open a batched-extend context manager.
+    ///
+    /// Inside the ``with`` block every :meth:`extend` call buffers
+    /// its input in RAM rather than re-encoding the trailing
+    /// partial tile on every call.  The buffer is concatenated
+    /// and handed to the existing extend code once at
+    /// ``__exit__`` (normal or exceptional), collapsing N
+    /// partial-tile re-encodes into 1.
+    ///
+    /// Pattern::
+    ///
+    ///     with hdu.extending():
+    ///         for batch in batches:
+    ///             hdu.extend(batch)
+    ///         # __exit__ here: drains the buffer
+    ///
+    /// Performance: a sub-tile-chunk extend loop costs roughly
+    /// ``write-once`` total instead of ``N × partial_tile_cost``;
+    /// see the "2-D image extend" section of the user-facing
+    /// performance docs for the measured numbers.
+    ///
+    /// Restrictions inside the context (raise ``ValueError``):
+    /// :meth:`read`, ``__getitem__``, :meth:`write`,
+    /// ``__setitem__``, :meth:`repack`, :meth:`add_checksum`,
+    /// :meth:`add_datasum`, :meth:`verify_checksum`,
+    /// :meth:`verify_datasum`.  Exit the context first.
+    /// :meth:`FITS.close` also raises while a context is open
+    /// (the natural nested-``with`` pattern never triggers this;
+    /// it fires only for forgotten ``__exit__``).
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<CompressedImageExtendContext>> {
+        // Bound::clone is Py_INCREF + pointer copy (one atomic),
+        // NOT an HDU copy — the context's Py<> and the user's
+        // `hdu` variable refer to the same Python object, so a
+        // buffered extend() inside the `with` mutates the same
+        // `pending` Mutex the context will drain at __exit__.
+        let hdu_py: Py<CompressedImageHDU> = slf.clone().unbind();
+        Py::new(py, CompressedImageExtendContext { hdu: hdu_py })
+    }
+
     // __setitem__ is a pyo3 slot dunder — no per-method docstring.
     // Same slice surface as ImageHDU.__setitem__: anything
     // hdu[key] reads, hdu[key] = value writes.  Internally
@@ -658,6 +738,7 @@ impl CompressedImageHDU {
         key: &Bound<'_, PyAny>,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let cache = Arc::clone(&slf.cache);
         let quantize_config = Arc::clone(&slf.quantize_config);
         let compress_config = Arc::clone(&slf.compress_config);
@@ -697,6 +778,7 @@ impl CompressedImageHDU {
     ///
     /// No-op for an already-compact heap.
     fn repack(slf: PyRef<'_, Self>) -> PyResult<()> {
+        check_not_in_context(&slf.pending)?;
         let cache = Arc::clone(&slf.cache);
         let super_ = slf.into_super().into_super();
         repack_compressed_heap(&super_, &cache)

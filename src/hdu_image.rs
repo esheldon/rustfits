@@ -657,6 +657,33 @@ impl ImageHDU {
         let super_: PyRef<HDU> = slf.into_super();
         checksum_hdu_verify_checksum(&super_, "CHECKSUM")
     }
+
+    /// No-op batched-extend context manager.
+    ///
+    /// Uncompressed image extends already go straight to disk
+    /// (there's no partial-trailing-tile re-encode tax to
+    /// amortize), so this context does nothing on enter or exit
+    /// — it exists for API symmetry with
+    /// :meth:`CompressedImageHDU.extending`, where the context
+    /// does meaningful work.  Generic code that iterates HDUs of
+    /// mixed compressed / uncompressed types can therefore use
+    /// the pattern uniformly::
+    ///
+    ///     for hdu in fits:
+    ///         with hdu.extending():
+    ///             for batch in batches:
+    ///                 hdu.extend(batch)
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Py::new(
+            py,
+            crate::common::NoopExtendContext {
+                hdu: slf.clone().into_any().unbind(),
+            },
+        )
+    }
 }
 
 // ----- shared HDU-level checksum helpers -----

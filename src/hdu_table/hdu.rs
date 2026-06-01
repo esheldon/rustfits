@@ -1097,6 +1097,44 @@ impl TableHDU {
     ) -> PyResult<super::iter::TableIter> {
         super::iter::make_table_iter(slf, chunksize, columns, scale)
     }
+
+    /// No-op batched-append context manager.
+    ///
+    /// Uncompressed table appends already go straight to disk
+    /// (no partial-trailing-tile re-encode tax to amortize),
+    /// so this context does nothing on enter or exit — it
+    /// exists for API symmetry with
+    /// :meth:`CompressedTableHDU.appending`, where the context
+    /// does meaningful work.  Generic code that iterates HDUs
+    /// of mixed compressed / uncompressed types can use the
+    /// pattern uniformly::
+    ///
+    ///     for hdu in fits:
+    ///         with hdu.appending():
+    ///             for batch in batches:
+    ///                 hdu.append(batch)
+    fn appending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Py::new(
+            py,
+            crate::common::NoopExtendContext {
+                hdu: slf.clone().into_any().unbind(),
+            },
+        )
+    }
+
+    /// Alias for :meth:`appending`.  Mirrors
+    /// :meth:`CompressedImageHDU.extending` for parity with the
+    /// image side, so generic code that iterates HDUs of any
+    /// type can use ``with hdu.extending():`` uniformly.
+    fn extending(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<crate::common::NoopExtendContext>> {
+        Self::appending(slf, py)
+    }
 }
 
 // What kind of selection the user passed to TableHDU.__getitem__.

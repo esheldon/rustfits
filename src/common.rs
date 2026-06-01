@@ -754,3 +754,41 @@ impl Drop for RawBuffer {
         unsafe { pyo3::ffi::PyBuffer_Release(&mut *self.view) };
     }
 }
+
+// No-op context manager returned by `extending()` / `appending()`
+// on the uncompressed `ImageHDU` and `TableHDU`.  Both subclasses
+// (CompressedImageHDU + CompressedTableHDU) override those
+// pymethods with their real buffering contexts via Python MRO;
+// this no-op exists so generic code that iterates HDUs of mixed
+// types can use the pattern uniformly without branching::
+//
+//     for hdu in fits:
+//         with hdu.extending():
+//             for batch in batches:
+//                 hdu.extend(batch)
+//
+// The uncompressed extend / append paths don't have a partial-
+// trailing-tile re-encode tax to amortize, so the context is
+// genuinely a no-op: `__enter__` hands the user's HDU back so
+// `as` works (`with hdu.extending() as h: ...`), and `__exit__`
+// returns False so any in-flight exception propagates.
+#[pyclass(module = "rustfits._rust")]
+pub(crate) struct NoopExtendContext {
+    pub(crate) hdu: Py<PyAny>,
+}
+
+#[pymethods]
+impl NoopExtendContext {
+    fn __enter__(&self, py: Python<'_>) -> Py<PyAny> {
+        self.hdu.clone_ref(py)
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        false
+    }
+}

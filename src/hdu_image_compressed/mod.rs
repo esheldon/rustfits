@@ -16,11 +16,13 @@
 // file's header for what it owns.
 
 mod checksum;
+mod extending;
 mod hdu;
 mod meta;
 mod read;
 mod repack;
 mod write;
 
+pub(crate) use extending::CompressedImageExtendContext;
 pub(crate) use hdu::{header_has_zimage, CompressedImageHDU};
 pub(crate) use meta::compute_n_tiles;
