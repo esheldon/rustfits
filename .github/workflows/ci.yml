@@ -85,12 +85,19 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      # `python-gil` pins the stock GIL Python build (vs the optional
+      # `python-freethreading` no-GIL build conda-forge ships from 3.13
+      # onward).  rustfits has not been audited for free-threading
+      # safety; without the pin micromamba could pick the no-GIL
+      # variant on py3.14 and surface latent races as heap corruption
+      # (which is exactly what macOS py3.14 hit on the first run).
       - name: Set up conda env (python ${{ matrix.python }})
         uses: mamba-org/setup-micromamba@v2
         with:
           environment-name: rustfits-test
           create-args: >-
             python=${{ matrix.python }}
+            python-gil
           cache-environment: true
           init-shell: bash
 
