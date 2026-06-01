@@ -11,6 +11,7 @@
 // "ASCII tables" roadmap).
 
 mod columns;
+mod edit;
 mod format;
 mod hdu;
 mod meta;

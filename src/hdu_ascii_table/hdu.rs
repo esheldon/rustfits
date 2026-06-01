@@ -21,6 +21,7 @@ use crate::hdu::HDU;
 use crate::hdu_table::try_extract_column_name;
 use crate::hdu_table::TableIter;
 
+use super::edit::{delete_column_impl, insert_column_impl};
 use super::meta::{parse_ascii_table_meta, AsciiTableMeta};
 use super::read::{
     ascii_repr_dtype_str, build_ascii_numpy_dtype, read_ascii_table,
@@ -502,6 +503,91 @@ impl AsciiTableHDU {
         names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         Self::append(slf, py, data, names)
+    }
+
+    /// Insert a new column into the table at the given position.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name (case-insensitive on subsequent lookup).
+    /// data : numpy.ndarray
+    ///     1-D ndarray of length ``NAXIS2``.  Supported dtype kinds:
+    ///     ``i?`` (any signed-int width) → ``I20``; ``u?`` → ``I20``
+    ///     + ``TZERO=2**63`` (unsigned-int trick); ``f4`` → ``E15.7``;
+    ///     ``f8`` → ``D25.17``; ``S<w>`` / ``U<w>`` → ``A<w>``.
+    ///     Object-dtype (VLA) is rejected — ASCII tables have no
+    ///     heap.
+    /// position : int, optional
+    ///     0-based slot for the new column (0..=ncols).  Default
+    ///     appends at the end.  At most one of ``position`` /
+    ///     ``after`` / ``before`` may be set.
+    /// after : str or int, optional
+    ///     Insert just after this column (name case-insensitive, or
+    ///     0-based integer index with negative wrap-around).
+    /// before : str or int, optional
+    ///     Insert just before this column.
+    /// unit : str, optional
+    ///     ``TUNITn`` informational unit string.
+    /// format : str, optional
+    ///     Override the auto-picked ``TFORM`` string (e.g. ``"I10"``,
+    ///     ``"F12.4"``, ``"E15.7"``, ``"D25.17"``, ``"A20"``).
+    ///     Letter must be compatible with the input dtype kind.
+    ///
+    /// Notes
+    /// -----
+    /// Validate-then-mutate: the input is fully validated before any
+    /// file or header bytes are touched.  Mid-write I/O failures
+    /// taint the file (close + reopen to recover).
+    ///
+    /// For non-last HDUs the file tail shifts forward to make room
+    /// for the wider rows; previously-issued HDU handles transparently
+    /// see the new offsets via the shared layout.
+    ///
+    /// Every column at or after the new column's position has its
+    /// ``TBCOLn`` byte-position bumped by the new column's width.
+    #[pyo3(signature = (name, data, *, position=None, after=None, before=None, unit=None, format=None))]
+    fn insert_column(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+        position: Option<i64>,
+        after: Option<&Bound<'_, PyAny>>,
+        before: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        format: Option<&str>,
+    ) -> PyResult<()> {
+        let super_ = slf.into_super();
+        insert_column_impl(
+            py, &super_, name, data, position, after, before, unit, format,
+        )
+    }
+
+    /// Delete a column from the table.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str or int
+    ///     Column name (case-insensitive) or 0-based integer index
+    ///     (negative wraps).
+    ///
+    /// Notes
+    /// -----
+    /// Every column after the deleted slot has its ``TBCOLn``
+    /// byte-position reduced by the deleted column's width.  The
+    /// data section shrinks accordingly; for non-last HDUs the
+    /// file tail is shifted backward and previously-issued HDU
+    /// handles transparently see the new offsets.
+    ///
+    /// Mid-write I/O failures taint the file (close + reopen to
+    /// recover).
+    fn delete_column(
+        slf: PyRef<'_, Self>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let super_ = slf.into_super();
+        delete_column_impl(&super_, key)
     }
 
     // hdu[key] dispatches based on what `key` looks like:

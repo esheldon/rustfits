@@ -237,21 +237,33 @@ else stays private to its file.
     minus all VLA + WriteTransform machinery — every partial-write
     path passes `pad_to_block=false` so the existing trailing
     block-pad is left untouched.
+  - `edit.rs` — `insert_column_impl` + `delete_column_impl` schema-
+    edit machinery.  Strip-based row shuffle (back-to-front for
+    insert / front-to-back for delete, ~1 MiB per buffer), header
+    card mutation including the ASCII-specific TBCOL VALUE shift
+    (every column at/after the slot has its `TBCOLn` byte position
+    shifted by ±new_col_width — separate from the keyword-index
+    renumber that BINTABLE also does), grow/shrink data extent.
+    Mirrors `hdu_table/edit.rs` minus the heap / VLA / WriteTransform
+    machinery — ASCII has no heap so there's no `relocate_region_*`
+    step; the new column's cell bytes are formatted directly via
+    `format_one_cell`.  Same `validate-then-mutate` + taint
+    discipline.
   - `hdu.rs` — `AsciiTableHDU` pyclass + `#[pymethods]`
     (`add_datasum` / `add_checksum` / `verify_datasum` /
     `verify_checksum` — delegate to the shared `checksum_hdu_*`
     helpers in `hdu_image.rs`; the helpers stream the padded
     data section and are HDU-type-agnostic, so ASCII works with
     the same wiring as Image + BINTABLE); read, write, append,
-    extend, `__getitem__`, `__setitem__`, `__iter__`, iter,
-    `appending` / `extending` (no-op contexts via
-    `NoopExtendContext`, for API symmetry with the compressed
-    types — generic code that iterates HDUs of any type can use
-    `with hdu.extending():` uniformly), accessors, repr.
-    `AsciiTableKey` + `classify_ascii_table_key` classifier;
-    `AsciiSingleColumnSubset` + `AsciiColumnSubset` pyclasses
-    with `read` / `write` / `__setitem__`.  Sibling of TableHDU
-    (NOT a subclass): on-disk layout differs enough that
+    extend, `__getitem__`, `__setitem__`, `insert_column`,
+    `delete_column`, `__iter__`, iter, `appending` / `extending`
+    (no-op contexts via `NoopExtendContext`, for API symmetry
+    with the compressed types — generic code that iterates HDUs
+    of any type can use `with hdu.extending():` uniformly),
+    accessors, repr.  `AsciiTableKey` + `classify_ascii_table_key`
+    classifier; `AsciiSingleColumnSubset` + `AsciiColumnSubset`
+    pyclasses with `read` / `write` / `__setitem__`.  Sibling of
+    TableHDU (NOT a subclass): on-disk layout differs enough that
     inheriting would put per-method `if ascii` branches
     throughout BINTABLE methods.
 
@@ -1709,7 +1721,13 @@ astropy/fitsio cross-tool).
 | 2 | Slicing / columns= / rows= / iter / subset objects / mask_null | ✅ Shipped |
 | 3 | `create_ascii_table_hdu` + `write` + `append` + `extend` alias | ✅ Shipped |
 | 4 | `__setitem__` (all forms) + subset writes | ✅ Shipped |
-| 5 | `insert_column` + `delete_column` | ⬜ See pickup notes below |
+| 5 | `insert_column` + `delete_column` | ✅ Shipped |
+
+Plus BINTABLE-parity additions outside the original phase plan: the
+4 checksum methods (`add_datasum` / `add_checksum` / `verify_datasum`
+/ `verify_checksum`) and the `appending()` / `extending()` no-op
+context managers.  ASCII now has the full BINTABLE-symmetric public
+surface minus VLA (which the format doesn't allow).
 
 **Code lives in `src/hdu_ascii_table/`** (see "Project structure"
 above for the per-file breakdown).  Sibling class to TableHDU, NOT
@@ -1725,7 +1743,8 @@ table.  Generic "any tabular HDU" code works via duck typing on
 `tests/test_ascii_table_append.py` (8),
 `tests/test_ascii_table_setitem.py` (30),
 `tests/test_ascii_table_setitem_subset.py` (18),
-`tests/test_ascii_table_checksum.py` (8) — total 158 cases.
+`tests/test_ascii_table_checksum.py` (8),
+`tests/test_ascii_table_edit_columns.py` (33) — total 191 cases.
 Plus 4 ASCII-specific cases in
 `tests/test_hdu_extending_noop.py` for `appending` / `extending`.
 
@@ -1833,39 +1852,52 @@ shape as BINTABLE's `SingleColumnSubset` / `ColumnSubset`.  With
 the column key (so the efficient whole-column writer is used);
 with `rows=<spec>` they route through the per-cell loop.
 
-### Phase 5 pickup notes — `insert_column` + `delete_column`
+### Phase 5 — `insert_column` + `delete_column` (shipped)
 
-**Scope.**  `hdu.insert_column(name, data, *, position=None,
-after=None, before=None, unit=None, format=None)` and
-`hdu.delete_column(name_or_index)`.
+API on `AsciiTableHDU`:
 
-**Reference implementation.**  `src/hdu_table/edit.rs`.
-ASCII version is strictly SIMPLER than BINTABLE's:
+- `insert_column(name, data, *, position=None, after=None,
+  before=None, unit=None, format=None)`
+- `delete_column(name_or_index)`
 
-- No heap relocation (PCOUNT is always 0).
-- No VLA branches.
-- Strip-based row shuffle: back-to-front for grow (insert) /
-  front-to-back for shrink (delete) at ~1 MiB strips.
+`data` must be a 1-D ndarray of length `NAXIS2` with a supported
+ASCII dtype kind (i? / u? / f4 / f8 / S? / U?).  Object dtype is
+rejected — ASCII has no heap.  The auto-pick format follows the
+same rules as `create_ascii_table_hdu` (I20 / E15.7 / D25.17 /
+A<w> + unsigned-int trick), or `format=` overrides per-letter.
 
-**New mechanic — TBCOL renumber.**  This is the cross-cutting
-piece that doesn't exist on the BINTABLE side: every column at
-or after the inserted/deleted slot shifts its `TBCOLn` card by
-`±new_col_width`.  The renumber walks the card list once,
-matches `TBCOL<n>` cards by index, rewrites the value.
+**Implementation.**  `src/hdu_ascii_table/edit.rs`.  Order of
+operations matches BINTABLE:
+1. Build new card list (renumber per-column keyword suffixes
+   + shift TBCOL values in one pass; insert / drop the target
+   column's cards; update TFIELDS + NAXIS1).  Header rewrite to
+   disk via the shared `rewrite_header_to_disk`.
+2. Grow / shrink data extent (may shift later HDUs via the
+   forward / backward tail-shift primitives in
+   `crate::common`).
+3. Strip-walk main rows back-to-front (insert) or front-to-back
+   (delete), ~1 MiB per buffer.  The insert path formats the
+   new column's cell via `format_one_cell` inline; no separate
+   pass to materialize new column bytes.
 
-**Order of operations** (same as BINTABLE edit):
-1. Header rewrite first (may grow header blocks via shared
-   `rewrite_header_to_disk`).
-2. Data-extent grow/shrink (may shift later HDUs via
-   `shift_file_tail_and_update_offsets` for non-last HDUs).
-3. Row shuffle (strip-based, 1 MiB budget).
+**TBCOL value shift** (the ASCII-specific bit).  Distinct from
+BINTABLE's per-column keyword renumber, ASCII edit also has to
+update each surviving column's TBCOLn VALUE (the byte position
+within each row) by `±new_col_width`.  Both the renumber and
+the value shift are folded into one pass
+(`renumber_and_shift_per_column_cards`); TBCOL gets the value
+update via `shift_tbcol_value` + `build_tbcol_card`, other
+prefixes go through the same `rebuild_per_column_card` BINTABLE
+uses.
 
-**Files to create.**  `src/hdu_ascii_table/edit.rs` with
-`insert_column_impl` + `delete_column_impl` + the TBCOL
-renumber helper.  Wire into `hdu.rs` with `#[pymethods]`.
-
-**Tests.**  `tests/test_ascii_table_edit_columns.py` mirroring
-`tests/test_table_edit_columns.py`; drop the VLA-specific cases.
+**Tests.**  `tests/test_ascii_table_edit_columns.py` (33 cases):
+all 7 insert positioning forms (default-append / position / after /
+before, by name + by index + negative), unsigned-int trick,
+`format=` override, `unit=`, TBCOL value-shift verification for
+both insert and delete, all 4 delete forms, case-insensitive
+lookup, round-trip insert→delete restoring layout exactly, non-
+last-HDU shifts both directions, astropy cross-tool, and 10
+rejection paths.
 
 ### Open questions / out-of-scope for ASCII roadmap
 
@@ -2557,11 +2589,12 @@ request flags something.
 3. ✅ **`AsciiTableHDU` note** — section in ``tables.rst``
    documenting the read-stub state and pointing at astropy as
    the fallback.  **Stale as of 2026-06** — ASCII tables now
-   support full read + write + append + `__setitem__` + subset
-   writes (Phases 1-4 shipped on branch `ascii`); the
-   tables.rst section needs a rewrite after Phase 5
-   (`insert_column` / `delete_column`) lands.  Cross-reference
-   the "ASCII tables (XTENSION='TABLE')" roadmap.
+   have the full BINTABLE-parity public surface (all 5 phases
+   plus checksum + appending/extending; only VLA-specific
+   features are absent because the format doesn't allow them).
+   `tables.rst` should be rewritten to document ASCII as
+   first-class.  Cross-reference the "ASCII tables
+   (XTENSION='TABLE')" roadmap.
 4. ✅ **Known limitations** — new ``limitations.rst`` page
    listing gaps tagged ``(not yet)`` vs ``(by design)`` with
    workarounds, plus cross-tool interop caveats.
