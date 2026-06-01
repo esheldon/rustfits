@@ -45,18 +45,13 @@ Images
 The image surface (read, slice, write, ``extend``, ``__setitem__``,
 BLANK / MaskedArray, BSCALE/BZERO, unsigned-int trick) is
 feature-complete for both uncompressed and tile-compressed HDUs.
-Two narrow gaps:
+One narrow gap:
 
 * **Per-tile ZBLANK column** *(not yet)* — header-level ZBLANK on
   compressed integer images is supported.  The convention also
   allows a per-tile *column*-form ZBLANK; rustfits doesn't read
   it.  Rare in practice — cfitsio typically emits the header
   form even for DITHER_2.
-* **``mask_blank=True`` on quantized-float compressed reads**
-  *(by design)* — the FITS spec forbids BLANK on floating-point
-  arrays; NaN serves that role.  rustfits surfaces quantized
-  NaN sentinels (NULL_VALUE_I32) as proper NaN in the decoded
-  output; if you want a Boolean mask, do ``np.isnan(arr)``.
 
 General
 -------
