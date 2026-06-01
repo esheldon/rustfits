@@ -25,7 +25,7 @@ Tables
   dims, useful for VLA-of-images, but with a quirk: the spec only allows ONE
   variable axis per cell, so fully variable ``(n, m)`` shapes aren't
   expressible in FITS without padding.
-* **``TDISPn`` on write** *(not yet)* — the display-format hint
+* **``TDISPn`` on write** *(by design)* — the display-format hint
   isn't emitted by rustfits's writers.  Add it by hand via
   ``header["TDISP1"] = ...`` if you need it; it's informational
   per the spec.
