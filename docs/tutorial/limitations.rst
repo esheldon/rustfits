@@ -22,9 +22,9 @@ Tables
   ``1PE`` shape (one descriptor per row) is fully supported.
 * **Variable-length columns with TDIMn** *(not yet)* — TDIMn on
   a P/Q column would reshape each heap cell to the declared
-  dims, useful for VLA-of-images.  Note the spec only allows
-  ONE variable axis per cell, so fully variable ``(n, m)``
-  shapes aren't expressible in FITS without padding.
+  dims, useful for VLA-of-images, but with a quirk: the spec only allows ONE
+  variable axis per cell, so fully variable ``(n, m)`` shapes aren't
+  expressible in FITS without padding.
 * **TNULL masking on VLA columns** *(not yet)* — ``mask_null=True``
   works for fixed B/I/J/K columns but raises on VLA columns with
   a TNULL card in the header.  Read with ``mask_null=False`` and
