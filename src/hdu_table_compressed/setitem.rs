@@ -22,7 +22,8 @@ use crate::zimage::CompressionAlgorithm;
 use super::append::decode_existing_tile_to_be_bytes;
 use super::hdu::ColumnTileCache;
 use super::read::{gzip_decompress_bytes};
-use super::write::{grow_file_to_at_least, set_zpcount_in_cards};
+use crate::common::grow_file_to_at_least;
+use super::write::set_zpcount_in_cards;
 use super::write_setup::{
     ColPrep, encode_be_slab_to_heap_and_record, encode_table_column_slab,
     gzip_level_of, prepare_fixed_column, rice_blocksize_of,

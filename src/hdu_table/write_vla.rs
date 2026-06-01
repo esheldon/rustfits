@@ -11,7 +11,8 @@ use std::sync::atomic::Ordering;
 use crate::common::{
     check_not_tainted, lock_file, parse_keyword,
     shift_file_tail_and_update_offsets,
-    shift_file_tail_backward_and_update_offsets, zero_fill_range,
+    shift_file_tail_backward_and_update_offsets, stream_copy_in_file,
+    zero_fill_range,
     FileHandle, RawBuffer, Storage,
 };
 use crate::hdu::HDU;
@@ -1099,6 +1100,15 @@ pub(crate) fn append_vla_aware(
 // metadata) don't taint.  Once any byte movement starts, failures
 // taint.  No-op for non-VLA tables and for already-compact heaps.
 pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
+    // Streaming + staging implementation: never reads the whole
+    // heap into RAM.  Walks the descriptor table (small), builds
+    // an (old_off, length, new_off) move-plan vector, sorts by
+    // old_off, fast-path stream-copies live cells in place when
+    // safe, slow-path stages past EOF otherwise.  Peak working
+    // memory: ~1 MiB chunk + descriptor table + move-plan vector
+    // (~40 bytes per live cell).  Mirrors the ZIMAGE + ZTABLE
+    // streaming repack pattern; shared primitive
+    // `stream_copy_in_file` lives in `src/common.rs`.
     check_not_tainted(&super_.tainted)?;
     let cards = super_.header_snapshot()?;
     let columns = parse_columns(&cards)?;
@@ -1131,11 +1141,13 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
             theap_raw, main_bytes)));
     }
 
-    // Read the main table + old heap into RAM under a single file lock.
+    // Read just the descriptor table (small: nrows * row_width
+    // bytes — typically a few KB to a few MB even for huge tables
+    // because row_width is the FIXED part, descriptors are 8 or
+    // 16 bytes each).
     let mut main_buf = vec![0u8; nrows * row_width];
-    let mut old_heap = vec![0u8; current_pcount as usize];
     let heap_base = heap_base_in_data(&cards);
-    let old_heap_off = data_offset + heap_base;
+    let heap_start = data_offset + heap_base;
     {
         let mut g = lock_file(&super_.file)?;
         let f = g.as_mut()
@@ -1145,17 +1157,19 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
         f.read_exact(&mut main_buf)
             .map_err(|e| PyIOError::new_err(format!(
                 "repack: read main table failed: {}", e)))?;
-        f.seek(SeekFrom::Start(old_heap_off))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        f.read_exact(&mut old_heap)
-            .map_err(|e| PyIOError::new_err(format!(
-                "repack: read heap failed: {}", e)))?;
     }
 
-    // Walk rows × VLA columns, copy live cells from old_heap into a
-    // new compact buffer, and rewrite each descriptor in main_buf to
-    // point at its new location.
-    let mut new_heap: Vec<u8> = Vec::new();
+    // Walk rows × VLA columns, build the move plan, and rewrite
+    // each descriptor in `main_buf` to point at its new compact
+    // position.  Empty descriptors (nelements == 0) are
+    // canonicalized to (0, 0) and don't contribute to plans.
+    struct MovePlan {
+        old_off: u64,
+        length: u64,
+        new_off: u64,
+    }
+    let mut plans: Vec<MovePlan> = Vec::new();
+    let mut new_cursor: u64 = 0;
     for r in 0..nrows {
         let row_off = r * row_width;
         for col in &columns {
@@ -1190,23 +1204,51 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
                      past heap end (offset+bytes={} > PCOUNT={})",
                     col.name, r, old_off + n_bytes, current_pcount)));
             }
-            let new_off = new_heap.len() as u64;
-            if n_bytes > 0 {
-                new_heap.extend_from_slice(
-                    &old_heap[old_off as usize
-                        ..(old_off + n_bytes) as usize]);
-            }
+            // Empty cells stay (0, 0) — already that way in the
+            // descriptor by construction, but rewrite explicitly
+            // for canonicalization.
+            let new_off = new_cursor;
             let dst = &mut main_buf[desc_off..desc_off + col.byte_width];
             write_descriptor(
                 descriptor_kind, nelements as usize, new_off as usize, dst);
+            if n_bytes > 0 {
+                plans.push(MovePlan { old_off, length: n_bytes, new_off });
+                new_cursor += n_bytes;
+            }
         }
     }
-    drop(old_heap);
-    let new_pcount = new_heap.len() as u64;
+    let new_pcount = new_cursor;
     if new_pcount == current_pcount {
         // Already compact; nothing to do.
         return Ok(());
     }
+
+    // Sort plans by old_off so the in-place fast path reads
+    // sequentially without backtracking.
+    plans.sort_by_key(|p| p.old_off);
+
+    // Fast-path safety: for every adjacent pair `[i, i+1]` in
+    // sorted-by-old_off order, plan i's write region must end at
+    // or before plan i+1's read region (otherwise the write
+    // clobbers an unread cell).  Holds for the post-`__setitem__`
+    // orphan pattern (orphans before live tail) — every test
+    // case in `test_table_vla_repack.py` lays out this way.
+    let mut fast_path_safe = true;
+    for i in 0..plans.len() {
+        let cur = &plans[i];
+        let next_read_start = if i + 1 < plans.len() {
+            plans[i + 1].old_off
+        } else {
+            current_pcount
+        };
+        if cur.new_off + cur.length > next_read_start {
+            fast_path_safe = false;
+            break;
+        }
+    }
+
+    const CHUNK: u64 = 1 << 20;
+    let mut buf = vec![0u8; CHUNK as usize];
 
     let current_data_bytes = main_bytes + current_pcount;
     let new_data_bytes = main_bytes + new_pcount;
@@ -1215,15 +1257,81 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
     let current_hdu_end = data_offset + current_padded;
     let new_hdu_end = data_offset + new_padded;
 
-    // Write the rebuilt main table + new heap (the new heap sits
-    // immediately after main; if the old heap was at default position
-    // we may be partially overwriting old-heap bytes, which is fine
-    // since they're in RAM as old_heap was already dropped above —
-    // sorry, the read snapshot in main_buf+new_heap is what we write
-    // out).  Pad the heap region within the current padded extent so
-    // any trailing bytes between new heap end and current end are
-    // zeroed (they won't be reachable from any descriptor regardless).
-    let heap_off_in_file = data_offset + main_bytes;
+    // Track the "effective current HDU end" used by the shrink
+    // step below.  In the fast path the file extent is unchanged
+    // (current_hdu_end).  In the slow path we grow to accommodate
+    // staging — the post-grow extent (block-rounded over the
+    // stage area) becomes the new "current end" that the shrink
+    // logic operates against.
+    let effective_current_hdu_end = if fast_path_safe {
+        current_hdu_end
+    } else {
+        data_offset
+            + round_up_to_block(main_bytes + current_pcount + new_pcount)
+    };
+
+    if fast_path_safe {
+        // In-place streaming.  Reading in old-offset order means
+        // every subsequent read is past any prior write, so no
+        // clobbering.
+        for plan in &plans {
+            if plan.new_off == plan.old_off {
+                continue;
+            }
+            stream_copy_in_file(
+                &super_.file,
+                heap_start + plan.old_off,
+                heap_start + plan.new_off,
+                plan.length,
+                &mut buf,
+                CHUNK,
+                &super_.tainted,
+                "repack: in-place move",
+            )?;
+        }
+    } else {
+        // Slow path — stage live cells past the current heap end
+        // (writes never clobber any read), then back-copy from
+        // staging to the final in-heap positions.  Use
+        // `grow_file_to_at_least` so a non-last HDU's trailing
+        // HDUs get shifted forward to make room for the staging
+        // area — bare `set_len` would silently overwrite the next
+        // HDU's bytes.
+        crate::common::grow_file_to_at_least(
+            &super_.file, &super_.layout, data_offset,
+            main_bytes + current_pcount + new_pcount,
+            &super_.tainted,
+        )?;
+        let staging_start = heap_start + current_pcount;
+        for plan in &plans {
+            stream_copy_in_file(
+                &super_.file,
+                heap_start + plan.old_off,
+                staging_start + plan.new_off,
+                plan.length,
+                &mut buf,
+                CHUNK,
+                &super_.tainted,
+                "repack: copy to staging",
+            )?;
+        }
+        for plan in &plans {
+            stream_copy_in_file(
+                &super_.file,
+                staging_start + plan.new_off,
+                heap_start + plan.new_off,
+                plan.length,
+                &mut buf,
+                CHUNK,
+                &super_.tainted,
+                "repack: back-copy from staging",
+            )?;
+        }
+    }
+
+    // Write the updated descriptor table back.  Live cells are
+    // already at their new positions in the heap; only the
+    // descriptors changed.
     {
         let mut g = lock_file(&super_.file)?;
         let f = g.as_mut()
@@ -1235,13 +1343,6 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
             return Err(PyIOError::new_err(format!(
                 "repack: write main failed: {}; close + reopen", e)));
         }
-        f.seek(SeekFrom::Start(heap_off_in_file))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        if let Err(e) = f.write_all(&new_heap) {
-            super_.tainted.store(true, Ordering::Release);
-            return Err(PyIOError::new_err(format!(
-                "repack: write heap failed: {}; close + reopen", e)));
-        }
         if let Err(e) = f.flush() {
             super_.tainted.store(true, Ordering::Release);
             return Err(PyIOError::new_err(format!(
@@ -1252,8 +1353,11 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
     // Shrink the file extent.  For non-last HDUs, shift the tail
     // backward to fill the gap and bump every later HDU's offset down;
     // for the last HDU, a plain set_len reclaims the trailing block(s).
-    if new_hdu_end < current_hdu_end {
-        let delta = current_hdu_end - new_hdu_end;
+    // `effective_current_hdu_end` accounts for the slow-path file
+    // grow (post-stage); in the fast path it equals
+    // `current_hdu_end` (no change).
+    if new_hdu_end < effective_current_hdu_end {
+        let delta = effective_current_hdu_end - new_hdu_end;
         let file_len = {
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
@@ -1261,10 +1365,10 @@ pub(crate) fn repack_table_heap(super_: &HDU) -> PyResult<()> {
             f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         };
-        if file_len > current_hdu_end {
+        if file_len > effective_current_hdu_end {
             shift_file_tail_backward_and_update_offsets(
                 &super_.file, &super_.layout,
-                current_hdu_end, delta, &super_.tainted)?;
+                effective_current_hdu_end, delta, &super_.tainted)?;
         } else {
             let mut g = lock_file(&super_.file)?;
             let f = g.as_mut()

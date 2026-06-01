@@ -2,6 +2,7 @@
 // ZIMAGE detection (header_has_zimage), the TileCache alias, and the
 // per-HDU meta-cache accessor.  Free helpers live in sibling modules.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
@@ -150,6 +151,15 @@ pub(crate) struct CompressedImageHDU {
     // the direct on-disk path when `None`.  See `extending.rs`
     // for the full design.
     pub(crate) pending: Arc<Mutex<Option<PendingBuffer>>>,
+    // Soft cap (bytes) on the pending-buffer size before a
+    // mid-context tile-aligned drain triggers.  Defaults to
+    // `extending::MAX_PENDING_BYTES` (32 MiB) and is held in
+    // an `AtomicU64` so the test-only `_set_pending_cap_for_testing`
+    // pymethod can lower it to a few KB without rebuilding the
+    // HDU.  See `extending.rs` for the cap-triggered drain
+    // logic; see `_set_pending_cap_for_testing` for the test
+    // plumbing rationale.
+    pub(crate) pending_cap: Arc<AtomicU64>,
 }
 
 impl CompressedImageHDU {
@@ -179,6 +189,9 @@ impl CompressedImageHDU {
                 compress_config: Arc::new(Mutex::new(compress_config)),
                 meta_cache: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(None)),
+                pending_cap: Arc::new(AtomicU64::new(
+                    super::extending::MAX_PENDING_BYTES,
+                )),
             })
     }
 
@@ -725,6 +738,18 @@ impl CompressedImageHDU {
         // `pending` Mutex the context will drain at __exit__.
         let hdu_py: Py<CompressedImageHDU> = slf.clone().unbind();
         Py::new(py, CompressedImageExtendContext { hdu: hdu_py })
+    }
+
+    /// Test-only hook: override the per-HDU mid-context drain
+    /// cap (``MAX_PENDING_BYTES``, 32 MiB by default).  Lets
+    /// tests trigger the cap-driven drain on small fixtures
+    /// (a few KB) instead of pushing >32 MB through ``extend()``
+    /// just to assert the drain fires.  Underscored to signal
+    /// "test plumbing, not a public API" — same convention as
+    /// :meth:`HDU._force_taint`.  Cheap enough to leave on at
+    /// runtime; no public-API doc.
+    fn _set_pending_cap_for_testing(slf: PyRef<'_, Self>, bytes: u64) {
+        slf.pending_cap.store(bytes, Ordering::Release);
     }
 
     // __setitem__ is a pyo3 slot dunder — no per-method docstring.

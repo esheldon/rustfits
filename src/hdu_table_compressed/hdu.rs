@@ -5,6 +5,7 @@
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cache::BytesBoundLruCache;
@@ -169,6 +170,12 @@ pub(crate) struct CompressedTableHDU {
     // / `extend()` route to the buffer when `Some` and to the
     // direct on-disk path when `None`.  See `extending.rs`.
     pub(crate) pending: Arc<Mutex<Option<PendingBuffer>>>,
+    // Per-HDU pending-buffer cap; defaults to
+    // `extending::MAX_PENDING_BYTES` (32 MiB).  Mirrors
+    // `CompressedImageHDU::pending_cap` — overridable via
+    // `_set_pending_cap_for_testing` so tests can trigger
+    // mid-context drains on a few KB instead of >32 MB.
+    pub(crate) pending_cap: Arc<AtomicU64>,
 }
 
 impl CompressedTableHDU {
@@ -195,6 +202,9 @@ impl CompressedTableHDU {
                 compress_configs: Arc::new(Mutex::new(compress_configs)),
                 meta_cache: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(None)),
+                pending_cap: Arc::new(AtomicU64::new(
+                    super::extending::MAX_PENDING_BYTES,
+                )),
             })
     }
 
@@ -907,6 +917,16 @@ impl CompressedTableHDU {
         py: Python<'_>,
     ) -> PyResult<Py<CompressedTableAppendContext>> {
         Self::appending(slf, py)
+    }
+
+    /// Test-only hook: override the per-HDU mid-context drain
+    /// cap (``MAX_PENDING_BYTES``, 32 MiB by default).  Same
+    /// rationale as :meth:`CompressedImageHDU._set_pending_cap_for_testing`
+    /// — lets tests trigger drains on a few KB instead of
+    /// pushing >32 MB through ``append()``.  Underscored to
+    /// signal "test plumbing, not a public API".
+    fn _set_pending_cap_for_testing(slf: PyRef<'_, Self>, bytes: u64) {
+        slf.pending_cap.store(bytes, Ordering::Release);
     }
 
     /// Rebuild the heap, reclaiming orphan blobs.

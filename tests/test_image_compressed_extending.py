@@ -363,18 +363,18 @@ def test_astropy_can_read_buffered_extends():
 
 def test_mid_context_drain_keeps_data_correct():
     """
-    Push enough data through ``extend()`` calls that the 32 MB cap
-    should trigger at least one mid-context drain.  The final
-    image must still round-trip bit-exact.
+    Trigger at least one mid-context drain via the cap and verify
+    the final image round-trips bit-exact.
 
-    Image: 50000 rows x 200 cols i4 = 40 MB raw, comfortably over
-    the 32 MB cap.  Chunks of 50 rows = 40 KB each, so ~800
-    chunks; drains fire when the buffer crosses ~32 MB.  Uses
-    arange data + i4 dtype for fast generation (the cap logic is
-    indifferent to dtype).
+    Uses the test-only ``_set_pending_cap_for_testing`` hook to
+    lower the cap from 32 MB to 4 KB so the test runs on a small
+    fixture (10 rows × 20 cols × 4 B / chunk = 800 B; 5 chunks
+    = 4 KB triggers the cap).  The cap logic is dtype/size
+    agnostic, so this is a faithful test of the drain trigger
+    without the 40 MB of data the default cap would need.
     """
-    rows, cols = 50_000, 200
-    chunk_rows = 50
+    rows, cols = 50, 20
+    chunk_rows = 10
     full = (np.arange(rows * cols, dtype="i4") % 1_000_000).reshape(rows, cols)
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
@@ -382,9 +382,10 @@ def test_mid_context_drain_keeps_data_correct():
             f.create_image_hdu(
                 "i4",
                 (0, cols),
-                compress=rustfits.Gzip1(tile_shape=(100, cols)),
+                compress=rustfits.Gzip1(tile_shape=(20, cols)),
             )
             hdu = f[1]
+            hdu._set_pending_cap_for_testing(4 * 1024)
             with hdu.extending():
                 for r0 in range(0, rows, chunk_rows):
                     hdu.extend(full[r0 : r0 + chunk_rows])
@@ -397,11 +398,12 @@ def test_mid_context_drain_aligned_chunks_streaming():
     """
     Tile-aligned chunks: each mid-context drain ends at exactly
     NAXIS0 == k * tile_rows, so the final residual drain has
-    nothing to do (no partial-tile re-encode).  This covers the
-    "tile-aligned input + cap-triggered drain" interaction.
+    nothing to do (no partial-tile re-encode).  Same test-cap
+    plumbing as the previous test — a few KB triggers the cap
+    instead of >32 MB.
     """
-    rows, cols = 50_000, 200
-    tile_rows = 100
+    rows, cols = 100, 20
+    tile_rows = 20
     full = (np.arange(rows * cols, dtype="i4") % 1_000_000).reshape(rows, cols)
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
@@ -412,6 +414,7 @@ def test_mid_context_drain_aligned_chunks_streaming():
                 compress=rustfits.Gzip1(tile_shape=(tile_rows, cols)),
             )
             hdu = f[1]
+            hdu._set_pending_cap_for_testing(4 * 1024)
             with hdu.extending():
                 for r0 in range(0, rows, tile_rows):
                     hdu.extend(full[r0 : r0 + tile_rows])

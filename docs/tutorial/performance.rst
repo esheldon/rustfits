@@ -963,34 +963,34 @@ path.
      - notes
    * - BINTABLE VLA (uncompressed)
      - 10 MB
-     - 6.8 ms
-     - 59 MB
-     - whole-heap-into-RAM impl
+     - 8.2 ms
+     - 50 MB
+     - streaming + staging impl
    * - BINTABLE VLA
      - 100 MB
-     - 51.2 ms
-     - 149 MB
-     - linear: baseline + heap
+     - 16.4 ms
+     - **50 MB**
+     - **flat** — no PCOUNT scaling
    * - BINTABLE VLA
      - 1,000 MB
-     - 451.3 ms
-     - 1,049 MB
-     - 1.05× PCOUNT
+     - 94.2 ms
+     - **50 MB**
+     - **flat** at 1 GB heap
    * - ZIMAGE compressed image
      - 11 MB
-     - 8.3 ms
-     - 64 MB
-     - whole-heap-into-RAM impl
+     - 2.0 ms
+     - 49 MB
+     - streaming + staging impl
    * - ZIMAGE compressed image
      - 119 MB
-     - 83.3 ms
-     - 219 MB
-     - 1.5× PCOUNT (live+orphan coexist)
+     - 19.6 ms
+     - **49 MB**
+     - **flat** — no PCOUNT scaling
    * - ZIMAGE compressed image
      - 1,215 MB
-     - 818.7 ms
-     - 1,787 MB
-     - 1.54× PCOUNT
+     - 189.6 ms
+     - **50 MB**
+     - **flat** at 1 GB heap
    * - ZTABLE compressed table
      - 7 MB
      - 1.8 ms
@@ -1007,38 +1007,49 @@ path.
      - **50 MB**
      - **flat** at 1 GB heap
 
-Three takeaways:
+Two takeaways:
 
-1. **ZTABLE repack is the standout.**  RSS is constant at
-   ~50 MB (Python + rustfits baseline) regardless of heap size,
-   from 10 MB to 1 GB.  The streaming + staging implementation
-   (a ~1 MiB chunk plus the descriptor table; documented in
-   CLAUDE.md under "Heap repack") pays off — even on a 1 GB
-   compressed heap the working set is small enough to run on
-   memory-constrained machines.  Time scales linearly at
-   ~6 GB/s effective heap throughput.
+1. **All three repack flavors are bounded-memory.**  RSS stays
+   constant at ~50 MB (Python + rustfits baseline) regardless
+   of heap size, from 10 MB to 1 GB, for all three: BINTABLE
+   VLA, ZIMAGE, and ZTABLE.  All three share the same
+   streaming + staging implementation (a ~1 MiB chunk plus
+   the descriptor table + a small move-plan vector;
+   documented in CLAUDE.md under "Heap repack").  The shared
+   primitives ``stream_copy_in_file`` and
+   ``grow_file_to_at_least`` live in ``src/common.rs``.
 
-2. **The uncompressed BINTABLE VLA path is whole-heap-into-RAM.**
-   Repack reads the entire old heap into a ``Vec<u8>``, walks
-   live descriptors copying small live cells to a new ``Vec``,
-   then writes back.  Peak RSS = baseline + old_heap, so RSS
-   scales 1:1 with PCOUNT.  For a 1 GB heap, plan on 1 GB of
-   working memory plus baseline.  In this bench live ≈ 40 KB
-   so new_heap is negligible; a workload with substantial
-   live data would push RSS up by that much more.
+2. **The rewrite cycle (2026-05-31) was driven by a real
+   in-place-modify-large-compressed-image workload** needing
+   ``repack()`` on a memory-constrained worker.  Before the
+   rewrite, BINTABLE VLA repack scaled at ~1.05× PCOUNT and
+   ZIMAGE at ~1.5× PCOUNT.  The numbers:
 
-3. **The ZIMAGE compressed-image path is also whole-heap-into-
-   RAM, with a 1.5× peak.**  Same shape as BINTABLE VLA, but
-   when ``__setitem__`` overwrites entire tiles (the natural
-   orphan pattern), the live half and orphan half coexist in
-   RAM during the copy loop — old_heap + new_heap together
-   peak around 1.5× PCOUNT.  For a 1 GB heap, plan on ~1.5 GB.
+   .. list-table:: Repack rewrite — 1 GB heap, before vs after
+      :widths: 28 26 26 20
+      :header-rows: 1
 
-The bounded-memory ZTABLE implementation predates the others;
-the uncompressed and ZIMAGE paths could be rewritten with the
-same streaming + staging approach but haven't been (no real
-user has hit the wall yet).  When they are, this bench will
-show the win directly.
+      * - flavor
+        - before
+        - after
+        - improvement
+      * - BINTABLE VLA
+        - 1.05 GB peak, 451 ms
+        - **50 MB peak, 94 ms**
+        - 21× less RAM, 4.8× faster
+      * - ZIMAGE
+        - 1.79 GB peak, 819 ms
+        - **50 MB peak, 190 ms**
+        - 36× less RAM, 4.3× faster
+      * - ZTABLE
+        - (already streaming)
+        - 50 MB peak, ~160 ms
+        - (unchanged)
+
+   The time win on the two new streaming paths comes from
+   eliminating the entire Vec-allocate + memcpy + drop cycle
+   on the heap bytes; the streaming approach reads + writes
+   1 MiB chunks straight through the file handle.
 
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
