@@ -14,9 +14,10 @@ use crate::hdu_table::{
     read_descriptor, write_descriptor, Column,
 };
 
+use crate::common::grow_file_to_at_least;
+
 use super::hdu::{ColumnTileCache, synthesize_uncompressed_cards};
 use super::read::{gzip_decompress_bytes};
-use super::write::grow_file_to_at_least;
 
 // ---------------------------------------------------------------------------
 // Phase 6c-1 — repack() on compressed tables (streaming)

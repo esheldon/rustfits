@@ -194,6 +194,20 @@ pub(crate) fn repack_compressed_heap(
     let current_hdu_end = data_offset + current_padded;
     let new_hdu_end = data_offset + new_padded;
 
+    // Track the "effective current HDU end" used by the shrink
+    // step below.  In the fast path the file extent is unchanged
+    // (current_hdu_end).  In the slow path we grow to accommodate
+    // staging — the post-grow extent (block-rounded over the
+    // stage area) becomes the new "current end" that the shrink
+    // logic operates against.
+    let effective_current_hdu_end = if fast_path_safe {
+        current_hdu_end
+    } else {
+        data_offset
+            + crate::hdu_image::round_up_to_block(
+                main_bytes + current_pcount + new_pcount)
+    };
+
     if fast_path_safe {
         // In-place streaming.  Reading in old-offset order means
         // every subsequent read is past any prior write, so no
@@ -218,27 +232,19 @@ pub(crate) fn repack_compressed_heap(
         // (writes never clobber any read), then back-copy staging →
         // final in-heap positions (back-copy is dst < src in fresh
         // space, also safe).
+        //
+        // Use `grow_file_to_at_least` so a non-last HDU's trailing
+        // HDUs get shifted forward to make room for the staging
+        // area — bare `set_len` would silently overwrite the next
+        // HDU's bytes.  Not exercised by current `__setitem__`
+        // patterns (which always satisfy the fast-path safety
+        // check) but kept for forward compat.
+        crate::common::grow_file_to_at_least(
+            &super_.file, &super_.layout, data_offset,
+            main_bytes + current_pcount + new_pcount,
+            &super_.tainted,
+        )?;
         let staging_start = heap_start + current_pcount;
-        // Grow the file so the staging area sits past the live
-        // heap.  We don't update HduOffsets here because we're
-        // about to shrink back at the end; intermediate growth is
-        // purely scratch.
-        {
-            let mut g = lock_file(&super_.file)?;
-            let f = g.as_mut()
-                .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-            let target = staging_start + new_pcount;
-            let cur_len = f.len()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            if cur_len < target {
-                f.set_len(target).map_err(|e| {
-                    super_.tainted.store(true, Ordering::Release);
-                    PyIOError::new_err(format!(
-                        "repack: set_len for staging: {}; close + reopen",
-                        e))
-                })?;
-            }
-        }
         // Copy each live blob to its staging position.
         for plan in &plans {
             stream_copy_in_file(
@@ -288,8 +294,11 @@ pub(crate) fn repack_compressed_heap(
         }
     }
 
-    if new_hdu_end < current_hdu_end {
-        let delta = current_hdu_end - new_hdu_end;
+    // `effective_current_hdu_end` accounts for the slow-path
+    // file grow (post-stage); in the fast path it equals
+    // `current_hdu_end` (no change).
+    if new_hdu_end < effective_current_hdu_end {
+        let delta = effective_current_hdu_end - new_hdu_end;
         let file_len = {
             let g = lock_file(&super_.file)?;
             let f = g.as_ref()
@@ -297,10 +306,10 @@ pub(crate) fn repack_compressed_heap(
             f.len()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         };
-        if file_len > current_hdu_end {
+        if file_len > effective_current_hdu_end {
             shift_file_tail_backward_and_update_offsets(
                 &super_.file, &super_.layout,
-                current_hdu_end, delta, &super_.tainted)?;
+                effective_current_hdu_end, delta, &super_.tainted)?;
         } else {
             let mut g = lock_file(&super_.file)?;
             let f = g.as_mut()

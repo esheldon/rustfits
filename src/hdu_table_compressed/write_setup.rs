@@ -20,7 +20,7 @@ use crate::hdu_table::{
 };
 use crate::zimage::CompressionAlgorithm;
 
-use super::write::{grow_file_to_at_least};
+use crate::common::grow_file_to_at_least;
 
 fn default_table_algorithm(letter: char) -> CompressionAlgorithm {
     match letter {

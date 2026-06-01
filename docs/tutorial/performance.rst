@@ -963,19 +963,19 @@ path.
      - notes
    * - BINTABLE VLA (uncompressed)
      - 10 MB
-     - 6.8 ms
-     - 59 MB
-     - whole-heap-into-RAM impl
+     - 8.2 ms
+     - 50 MB
+     - streaming + staging impl
    * - BINTABLE VLA
      - 100 MB
-     - 51.2 ms
-     - 149 MB
-     - linear: baseline + heap
+     - 16.4 ms
+     - **50 MB**
+     - **flat** — no PCOUNT scaling
    * - BINTABLE VLA
      - 1,000 MB
-     - 451.3 ms
-     - 1,049 MB
-     - 1.05× PCOUNT
+     - 94.2 ms
+     - **50 MB**
+     - **flat** at 1 GB heap
    * - ZIMAGE compressed image
      - 11 MB
      - 2.0 ms
@@ -1007,45 +1007,49 @@ path.
      - **50 MB**
      - **flat** at 1 GB heap
 
-Three takeaways:
+Two takeaways:
 
-1. **ZTABLE and ZIMAGE compressed-heap repack are both
-   bounded-memory.**  RSS stays constant at ~50 MB (Python +
-   rustfits baseline) regardless of heap size, from 10 MB to
-   1 GB, for both flavors.  Both use the same streaming +
-   staging implementation (a ~1 MiB chunk plus the descriptor
-   table + a small move-plan vector; documented in CLAUDE.md
-   under "Heap repack"), sharing the ``stream_copy_in_file``
-   primitive lifted into ``src/common.rs``.  Even on a 1 GB
-   compressed heap the working set is small enough to run on
-   memory-constrained machines, and time scales linearly at
-   several GB/s effective throughput.
+1. **All three repack flavors are bounded-memory.**  RSS stays
+   constant at ~50 MB (Python + rustfits baseline) regardless
+   of heap size, from 10 MB to 1 GB, for all three: BINTABLE
+   VLA, ZIMAGE, and ZTABLE.  All three share the same
+   streaming + staging implementation (a ~1 MiB chunk plus
+   the descriptor table + a small move-plan vector;
+   documented in CLAUDE.md under "Heap repack").  The shared
+   primitives ``stream_copy_in_file`` and
+   ``grow_file_to_at_least`` live in ``src/common.rs``.
 
-2. **The uncompressed BINTABLE VLA path is still
-   whole-heap-into-RAM.**  Repack reads the entire old heap
-   into a ``Vec<u8>``, walks live descriptors copying small
-   live cells to a new ``Vec``, then writes back.  Peak RSS =
-   baseline + old_heap, so RSS scales 1:1 with PCOUNT.  For a
-   1 GB heap, plan on 1 GB of working memory plus baseline.
-   In this bench live ≈ 40 KB so new_heap is negligible; a
-   workload with substantial live data would push RSS up by
-   that much more.
+2. **The rewrite cycle (2026-05-31) was driven by a real
+   in-place-modify-large-compressed-image workload** needing
+   ``repack()`` on a memory-constrained worker.  Before the
+   rewrite, BINTABLE VLA repack scaled at ~1.05× PCOUNT and
+   ZIMAGE at ~1.5× PCOUNT.  The numbers:
 
-3. **The ZIMAGE rewrite (2026-05-31) was driven by a real
-   in-place-modify-large-compressed-image workload.**  Before
-   the rewrite, ZIMAGE repack scaled at 1.5× PCOUNT (live and
-   orphan halves coexisting in RAM during the copy loop); a
-   1 GB heap needed ~1.79 GB working memory and 819 ms.
-   After: ~50 MB and 190 ms — **36× less RAM and 4.3×
-   faster**.  The time win comes from eliminating the entire
-   Vec-allocate + memcpy + drop cycle on the heap bytes; the
-   streaming approach reads + writes 1 MiB chunks straight
-   through the file handle.
+   .. list-table:: Repack rewrite — 1 GB heap, before vs after
+      :widths: 28 26 26 20
+      :header-rows: 1
 
-The BINTABLE VLA path could be ported to the same streaming
-pattern (the primitive is already shared); deferred until a
-concrete user workload needs it.  When it lands, this bench
-will show the win directly.
+      * - flavor
+        - before
+        - after
+        - improvement
+      * - BINTABLE VLA
+        - 1.05 GB peak, 451 ms
+        - **50 MB peak, 94 ms**
+        - 21× less RAM, 4.8× faster
+      * - ZIMAGE
+        - 1.79 GB peak, 819 ms
+        - **50 MB peak, 190 ms**
+        - 36× less RAM, 4.3× faster
+      * - ZTABLE
+        - (already streaming)
+        - 50 MB peak, ~160 ms
+        - (unchanged)
+
+   The time win on the two new streaming paths comes from
+   eliminating the entire Vec-allocate + memcpy + drop cycle
+   on the heap bytes; the streaming approach reads + writes
+   1 MiB chunks straight through the file handle.
 
 Other self-comparisons + RSS benches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

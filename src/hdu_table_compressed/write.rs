@@ -7,7 +7,7 @@ use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
 use crate::common::{
-    lock_file,
+    grow_file_to_at_least, lock_file,
     FileHandle, FileLayout, TaintFlag,
 };
 use crate::zimage::compression_config::CompressionConfigKind;
@@ -284,69 +284,9 @@ pub(crate) fn set_zpcount_in_cards(new_cards: &mut Vec<String>, new_value: u64) 
     }
 }
 
-// Grow this HDU's data extent so it covers at least `min_bytes`
-// (relative to data_offset).  Block-rounds; pushes later HDUs
-// forward via the shared shift primitive when needed.  No-op when
-// this HDU's data section already extends past `want_end`.
-//
-// For non-last HDUs the upper bound is the NEXT HDU's start, not
-// the file length — file length includes trailing HDU bytes that
-// belong to those HDUs and must not be overwritten.  Bare file-
-// length as the cap (the original buggy form) silently passes
-// writes that overlap a trailing HDU's region whenever the
-// growth fits in the block-alignment padding, and corrupts the
-// trailing HDU once growth exceeds the padding.
-pub(crate) fn grow_file_to_at_least(
-    file: &FileHandle,
-    layout: &Arc<FileLayout>,
-    data_offset: u64,
-    min_bytes: u64,
-    tainted: &TaintFlag,
-) -> PyResult<()> {
-    use crate::common::shift_file_tail_and_update_offsets;
-    use crate::hdu_image::round_up_to_block;
-    use std::sync::atomic::Ordering;
-
-    let want_end = data_offset + round_up_to_block(min_bytes);
-    let next_hdu_start = {
-        let guard = layout.hdus.lock()
-            .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
-        guard.iter()
-            .map(|o| o.header_offset())
-            .filter(|&off| off > data_offset)
-            .min()
-    };
-    let file_len = {
-        let g = lock_file(file)?;
-        let f = g.as_ref()
-            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.len()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?
-    };
-    // Effective end is bounded by the next HDU's start (non-last)
-    // or by the file length (last HDU).
-    let effective_end = next_hdu_start.unwrap_or(file_len);
-    if want_end <= effective_end {
-        return Ok(());
-    }
-    let delta = want_end - effective_end;
-    if next_hdu_start.is_none() {
-        let mut g = lock_file(file)?;
-        let f = g.as_mut()
-            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.set_len(want_end).map_err(|e| {
-            tainted.store(true, Ordering::Release);
-            PyIOError::new_err(format!(
-                "compressed table write: set_len({}) failed: {}",
-                want_end, e))
-        })?;
-    } else {
-        shift_file_tail_and_update_offsets(
-            file, layout, effective_end, delta, tainted,
-        )?;
-    }
-    Ok(())
-}
+// `grow_file_to_at_least` lifted to `src/common.rs` so the ZIMAGE-side
+// and BINTABLE-VLA-side streaming repacks can share the same primitive.
+// All callers in this module now import from `crate::common`.
 
 // Encode one VLA column for one tile.  Per row in the tile: compress
 // the cell's BE bytes per ZCTYPn (with cfitsio's uncompressed

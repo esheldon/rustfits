@@ -424,6 +424,77 @@ pub(crate) fn zero_fill_range(
     Ok(())
 }
 
+// Grow an HDU's data section so it covers at least `min_bytes`
+// starting at `data_offset`, shifting any later HDUs forward to
+// make room.  Used by the streaming-repack slow path to allocate
+// a staging area past the current heap end without clobbering a
+// trailing HDU.
+//
+// The end-of-data target is `data_offset + round_up_to_block(min_bytes)`
+// so the new data section stays block-aligned.  Three cases:
+//
+//   1. `want_end <= effective_end`: already enough room (either
+//      in the file's padding/extension for a last HDU, or under
+//      the next HDU's start).  No-op.
+//   2. No next HDU (this is the last HDU on disk): plain
+//      `set_len(want_end)` extends the file.
+//   3. There is a next HDU and `want_end > next_hdu_start`:
+//      `shift_file_tail_and_update_offsets` moves the trailing
+//      HDUs forward by `want_end - next_hdu_start`, atomically
+//      updating their `HduOffsets` so previously-issued handles
+//      transparently see the post-shift layout.
+//
+// `effective_end` is bounded by `next_hdu_start.unwrap_or(file_len)`
+// — earlier attempts used just `file_len` and silently passed
+// writes that overlapped a trailing HDU whenever the growth fit
+// in the block-alignment padding.
+pub(crate) fn grow_file_to_at_least(
+    file: &FileHandle,
+    layout: &Arc<FileLayout>,
+    data_offset: u64,
+    min_bytes: u64,
+    tainted: &TaintFlag,
+) -> PyResult<()> {
+    let want_end = data_offset
+        + crate::hdu_image::round_up_to_block(min_bytes);
+    let next_hdu_start = {
+        let guard = layout.hdus.lock()
+            .map_err(|_| PyIOError::new_err("layout lock poisoned"))?;
+        guard.iter()
+            .map(|o| o.header_offset())
+            .filter(|&off| off > data_offset)
+            .min()
+    };
+    let file_len = {
+        let g = lock_file(file)?;
+        let f = g.as_ref()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.len()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+    };
+    let effective_end = next_hdu_start.unwrap_or(file_len);
+    if want_end <= effective_end {
+        return Ok(());
+    }
+    let delta = want_end - effective_end;
+    if next_hdu_start.is_none() {
+        let mut g = lock_file(file)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.set_len(want_end).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "grow_file_to_at_least: set_len({}) failed: {}",
+                want_end, e))
+        })?;
+    } else {
+        shift_file_tail_and_update_offsets(
+            file, layout, effective_end, delta, tainted,
+        )?;
+    }
+    Ok(())
+}
+
 // Chunked read-then-write copy of `length` bytes from `src_off` to
 // `dst_off` within the same file.  The shared streaming primitive
 // used by the compressed-HDU repack paths to relocate live heap

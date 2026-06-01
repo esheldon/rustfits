@@ -616,30 +616,45 @@ repack→setitem→repack).  `tests/test_image_compressed_repack.py`
 shift, algorithm matrix Gzip1/Gzip2/Rice1/Hcompress1, quantized
 float, unquantized float, cache invalidation).
 
-**Peak RSS scaling.**  Per-flavor as of 2026-05-31:
+**Peak RSS scaling: constant ~50 MB across all three
+flavors** (as of 2026-05-31).  All three repack paths share
+the same streaming + staging implementation:
 
-- **BINTABLE-VLA**: still whole-heap-into-RAM.  Step 1 (read
-  whole old heap into a `Vec<u8>`) dominates: ~1.05× PCOUNT
-  (a 1 GB heap → ~1 GB peak RSS).  Per `perf/perf-table-repack.py`.
-  Tracked as TODO #11 to port to the streaming pattern; defer
-  until a concrete user workload needs it.
-- **ZIMAGE compressed image**: streaming + staging (done
-  2026-05-31).  Walks the descriptor table, builds an
-  `(old_off, length, new_off)` move-plan vector, sorts by
-  old_off, fast-path in-place stream-copies blob bytes in
-  1 MiB chunks when writes can't clobber unread regions, slow-
-  path stages past EOF otherwise.  Constant ~50 MB peak RSS
-  regardless of heap size (a 1 GB heap → 50 MB, was 1.79 GB
-  pre-rewrite).  Per `perf/perf-compressed-image-repack.py`.
-- **ZTABLE compressed table**: streaming + staging.  Same
-  shape (`repack_compressed_table_heap` in
-  `src/hdu_table_compressed/repack.rs`), constant ~50 MB peak
-  RSS at any heap size.  This was the original streaming
-  implementation; the ZIMAGE side was retrofitted from it.
+- Walk the descriptor table (small).
+- Build a `MovePlan { old_off, length, new_off }` vector.
+- Sort by `old_off`.
+- Fast path: stream-copy live bytes in 1 MiB chunks in place
+  when writes can't clobber unread regions.
+- Slow path: stage past the heap end (shifting trailing HDUs
+  forward if non-last via `grow_file_to_at_least`), copy
+  live cells to staging, back-copy to final positions.
+- Write the updated descriptor table.
+- Shrink the file extent.
 
-The shared streaming primitive `stream_copy_in_file` lives in
-`src/common.rs`.  Both compressed-heap repack paths import
-from there.
+Implementations:
+- `repack_table_heap` in `src/hdu_table/write_vla.rs` —
+  BINTABLE VLA columns.
+- `repack_compressed_heap` in
+  `src/hdu_image_compressed/repack.rs` — ZIMAGE.
+- `repack_compressed_table_heap` in
+  `src/hdu_table_compressed/repack.rs` — ZTABLE.
+
+Shared primitives in `src/common.rs`:
+- `stream_copy_in_file` — chunked in-file read-then-write copy.
+- `grow_file_to_at_least` — allocates staging room, shifting
+  later HDUs forward via `shift_file_tail_and_update_offsets`
+  when needed (bare `set_len` would silently overwrite a
+  trailing HDU's bytes).
+
+Pre-rewrite (before 2026-05-31) BINTABLE-VLA and ZIMAGE both
+read the whole heap into a `Vec<u8>` (~1.05× and ~1.5× PCOUNT
+peak RSS respectively).  The rewrite was driven by an
+in-place modify-large-compressed-image workflow that needed
+repack on a memory-constrained worker.  Per
+`perf/perf-table-repack.py` and
+`perf/perf-compressed-image-repack.py`: 1 GB heap before vs
+after was ~1 GB / 451 ms → 50 MB / 94 ms (BINTABLE VLA) and
+~1.79 GB / 819 ms → 50 MB / 190 ms (ZIMAGE).
 
 ## Feature status: supported and missing
 
@@ -2416,7 +2431,7 @@ wrapper around cfitsio).  Headline wins:
 | 2-D image extend, GZIP_2 multi-tile chunks | 1.5× write-once, 1.8× less RAM |
 | 2-D compressed image `extending()` context (sub-tile chunks) | **18× faster** than unbuffered extend (22.3× → 1.26× write-once); 1.7× less RAM than write-once |
 | ZTABLE `appending()` context (sub-tile chunks, realistic streaming) | **45× faster** than unbuffered append at C=1% of ZTILELEN (48.9× → 1.07× write-once); flattens the chunk-size curve to ≤1.07× at every chunk size |
-| ZTABLE + ZIMAGE repack (1 GB heap, post streaming rewrite) | **bounded ~50 MB RSS** at any heap size; ZIMAGE was 1.5× PCOUNT (1.79 GB) before the 2026-05-31 streaming rewrite → 50 MB after, 819 ms → 190 ms (36× less RAM, 4.3× faster) |
+| All three repack flavors (1 GB heap, post streaming rewrite) | **bounded ~50 MB RSS** at any heap size for ZTABLE / ZIMAGE / BINTABLE-VLA.  Pre-rewrite: 1 GB BINTABLE-VLA heap → 1.05 GB / 451 ms → **50 MB / 94 ms** (21× less RAM, 4.8× faster); 1 GB ZIMAGE heap → 1.79 GB / 819 ms → **50 MB / 190 ms** (36× less RAM, 4.3× faster) |
 | ZTABLE streaming append (`create(nrows=0)` + `append`, post ZTILELEN-bug fix) | **61× faster** at chunk = ZTILELEN; now matches write_once within 2% |
 
 ZTABLE (compressed BINTABLE) is a rustfits self-comparison —
@@ -2780,13 +2795,11 @@ worth checking comes up; cross items off as they ship.
    reset on exec) and routing all six RSS-measuring perf scripts
    through it.
 
-   **Practical guidance** (as of 2026-05-31): on memory-
-   constrained machines, ZTABLE and ZIMAGE compressed-heap
-   repack are both safe at any heap size (~50 MB peak RSS via
-   the shared streaming implementation).  BINTABLE-VLA repack
-   still requires RAM ≈ 1.05× PCOUNT; the streaming rewrite
-   for that path is tracked under TODO #11 (deferred until a
-   concrete user workload needs it).
+   **Practical guidance** (as of 2026-05-31): all three repack
+   flavors (ZTABLE, ZIMAGE, BINTABLE-VLA) are now safe at any
+   heap size — bounded ~50 MB peak RSS via the shared
+   streaming + staging implementation.  See TODO #11 below for
+   the rewrite details.
 
    Documented in `docs/tutorial/performance.rst` under
    "``repack()`` — peak RSS scaling at large heap".
@@ -2982,46 +2995,73 @@ worth checking comes up; cross items off as they ship.
     `perf/perf-table-compressed-append-chunks.py` covers the
     full chunk/ZTILELEN sweep.
 
-11. 🟡 **Rewrite BINTABLE-VLA + ZIMAGE repack as streaming —
-    ZIMAGE done, BINTABLE-VLA still open.**
+11. ✅ **Rewrite BINTABLE-VLA + ZIMAGE repack as streaming.**
+    Done 2026-05-31 (both flavors).  All three repack flavors
+    (ZTABLE, ZIMAGE, BINTABLE-VLA) now share the same streaming
+    + staging implementation pattern with bounded ~50 MB peak
+    RSS at any heap size.  Shared primitives in `src/common.rs`:
+    `stream_copy_in_file` (chunked in-file copy) and
+    `grow_file_to_at_least` (allocates staging room, shifting
+    later HDUs forward when needed).
 
-    The shared primitive `stream_copy_in_file` was lifted from
-    `hdu_table_compressed/repack.rs` to `src/common.rs` and the
-    ZIMAGE repack rewritten to use it.  Real-user motivation: an
-    in-place modify-large-compressed-image workflow that needs
-    `repack()` afterward (without OOM on memory-constrained
-    workers).
+    | Flavor | Heap | Before | After |
+    |---|---|---|---|
+    | BINTABLE-VLA | 1 GB | 1.05 GB, 451 ms | **50 MB, 94 ms** (21× less RAM, 4.8× faster) |
+    | ZIMAGE | 1.2 GB | 1.79 GB, 819 ms | **50 MB, 190 ms** (36× less RAM, 4.3× faster) |
+    | ZTABLE | 1 GB | (already streaming) | 50 MB |
 
-    **ZIMAGE side (done 2026-05-31):**
+    Real-user motivation for the ZIMAGE port: an in-place
+    modify-large-compressed-image workflow that needs `repack()`
+    afterward without OOM on memory-constrained workers.  The
+    BINTABLE-VLA port followed because the pattern was identical
+    and the shared primitives were in place.
 
-    | Heap | Before | After |
-    |---|---|---|
-    | 119 MB | ~180 MB peak | **49 MB peak** |
-    | 1.2 GB | **1.79 GB peak, 819 ms** | **50 MB peak, 190 ms** |
+    Implementation pattern (identical across all three):
+    - Read just the descriptor table (small).
+    - Walk descriptors building a `MovePlan { old_off, length,
+      new_off }` vector; rewrite each descriptor in main_buf
+      in place.
+    - Sort plans by `old_off`.
+    - Fast path: if writes don't clobber unread regions
+      (`new_off[i] + length[i] <= old_off[i+1]`), stream-copy
+      live bytes in 1 MiB chunks straight from old → new
+      positions in the heap.
+    - Slow path: when fast-path safety fails (e.g. early-row
+      cells with tiny `old_off` shift to higher `new_off`),
+      `grow_file_to_at_least` allocates staging past the heap
+      end (shifting trailing HDUs forward if non-last), copy
+      live cells to staging, back-copy to final positions.
+    - Write the updated descriptor table back.
+    - Shrink the file extent (set_len for last HDU; backward
+      tail-shift for non-last) — using `effective_current_hdu_end`
+      which accounts for the slow-path post-grow extent.
 
-    36× less RAM AND 4.3× faster on the 1 GB heap.  The
-    streaming approach also eliminates the entire Vec
-    allocate + memcpy + drop cycle for the heap bytes, which
-    is where the time win comes from.  Same correctness
-    contract (11 tests in `tests/test_image_compressed_repack.py`
-    all pass): orphan drop, file shrink, no-op compact, non-last
-    HDU shift, algorithm matrix, quant/unquant float, cache
-    invalidation.  Implementation in
-    `src/hdu_image_compressed/repack.rs`; mirrors the ZTABLE
-    pattern (move-plan vector, sort by old_off, fast-path
-    in-place stream-copy when safe, slow-path stage-past-EOF
-    otherwise).
+    **Slow-path coverage caveat.**  The fast path covers the
+    natural setitem orphan layout for ZTABLE and ZIMAGE
+    (orphans at start, live cells at end → all live moves are
+    backward, safe).  BINTABLE-VLA has the slow path exercised
+    by the realistic test `test_repack_non_last_hdu_shifts_tail_backward`
+    where some rows have small `old_off` (the initial write)
+    and another row has a much larger `old_off` (10 setitems
+    later) — sort + fast-path safety check fails for the
+    early-row plans, and the slow path runs end-to-end.
 
-    **BINTABLE-VLA side (still open):**
-    `repack_table_heap` in `src/hdu_table/write_vla.rs` still
-    reads the whole main + heap into RAM.  Peak RSS ~1.05×
-    PCOUNT.  The pattern to port is identical to the ZIMAGE
-    rewrite — walk per-row × per-VLA-column descriptors,
-    build move plan, sort by old_off, fast/slow stream-copy.
-    The shared `stream_copy_in_file` primitive is already in
-    place.  Defer until a concrete user workload needs it; the
-    ZIMAGE win was motivated by a real use case, this one
-    isn't yet.
+    The slow-path fix included a subtle bug fix: the original
+    plan called `set_len(target)` directly for staging, which
+    would silently overwrite a trailing HDU's bytes on a
+    non-last HDU.  `grow_file_to_at_least` is the correct
+    primitive — it shifts trailing HDUs forward via
+    `shift_file_tail_and_update_offsets` (atomically updating
+    their `HduOffsets`).  Both ZIMAGE and BINTABLE-VLA slow
+    paths use it now.  After the back-copy the shrink step
+    uses `effective_current_hdu_end` (post-grow extent), not
+    the original `current_hdu_end`, so the trailing HDU gets
+    shifted backward from its post-stage position to its final
+    one in a single shift.
+
+    Tests: all 28 (9 BINTABLE-VLA + 11 ZIMAGE + 8 ZTABLE)
+    pass — same correctness contract preserved across all
+    three flavors.
 
 12. ✅ **Compressed-image extend: sub-tile chunk re-encode tax.**
     Done 2026-05-31 via the `hdu.extending()` context manager.
