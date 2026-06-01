@@ -1379,10 +1379,6 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
 
 - **Random groups (`GROUPS=T`, `PTYPEn`)** — legacy format,
   vanishingly rare in new files.
-- **Memory-mapped reads** — chunked sequential I/O already keeps peak
-  RSS at ~1 MiB above the output array, so motivation is weak.
-- **Streaming / row-iterator API** — for tables that don't fit in
-  RAM.  No user has asked yet; add when one does.
 - **Remote file reads (`http`/`https`/`ftp`/`ftps`)** — open a FITS
   file from a URL.  **Shipped** (download-then-open, read-only; see the
   "Remote file reads" roadmap below).  Range-based partial reads, and

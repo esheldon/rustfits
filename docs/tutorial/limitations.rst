@@ -59,12 +59,6 @@ General
 * **Random groups** (``GROUPS=T``, ``PTYPEn``) *(by design)* —
   legacy format from the radio-astronomy era; vanishingly rare
   in new files.  Not on the roadmap.
-* **Memory-mapped reads** *(by design)* — chunked sequential I/O
-  already keeps peak RSS at ~1 MiB above the output array, so
-  the motivation for mmap is weak.  If you hit a case where mmap
-  would help, file an issue with the access pattern.
-* **Streaming / row-iterator API** *(not yet)* — for tables that
-  don't fit in RAM.  Add when a real workload prompts it.
 * **Multithreaded throughput (GIL release)** *(not yet)* — rustfits
   releases the GIL only during remote (``http`` / ``ftp``) downloads.
   The heavy CPU paths — tile decode/encode, large chunked I/O,
