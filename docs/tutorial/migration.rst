@@ -29,6 +29,35 @@ The high-level shape is deliberately close to fitsio:
 
 The big idea — "open, index, read" — translates one-for-one.
 
+A thin fitsio-style shim
+------------------------
+
+If you want to keep the literal ``FITS(path, 'rw', clobber=True)``
+constructor unchanged, rustfits ships a thin shim:
+
+.. code-block:: python
+
+   from rustfits import fitsio
+
+   with fitsio.FITS(path, "rw", clobber=True) as fits:
+       fits.write_image(data, extname="sci", compress="RICE_1")
+
+The shim translates fitsio's ``mode='r' | 'rw'`` (plus the
+``'READONLY'`` / ``'READWRITE'`` / ``0`` / ``1`` synonyms) and the
+``clobber=`` kwarg to rustfits's native modes; everything else is
+the real :class:`rustfits.FITS` object, so indexing, iteration,
+``hdu.read()`` / ``hdu.write()``, the ``hdu.header`` accessor and
+so on behave as rustfits-native, *not* as fitsio.
+
+What it does NOT translate: ``vstorage=`` / ``case_sensitive=`` /
+``upper=`` / ``lower=`` / ``where=`` kwargs (use the recipes
+below), and ``hdu.header`` returns a :class:`rustfits.FITSHeader`
+rather than fitsio's ``FITSHDR`` (``hdr[key]`` and ``key in hdr``
+work; ``hdr.records()`` does not — see :doc:`headers`).  The
+shim is deliberately narrow — it gets you past the constructor
+and onto the rustfits surface; the rest of this page covers the
+rest.
+
 What's different
 ----------------
 
