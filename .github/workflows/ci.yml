@@ -124,9 +124,42 @@ jobs:
         shell: bash -el {0}
         run: maturin develop
 
-      - name: pytest
+      - name: pytest (Linux — full suite)
+        if: matrix.os == 'ubuntu-latest'
         shell: bash -el {0}
         run: pytest
+
+      # Phase 1 diagnostic: amplify the macOS-only heap-corruption
+      # flake in the compressed-image extend area (~50% hit rate
+      # across recent runs, both py3.12 and py3.14).  Loop the two
+      # suspect test files 10x under macOS's strict malloc env
+      # vars:
+      #   MallocScribble=1   — fill freed memory with 0x55; any
+      #                        use-after-free reads garbage rather
+      #                        than the still-correct-looking stale
+      #                        contents, surfacing immediately.
+      #   MallocGuardEdges=1 — guard pages around large allocations;
+      #                        an overrun traps at the write site,
+      #                        not at the next unrelated malloc that
+      #                        notices the corrupted heap (which is
+      #                        what we have today — the crash stack
+      #                        ends in card_string's format!() which
+      #                        is downstream of the actual scribble).
+      # `-x` stops at first failure for a clean trace; the full
+      # macOS suite gets restored once we've found + fixed the bug.
+      - name: pytest (macOS — amplifying diagnostic loop)
+        if: matrix.os == 'macos-latest'
+        shell: bash -el {0}
+        env:
+          MallocScribble: "1"
+          MallocGuardEdges: "1"
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            echo "=========== iteration $i ==========="
+            pytest -xv \
+              tests/test_image_compressed_extend.py \
+              tests/test_image_compressed_extending.py
+          done
 
   # ----- Coverage (single config) ----------------------------------
   # Python coverage via pytest-cov + Rust coverage via cargo-llvm-cov.
