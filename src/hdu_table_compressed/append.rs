@@ -22,7 +22,7 @@ use crate::zimage::CompressionAlgorithm;
 
 use super::hdu::ColumnTileCache;
 use super::read::{decompress_column_slab, gzip_decompress_bytes};
-use super::repack::{stream_copy_in_file};
+use crate::common::stream_copy_in_file;
 use super::write::{
     encode_vla_column_tile, grow_file_to_at_least, set_zpcount_in_cards,
 };

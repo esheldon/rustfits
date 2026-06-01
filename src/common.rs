@@ -424,6 +424,77 @@ pub(crate) fn zero_fill_range(
     Ok(())
 }
 
+// Chunked read-then-write copy of `length` bytes from `src_off` to
+// `dst_off` within the same file.  The shared streaming primitive
+// used by the compressed-HDU repack paths to relocate live heap
+// blobs without ever holding the whole heap in RAM.
+//
+// Caller is responsible for ensuring the move is safe — writes must
+// not clobber unread regions.  Two patterns satisfy this:
+//
+//   1. In-place forward streaming when dst <= src for every byte
+//      in the copy AND the moves are processed in increasing
+//      src_off order.  Each write lands in a region whose source
+//      content has already been read; subsequent reads sit at
+//      offsets > the previous write's dst+length.  This is the
+//      "fast path" repack uses on the post-setitem orphan layout
+//      ([orphans][live_tail] → [live_compact]).
+//
+//   2. Staging past EOF: copy all live blobs to a fresh region
+//      appended past the current data extent, then copy them
+//      back to their final in-heap positions.  Safe for any
+//      orphan layout because writes go to fresh space and the
+//      back-copy is also dst < src.  The "slow path" fallback.
+//
+// Acquires + releases the file lock per chunk so a multi-second
+// repack on a multi-GB heap doesn't block other operations on the
+// same file (e.g. header inspection from another caller).  The
+// buffer is caller-owned + reused across calls so each repack
+// allocates the chunk buffer once.
+//
+// Taint discipline: pre-I/O failures (lock acquire, seek before
+// any byte movement) don't taint.  Any read or write error within
+// the loop DOES taint — the in-flight chunk may have been
+// partially written.  Caller recovers via close + reopen.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_copy_in_file(
+    file_handle: &FileHandle,
+    src_off: u64,
+    dst_off: u64,
+    length: u64,
+    buf: &mut Vec<u8>,
+    chunk: u64,
+    tainted: &TaintFlag,
+    op_label: &str,
+) -> PyResult<()> {
+    let mut processed: u64 = 0;
+    while processed < length {
+        let n = (length - processed).min(chunk);
+        buf.resize(n as usize, 0);
+        let mut g = lock_file(file_handle)?;
+        let f = g.as_mut()
+            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
+        f.seek(SeekFrom::Start(src_off + processed))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        f.read_exact(buf).map_err(|e| {
+            tainted.store(true, Ordering::Release);
+            PyIOError::new_err(format!(
+                "{}: read at offset {}: {}; close + reopen",
+                op_label, src_off + processed, e))
+        })?;
+        f.seek(SeekFrom::Start(dst_off + processed))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if let Err(e) = f.write_all(buf) {
+            tainted.store(true, Ordering::Release);
+            return Err(PyIOError::new_err(format!(
+                "{}: write at offset {}: {}; close + reopen",
+                op_label, dst_off + processed, e)));
+        }
+        processed += n;
+    }
+    Ok(())
+}
+
 // Shift every byte in [old_after_offset..EOF] BACKWARD by `delta` bytes,
 // truncate the file to its new (smaller) size, and decrement every HDU
 // offset in `layout` whose `header_offset >= old_after_offset` by `delta`.

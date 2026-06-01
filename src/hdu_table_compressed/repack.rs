@@ -6,8 +6,7 @@ use pyo3::prelude::*;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::common::{
-    lock_file, parse_keyword,
-    FileHandle, TaintFlag,
+    lock_file, parse_keyword, stream_copy_in_file,
 };
 use crate::hdu::HDU;
 use crate::hdu_table::{
@@ -738,48 +737,6 @@ fn repack_compressed_table_heap_vla(
     Ok(())
 }
 
-// Chunked read-then-write copy of `length` bytes from `src_off` to
-// `dst_off` in `file`.  Used by repack's in-place fast path AND the
-// staging slow path.  Caller is responsible for ensuring the move
-// is safe (writes don't clobber unread regions).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn stream_copy_in_file(
-    file: &FileHandle,
-    src_off: u64,
-    dst_off: u64,
-    length: u64,
-    buf: &mut Vec<u8>,
-    chunk: u64,
-    tainted: &TaintFlag,
-    op_label: &str,
-) -> PyResult<()> {
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-    let mut processed: u64 = 0;
-    while processed < length {
-        let n = (length - processed).min(chunk);
-        buf.resize(n as usize, 0);
-        let mut g = lock_file(file)?;
-        let f = g.as_mut()
-            .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-        f.seek(SeekFrom::Start(src_off + processed))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        f.read_exact(buf).map_err(|e| {
-            tainted.store(true, Ordering::Release);
-            PyIOError::new_err(format!(
-                "{}: read at offset {}: {}; close + reopen",
-                op_label, src_off + processed, e))
-        })?;
-        f.seek(SeekFrom::Start(dst_off + processed))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        if let Err(e) = f.write_all(buf) {
-            tainted.store(true, Ordering::Release);
-            return Err(PyIOError::new_err(format!(
-                "{}: write at offset {}: {}; close + reopen",
-                op_label, dst_off + processed, e)));
-        }
-        processed += n;
-    }
-    Ok(())
-}
+// `stream_copy_in_file` moved to `src/common.rs` so the ZIMAGE-side
+// repack can share the same primitive.
 
