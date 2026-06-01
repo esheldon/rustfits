@@ -236,9 +236,8 @@ pub(crate) fn repack_compressed_heap(
         // Use `grow_file_to_at_least` so a non-last HDU's trailing
         // HDUs get shifted forward to make room for the staging
         // area — bare `set_len` would silently overwrite the next
-        // HDU's bytes.  Not exercised by current `__setitem__`
-        // patterns (which always satisfy the fast-path safety
-        // check) but kept for forward compat.
+        // HDU's bytes.  Exercised by
+        // `test_repack_slow_path_non_last_hdu_no_corruption`.
         crate::common::grow_file_to_at_least(
             &super_.file, &super_.layout, data_offset,
             main_bytes + current_pcount + new_pcount,

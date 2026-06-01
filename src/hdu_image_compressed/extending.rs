@@ -290,12 +290,18 @@ fn drain_aligned_subset(
 
     // Cheap pre-check while holding only the pending lock: if
     // we're under cap, skip the meta lookup + drain math entirely.
+    // The cap is per-HDU (default `MAX_PENDING_BYTES`, 32 MiB)
+    // so tests can override it via `_set_pending_cap_for_testing`
+    // to trigger drains on small fixtures.
+    let cap = hdu.pending_cap.load(
+        std::sync::atomic::Ordering::Acquire,
+    );
     {
         let g = hdu.pending.lock().map_err(|_| {
             PyIOError::new_err("pending buffer lock poisoned")
         })?;
         let Some(buf) = g.as_ref() else { return Ok(()) };
-        if buf.total_bytes <= MAX_PENDING_BYTES {
+        if buf.total_bytes <= cap {
             return Ok(());
         }
     }

@@ -331,29 +331,28 @@ def test_reject_fits_with_exit_while_context_open():
 
 def test_mid_context_drain_keeps_data_correct():
     """
-    Push enough data through ``append()`` calls that the 32 MB cap
-    should trigger at least one mid-context drain.  Final table
-    round-trips bit-exact.
+    Trigger at least one mid-context drain via the cap and verify
+    the final table round-trips bit-exact.
 
-    Schema: 4 × f4 = 16 B / row.  Push 5M rows = 80 MB; appends of
-    1000 rows each = 16 KB / append → ~2000 appends per drain
-    boundary.  At least one mid-context drain fires.
+    Uses the test-only ``_set_pending_cap_for_testing`` hook to
+    lower the cap from 32 MB to 4 KB so the test runs on a small
+    fixture (16 B/row × 100 rows/chunk = 1.6 KB / append; 3 chunks
+    trigger the cap).  The cap logic is dtype/size agnostic.
     """
     dt = np.dtype([("a", "f4"), ("b", "f4"), ("c", "f4"), ("d", "f4")])
-    n_total = 5_000_000
-    chunk = 1000
+    n_total = 500
+    chunk = 100
     src = np.zeros(n_total, dtype=dt)
     src["a"] = np.arange(n_total).astype("f4")
     with tempfile.TemporaryDirectory() as tmp:
         fn = os.path.join(tmp, "t.fits.fz")
         with rustfits.FITS(fn, "w+") as f:
-            f.create_table_hdu(dt, nrows=0, compress=True, ztilelen=10_000)
+            f.create_table_hdu(dt, nrows=0, compress=True, ztilelen=100)
             hdu = f[1]
+            hdu._set_pending_cap_for_testing(4 * 1024)
             with hdu.appending():
                 for r0 in range(0, n_total, chunk):
                     hdu.append(src[r0 : r0 + chunk])
-            # Spot-check first / mid / last rather than full equality
-            # (which would generate another 80 MB).
             got = hdu.read()
             assert len(got) == n_total
             np.testing.assert_array_equal(
