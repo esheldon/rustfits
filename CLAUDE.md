@@ -2009,66 +2009,29 @@ follow-ups, and the Python-side API + structured `compress=` /
 `quantize=` config object design, see
 [docs/internal/zimage.md](docs/internal/zimage.md).**
 
-**Known bug — Inf in lossy-quantized tiles poisons the tile's
-bscale.**  Tracked as **GitHub issue #19** (`gh issue view 19`
-for the full repro + impact summary).  Status: filed
-2026-06-01, not yet fixed; pinned as `strict=True` xfail so the
-fix surfaces as XPASS.
-
-**Symptom.**  A float-image cell containing `+Inf` or `-Inf`
-encoded via the lossy quantizer (any algorithm with
-`quantize=Quantize(...)`, including the default `Quantize` on
-float input) causes the per-tile `bscale` to degenerate.  Every
-cell in the SAME tile decodes to the bzero midpoint constant on
-read — corrupting non-Inf neighbors.  `NaN` is unaffected
-(already handled by the noise estimator).  Lossless paths
-(`quantize=None` with `Gzip1`/`Gzip2`) are unaffected (no
-quantization step).  Single-tile / tiny-tile fixtures with no
-finite neighbors may "work" by accident (the existing test
-`test_nonfinite_round_trips_through_compressed_tile` is one
-such happy case — narrow scope is documented in its comment).
-
-**Why cfitsio doesn't have this.**  `imcomp_quantize_intgers`
-in `<cfitsio>/imcompress.c` pre-replaces every non-finite input
-value with the null sentinel BEFORE computing bscale.  rustfits
-doesn't yet have an equivalent pre-pass.
-
-**Pickup steps for the fix.**
-
-1. `gh issue view 19` — full repro + expected/actual + user
-   workarounds.
-2. Read the cfitsio reference (per "Reference sources for
-   byte-exact ports" below for how to resolve `<cfitsio>`):
-   `imcomp_quantize_intgers` in `<cfitsio>/imcompress.c`
-   and the per-tile noise estimator it calls.  The pre-pass
-   walks the tile bytes once, substituting each non-finite
-   value with the null sentinel.
-3. Implement the equivalent in `src/zimage/quantize.rs`.  The
-   per-tile noise estimator / bscale path is the seam — add a
-   non-finite scrub step at the START of the per-tile encode,
-   before any reduction over the tile values.  Use NaN-aware
-   reductions OR a single explicit scrub loop (the latter is
-   what cfitsio does and is the more conservative port).
-4. Verify:
-   - The four xfail cases in
-     `tests/test_image_compressed_float_edges.py
-     ::test_isolated_nonfinite_in_multi_tile_lossy[*-inf]` and
-     `[*--inf]` (f4/f8 × +Inf/-Inf) become XPASS.  The
-     `strict=True` on each xfail means XPASS is a test FAILURE
-     — that's the signal to drop the `pytest.param(..., marks=
-     pytest.mark.xfail(...))` wrappers and inline them as plain
-     parametrize entries.
-   - Run the full suite — no regressions in the NaN /
-     subnormal / DITHER_2 tests (they all go through the same
-     quantizer path).
-   - Bench: confirm the pre-pass doesn't measurably slow the
-     hot compressed-write path on a typical float image.  The
-     scrub is a single sequential pass over the tile bytes;
-     should be invisible vs the encode cost.
-
-**Likely scope.**  ~30-50 lines of Rust (one scrub function +
-one call site in the encoder) + dropping 4 xfail wrappers in
-the test file + this note's update to mark the bug fixed.
+**Non-finite floats in lossy-quantized tiles (issue #19,
+fixed 2026-06-01).**  A float-image cell containing `+Inf` or
+`-Inf` previously poisoned the per-tile `bscale` (NaN was
+already fine), making every cell in the SAME tile decode to a
+bzero-midpoint constant on read and corrupting non-Inf
+neighbors.  The fix folds non-finite detection into the
+existing null-check seam: when the caller passes `Some(NaN)`
+as the null sentinel (the only path the compressed-image
+writer uses), `is_null_f32`/`is_null_f64` now return true for
+any non-finite value (`!v.is_finite()`).  The noise estimator
+skips them naturally (its `is_valid` lambda goes through the
+same helper), the per-pixel quantize loop pushes
+`NULL_VALUE_I32` for them, and the dequantizer decodes that as
+NaN.  Zero allocation (no scratch tile copy) and ~6 lines of
+Rust in `src/zimage/quantize.rs`.  Callers passing a non-NaN
+sentinel keep the strict `==` match (no implicit Inf scrubbing
+for explicit-sentinel workflows).  Round-trip contract: a
+non-finite input cell decodes back as NaN; finite neighbors
+round-trip within the lossy tolerance.  Regression-pinned by
+the previously-xfail cases in
+`tests/test_image_compressed_float_edges.py
+::test_isolated_nonfinite_in_multi_tile_lossy` (now plain
+parametrize entries; full +Inf/-Inf × f4/f8 matrix passes).
 
 ## Tile-compressed tables (ZTABLE)
 

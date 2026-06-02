@@ -328,9 +328,22 @@ const N_RESERVED_VALUES: i32 = 10;
 // fails for NaN (IEEE 754: NaN != NaN), so when the user passes
 // `Some(NaN)` as the null sentinel we have to special-case it via
 // `is_nan()`.  Returns false when no null sentinel is configured.
+//
+// When the sentinel is NaN we ALSO catch +Inf and -Inf as null —
+// non-finite floats can't be losslessly quantized, and letting them
+// flow into the noise / range estimator poisons the per-tile bscale
+// (see GitHub issue #19, fixed 2026-06-01).  Cfitsio relies on the
+// caller pre-cleaning non-finite inputs; rustfits folds the
+// substitution into the null-check helper so the existing
+// noise-estimator skip path and per-pixel null branch handle Inf
+// with zero extra allocation.  Inf decodes to NaN through the
+// NULL_VALUE_I32 round-trip, matching the test contract that
+// non-finite inputs survive as non-finite (NaN or Inf — either is
+// OK).  Callers passing a non-NaN sentinel keep the strict `==`
+// match (no implicit Inf scrubbing for explicit-sentinel workflows).
 fn is_null_f32(v: f32, null_value: Option<f32>) -> bool {
     match null_value {
-        Some(nv) if nv.is_nan() => v.is_nan(),
+        Some(nv) if nv.is_nan() => !v.is_finite(),
         Some(nv) => v == nv,
         None => false,
     }
@@ -338,7 +351,7 @@ fn is_null_f32(v: f32, null_value: Option<f32>) -> bool {
 
 fn is_null_f64(v: f64, null_value: Option<f64>) -> bool {
     match null_value {
-        Some(nv) if nv.is_nan() => v.is_nan(),
+        Some(nv) if nv.is_nan() => !v.is_finite(),
         Some(nv) => v == nv,
         None => false,
     }

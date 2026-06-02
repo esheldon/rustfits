@@ -174,20 +174,22 @@ def test_rice_with_quantize_none_rejected_via_write_image():
 # Non-finite round-trip on a single small (1x5) tile
 # ---------------------------------------------------------------
 #
-# Narrow happy-case pin: NaN + +Inf + -Inf all round-trip exactly
-# in a 1x5 single-tile image across the supported compression
-# modes.  Lossless paths (Gzip1/Gzip2 + quantize=None) are
-# byte-faithful; the lossy paths (qlevel=4) happen to preserve
-# +/-Inf in this fixture because the tile is so small that the
-# bscale computation degenerates predictably — the noise estimator
-# returns a degenerate value that decodes back to the original.
+# NaN + +Inf + -Inf all round-trip bit-exactly in a 1x5 single-tile
+# image across the supported compression modes.  Lossless paths
+# (Gzip1/Gzip2 + quantize=None) preserve them by definition.  The
+# lossy paths (qlevel=4) also preserve them bit-exactly here
+# because: after the issue-#19 fix the quantizer treats every
+# non-finite cell as null (skipped by the noise estimator), so only
+# 2 finite pixels (1.0, 2.0) remain — too few to estimate noise, so
+# delta=0 and ``quantize_float`` returns None, triggering the raw-
+# float GZIP fallback for the whole tile.
 #
-# Inf preservation does NOT generalize to realistic multi-tile
-# lossy fixtures — see ``test_isolated_nonfinite_in_multi_tile_lossy``
-# below (4 strict-xfail cases) for the bug where Inf inside a tile
-# with finite neighbors corrupts the bscale and decodes neighbors
-# to a constant.  Cross-link: GitHub issue #19 (filed 2026-06-01,
-# `gh issue view 19` for the full diagnosis + fix-location pointer).
+# The realistic multi-tile lossy round-trip is pinned by
+# ``test_isolated_nonfinite_in_multi_tile_lossy`` below: that
+# fixture has plenty of finite neighbors, so the quantizer succeeds
+# and the non-finite cell decodes as NaN (via NULL_VALUE_I32).  The
+# weaker contract there is ``not np.isfinite(r[1, 1])`` — NaN or
+# Inf is acceptable.
 #
 # Companion to
 # fitsio/tests/test_util.py::test_nonfinite_as_cfitsio_floating_null_value
@@ -338,15 +340,14 @@ def test_subnormal_array_never_flushes_to_zero(dtype, subnormal):
 # computing the per-tile bscale, so non-finite values don't
 # contaminate the quantization range.
 #
-# NaN case works in rustfits today — likely because NaN propagates
-# through the noise estimator in a way that's already handled
-# (NaN-aware reductions or explicit skip).  The Inf cases FAIL:
-# the per-tile bscale calculation receives Inf and degenerates to
-# Inf, which means every cell in that tile decodes to bzero
-# (mid-range constant), corrupting the non-Inf neighbors.  Pinned
-# as xfail so the limitation is discoverable and a future codec
-# fix that pre-filters non-finite values before bscale will surface
-# as xpass.
+# Fixed 2026-06-01 (issue #19): the quantizer now redirects +Inf /
+# -Inf to the null sentinel before the per-tile noise + bscale
+# estimation (the ``is_null_*`` helpers in ``src/zimage/quantize.rs``
+# treat all non-finite values as null when the sentinel is NaN —
+# zero-allocation fold of cfitsio's pre-clean pattern into the
+# existing null-check seam).  Non-finite cells now decode to NaN
+# through the NULL_VALUE_I32 round-trip; the test contract
+# ``not np.isfinite(r[1, 1])`` accepts either NaN or Inf.
 #
 # Regression pin against fitsio/tests/test_image_compression.py
 # ::test_image_compression_nulls.
@@ -357,42 +358,10 @@ def test_subnormal_array_never_flushes_to_zero(dtype, subnormal):
     [
         ("f4", np.nan),
         ("f8", np.nan),
-        pytest.param(
-            "f4",
-            np.inf,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "rustfits's quantizer doesn't pre-filter non-finite "
-                    "values before computing per-tile bscale; +Inf in the "
-                    "tile makes bscale degenerate, corrupting neighbors."
-                ),
-            ),
-        ),
-        pytest.param(
-            "f8",
-            np.inf,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="see f4 +Inf above",
-            ),
-        ),
-        pytest.param(
-            "f4",
-            -np.inf,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="see f4 +Inf above",
-            ),
-        ),
-        pytest.param(
-            "f8",
-            -np.inf,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="see f4 +Inf above",
-            ),
-        ),
+        ("f4", np.inf),
+        ("f8", np.inf),
+        ("f4", -np.inf),
+        ("f8", -np.inf),
     ],
 )
 def test_isolated_nonfinite_in_multi_tile_lossy(dtype, nan_value):
