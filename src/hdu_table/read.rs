@@ -832,7 +832,6 @@ fn heap_pass(
                 }
                 take_end = take_end.max(next_end);
                 if take_end - cell_off > HEAP_CHUNK_BYTES as u64 {
-                    j += 1;
                     break;
                 }
                 j += 1;
