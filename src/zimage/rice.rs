@@ -279,8 +279,8 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
 
     // Seed: bbits-bit big-endian, sign-extended to i32.
     let mut seed_u: u32 = 0;
-    for k in 0..seed_bytes {
-        seed_u = (seed_u << 8) | (c[k] as u32);
+    for &b in &c[..seed_bytes] {
+        seed_u = (seed_u << 8) | (b as u32);
     }
     let mut lastpix: i32 = if bbits < 32 {
         let shift = 32 - bbits;

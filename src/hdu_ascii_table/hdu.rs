@@ -581,6 +581,7 @@ impl AsciiTableHDU {
     /// Every column at or after the new column's position has its
     /// ``TBCOLn`` byte-position bumped by the new column's width.
     #[pyo3(signature = (name, data, *, position=None, after=None, before=None, unit=None, format=None))]
+    #[allow(clippy::too_many_arguments)]
     fn insert_column(
         slf: PyRef<'_, Self>,
         py: Python<'_>,

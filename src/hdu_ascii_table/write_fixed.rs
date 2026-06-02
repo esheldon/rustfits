@@ -358,6 +358,7 @@ fn format_row(
 // covers all rows in the data section (start_offset == data_offset
 // AND n_rows == total NAXIS2) — partial-section writes leave the
 // existing pad untouched.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ascii_table_data(
     py: Python<'_>,
     super_: &HDU,
@@ -420,6 +421,7 @@ pub(crate) fn write_ascii_table_data(
 // One-call wrapper: validate input, extract per-column arrays, write
 // all rows starting at the data section.  Used by AsciiTableHDU.write
 // (which sets pad_to_block=true).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ascii_table_full(
     py: Python<'_>,
     super_: &HDU,

@@ -2305,6 +2305,7 @@ impl FITS {
         dtype, nrows=0, *,
         extname=None, extver=None, units=None, formats=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn create_ascii_table_hdu(
         &mut self,
         py: Python<'_>,
