@@ -432,7 +432,7 @@ fn storage_keyword(key: &str) -> String {
 // behalf — i.e., one whose value is determined by the file's structure,
 // integrity contract, or compression layout, and which the user must NOT
 // mutate directly?
-//
+// 
 // Categories: image-HDU structural, binary/ASCII table structural, random
 // groups, tiled image compression, integrity (CHECKSUM/DATASUM).  Not
 // protected: user metadata like OBJECT, EXPTIME, EXTNAME, BUNIT, BSCALE,
@@ -2190,6 +2190,27 @@ impl FITSHeaderEdit {
 
 // Python-facing thin wrapper for is_protected_key.  Case-insensitive (the
 // keyword is normalized to uppercase first).
+
+/// Check if the input keyword is protected
+///
+/// Is this (post-normalization) key one that rustfits manages on the user's
+/// behalf — i.e., one whose value is determined by the file's structure,
+/// integrity contract, or compression layout, and which the user must NOT
+/// mutate directly?
+/// 
+/// Categories: image-HDU structural, binary/ASCII table structural, random
+/// groups, tiled image compression, integrity (CHECKSUM/DATASUM).  Not
+/// protected: user metadata like OBJECT, EXPTIME, EXTNAME, BUNIT, BSCALE,
+/// BZERO, CTYPEn, CRVALn, etc.
+///
+/// Parameters
+/// ----------
+/// key: str
+///    A keyword name
+///
+/// Returns
+/// -------
+/// True if it is protected, False otherwise
 #[pyfunction]
 #[pyo3(name = "is_protected_key")]
 pub(crate) fn py_is_protected_key(key: &str) -> bool {
