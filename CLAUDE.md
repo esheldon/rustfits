@@ -2009,6 +2009,32 @@ follow-ups, and the Python-side API + structured `compress=` /
 `quantize=` config object design, see
 [docs/internal/zimage.md](docs/internal/zimage.md).**
 
+**Known limitation — Inf in lossy-quantized tiles poisons the
+tile's bscale.**  When a float-image cell containing `+Inf` or
+`-Inf` is encoded via the lossy quantizer (any algorithm with
+`quantize=Quantize(...)`, including default Quantize on float
+input), the per-tile `bscale` computation receives the Inf and
+degenerates, which makes every cell in the same tile decode to
+the bzero midpoint constant on read — corrupting the non-Inf
+neighbors.  cfitsio sidesteps this by pre-replacing all
+non-finite input values with the null sentinel BEFORE computing
+bscale; rustfits's quantizer doesn't do that pre-filter yet.
+
+NaN is unaffected (already handled by the noise estimator).
+Lossless paths (`quantize=None` with Gzip1/Gzip2) are unaffected
+(no quantization step).  Single-tile or tiny tiles with no
+finite neighbors may also "work" by accident.
+
+Pinned as xfail in
+`tests/test_image_compressed_float_edges.py
+::test_isolated_nonfinite_in_multi_tile_lossy[*-inf]` and
+`[*--inf]` (4 cases — f4/f8 × +Inf/-Inf), with `strict=True` so
+the test will FAIL as XPASS once the quantizer learns the
+pre-filter — that's the signal to remove the xfail markers.
+Fix location: `src/zimage/quantize.rs`, in the per-tile noise
+estimator / bscale path; replicate cfitsio's
+`imcomp_quantize_intgers` non-finite pre-pass.
+
 ## Tile-compressed tables (ZTABLE)
 
 ZTABLE is the BINTABLE counterpart of ZIMAGE: a normal BINTABLE
