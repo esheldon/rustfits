@@ -1503,19 +1503,34 @@ impl FITS {
         // builder + write path both want this lighter form).  The
         // full configs are stored on the HDU for in-session round trip
         // of write-only params like Gzip1(level=).
-        let algorithms: Vec<crate::zimage::CompressionAlgorithm> =
-            per_col_cfgs.iter().map(|cfg| match cfg {
+        let algorithms: Vec<crate::zimage::CompressionAlgorithm> = per_col_cfgs
+            .iter()
+            .enumerate()
+            .map(|(i, cfg)| match cfg {
                 CompressionConfigKind::Gzip1(_) =>
-                    crate::zimage::CompressionAlgorithm::Gzip1,
+                    Ok(crate::zimage::CompressionAlgorithm::Gzip1),
                 CompressionConfigKind::Gzip2(_) =>
-                    crate::zimage::CompressionAlgorithm::Gzip2,
+                    Ok(crate::zimage::CompressionAlgorithm::Gzip2),
                 CompressionConfigKind::Rice1(_) =>
-                    crate::zimage::CompressionAlgorithm::Rice1,
-                CompressionConfigKind::Hcompress1(_) =>
-                    crate::zimage::CompressionAlgorithm::Hcompress1,
-                CompressionConfigKind::Plio1(_) =>
-                    crate::zimage::CompressionAlgorithm::Plio1,
-            }).collect();
+                    Ok(crate::zimage::CompressionAlgorithm::Rice1),
+                // HCOMPRESS_1 and PLIO_1 are image-only.  resolve_compress_arg
+                // rejects them on the public path; this arm is defense-in-depth
+                // for any future caller that builds per_col_cfgs by hand.
+                CompressionConfigKind::Hcompress1(_)
+                | CompressionConfigKind::Plio1(_) => Err(PyValueError::new_err(
+                    format!(
+                        "column '{}': {} is an image-only algorithm and cannot \
+                         be used for tables (allowed: GZIP_1, GZIP_2, RICE_1)",
+                        columns[i].name,
+                        match cfg {
+                            CompressionConfigKind::Hcompress1(_) => "HCOMPRESS_1",
+                            CompressionConfigKind::Plio1(_) => "PLIO_1",
+                            _ => unreachable!(),
+                        },
+                    ),
+                )),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
 
         let (cards, _n_tiles, data_size) = build_compressed_table_header(
             &table_cards, row_width, nrows, ztilelen_u, &algorithms,
