@@ -209,7 +209,6 @@ pub(crate) fn decode_rice(
 // monomorphization.  `write_at` is `#[inline(always)]` so each impl
 // reduces to a single store at the call site.
 trait PixelWrite {
-    #[allow(dead_code)]
     const BYTES: usize;
     fn write_at(out: &mut [u8], i: usize, v: i32);
 }

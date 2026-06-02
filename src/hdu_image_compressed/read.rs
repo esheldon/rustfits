@@ -404,18 +404,15 @@ pub(crate) fn get_or_decode_tile(
     Ok(arc)
 }
 
-// Read one tile's heap payload.  Checks the data columns in
-// priority order: primary COMPRESSED_DATA → GZIP_COMPRESSED_DATA
-// fallback → UNCOMPRESSED_DATA fallback.  Returns whichever has
-// non-zero nelements first, tagged so the caller knows which
-// decoder to run.  All present columns' descriptors are read for
-// the row; reading is cheap (8 or 16 bytes apiece) and keeping a
-// single lock-acquire is simpler than retrying.
-// Same as fetch_tile_payload but also reads the per-tile
-// ZSCALE/ZZERO doubles under the same file lock acquire.  Returns
-// `(payload, Some((scale, zero)))` when `quant` is Some, else
-// `(payload, None)`.  Pairing the reads avoids a second lock cycle
-// in the hot tile loop.
+// Read one tile's heap payload — and, optionally, the per-tile
+// ZSCALE/ZZERO doubles — under a single file-lock acquire.
+// `fetch_tile_payload_inner` checks the data columns in priority
+// order (primary COMPRESSED_DATA → GZIP_COMPRESSED_DATA fallback
+// → UNCOMPRESSED_DATA fallback) and returns whichever has non-zero
+// nelements first, tagged so the caller knows which decoder to run.
+// Pairing the payload + scale/zero reads avoids a second lock cycle
+// in the hot tile loop; when `quant` is None, only the payload is
+// returned.
 #[allow(clippy::too_many_arguments)]
 fn fetch_tile_payload_and_quant(
     file_handle: &FileHandle,
@@ -448,29 +445,6 @@ fn fetch_tile_payload_and_quant(
         None => None,
     };
     Ok((payload, scale_zero))
-}
-
-// Original payload-only entry point.  Still called from
-// fetch_tile_payload_and_quant above; kept as a free fn so the
-// payload dispatch logic lives in one place.
-#[allow(dead_code)]
-fn fetch_tile_payload(
-    file_handle: &FileHandle,
-    tile_idx: u64,
-    data_offset: u64,
-    naxis1: u64,
-    theap: u64,
-    cols: &ZimageDataColumns,
-    algorithm: CompressionAlgorithm,
-) -> PyResult<TilePayload> {
-    let mut guard = file_handle.lock()
-        .map_err(|_| PyIOError::new_err("file lock poisoned"))?;
-    let file = guard.as_mut()
-        .ok_or_else(|| PyIOError::new_err("file is closed"))?;
-    let row_offset = data_offset + tile_idx * naxis1;
-    fetch_tile_payload_inner(
-        file, tile_idx, data_offset, theap, cols, algorithm, row_offset,
-    )
 }
 
 fn fetch_tile_payload_inner(
@@ -577,7 +551,7 @@ fn read_descriptor(
 
 // Read `n_bytes` of heap payload starting at the absolute file
 // offset.  Convenience wrapper for the read_descriptor + heap-read
-// pair done in fetch_tile_payload.
+// pair done in fetch_tile_payload_inner.
 fn read_heap_bytes(
     file: &mut Storage,
     heap_byte_offset: u64,
