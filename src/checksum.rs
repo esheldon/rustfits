@@ -135,10 +135,10 @@ pub(crate) fn encode_checksum_ascii(sum: u32, complement: bool) -> [u8; 16] {
 // Decode a 16-char ASCII CHECKSUM string back to the 32-bit
 // sum.  When `complement = true`, returns the un-complemented
 // value (i.e., the original sum the card encodes).  Direct port
-// of cfitsio's `ffdsum`.
-// Inverse of `encode_checksum_ascii`; exercised by this module's unit
-// tests and kept for symmetry with the encoder (no non-test caller yet).
-#[allow(dead_code)]
+// of cfitsio's `ffdsum`.  Inverse of `encode_checksum_ascii`;
+// only consumed by this module's unit tests (no non-test caller
+// yet — kept for symmetry with the encoder).
+#[cfg(test)]
 pub(crate) fn decode_checksum_ascii(ascii: &[u8], complement: bool) -> u32 {
     debug_assert!(ascii.len() >= 16);
     let mut cbuf = [0i32; 16];

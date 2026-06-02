@@ -40,14 +40,6 @@ pub(crate) struct CardsWriteGuard<'a> {
 }
 
 impl CardsWriteGuard<'_> {
-    /// Read-only view of the current cards.  Used by future cache
-    /// readers that need to parse fresh metadata on miss without
-    /// dropping the lock.
-    #[allow(dead_code)]
-    pub(crate) fn as_slice(&self) -> &[String] {
-        &self.inner
-    }
-
     /// Clone the current cards out so the caller can stage a modified
     /// replacement.  Typical pattern:
     ///

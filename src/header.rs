@@ -1432,9 +1432,8 @@ pub(crate) struct FITSHeader {
     // Shared with the parent HDU and FITS; mutated by grow operations so
     // post-grow reads land at the correct disk offsets.
     pub(crate) offsets: Arc<HduOffsets>,
-    // Held for the upcoming grow path (phase 2) which needs to walk all
-    // HDUs to shift their offsets after the byte tail moves.
-    #[allow(dead_code)]
+    // Held so the grow path can walk all HDUs to shift their offsets
+    // after the byte tail moves.
     pub(crate) layout: Arc<FileLayout>,
     pub(crate) tainted: TaintFlag,
     // Shared with the parent HDU; bumped on every successful cards
