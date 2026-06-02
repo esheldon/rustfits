@@ -111,6 +111,7 @@ def test_append_non_last_hdu_shifts_tail():
             fits[1].append(new)
             # First HDU grew.
             assert fits[1].nrows == 7
+            assert fits[1].shape[0] == 7
             got1 = fits[1].read()
             np.testing.assert_array_equal(got1[:4], first_initial)
             np.testing.assert_array_equal(got1[4:], new)

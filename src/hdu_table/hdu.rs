@@ -397,6 +397,14 @@ impl TableHDU {
         Ok(meta.nrows as usize)
     }
 
+    /// Shape of the table, equivalent to `(hdu.nrows, )`
+    #[getter]
+    fn shape(slf: PyRef<'_, Self>, py:Python<'_>) -> PyResult<Py<PyTuple>> {
+        let super_ = slf.as_super();
+        let meta = slf.meta(super_)?;
+        Ok(PyTuple::new(py, vec![meta.nrows as usize])?.unbind())
+    }
+
     /// Number of columns in the table (``TFIELDS``).
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {
