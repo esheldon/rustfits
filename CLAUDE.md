@@ -2009,31 +2009,66 @@ follow-ups, and the Python-side API + structured `compress=` /
 `quantize=` config object design, see
 [docs/internal/zimage.md](docs/internal/zimage.md).**
 
-**Known limitation — Inf in lossy-quantized tiles poisons the
-tile's bscale.**  When a float-image cell containing `+Inf` or
-`-Inf` is encoded via the lossy quantizer (any algorithm with
-`quantize=Quantize(...)`, including default Quantize on float
-input), the per-tile `bscale` computation receives the Inf and
-degenerates, which makes every cell in the same tile decode to
-the bzero midpoint constant on read — corrupting the non-Inf
-neighbors.  cfitsio sidesteps this by pre-replacing all
-non-finite input values with the null sentinel BEFORE computing
-bscale; rustfits's quantizer doesn't do that pre-filter yet.
+**Known bug — Inf in lossy-quantized tiles poisons the tile's
+bscale.**  Tracked as **GitHub issue #19** (`gh issue view 19`
+for the full repro + impact summary).  Status: filed
+2026-06-01, not yet fixed; pinned as `strict=True` xfail so the
+fix surfaces as XPASS.
 
-NaN is unaffected (already handled by the noise estimator).
-Lossless paths (`quantize=None` with Gzip1/Gzip2) are unaffected
-(no quantization step).  Single-tile or tiny tiles with no
-finite neighbors may also "work" by accident.
+**Symptom.**  A float-image cell containing `+Inf` or `-Inf`
+encoded via the lossy quantizer (any algorithm with
+`quantize=Quantize(...)`, including the default `Quantize` on
+float input) causes the per-tile `bscale` to degenerate.  Every
+cell in the SAME tile decodes to the bzero midpoint constant on
+read — corrupting non-Inf neighbors.  `NaN` is unaffected
+(already handled by the noise estimator).  Lossless paths
+(`quantize=None` with `Gzip1`/`Gzip2`) are unaffected (no
+quantization step).  Single-tile / tiny-tile fixtures with no
+finite neighbors may "work" by accident (the existing test
+`test_nonfinite_round_trips_through_compressed_tile` is one
+such happy case — narrow scope is documented in its comment).
 
-Pinned as xfail in
-`tests/test_image_compressed_float_edges.py
-::test_isolated_nonfinite_in_multi_tile_lossy[*-inf]` and
-`[*--inf]` (4 cases — f4/f8 × +Inf/-Inf), with `strict=True` so
-the test will FAIL as XPASS once the quantizer learns the
-pre-filter — that's the signal to remove the xfail markers.
-Fix location: `src/zimage/quantize.rs`, in the per-tile noise
-estimator / bscale path; replicate cfitsio's
-`imcomp_quantize_intgers` non-finite pre-pass.
+**Why cfitsio doesn't have this.**  `imcomp_quantize_intgers`
+in `<cfitsio>/imcompress.c` pre-replaces every non-finite input
+value with the null sentinel BEFORE computing bscale.  rustfits
+doesn't yet have an equivalent pre-pass.
+
+**Pickup steps for the fix.**
+
+1. `gh issue view 19` — full repro + expected/actual + user
+   workarounds.
+2. Read the cfitsio reference (per "Reference sources for
+   byte-exact ports" below for how to resolve `<cfitsio>`):
+   `imcomp_quantize_intgers` in `<cfitsio>/imcompress.c`
+   and the per-tile noise estimator it calls.  The pre-pass
+   walks the tile bytes once, substituting each non-finite
+   value with the null sentinel.
+3. Implement the equivalent in `src/zimage/quantize.rs`.  The
+   per-tile noise estimator / bscale path is the seam — add a
+   non-finite scrub step at the START of the per-tile encode,
+   before any reduction over the tile values.  Use NaN-aware
+   reductions OR a single explicit scrub loop (the latter is
+   what cfitsio does and is the more conservative port).
+4. Verify:
+   - The four xfail cases in
+     `tests/test_image_compressed_float_edges.py
+     ::test_isolated_nonfinite_in_multi_tile_lossy[*-inf]` and
+     `[*--inf]` (f4/f8 × +Inf/-Inf) become XPASS.  The
+     `strict=True` on each xfail means XPASS is a test FAILURE
+     — that's the signal to drop the `pytest.param(..., marks=
+     pytest.mark.xfail(...))` wrappers and inline them as plain
+     parametrize entries.
+   - Run the full suite — no regressions in the NaN /
+     subnormal / DITHER_2 tests (they all go through the same
+     quantizer path).
+   - Bench: confirm the pre-pass doesn't measurably slow the
+     hot compressed-write path on a typical float image.  The
+     scrub is a single sequential pass over the tile bytes;
+     should be invisible vs the encode cost.
+
+**Likely scope.**  ~30-50 lines of Rust (one scrub function +
+one call site in the encoder) + dropping 4 xfail wrappers in
+the test file + this note's update to mark the bug fixed.
 
 ## Tile-compressed tables (ZTABLE)
 

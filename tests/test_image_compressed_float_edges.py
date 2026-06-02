@@ -171,17 +171,25 @@ def test_rice_with_quantize_none_rejected_via_write_image():
 
 
 # ---------------------------------------------------------------
-# All non-finite values (NaN, +Inf, -Inf) round-trip exactly
+# Non-finite round-trip on a single small (1x5) tile
 # ---------------------------------------------------------------
 #
-# The FITS tile-compression spec defines a null-sentinel
-# (cfitsio's _FLOATING_NULL_VALUE) for representing non-finite
-# floats through the quantizer, but only mandates NaN
-# preservation.  rustfits preserves +Inf and -Inf as well,
-# distinctly from NaN, across every supported compression mode.
+# Narrow happy-case pin: NaN + +Inf + -Inf all round-trip exactly
+# in a 1x5 single-tile image across the supported compression
+# modes.  Lossless paths (Gzip1/Gzip2 + quantize=None) are
+# byte-faithful; the lossy paths (qlevel=4) happen to preserve
+# +/-Inf in this fixture because the tile is so small that the
+# bscale computation degenerates predictably — the noise estimator
+# returns a degenerate value that decodes back to the original.
 #
-# Pinned here so a future codec refactor doesn't silently fold
-# Inf to NaN.  Companion to
+# Inf preservation does NOT generalize to realistic multi-tile
+# lossy fixtures — see ``test_isolated_nonfinite_in_multi_tile_lossy``
+# below (4 strict-xfail cases) for the bug where Inf inside a tile
+# with finite neighbors corrupts the bscale and decodes neighbors
+# to a constant.  Cross-link: GitHub issue #19 (filed 2026-06-01,
+# `gh issue view 19` for the full diagnosis + fix-location pointer).
+#
+# Companion to
 # fitsio/tests/test_util.py::test_nonfinite_as_cfitsio_floating_null_value
 # (which tests fitsio's internal nonfinite-to-sentinel utility;
 # this test exercises the user-facing round-trip directly).
