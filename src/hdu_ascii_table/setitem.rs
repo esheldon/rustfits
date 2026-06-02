@@ -126,7 +126,7 @@ pub(crate) fn setitem_row_slice(
             "AsciiTableHDU[slice] = value: negative or zero step is not \
              supported"));
     }
-    let count = indices.slicelength as usize;
+    let count = indices.slicelength;
     let start = indices.start as i64;
     let step = indices.step as i64;
 

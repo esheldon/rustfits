@@ -223,6 +223,11 @@ fn aligned_drain_rows(
 // needed (slicing applied uniformly across every column).  The
 // buffer's `total_rows` / `total_bytes` are recomputed from the
 // residual.
+// The `for col_idx in 0..ncols` loops walk two parallel arrays
+// (per_col_taken AND buf.chunks[consume_idx]); iterator form
+// requires juggling double mutable borrows that would obscure the
+// code.  Same allow rationale as the cfitsio-port files.
+#[allow(clippy::needless_range_loop)]
 fn pop_front_rows(
     py: Python<'_>,
     buf: &mut PendingBuffer,
