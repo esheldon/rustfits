@@ -2682,6 +2682,62 @@ impl FITS {
         ))
     }
 
+    // Membership test: `i in fits` (HDU position, incl. negatives) or
+    // `"name" in fits` (case-insensitive EXTNAME match).  Mirrors the
+    // __getitem__ key dispatch — same accepted types, same rejection of
+    // bool — but returns a bool instead of raising on miss.  Lets users
+    // guard a lookup without try/except:
+    //
+    //     if "SCI" in fits:
+    //         arr = fits["SCI"].read()
+    fn __contains__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if key.is_instance_of::<PyBool>() {
+            return Err(PyValueError::new_err(
+                "FITS membership test key must be int (HDU position) or \
+                 str (EXTNAME); got bool",
+            ));
+        }
+        if let Ok(index) = key.extract::<isize>() {
+            let len = self.hdus.len() as isize;
+            let idx = if index < 0 { len + index } else { index };
+            return Ok(idx >= 0 && idx < len);
+        }
+        let name: Option<String> = if key.is_instance_of::<PyString>() {
+            Some(key.extract::<String>()?)
+        } else if key.is_instance_of::<PyBytes>() {
+            let b: Vec<u8> = key.extract()?;
+            if !b.iter().all(|c| c.is_ascii()) {
+                return Err(PyValueError::new_err(
+                    "FITS EXTNAME lookup key must be ASCII",
+                ));
+            }
+            Some(String::from_utf8(b).unwrap())
+        } else {
+            None
+        };
+        if let Some(name) = name {
+            let target = name.trim().to_ascii_uppercase();
+            for hdu_obj in &self.hdus {
+                let bound = hdu_obj.bind(py);
+                let hdu_ref = bound.cast::<HDU>()?.borrow();
+                let cards_guard = hdu_ref.header.lock()
+                    .map_err(|_| PyIOError::new_err("header lock poisoned"))?;
+                let matched = parse_string_keyword(&cards_guard, "EXTNAME")
+                    .map(|s| s.trim().to_ascii_uppercase() == target)
+                    .unwrap_or(false);
+                drop(cards_guard);
+                if matched {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        Err(PyValueError::new_err(
+            "FITS membership test key must be int (HDU position) or \
+             str/bytes (EXTNAME)",
+        ))
+    }
+
     fn __enter__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }

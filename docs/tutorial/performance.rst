@@ -1058,3 +1058,25 @@ ZTABLE read/write (rustfits compressed vs rustfits
 uncompressed) and the image-extend RSS benches.
 
 .. include:: _perf_tables_self.rst
+
+EXTNAME lookup (``name in fits`` / ``fits[name]``) — linear in HDU count
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``name in fits`` and ``fits["NAME"]`` walk the HDU list until a
+match is found (or fall through and return False / raise on miss),
+reading and parsing each HDU's EXTNAME card along the way.  Cost
+scales linearly at roughly **0.14 µs per HDU** on the reference
+machine — about 1.4 ms for a 10,000-HDU file when the name lives
+at the end (or doesn't exist).  fitsio caches a name→index dict
+and returns in ~10 µs regardless of HDU count.
+
+For typical files (tens to a few hundred HDUs) the gap is invisible.  Workloads
+that do many name lookups on a multi- thousand-HDU file will notice; integer
+indexing is O(1) in both libraries, so the workaround until this is fixed is to
+build the name→index dict yourself once::
+
+    name_to_idx = {h.extname: i for i, h in enumerate(fits) if h.extname}
+
+This could be re-engineered to match fitsio (file-level
+name→index cache with version-stamped invalidation) if a real
+workload asks for it.
