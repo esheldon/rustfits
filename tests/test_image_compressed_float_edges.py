@@ -171,6 +171,67 @@ def test_rice_with_quantize_none_rejected_via_write_image():
 
 
 # ---------------------------------------------------------------
+# All non-finite values (NaN, +Inf, -Inf) round-trip exactly
+# ---------------------------------------------------------------
+#
+# The FITS tile-compression spec defines a null-sentinel
+# (cfitsio's _FLOATING_NULL_VALUE) for representing non-finite
+# floats through the quantizer, but only mandates NaN
+# preservation.  rustfits preserves +Inf and -Inf as well,
+# distinctly from NaN, across every supported compression mode.
+#
+# Pinned here so a future codec refactor doesn't silently fold
+# Inf to NaN.  Companion to
+# fitsio/tests/test_util.py::test_nonfinite_as_cfitsio_floating_null_value
+# (which tests fitsio's internal nonfinite-to-sentinel utility;
+# this test exercises the user-facing round-trip directly).
+
+
+_NONFINITE_CASES = [
+    ("gzip_1", None),
+    ("gzip_1", 4),
+    ("gzip_2", None),
+    ("gzip_2", 4),
+    ("rice_1", 4),
+    # rice_1 + None is rejected by design (covered above).
+]
+
+
+@pytest.mark.parametrize("compress,qlevel", _NONFINITE_CASES)
+def test_nonfinite_round_trips_through_compressed_tile(compress, qlevel):
+    data = np.array(
+        [[1.0, 2.0, np.nan, np.inf, -np.inf]],
+        dtype="f4",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            if qlevel is None:
+                f.write_image(data, compress=compress, quantize=None)
+            else:
+                f.write_image(
+                    data,
+                    compress=compress,
+                    quantize=rustfits.Quantize(
+                        level=float(qlevel),
+                        seed=10,
+                    ),
+                )
+        with rustfits.FITS(fname, "r") as f:
+            r = f[1].read()
+    assert np.isnan(r[0, 2]), "NaN should survive"
+    assert r[0, 3] == np.inf, f"+Inf should survive (got {r[0, 3]})"
+    assert r[0, 4] == -np.inf, f"-Inf should survive (got {r[0, 4]})"
+    # Finite values round-trip too (lossy is within tolerance).
+    if qlevel is None:
+        assert r[0, 0] == 1.0
+        assert r[0, 1] == 2.0
+    else:
+        np.testing.assert_allclose(r[0, 0], 1.0, rtol=0, atol=0.1)
+        np.testing.assert_allclose(r[0, 1], 2.0, rtol=0, atol=0.1)
+
+
+# ---------------------------------------------------------------
 # Test #5 — DITHER_2 preserves exact zero pixels
 # ---------------------------------------------------------------
 #
