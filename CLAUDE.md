@@ -453,6 +453,58 @@ HDU type needs to be consulted: if the target is a table, these three
 keys should be stripped from the source.  Same direction in reverse
 (table → image) would strip TUNIT/TDISP/etc.
 
+## Strict header parsing + opt-in `lenient=True`
+
+`FITS::new` and `FITS::from_bytes` reject any header block
+containing bytes outside printable ASCII (0x20-0x7E) by default.
+This is the right default for most workflows — if the file
+opened, every header byte was spec-compliant.
+
+`FITS(fname, "r", lenient=True)` opts into archive-friendly
+parsing for files written by older non-conforming tools (IDL
+MWRFITS in particular emits keys with non-ASCII bytes that the
+FITS standard disallows).  Lenient mode:
+
+- Substitutes each non-printable header byte with `_` in place,
+  then proceeds with the existing UTF-8 / card-split logic.
+  Matches astropy's substitution rule; lossy but predictable.
+- Has no side effect on well-formed files (the byte check
+  passes; the substitution loop runs but finds nothing to do).
+- Does NOT change writes.  A new card mutation still goes
+  through the strict `validate_keyword` path; lenient is a
+  READ-only relaxation.
+- Implementation lives entirely in
+  `parse_hdus_from_file::header-read loop` (src/fits.rs).
+  Everything else just sees the substituted bytes as normal
+  printable ASCII.
+
+Other classes of "garbage" the IDL MWRFITS fixture surfaced
+already work transparently in BOTH modes (no lenient flag
+needed) because rustfits stores cards as raw strings and
+defers validation:
+
+- Keys with illegal chars (`BAR@`, `BI.Z`) — the 8-char
+  keyword text is stored verbatim and looked up by raw
+  substring match (case-insensitive).  `header["BAR@"]`
+  returns the value.
+- Unquoted `NAN` / `INF` / `-INF` as values — parsed as
+  `float('nan')` / `float('inf')` because Rust's
+  `f64::from_str` accepts these tokens.  **Diverges from
+  fitsio** which preserves them as strings; the float form
+  is arguably more useful for downstream code (composes
+  with `math.isnan` / numpy).  Document the divergence if
+  it ever bites a user.
+- Numbers-in-quotes (`'1.0'`) — already correctly returned
+  as strings, since the value parser only attempts numeric
+  parse on unquoted text.
+- HIERARCH keys with `.` and `@` — already permitted by the
+  HIERARCH validator (which is broader than the 8-char one).
+
+Regression pin: `tests/test_header_lenient.py` opens the IDL
+MWRFITS fixture verbatim from fitsio's test suite and asserts
+both the strict-mode rejection (with the lenient= hint) and
+the lenient-mode per-key parsing.
+
 ## CONTINUE-chained string values
 
 Long string values (escaped length > 68 chars) auto-emit a CONTINUE chain:

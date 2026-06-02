@@ -303,6 +303,7 @@ fn parse_hdus_from_file(
     handle: &FileHandle,
     layout: &Arc<FileLayout>,
     tainted: &TaintFlag,
+    lenient: bool,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let mut guard = lock_file(handle)?;
     let file = guard.as_mut()
@@ -333,12 +334,23 @@ fn parse_hdus_from_file(
             }
 
             // FITS header bytes are restricted to printable ASCII (0x20-0x7E).
-            for (j, &b) in block.iter().enumerate() {
-                if !(0x20..=0x7E).contains(&b) {
-                    return Err(PyValueError::new_err(format!(
-                        "non-printable byte 0x{:02X} in header block at byte offset {}",
-                        b, offset + j as u64
-                    )));
+            // In strict mode (default) we reject; in lenient mode we substitute
+            // each non-printable byte with an underscore so the file parses.
+            // This is what astropy / fitsio do for archive files that were
+            // written by older tools (IDL MWRFITS in particular emits keys
+            // with non-ASCII bytes that the FITS standard disallows).
+            for (j, b) in block.iter_mut().enumerate() {
+                if !(0x20..=0x7E).contains(b) {
+                    if lenient {
+                        *b = b'_';
+                    } else {
+                        return Err(PyValueError::new_err(format!(
+                            "non-printable byte 0x{:02X} in header block at byte offset {} \
+                             (pass lenient=True to FITS() to substitute these with '_' for \
+                             archive files written by non-conforming tools)",
+                            *b, offset + j as u64
+                        )));
+                    }
                 }
             }
 
@@ -679,6 +691,21 @@ fn append_header_and_data_to_file(
 ///     * ``'w+'`` — read+write; creates the file if it doesn't
 ///       exist, **truncates** to zero length if it does.
 ///       Equivalent to fitsio's ``'rw'`` + ``clobber=True``.
+/// lenient : bool, optional, keyword-only
+///     If ``False`` (default), header blocks must contain only
+///     printable ASCII bytes (0x20-0x7E); any other byte is
+///     rejected at open with a clear error.  This is the right
+///     default for most workflows — if the file opened, every
+///     header byte was spec-compliant.
+///
+///     If ``True``, non-printable bytes are substituted in place
+///     with ``_`` (matches astropy's substitution rule) and
+///     parsing proceeds normally.  Useful for archive files
+///     written by older non-conforming tools (IDL MWRFITS in
+///     particular emits keys with non-ASCII bytes the standard
+///     disallows).  Lenient mode is READ-only — new card
+///     mutations through ``header[k] = v`` still go through
+///     strict validation.
 ///
 /// Notes
 /// -----
@@ -1517,8 +1544,13 @@ impl FITS {
     // built-in open(filename) convention.  'r+' opens for in-place
     // mutation; 'w+' truncates / creates.
     #[new]
-    #[pyo3(signature = (filename, mode="r"))]
-    fn new(py: Python<'_>, filename: String, mode: &str) -> PyResult<Self> {
+    #[pyo3(signature = (filename, mode="r", *, lenient=false))]
+    fn new(
+        py: Python<'_>,
+        filename: String,
+        mode: &str,
+        lenient: bool,
+    ) -> PyResult<Self> {
         if !matches!(mode, "r" | "r+" | "w+") {
             return Err(PyIOError::new_err(format!(
                 "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",
@@ -1595,7 +1627,7 @@ impl FITS {
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
         let layout = FileLayout::new();
         let hdus = parse_hdus_from_file(
-            py, &filename, &handle, &layout, &tainted,
+            py, &filename, &handle, &layout, &tainted, lenient,
         )?;
 
         Ok(FITS {
@@ -1610,15 +1642,31 @@ impl FITS {
 
     /// Parse a FITS file from in-memory bytes (no disk access).
     ///
-    /// ``data`` is copied into a private in-memory buffer, so the
-    /// returned :class:`FITS` is fully independent of the original
-    /// object.  ``mode`` may be ``'r'`` (default) or ``'r+'`` (allow
-    /// in-memory mutation of the private copy); ``'w+'`` is rejected
-    /// because it would discard the bytes you just passed — use
-    /// ``FITS("mem://", "w+")`` to create an empty in-memory file.
+    /// Parameters
+    /// ----------
+    /// data : bytes
+    ///     Raw FITS bytes.  Copied into a private in-memory buffer,
+    ///     so the returned :class:`FITS` is fully independent of
+    ///     the original object.
+    /// mode : {'r', 'r+'}, optional
+    ///     ``'r'`` (default) opens read-only; ``'r+'`` allows
+    ///     in-memory mutation of the private copy.  ``'w+'`` is
+    ///     rejected because it would discard the bytes you just
+    ///     passed — use ``FITS("mem://", "w+")`` to create an
+    ///     empty in-memory file.
+    /// lenient : bool, optional, keyword-only
+    ///     Same semantics as the :class:`FITS` constructor: if
+    ///     ``True``, substitute non-printable header bytes with
+    ///     ``_`` instead of rejecting.  Default ``False`` (strict).
+    ///     See the :class:`FITS` docstring for details.
     #[staticmethod]
-    #[pyo3(signature = (data, mode="r"))]
-    fn from_bytes(py: Python<'_>, data: Vec<u8>, mode: &str) -> PyResult<Self> {
+    #[pyo3(signature = (data, mode="r", *, lenient=false))]
+    fn from_bytes(
+        py: Python<'_>,
+        data: Vec<u8>,
+        mode: &str,
+        lenient: bool,
+    ) -> PyResult<Self> {
         if !matches!(mode, "r" | "r+") {
             return Err(PyValueError::new_err(format!(
                 "from_bytes supports mode 'r' or 'r+' (got '{}'); 'w+' would \
@@ -1632,7 +1680,7 @@ impl FITS {
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
         let layout = FileLayout::new();
         let hdus = parse_hdus_from_file(
-            py, "mem://", &handle, &layout, &tainted,
+            py, "mem://", &handle, &layout, &tainted, lenient,
         )?;
         Ok(FITS {
             filename: "mem://".to_string(),
