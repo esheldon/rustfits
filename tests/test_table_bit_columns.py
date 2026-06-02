@@ -543,5 +543,70 @@ def test_fitsio_cross_reads_x_columns():
         )
 
 
+def test_x_columns_row_and_column_subset_read_paths():
+    """
+    Bit-packed X columns exercised through every row-selection and
+    column-subset read path: whole-table, sorted/unsorted fancy rows,
+    slice, read(columns=, rows=) combined, and read_column().  The
+    bit-unpack logic must produce the correct shapes / values
+    through each path -- a regression that broke the unpack only
+    on the rows= or column-subset code path would surface here.
+
+    Regression pin against fitsio/tests/test_table.py
+    ::test_table_bitcol_read_write (which exercises the same matrix
+    via fitsio's write_bitcols=True path).
+    """
+    # Fixture: nvec=2 boolean vector + 21x21 boolean image per row,
+    # 4 rows.  Matches fitsio's bdata fixture in
+    # fitsio/tests/makedata.py.
+    nvec = 2
+    ashape = (21, 21)
+    dt = np.dtype([("b1vec", "?", nvec), ("b1arr", "?", ashape)])
+    nrows = 4
+    bdata = np.zeros(nrows, dtype=dt)
+    bdata["b1vec"] = (
+        (np.arange(nrows * nvec) % 2 == 0).astype("?").reshape(nrows, nvec)
+    )
+    arr = (np.arange(nrows * ashape[0] * ashape[1]) % 2 == 0).astype("?")
+    bdata["b1arr"] = arr.reshape(nrows, ashape[0], ashape[1])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, bit_columns=True)
+            f[1].write(bdata)
+
+        with rustfits.FITS(fname, "r") as f:
+            t = f[1]
+
+            # Whole-table read.
+            whole = t.read()
+            np.testing.assert_array_equal(whole["b1vec"], bdata["b1vec"])
+            np.testing.assert_array_equal(whole["b1arr"], bdata["b1arr"])
+
+            # rows= subset, sorted and unsorted (result order must
+            # match the request order; the heap planner is allowed
+            # to read in disk order internally).
+            for rows in ([0, 2], [2, 0], [1, 3], [3, 1]):
+                r = t.read(rows=rows)
+                np.testing.assert_array_equal(r["b1vec"], bdata["b1vec"][rows])
+                np.testing.assert_array_equal(r["b1arr"], bdata["b1arr"][rows])
+
+            # Slice on a bit-column-bearing whole table.
+            sl = t[:2]
+            np.testing.assert_array_equal(sl["b1vec"], bdata["b1vec"][:2])
+            np.testing.assert_array_equal(sl["b1arr"], bdata["b1arr"][:2])
+
+            # read(columns=, rows=) combined, sorted and unsorted.
+            for rows in ([0, 2], [3, 1]):
+                r = t.read(columns=["b1vec", "b1arr"], rows=rows)
+                np.testing.assert_array_equal(r["b1vec"], bdata["b1vec"][rows])
+                np.testing.assert_array_equal(r["b1arr"], bdata["b1arr"][rows])
+
+            # read_column per field.
+            for name in dt.names:
+                np.testing.assert_array_equal(t.read_column(name), bdata[name])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])
