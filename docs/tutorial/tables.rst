@@ -276,6 +276,22 @@ table along its rows.  Accepts the same three input forms as
 If the table isn't the last HDU on disk, later HDUs shift
 forward; offsets on any cached handles update transparently.
 
+If your table is compressed and you plan build a table piecewise with many
+appends, it is much more efficient to use an
+:meth:`~rustfits.CompressedTableHDU.appending` context
+
+.. code-block:: python
+
+   with rustfits.FITS(fname, 'r+') as fits:
+       with fits['data'].appending():
+           for i in range(nchunks):
+               new_rows = np.zeros(chunksize, dtype=hdu.dtype)
+               fits['data'].append(new_rows)
+
+The :meth:`~rustfits.CompressedTableHDU.appending` context buffers writes to
+avoid many decompressing and recompressing cycles when writing chunks smaller
+than the compressed tile size.
+
 Adding and removing columns
 ---------------------------
 
