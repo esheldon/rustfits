@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use std::sync::Arc;
 
-use crate::hdu_table::coerce_to_len1_record;
+use crate::hdu_table::{coerce_to_len1_record, read_rows_maybe_scalar};
 
 use super::hdu::{CompressedTableHDU};
 use super::read::{read_compressed_table};
@@ -62,14 +62,17 @@ impl CompressedSingleColumnSubset {
         let super_ = pyref.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
-        let arr = read_compressed_table(
-            py, &cards, data_offset, &super_.file,
-            Some(rows), Some(vec![self.name.clone()]),
-            /* scale = */ true, &cache,
-        )?;
-        // Unwrap to a plain (non-structured) ndarray view of the
-        // single column — mirrors the uncompressed SingleColumnSubset.
-        Ok(arr.bind(py).get_item(self.name.as_str())?.unbind())
+        // Closure does the read AND the field extract so the helper's
+        // [0] strip works on the plain (non-structured) column view —
+        // mirrors the uncompressed SingleColumnSubset return shape.
+        read_rows_maybe_scalar(py, rows, |rk| {
+            let arr = read_compressed_table(
+                py, &cards, data_offset, &super_.file,
+                Some(rk), Some(vec![self.name.clone()]),
+                /* scale = */ true, &cache,
+            )?;
+            Ok(arr.bind(py).get_item(self.name.as_str())?.unbind())
+        })
     }
 
     /// Read this column.
@@ -264,11 +267,11 @@ impl CompressedColumnSubset {
         let super_ = pyref.into_super().into_super();
         let cards = super_.header_snapshot()?;
         let data_offset = super_.offsets.data_offset();
-        read_compressed_table(
+        read_rows_maybe_scalar(py, rows, |rk| read_compressed_table(
             py, &cards, data_offset, &super_.file,
-            Some(rows), Some(self.columns.clone()),
+            Some(rk), Some(self.columns.clone()),
             /* scale = */ true, &cache,
-        )
+        ))
     }
 
     /// Read these columns.

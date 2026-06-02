@@ -32,7 +32,7 @@ pub(crate) use setitem::{
 pub(crate) use read::{
     build_numpy_dtype, build_var_cell_value, convert_column_cell,
     field_dtype_and_shape, numpy_field_layout, read_descriptor,
-    resolve_columns, resolve_rows,
+    read_rows_maybe_scalar, resolve_columns, resolve_rows,
 };
 pub(crate) use write_fixed::{apply_transform_cell, set_pcount_in_cards};
 pub(crate) use write_setup::{

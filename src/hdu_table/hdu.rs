@@ -17,7 +17,8 @@ use crate::hdu::HDU;
 use super::columns::{parse_columns, parse_table_meta, Column, TableMeta};
 use super::edit::{delete_column_impl, insert_column_impl};
 use super::read::{
-    build_numpy_dtype, field_dtype_and_shape, read_one_column, read_table,
+    build_numpy_dtype, field_dtype_and_shape, read_one_column,
+    read_rows_maybe_scalar, read_table,
 };
 use super::setitem::{
     classify_setitem_key, setitem_fancy_rows,
@@ -1272,11 +1273,11 @@ impl SingleColumnSubset {
         let super_ = pyref.as_super();
         let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
-        read_one_column(
+        read_rows_maybe_scalar(py, rows, |rk| read_one_column(
             py, &meta, data_offset, &super_.file,
-            &self.name, Some(rows), /* as_bytes = */ false,
+            &self.name, Some(rk), /* as_bytes = */ false,
             /* scale = */ true, /* mask_null = */ false,
-        )
+        ))
     }
 
     /// Read this column.
@@ -1438,11 +1439,11 @@ impl ColumnSubset {
         let super_ = pyref.as_super();
         let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
-        read_table(
+        read_rows_maybe_scalar(py, rows, |rk| read_table(
             py, &meta, data_offset, &super_.file,
-            Some(rows), Some(self.columns.clone()),
+            Some(rk), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
-        )
+        ))
     }
 
     /// Read these columns.

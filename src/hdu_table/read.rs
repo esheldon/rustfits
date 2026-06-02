@@ -946,6 +946,52 @@ struct RunPlan {
 // normalized and duplicates removed (first occurrence kept).  Validates
 // range up front so a bad index in the middle of a large request fails
 // before any I/O.
+// Subset __getitem__ accepts a bare int as a scalar row index (parallel
+// to TableHDU[i] returning a 0-d record).  Returns Some(idx) if `key` is
+// a bare int (not bool — Python bool is a subclass of int and would
+// otherwise be silently treated as 0 / 1), None otherwise.  Bool keys
+// are rejected explicitly to mirror classify_table_key's behavior on
+// the parent.
+pub(crate) fn try_extract_scalar_row(
+    key: &Bound<'_, PyAny>,
+) -> PyResult<Option<i64>> {
+    if key.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyValueError::new_err(
+            "subset index must be int, slice, or iterable of int; got bool",
+        ));
+    }
+    Ok(key.extract::<i64>().ok())
+}
+
+// Generic scalar/slice dispatcher for subset __getitem__.  If `rows` is
+// a bare int, wraps it in a 1-element list, invokes `read` with that,
+// and strips the leading axis from the result (`arr[0]`).  Otherwise
+// passes `rows` straight through to `read`.
+//
+// The closure is responsible for returning a value already in the
+// shape an `arr[0]` strip makes sense for — for compressed single-col
+// subsets that means extracting the column field inside the closure
+// before returning, so the helper's strip step works uniformly.
+//
+// One place owns the scalar-stripping semantics; if a future change
+// wants a bare int to return a different shape (0-d vs scalar, etc.),
+// it changes here and all 6 subset classes inherit it.
+pub(crate) fn read_rows_maybe_scalar<'py, F>(
+    py: Python<'py>,
+    rows: &Bound<'py, PyAny>,
+    read: F,
+) -> PyResult<Py<PyAny>>
+where
+    F: FnOnce(&Bound<'py, PyAny>) -> PyResult<Py<PyAny>>,
+{
+    if let Some(idx) = try_extract_scalar_row(rows)? {
+        let one = PyList::new(py, [idx])?;
+        let arr = read(one.as_any())?;
+        return Ok(arr.bind(py).get_item(0)?.unbind());
+    }
+    read(rows)
+}
+
 pub(crate) fn resolve_rows(
     rows_arg: &Bound<'_, PyAny>,
     n_rows: usize,

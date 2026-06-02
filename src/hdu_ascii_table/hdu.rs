@@ -18,7 +18,7 @@ use crate::common::{
     HduOffsets, TaintFlag,
 };
 use crate::hdu::HDU;
-use crate::hdu_table::try_extract_column_name;
+use crate::hdu_table::{read_rows_maybe_scalar, try_extract_column_name};
 use crate::hdu_table::TableIter;
 
 use super::edit::{delete_column_impl, insert_column_impl};
@@ -849,11 +849,11 @@ impl AsciiSingleColumnSubset {
         check_not_tainted(&super_.tainted)?;
         let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
-        read_one_column(
+        read_rows_maybe_scalar(py, rows, |rk| read_one_column(
             py, &meta, data_offset, &super_.file,
-            &self.name, Some(rows), /* as_bytes = */ false,
+            &self.name, Some(rk), /* as_bytes = */ false,
             /* scale = */ true, /* mask_null = */ false,
-        )
+        ))
     }
 
     /// Read this column.
@@ -969,11 +969,11 @@ impl AsciiColumnSubset {
         check_not_tainted(&super_.tainted)?;
         let meta = pyref.meta(super_)?;
         let data_offset = super_.offsets.data_offset();
-        read_ascii_table(
+        read_rows_maybe_scalar(py, rows, |rk| read_ascii_table(
             py, &meta, data_offset, &super_.file,
-            Some(rows), Some(self.columns.clone()),
+            Some(rk), Some(self.columns.clone()),
             /* scale = */ true, /* mask_null = */ false,
-        )
+        ))
     }
 
     /// Read these columns.
