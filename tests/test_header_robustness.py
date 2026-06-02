@@ -10,6 +10,7 @@ Covers:
       cause the reader to error rather than silently substitute.
     - Mandatory keywords (SIMPLE, BITPIX, NAXIS, NAXISn) must be present;
       the reader rejects headers missing any of them.
+    - Extension headers must start with XTENSION (not a stray SIMPLE).
 """
 
 import os
@@ -186,6 +187,40 @@ def test_missing_naxisn_rejected():
             rustfits.FITS(fname, "r")
 
 
+def test_extension_starts_with_simple_rejected():
+    """
+    A multi-HDU file whose second HDU's header starts with SIMPLE
+    instead of XTENSION must be rejected with a clear error.  This
+    is what a file looks like when an extension is missing its
+    XTENSION marker (or, equivalently, when two primary headers
+    were concatenated by mistake).  Regression pin against the
+    fitsio fixture in fitsio/tests/test_header_junk.py
+    ::test_missing_xtension_keyword (same shape on a real-world
+    malformed file).
+    """
+    primary = [
+        _card("SIMPLE  =                    T"),
+        _card("BITPIX  =                    8"),
+        _card("NAXIS   =                    0"),
+        _card("EXTEND  =                    T"),
+        _card("END"),
+    ]
+    # Extension HDU but starts with SIMPLE — illegal.
+    extension = [
+        _card("SIMPLE  =                    T"),
+        _card("BITPIX  =                   32"),
+        _card("NAXIS   =                    2"),
+        _card("NAXIS1  =                   30"),
+        _card("NAXIS2  =                   30"),
+        _card("END"),
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "rb.fits")
+        _write_two_hdus(fname, primary, extension)
+        with pytest.raises(ValueError, match="XTENSION"):
+            rustfits.FITS(fname, "r")
+
+
 if __name__ == "__main__":
     test_naxis_keyword_not_matched_by_naxis1()
     test_end_card_does_not_match_endian()
@@ -194,4 +229,5 @@ if __name__ == "__main__":
     test_missing_bitpix_rejected()
     test_missing_naxis_rejected()
     test_missing_naxisn_rejected()
+    test_extension_starts_with_simple_rejected()
     print("all tests passed")
