@@ -351,5 +351,53 @@ def test_vla_column_iteration(kind):
             np.testing.assert_array_equal(chunks[1]["id"], np.arange(25, 50))
 
 
+# -------------------- __len__ (tqdm progress bars) --------------------
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_row_iter_len_matches_remaining(kind):
+    data = _basic_data(50)
+    with tempfile.TemporaryDirectory() as td:
+        path = _write_table(td, data, kind=kind, ztilelen=16)
+        with rustfits.FITS(path, "r") as f:
+            it = iter(f[1])
+            assert len(it) == 50
+            for k in range(10):
+                next(it)
+            assert len(it) == 40
+            # drain
+            for _ in it:
+                pass
+            assert len(it) == 0
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_chunk_iter_len_matches_remaining_chunks(kind):
+    data = _basic_data(50)
+    with tempfile.TemporaryDirectory() as td:
+        path = _write_table(td, data, kind=kind, ztilelen=16)
+        with rustfits.FITS(path, "r") as f:
+            # 50 rows / chunksize=20 -> 3 chunks of 20, 20, 10.
+            it = f[1].iter(chunksize=20)
+            assert len(it) == 3
+            next(it)
+            assert len(it) == 2
+            next(it)
+            assert len(it) == 1
+            next(it)
+            assert len(it) == 0
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_iter_len_empty_table(kind):
+    dt = np.dtype([("id", "i4")])
+    empty = np.zeros(0, dtype=dt)
+    with tempfile.TemporaryDirectory() as td:
+        path = _write_table(td, empty, kind=kind, ztilelen=16)
+        with rustfits.FITS(path, "r") as f:
+            assert len(iter(f[1])) == 0
+            assert len(f[1].iter(chunksize=10)) == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

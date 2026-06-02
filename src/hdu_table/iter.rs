@@ -73,6 +73,19 @@ impl TableIter {
         slf
     }
 
+    // Remaining items still to be yielded.  Exposing __len__ lets
+    // tqdm(hdu.iter()) show a real progress bar with total + ETA
+    // instead of a bare counter.  Returns rows in row mode and
+    // chunks in chunk mode (i.e. the count that matches what
+    // subsequent __next__ calls will yield).
+    fn __len__(&self) -> usize {
+        let on_disk = self.nrows.saturating_sub(self.next_row);
+        match self.chunksize {
+            None => self.buf_len.saturating_sub(self.buf_cursor) + on_disk,
+            Some(n) => on_disk.div_ceil(n),
+        }
+    }
+
     fn __next__(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,

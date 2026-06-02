@@ -173,5 +173,22 @@ def test_iter_independent_cursors():
             assert int(next(it2)["ID"]) == 1
 
 
+def test_iter_len_for_progress_bars():
+    """__len__ on the iterator lets tqdm() show a real progress bar."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = _ascii_fixture(tmp, 10)
+        with rustfits.FITS(fname) as f:
+            # row mode: remaining rows
+            it = iter(f[1])
+            assert len(it) == 10
+            next(it)
+            assert len(it) == 9
+            # chunk mode: remaining chunks
+            it2 = f[1].iter(chunksize=4)
+            assert len(it2) == 3  # 4 + 4 + 2
+            next(it2)
+            assert len(it2) == 2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
