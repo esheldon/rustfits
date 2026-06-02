@@ -188,6 +188,56 @@ def test_naxis0_has_no_data_section():
         assert os.path.getsize(fname) == 2880
 
 
+def test_chain_of_empty_image_hdus():
+    """
+    Write 8 NAXIS=0 image HDUs in a row, each with a per-HDU header.
+    Verifies the HDU-offset arithmetic for back-to-back zero-data
+    sections — when each HDU is exactly one header block (2880 B)
+    with no data section, a one-off bug in the offset bookkeeping
+    would surface as wrong-extname / KeyError on read-back.
+
+    Regression pin against fitsio/tests/test_image.py
+    ::test_image_write_empty (the DECam CCD-mosaic pattern: many
+    empty image extensions, each with the same boilerplate header).
+    """
+    extnames = [f"CCD{i}" for i in range(1, 9)]
+    hdr = {
+        "EXPTIME": 120,
+        "OBSERVER": "Beatrice Tinsley",
+        "INSTRUME": "DECam",
+        "FILTER": "r",
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "ccds.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            for extname in extnames:
+                fits.create_image_hdu(dtype="u1", dims=[], extname=extname)
+                fits[-1].header.update(hdr)
+        # All 8 readable, each with the right extname + header keys.
+        with rustfits.FITS(fname, "r") as fits:
+            assert len(fits) == 8
+            for i, extname in enumerate(extnames):
+                assert fits[i].extname == extname
+                assert fits[i].has_data is False
+                for k, v in hdr.items():
+                    assert fits[i].header[k] == v
+
+
+def test_chain_of_empty_image_hdus_file_size():
+    """
+    8 NAXIS=0 HDUs with only the structural keys + a few user keys
+    fit in one header block each.  File size must be exactly
+    8 * 2880 bytes; anything else indicates a stray data section
+    or padding error in the HDU-offset arithmetic.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "tight.fits")
+        with rustfits.FITS(fname, "w+") as fits:
+            for i in range(8):
+                fits.create_image_hdu(dtype="u1", dims=[], extname=f"E{i}")
+        assert os.path.getsize(fname) == 8 * 2880
+
+
 def test_extname_with_embedded_quote():
     """
     Single quotes inside EXTNAME must be doubled per the FITS standard,

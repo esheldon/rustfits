@@ -1441,6 +1441,68 @@ def test_var_rows_subset():
             assert c[1].tolist() == [100]
 
 
+def test_var_subset_objects_slice_and_fancy():
+    """
+    The subset-object paths -- t[[cols]][rows] and t["col"][rows] --
+    must work for slice AND fancy row-selectors when the underlying
+    table contains a VLA column.  Companion to test_var_rows_subset
+    (which covers `t.read(rows=)`, `t[[rows]]`, and
+    `t["col"][[fancy_rows]]`); this fills in:
+
+      - `t[lo:hi]` slice on a VLA-bearing whole table
+      - `t["vla_col"][lo:hi]` slice on a single-VLA-col subset
+      - `t[["fixed", "vla"]][lo:hi]` slice on a mixed subset
+      - `t[["fixed", "vla"]][[fancy]]` fancy on a mixed subset,
+        with the requested order preserved
+
+    Regression pin against the access-pattern sweep in
+    fitsio/tests/test_table.py::test_variable_length_columns.
+    """
+    # 4-row table: one fixed int + one VLA float, lengths 1/2/3/4.
+    dt = np.dtype([("ID", "i4"), ("VLA", "O")])
+    arr = np.zeros(4, dtype=dt)
+    arr["ID"] = [10, 20, 30, 40]
+    arr["VLA"][0] = np.array([1.0], dtype="f4")
+    arr["VLA"][1] = np.array([2.0, 2.5], dtype="f4")
+    arr["VLA"][2] = np.array([3.0, 3.5, 3.75], dtype="f4")
+    arr["VLA"][3] = np.array([4.0, 4.5, 4.75, 4.875], dtype="f4")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=4, var_dtypes={"VLA": "f4"})
+            f[1].write(arr)
+
+        with rustfits.FITS(fname, "r") as f:
+            t = f[1]
+
+            # `t[1:3]` -- slice on the VLA-bearing whole table.
+            sliced = t[1:3]
+            assert sliced["ID"].tolist() == [20, 30]
+            assert sliced["VLA"][0].tolist() == [2.0, 2.5]
+            assert sliced["VLA"][1].tolist() == [3.0, 3.5, 3.75]
+
+            # `t["VLA"][1:3]` -- single-VLA-col subset + slice.
+            single = t["VLA"][1:3]
+            assert single[0].tolist() == [2.0, 2.5]
+            assert single[1].tolist() == [3.0, 3.5, 3.75]
+
+            # `t[["ID", "VLA"]][1:3]` -- mixed subset + slice.
+            mixed_slice = t[["ID", "VLA"]][1:3]
+            assert mixed_slice["ID"].tolist() == [20, 30]
+            assert mixed_slice["VLA"][0].tolist() == [2.0, 2.5]
+            assert mixed_slice["VLA"][1].tolist() == [3.0, 3.5, 3.75]
+
+            # `t[["ID", "VLA"]][[2, 0]]` -- mixed subset + fancy
+            # unsorted.  The result must be in REQUESTED order
+            # (row 2 first, then row 0), not in the on-disk order
+            # the heap planner uses internally.
+            mixed_fancy = t[["ID", "VLA"]][[2, 0]]
+            assert mixed_fancy["ID"].tolist() == [30, 10]
+            assert mixed_fancy["VLA"][0].tolist() == [3.0, 3.5, 3.75]
+            assert mixed_fancy["VLA"][1].tolist() == [1.0]
+
+
 def test_var_mixed_with_fixed_columns():
     """
     A row has a fixed J and a variable PE; both must come out

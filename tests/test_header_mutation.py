@@ -71,6 +71,64 @@ def test_set_new_string_key():
             assert fits[0].header["OBJECT"] == "M31"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "35-8",  # looks like binary 35 - 8 = 27
+        "89113e6",  # looks like 8.9113e10 in scientific notation
+        "25-3",  # looks like 25 - 3 = 22
+        "1_000_000",  # Python int literal syntax
+        "J. Smith",  # contains '.' and space — neither numeric nor key-like
+    ],
+)
+def test_set_numeric_looking_string_preserved(value):
+    """
+    String values that LOOK numeric must round-trip as strings, not
+    get coerced to int / float / evaluated.  rustfits writes the
+    value as a quoted FITS string at __setitem__ time, and the
+    read-side value parser only attempts numeric parse on UNQUOTED
+    text — so the disambiguation is the quoting at write time.
+
+    Regression pin for the value-parser disambiguation: a
+    refactor that tried `int().parse()` before checking quote-
+    wrapping would silently break all 5 of these.
+
+    Companion to fitsio/tests/test_header.py::test_header_write_read
+    (which buries this case in a larger fixture).
+    """
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["FUNKY"] = value
+        with rustfits.FITS(fname, "r") as fits:
+            v = fits[0].header["FUNKY"]
+            assert isinstance(v, str), (
+                f"expected str, got {type(v).__name__}: {v!r}"
+            )
+            assert v == value, f"expected {value!r}, got {v!r}"
+
+
+def test_set_long_string_value_triggers_continue_round_trip():
+    """
+    A string value longer than 68 characters (the per-card payload
+    limit for a quoted value) is auto-chunked into a CONTINUE chain
+    on write and reassembled on read.  Pins the LOREM-IPSUM round-
+    trip case from fitsio/tests/test_header.py::test_header_write_read
+    where a multi-hundred-char value is round-tripped via the
+    CONTINUE machinery.
+    """
+    lorem = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, "
+        "sed do eiusmod tempor incididunt ut labore et dolore magna "
+        "aliqua. Ut enim ad minim veniam, quis nostrud exercitation."
+    )
+    assert len(lorem) > 68  # confirms the test forces a CONTINUE chain
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["LONGS"] = lorem
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].header["LONGS"] == lorem
+
+
 def test_set_new_bool_key():
     with _new_file() as fname:
         with rustfits.FITS(fname, "r+") as fits:

@@ -221,6 +221,97 @@ def test_extension_starts_with_simple_rejected():
             rustfits.FITS(fname, "r")
 
 
+# --------------------------- CONTINUE quirks -------------------------------
+
+
+def _write_primary_with_cards(fname, extra_cards):
+    """
+    Single-HDU file with NAXIS=0 (no data) plus the given user cards.
+    """
+    cards = [
+        _card("SIMPLE  =                    T"),
+        _card("BITPIX  =                    8"),
+        _card("NAXIS   =                    0"),
+    ]
+    cards.extend(extra_cards)
+    cards.append(_card("END"))
+    _write_header_only(fname, cards)
+
+
+def test_orphan_continue_card_does_not_crash():
+    """
+    A CONTINUE card with no preceding string ending in '&' is
+    malformed per the FITS spec, but archive files contain them
+    (and fitsio + astropy both tolerate them).  rustfits must
+    parse the file without crashing and the neighboring cards
+    must still read correctly; the orphan CONTINUE is silently
+    dropped from the keys() view (CONTINUE is in the commentary-
+    key exclusion list).  Regression pin against
+    fitsio/tests/test_header.py::test_corrupt_continue (the
+    first half of the smoke test).
+    """
+    orphan = [
+        _card("IVAL    =                   35 / integer value"),
+        _card("SHORTS  = 'hello world'"),
+        _card("CONTINUE= '        '           / orphan CONTINUE here"),
+        _card("UND     ="),
+        _card("DBL     =                 1.25"),
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "orphan.fits")
+        _write_primary_with_cards(fname, orphan)
+        with rustfits.FITS(fname, "r") as fits:
+            h = fits[0].header
+            # Neighboring cards still parse, the orphan CONTINUE
+            # doesn't propagate into them.
+            assert h["IVAL"] == 35
+            assert h["SHORTS"] == "hello world"
+            assert h["UND"] is None
+            assert h["DBL"] == 1.25
+
+
+def test_multi_card_continue_chain_does_not_crash():
+    """
+    A 3-card CONTINUE chain (PROGRAM + 2 CONTINUE cards, where the
+    last CONTINUE has '&' as payload) must parse without crashing.
+    The exact final value text is implementation-defined for this
+    edge case (the spec is ambiguous about what '&' as payload on
+    the last card means), so this test pins only the
+    no-crash + chain-detection invariant + the neighboring keys.
+    Regression pin against fitsio/tests/test_header.py
+    ::test_corrupt_continue (the second half of the smoke test).
+    """
+    chain = [
+        _card("IVAL    =                   35 / integer value"),
+        _card("SHORTS  = 'hello world'"),
+        _card(
+            "PROGRAM = 'Setting the Scale: "
+            "Determining the Absolute Mass Norm. and &'"
+        ),
+        _card("CONTINUE  'Scaling Relations for Clusters at z~0.1&'"),
+        _card("CONTINUE  '&' / Current observing program"),
+        _card("UND     ="),
+        _card("DBL     =                 1.25"),
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = os.path.join(tmpdir, "chain.fits")
+        _write_primary_with_cards(fname, chain)
+        with rustfits.FITS(fname, "r") as fits:
+            h = fits[0].header
+            # The chain follower actually concatenates the segments
+            # (don't pin the trailing-'&' edge case — start-match
+            # only, so the test stays robust to future tightening
+            # of the spec-ambiguous tail handling).
+            assert isinstance(h["PROGRAM"], str)
+            assert h["PROGRAM"].startswith("Setting the Scale:")
+            assert "Scaling Relations" in h["PROGRAM"]
+            # Neighboring cards unaffected by the chain logic.
+            assert h["IVAL"] == 35
+            assert h["SHORTS"] == "hello world"
+            assert h["UND"] is None
+            assert h["DBL"] == 1.25
+
+
 if __name__ == "__main__":
     test_naxis_keyword_not_matched_by_naxis1()
     test_end_card_does_not_match_endian()
@@ -230,4 +321,6 @@ if __name__ == "__main__":
     test_missing_naxis_rejected()
     test_missing_naxisn_rejected()
     test_extension_starts_with_simple_rejected()
+    test_orphan_continue_card_does_not_crash()
+    test_multi_card_continue_chain_does_not_crash()
     print("all tests passed")

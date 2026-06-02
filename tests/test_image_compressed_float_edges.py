@@ -171,6 +171,67 @@ def test_rice_with_quantize_none_rejected_via_write_image():
 
 
 # ---------------------------------------------------------------
+# All non-finite values (NaN, +Inf, -Inf) round-trip exactly
+# ---------------------------------------------------------------
+#
+# The FITS tile-compression spec defines a null-sentinel
+# (cfitsio's _FLOATING_NULL_VALUE) for representing non-finite
+# floats through the quantizer, but only mandates NaN
+# preservation.  rustfits preserves +Inf and -Inf as well,
+# distinctly from NaN, across every supported compression mode.
+#
+# Pinned here so a future codec refactor doesn't silently fold
+# Inf to NaN.  Companion to
+# fitsio/tests/test_util.py::test_nonfinite_as_cfitsio_floating_null_value
+# (which tests fitsio's internal nonfinite-to-sentinel utility;
+# this test exercises the user-facing round-trip directly).
+
+
+_NONFINITE_CASES = [
+    ("gzip_1", None),
+    ("gzip_1", 4),
+    ("gzip_2", None),
+    ("gzip_2", 4),
+    ("rice_1", 4),
+    # rice_1 + None is rejected by design (covered above).
+]
+
+
+@pytest.mark.parametrize("compress,qlevel", _NONFINITE_CASES)
+def test_nonfinite_round_trips_through_compressed_tile(compress, qlevel):
+    data = np.array(
+        [[1.0, 2.0, np.nan, np.inf, -np.inf]],
+        dtype="f4",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            if qlevel is None:
+                f.write_image(data, compress=compress, quantize=None)
+            else:
+                f.write_image(
+                    data,
+                    compress=compress,
+                    quantize=rustfits.Quantize(
+                        level=float(qlevel),
+                        seed=10,
+                    ),
+                )
+        with rustfits.FITS(fname, "r") as f:
+            r = f[1].read()
+    assert np.isnan(r[0, 2]), "NaN should survive"
+    assert r[0, 3] == np.inf, f"+Inf should survive (got {r[0, 3]})"
+    assert r[0, 4] == -np.inf, f"-Inf should survive (got {r[0, 4]})"
+    # Finite values round-trip too (lossy is within tolerance).
+    if qlevel is None:
+        assert r[0, 0] == 1.0
+        assert r[0, 1] == 2.0
+    else:
+        np.testing.assert_allclose(r[0, 0], 1.0, rtol=0, atol=0.1)
+        np.testing.assert_allclose(r[0, 1], 2.0, rtol=0, atol=0.1)
+
+
+# ---------------------------------------------------------------
 # Test #5 — DITHER_2 preserves exact zero pixels
 # ---------------------------------------------------------------
 #
@@ -249,6 +310,106 @@ def test_subnormal_array_never_flushes_to_zero(dtype, subnormal):
             r = f[0].read() if f[0].has_data else f[-1].read()
     assert (r == subnormal).all()
     assert (r != 0).all()
+
+
+# ---------------------------------------------------------------
+# Isolated non-finite cell in a multi-tile lossy compressed image
+# ---------------------------------------------------------------
+#
+# Sets exactly one cell (the [1, 1] position) of a 6x6 float image
+# to NaN / +Inf / -Inf, then compresses with RICE_1 + qlevel=2 +
+# tile_shape=(3, 3) so the non-finite cell sits inside one tile
+# while three other tiles are well-formed integer ranges.  This is
+# the realistic "one bad pixel in a mostly-good image" pattern
+# (cosmic ray, saturated pixel, sensor defect).
+#
+# Spec contract: a non-finite input cell must read back non-finite
+# AND surrounding cells in the same tile must round-trip within
+# the lossy tolerance.  cfitsio (and fitsio) achieve this by
+# replacing non-finite values with the null sentinel BEFORE
+# computing the per-tile bscale, so non-finite values don't
+# contaminate the quantization range.
+#
+# NaN case works in rustfits today — likely because NaN propagates
+# through the noise estimator in a way that's already handled
+# (NaN-aware reductions or explicit skip).  The Inf cases FAIL:
+# the per-tile bscale calculation receives Inf and degenerates to
+# Inf, which means every cell in that tile decodes to bzero
+# (mid-range constant), corrupting the non-Inf neighbors.  Pinned
+# as xfail so the limitation is discoverable and a future codec
+# fix that pre-filters non-finite values before bscale will surface
+# as xpass.
+#
+# Regression pin against fitsio/tests/test_image_compression.py
+# ::test_image_compression_nulls.
+
+
+@pytest.mark.parametrize(
+    "dtype,nan_value",
+    [
+        ("f4", np.nan),
+        ("f8", np.nan),
+        pytest.param(
+            "f4",
+            np.inf,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "rustfits's quantizer doesn't pre-filter non-finite "
+                    "values before computing per-tile bscale; +Inf in the "
+                    "tile makes bscale degenerate, corrupting neighbors."
+                ),
+            ),
+        ),
+        pytest.param(
+            "f8",
+            np.inf,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="see f4 +Inf above",
+            ),
+        ),
+        pytest.param(
+            "f4",
+            -np.inf,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="see f4 +Inf above",
+            ),
+        ),
+        pytest.param(
+            "f8",
+            -np.inf,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="see f4 +Inf above",
+            ),
+        ),
+    ],
+)
+def test_isolated_nonfinite_in_multi_tile_lossy(dtype, nan_value):
+    data = np.arange(36).reshape((6, 6)).astype(dtype)
+    data[1, 1] = nan_value
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fname = os.path.join(tmp, "t.fits")
+        with rustfits.FITS(fname, "w+") as f:
+            f.write_image(
+                data,
+                compress=rustfits.Rice1(tile_shape=(3, 3)),
+                quantize=rustfits.Quantize(level=2.0, seed=10),
+            )
+        with rustfits.FITS(fname, "r") as f:
+            r = f[1].read()
+
+    # The marked cell stays non-finite (NaN or Inf — either is OK).
+    assert not np.isfinite(r[1, 1]), (
+        f"expected non-finite at [1, 1], got {r[1, 1]!r}"
+    )
+    # Every other cell round-trips within lossy tolerance.  Use a
+    # mask so the non-finite [1, 1] doesn't poison the diff.
+    mask = np.isfinite(data)
+    np.testing.assert_allclose(r[mask], data[mask], rtol=0, atol=1.0)
 
 
 if __name__ == "__main__":
