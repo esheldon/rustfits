@@ -35,7 +35,7 @@ What's there today:
   by those tools (or by `cfitsio` / `fpack`) read back in `rustfits`
   unchanged.
 
-## Quick example
+## Quick examples
 
 ```python
 import rustfits
@@ -45,11 +45,24 @@ img = rustfits.read("image.fits")
 
 # Slice an existing image without loading the full array.
 with rustfits.FITS("image.fits") as fits:
+    image = fits["sci"].read()
+    image = fits["sci"][:, :]
+
     stamp = fits["sci"][100:200, 50:150]
 
 # Read a table; subset columns and rows.
 with rustfits.FITS("catalog.fits") as fits:
-    tab = fits[1].read(columns=["ra", "dec"], rows=slice(0, 100))
+    hdu = fits[1]
+
+    # using numpy-style slicing
+    tab = hdu[:]
+    tabsub = hdu[0:100]
+    ra = hdu['ra'][20:30]
+    radec = hdu[['ra', 'dec']][[3, 5, 25]]
+
+    # using the read() function
+    tab = hdu.read()  # same as hdu[:]
+    tabsub = hdu.read(columns=["ra", "dec"], rows=[3, 5, 25])
 
 # Write an image or table to a new file (auto-detects).
 import numpy as np
@@ -58,7 +71,7 @@ rustfits.write("out.fits", np.zeros((1024, 1024), dtype="f4"))
 cat = np.zeros(100, dtype=[("ra", "f8"), ("dec", "f8")])
 rustfits.write("cat.fits", cat)
 
-# Update the data with write or numpy-style setitem
+# Update the data with numpy-style setitem
 with rustfits.FITS(fname, 'r+') as fits:
     hdu = fits["table"]
     hdu[10:20] = updated_rows
