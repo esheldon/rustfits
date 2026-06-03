@@ -152,7 +152,12 @@ jobs:
           environment-name: rustfits-docs
           create-args: >-
             python=3.12
-          cache-environment: true
+          # cache-environment intentionally off: this env is small
+          # (sphinx + furo + maturin) and we hit recurring stale-cache
+          # corruption ("Cannot find a valid extracted directory cache
+          # for ...") on cached runs.  Fresh resolve each time costs a
+          # few seconds and avoids the failure mode entirely.
+          cache-environment: false
           init-shell: bash
 
       - name: Install conda deps + sphinx
