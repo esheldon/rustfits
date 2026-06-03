@@ -128,6 +128,48 @@ jobs:
         shell: bash -el {0}
         run: pytest
 
+  # ----- Sphinx docs build -----------------------------------------
+  # Mirrors what readthedocs.io does on every push: install rustfits
+  # (autodoc imports the module), install docs/requirements.txt, run
+  # sphinx-build with -W so any new warning is a hard failure.  Catches
+  # broken cross-refs, missing autodoc targets, rst syntax errors, and
+  # bad intersphinx links before they reach RTD.
+  docs:
+    name: Sphinx build (-W)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up conda env (python 3.12)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: rustfits-docs
+          create-args: >-
+            python=3.12
+          cache-environment: true
+          init-shell: bash
+
+      - name: Install conda deps + sphinx
+        shell: bash -el {0}
+        run: |
+          micromamba install -y -c conda-forge \
+            --file conda-requirements.txt
+          pip install -r docs/requirements.txt
+
+      - name: maturin develop (so autodoc can import rustfits)
+        shell: bash -el {0}
+        run: maturin develop
+
+      - name: sphinx-build -W
+        shell: bash -el {0}
+        run: sphinx-build -W -b html docs docs/_build/html
+
   # ----- Coverage (single config) ----------------------------------
   # Python coverage via pytest-cov + Rust coverage via cargo-llvm-cov.
   # Only runs on one OS / Python combo — coverage instrumentation
