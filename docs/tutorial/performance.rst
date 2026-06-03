@@ -1060,7 +1060,7 @@ uncompressed) and the image-extend RSS benches.
 .. include:: _perf_tables_self.rst
 
 EXTNAME lookup (``name in fits`` / ``fits[name]``) — linear in HDU count
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``name in fits`` and ``fits["NAME"]`` walk the HDU list until a
 match is found (or fall through and return False / raise on miss),

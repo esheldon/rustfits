@@ -656,28 +656,6 @@ fn append_header_and_data_to_file(
 
 /// A FITS file open for reading, writing, or both.
 ///
-/// The top-level entry point of rustfits.  Open an existing file
-/// or create a new one, then index or iterate to reach individual
-/// HDUs::
-///
-///     # Read an existing file
-///     with rustfits.FITS("data.fits", "r") as fits:
-///         for hdu in fits:
-///             print(hdu.extname, hdu.has_data)
-///         sci = fits["SCI"]            # by EXTNAME
-///         hdu2 = fits[2]               # by position
-///         arr = fits[1].read()
-///
-///     # Append a new HDU to an existing file
-///     with rustfits.FITS("data.fits", "r+") as fits:
-///         fits.create_image_hdu("f4", (100, 100), extname="MODEL")
-///         fits[-1].write(model)
-///
-///     # Create a new file (or truncate an existing one)
-///     with rustfits.FITS("out.fits", "w+") as fits:
-///         fits.create_table_hdu(my_dtype, nrows=1000)
-///         fits[1].write(rows)
-///
 /// Parameters
 /// ----------
 /// filename : str
@@ -706,6 +684,34 @@ fn append_header_and_data_to_file(
 ///     disallows).  Lenient mode is READ-only — new card
 ///     mutations through ``header[k] = v`` still go through
 ///     strict validation.
+///
+/// Examples
+/// --------
+/// FITS is the top-level entry point of rustfits.  Open an existing file
+/// or create a new one, then index or iterate to reach individual
+/// HDUs::
+///
+///     # Read an existing file
+///     with rustfits.FITS("data.fits") as fits:
+///         for hdu in fits:
+///             print(hdu.extname, hdu.has_data)
+///         sci = fits["SCI"]            # by EXTNAME
+///         hdu2 = fits[2]               # by position
+///         arr = fits[1].read()
+///
+///     # The default mode is "r", so the above is the same
+///     # as as FITS(fname, "r")
+///
+///     # Open for read and write.
+///     # Append a new HDU to an existing file
+///     with rustfits.FITS("data.fits", "r+") as fits:
+///         fits.create_image_hdu("f4", (100, 100), extname="MODEL")
+///         fits[-1].write(model)
+///
+///     # Create a new file (or truncate an existing one)
+///     with rustfits.FITS("out.fits", "w+") as fits:
+///         fits.create_table_hdu(my_dtype, nrows=1000)
+///         fits[1].write(rows)
 ///
 /// Notes
 /// -----
