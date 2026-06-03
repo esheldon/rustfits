@@ -57,6 +57,13 @@ rustfits.write("out.fits", np.zeros((1024, 1024), dtype="f4"))
 
 cat = np.zeros(100, dtype=[("ra", "f8"), ("dec", "f8")])
 rustfits.write("cat.fits", cat)
+
+# Update the data with write or numpy-style setitem
+with rustfits.FITS(fname, 'r+') as fits:
+    hdu = fits["table"]
+    hdu[10:20] = updated_rows
+    hdu['ra'] = new_values
+    hdu[['ra', 'dec']][10:50] = new_radec
 ```
 
 See the [tutorial](https://rustfits.readthedocs.io/en/latest/tutorial/index.html)
