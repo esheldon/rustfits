@@ -1,5 +1,7 @@
 # rustfits
 
+[![Documentation Status](https://readthedocs.org/projects/rustfits/badge/?version=latest)](https://rustfits.readthedocs.io/en/latest/)
+
 A Python FITS library with the heavy lifting written in Rust.
 
 ## What it does
@@ -57,13 +59,18 @@ cat = np.zeros(100, dtype=[("ra", "f8"), ("dec", "f8")])
 rustfits.write("cat.fits", cat)
 ```
 
-See the [tutorial](docs/tutorial/index.rst) for a guided tour
-covering images, tables, compression, headers, the error model,
-and known limitations.
+See the [tutorial](https://rustfits.readthedocs.io/en/latest/tutorial/index.html)
+for a guided tour covering images, tables, compression, headers,
+the error model, and known limitations.
 
 ## Documentation
 
-The Sphinx documentation lives in `docs/`. Build it locally with:
+Full documentation is hosted at
+[rustfits.readthedocs.io](https://rustfits.readthedocs.io/).
+The `latest` build tracks `main`; `stable` tracks the most recent
+release tag.
+
+To build the docs locally instead:
 
 ```bash
 sphinx-build docs docs/_build/html
