@@ -487,6 +487,76 @@ impl CompressedTableHDU {
         )
     }
 
+    /// Read one column into a plain (non-structured) ndarray.
+    ///
+    /// Same signature and return shape as
+    /// :meth:`TableHDU.read_column`.  Overridden so the read goes
+    /// through the compressed decode path; the inherited
+    /// :meth:`TableHDU.read_column` reads against the on-disk
+    /// schema, which for a compressed table is the ``1QB``
+    /// heap-descriptor column — it would hand back raw compressed
+    /// bytes.  Only the tiles overlapping ``rows`` are
+    /// decompressed; the single field is then extracted.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     Column name (case-insensitive).
+    /// rows : slice, int, or iterable of int, optional
+    ///     Row subset to read.  None (default) reads every row.
+    /// scale : bool, default True
+    ///     Apply ``TSCALn`` / ``TZEROn`` scaling on the way out.
+    ///
+    /// Returns
+    /// -------
+    /// numpy.ndarray
+    ///     The column's values, shape ``(n_selected,) +
+    ///     field_shape`` (``field_shape`` empty for scalar
+    ///     columns, the ``TDIM`` shape for subarray columns).
+    ///
+    /// Currently unsupported (parity with
+    /// :meth:`CompressedTableHDU.read`):
+    ///
+    /// * ``mask_null=True`` — TNULL masking on compressed reads.
+    /// * ``as_bytes=True`` — raw-byte (``S``) decode of ``A``
+    ///   columns; the compressed read path returns ``U`` strings
+    ///   with the on-disk padding already stripped, so it cannot
+    ///   reproduce the byte-exact stored form the uncompressed
+    ///   ``as_bytes`` returns.
+    #[pyo3(signature = (name, *, rows=None, as_bytes=false, scale=true, mask_null=false))]
+    fn read_column(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name: &str,
+        rows: Option<&Bound<'_, PyAny>>,
+        as_bytes: bool,
+        scale: bool,
+        mask_null: bool,
+    ) -> PyResult<Py<PyAny>> {
+        check_not_in_context(&slf.pending)?;
+        if mask_null {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU.read_column(mask_null=True): TNULL \
+                 masking on compressed-table reads is not yet \
+                 implemented"));
+        }
+        if as_bytes {
+            return Err(PyNotImplementedError::new_err(
+                "CompressedTableHDU.read_column(as_bytes=True): raw-byte \
+                 decode of compressed character columns is not supported \
+                 (the column is returned as a decoded 'U' string array)"));
+        }
+        let cache = Arc::clone(&slf.cache);
+        let super_ = slf.into_super().into_super();
+        let cards = super_.header_snapshot()?;
+        let data_offset = super_.offsets.data_offset();
+        let arr = read_compressed_table(
+            py, &cards, data_offset, &super_.file,
+            rows, Some(vec![name.to_string()]), scale, &cache,
+        )?;
+        Ok(arr.bind(py).get_item(name)?.unbind())
+    }
+
     // __getitem__ is a pyo3 slot dunder — no per-method docstring.
     // Same dispatch as TableHDU.__getitem__:
     //   hdu[i]            → 0-d structured record at row i
