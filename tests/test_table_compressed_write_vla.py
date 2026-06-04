@@ -329,5 +329,113 @@ def test_funpack_decompresses_vla_file():
                 )
 
 
+# ---------------------------------------------------------------------
+# String-VLA (PA) ZTABLE: rustfits round-trips, but cfitsio funpack
+# crashes on it -- a cfitsio bug (rustfits issue #9).
+# ---------------------------------------------------------------------
+
+
+def test_pa_vla_ztable_rustfits_roundtrip():
+    """
+    rustfits writes and reads a string-VLA (PA) compressed-table
+    column correctly.  This proves the funpack crash documented in
+    the next test is a cfitsio bug, not a rustfits one: our own
+    write -> read round-trip is exact.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        dt = np.dtype([("id", "i4"), ("name", "O")])
+        nrows = 300
+        src = np.empty(nrows, dtype=dt)
+        src["id"] = np.arange(nrows, dtype="i4")
+        for i in range(nrows):
+            src["name"][i] = "obj_" + "x" * (i % 15)
+
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(
+                dt,
+                nrows=nrows,
+                var_dtypes={"name": "S"},
+                compress=True,
+            )
+            f[1].write(src)
+
+        with rustfits.FITS(fname) as f:
+            got = f[1].read()
+
+        np.testing.assert_array_equal(got["id"], src["id"])
+        for i in range(nrows):
+            assert got["name"][i] == src["name"][i]
+
+
+@pytest.mark.skip(
+    reason=(
+        "cfitsio funpack crashes (realloc(): invalid next size, "
+        "SIGABRT) on string-VLA (PA/QA) ZTABLE columns -- a cfitsio "
+        "bug, NOT a rustfits one.  cfitsio crashes even on its own "
+        "fpack -table output, so the defect is in cfitsio's table "
+        "(de)compression of PA columns.  Tracked as rustfits issue "
+        "#9: https://github.com/esheldon/rustfits/issues/9 .  This "
+        "test is skip-documented so the repro isn't lost; unskip to "
+        "re-check after a cfitsio upgrade."
+    )
+)
+def test_funpack_pa_vla_ztable_cfitsio_crash_documented():
+    """
+    DOCUMENTED cfitsio limitation (rustfits #9): a PA/QA (string)
+    variable-length ZTABLE column is not funpack-interoperable.
+
+    The whole-table funpack-interop test above
+    (test_funpack_decompresses_vla_file) only covers numeric inner
+    types (PE / i2), so this gap was never exercised there.  The
+    body below is the repro; it is skipped because running funpack
+    on a PA-VLA file aborts the funpack subprocess via heap
+    corruption.  When cfitsio fixes the bug, unskip this test --
+    the funpack call will then succeed and the round-trip assertions
+    will pass.
+    """
+    if not _have_funpack():
+        pytest.skip("funpack (cfitsio CLI) required")
+    import fitsio
+    import warnings
+
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        dt = np.dtype([("id", "i4"), ("name", "O")])
+        nrows = 300
+        src = np.empty(nrows, dtype=dt)
+        src["id"] = np.arange(nrows, dtype="i4")
+        for i in range(nrows):
+            src["name"][i] = "obj_" + "x" * (i % 15)
+
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(
+                dt,
+                nrows=nrows,
+                var_dtypes={"name": "S"},
+                compress=True,
+            )
+            f[1].write(src)
+
+        out = os.path.join(td, "out.fits")
+        # This is the call that aborts with current cfitsio.
+        subprocess.run(
+            ["funpack", "-O", out, fname],
+            check=True,
+            capture_output=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fitsio.FITS(out, "r") as f:
+                cfit = f[1].read()
+
+        np.testing.assert_array_equal(cfit["id"], src["id"])
+        for i in range(nrows):
+            name = cfit["name"][i]
+            if isinstance(name, bytes):
+                name = name.decode()
+            assert name.rstrip("\x00 ") == src["name"][i]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])
