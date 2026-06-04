@@ -26,6 +26,29 @@ Override the cfitsio location with `CFITSIO_PREFIX=/path bash run.sh`.
 Confirmed against cfitsio 4.6.0 (fpack/funpack 1.7.0) on Linux
 x86_64.
 
+### Running under AddressSanitizer
+
+To get an exact overflow site (file/line) instead of a vague
+`realloc(): invalid next size`, build cfitsio with ASAN and run the
+instrumented `fpack`/`funpack` against the repro fixtures.  Using
+the bundled cfitsio source (see `CLAUDE.md` § "Reference sources for
+byte-exact ports" for where it untars):
+
+```bash
+SRC=~/git/fitsio/cfitsio-4.6.4
+B=$(mktemp -d); cp -r "$SRC"/. "$B"/
+( cd "$B" \
+  && CFLAGS="-fsanitize=address -g -O1 -fno-omit-frame-pointer" \
+       ./configure --disable-curl \
+  && make -j )
+# instrumented binaries land in $B/.libs/{fpack,funpack}
+./pa_vla_funpack_crash pa.fits          # write fixture (normal libcfitsio)
+"$B/.libs/fpack" -table pa.fits
+ASAN_OPTIONS=detect_leaks=0 "$B/.libs/funpack" -O out.fits pa.fits.fz
+```
+
+This is how the root-cause traces below were captured.
+
 ---
 
 ## #3 — String-VLA (`1PA`) ZTABLE columns crash `funpack`
@@ -49,6 +72,30 @@ realloc(): invalid next size
 Aborted (core dumped)
 funpack exit code: 134
 ```
+
+Root cause (AddressSanitizer build of cfitsio):
+
+```
+==ERROR: AddressSanitizer: heap-buffer-overflow
+READ of size 32768 at 0x... thread T0
+    #0 memcpy
+    #1 updatewindow (libz)
+    #2 inflate (libz)
+    #3 uncompress2mem_from_mem (libcfitsio)
+    #4 fits_uncompress_table (libcfitsio)
+    #5 fp_unpack_hdu utilities/fpackutil.c:1649
+    #6 fp_unpack / fp_loop / main (funpack.c:23)
+
+0x... is located 0 bytes after 24000-byte region
+allocated by thread T0 here:
+    #0 malloc
+    #1 fits_uncompress_table (libcfitsio)
+```
+
+So `fits_uncompress_table` **under-allocates the decompression
+output buffer** for the variable-length-string column (24000 bytes
+here), and zlib's `inflate`/`updatewindow` window copy reads 32 KiB
+off the end.
 
 ### Draft cfitsio issue
 
@@ -119,8 +166,27 @@ realloc(): invalid next size
 Aborted (core dumped)               # exit 134 = 128 + SIGABRT
 ```
 
+**Root cause** (AddressSanitizer build of cfitsio — `CFLAGS="-fsanitize=address -g" ./configure --disable-curl`):
+
+```
+ERROR: AddressSanitizer: heap-buffer-overflow
+READ of size 32768 ... 0 bytes after a 24000-byte region
+  #1 updatewindow (libz)
+  #2 inflate (libz)
+  #3 uncompress2mem_from_mem   (cfitsio)
+  #4 fits_uncompress_table     (cfitsio)   <- buffer allocated here
+  #5 fp_unpack_hdu  utilities/fpackutil.c:1649
+  #6 main           utilities/funpack.c:23
+```
+
+`fits_uncompress_table` under-allocates the decompression output
+buffer for the variable-length-string column (24000 bytes in this
+repro); zlib's `inflate`/`updatewindow` window copy then reads
+32 KiB past the end of it.
+
 **Expected:** funpack reconstructs the original table.
-**Actual:** heap corruption / abort.
+**Actual:** heap corruption / abort (ASAN: out-of-bounds read in
+`fits_uncompress_table`'s output buffer).
 
 ---
 
@@ -238,8 +304,15 @@ int image with (32,32) tiles, writes it, then patches sub-regions
 via `fits_write_subset` repeatedly — in both same-handle and
 reopen-then-patch variants, all in one process.
 
-**Result: it runs clean** — no corruption, no abort, exit 0.  So
-cfitsio's compressed-image patch path is *not* the culprit; the
-corruption is most likely in the fitsio Python wrapper's buffer /
-call handling.  Kept as the documented baseline so the wrapper hunt
-(if anyone picks it up) starts from "pure C is fine."
+**Result: it runs clean** — no corruption, no abort, exit 0 — under
+both the normal allocator **and an AddressSanitizer build of
+cfitsio** (ASAN's red zones find no overflow in the patch path).
+Together with six clean fitsio patterns on the current stack
+(fitsio 1.3.0 / cfitsio 4.060), this means the original
+`free(): invalid next size` was **non-local heap corruption**: an
+out-of-bounds write *elsewhere* in that one process clobbered a
+malloc chunk header, and the abort surfaced at an innocent `free()`
+here.  The original bench ran rustfits + fitsio on the same heap, so
+the culprit was plausibly since-fixed rustfits `unsafe` code, not
+cfitsio's patch path.  Kept as the documented baseline; nothing to
+file (see `docs/internal/upstream-bugs.md` entry 6).

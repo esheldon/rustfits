@@ -72,6 +72,18 @@ Everything else is documented inline at the cited locations.
   uncompressed table with a PA column, `fpack -table` it (cfitsio
   compresses the PA column), then `funpack` → crash.  So the defect
   is reproducible without rustfits or fitsio's high-level API.
+- **Root cause (ASAN, 2026-06):** built cfitsio with
+  `-fsanitize=address` and ran the repro through the instrumented
+  `funpack`.  ASAN reports a **heap-buffer-overflow READ of 32768
+  bytes, 0 bytes past a 24000-byte region** allocated in
+  `fits_uncompress_table`; the over-read happens in zlib
+  `inflate` → `updatewindow` called from `uncompress2mem_from_mem`
+  ← `fits_uncompress_table` (call path
+  `funpack.c:23` → `fpackutil.c` → `fits_uncompress_table`).  i.e.
+  cfitsio **under-allocates the decompression output buffer** for
+  the variable-length-string column and zlib's window copy runs off
+  the end.  Build recipe + full trace in
+  `tools/cfitsio-repro/README.md`.
 - **Documented:** rustfits **issue #9**
   (https://github.com/esheldon/rustfits/issues/9);
   pure-C repro `tools/cfitsio-repro/pa_vla_funpack_crash.c`;
@@ -151,34 +163,43 @@ Everything else is documented inline at the cited locations.
 
 ## fitsio (Python wrapper)
 
-### 6. compressed-image `__setitem__` sweep `free(): invalid next size`
+### 6. compressed-image `__setitem__` sweep `free(): invalid next size` — NOT a real bug (non-local corruption)
 
-- **Tool:** fitsio Python wrapper (Linux).  **Reclassified from
-  "cfitsio" — see finding below.**
-- **Trigger:** running fitsio's `write(start=)` compressed-image
-  patch across an *algorithm sweep in one process* (each call is
-  fine standalone; the cumulative sweep tickles it).
-- **Symptom:** `free(): invalid next size` heap corruption that
-  aborts the Python process.
-- **Finding (2026-06):** a pure-C reproducer
-  (`tools/cfitsio-repro/setitem_sweep_corruption.c`) exercises the
-  same shape with NO Python — create a (256,256) int image with
-  (32,32) tiles, then patch sub-regions via `fits_write_subset`
-  repeatedly, for all five algorithms in one process, in both
-  same-handle and reopen-then-patch variants.  **It runs clean** —
-  no corruption, no abort.  So the bug is **not** in cfitsio's
-  compressed-image patch path; it's most likely in the fitsio
-  wrapper's buffer/call handling (or a wrapper-specific call
-  sequence).  Distinct from entry 1 (different platform — Linux vs
-  macOS; different path — patch vs create).
+- **Originally observed:** `free(): invalid next size` heap
+  corruption aborting the Python process while patching a
+  compressed image via fitsio's `write(start=)` repeatedly across
+  an algorithm sweep in one process.  Each call was fine standalone;
+  the cumulative sweep "tickled" it — which is itself the tell.
+- **Investigation (2026-06) — could not reproduce; root cause is
+  elsewhere:**
+  - **6 fitsio patterns on the current stack** (fitsio 1.3.0 /
+    cfitsio 4.060, Linux) all run clean: write+patch one handle per
+    algo; one algo × 50 repeats; 8 configs incl. f4 quantized/
+    unquantized × 4 selections; reopen-then-patch; 2000-patch churn;
+    cross-tool (rustfits writes the fixture, fitsio patches it).
+  - **Pure-C probe** (`tools/cfitsio-repro/setitem_sweep_corruption.c`,
+    same-handle + reopen variants, all five algorithms) runs clean
+    under the normal allocator.
+  - **Pure-C probe under ASAN-instrumented cfitsio** also runs
+    **clean** — ASAN's red zones find no overflow anywhere in
+    cfitsio's compressed-image patch path.
+- **Conclusion:** this was **non-local heap corruption** — an
+  out-of-bounds write *somewhere else* in that one process clobbered
+  a malloc chunk header, and the abort surfaced at an innocent
+  `free()` inside the patch sweep.  The original bench ran rustfits
+  AND fitsio on the same heap, so the culprit could have been
+  rustfits `unsafe` code at the time (much of it since rewritten —
+  macos-heap-hunt, issue #19, the streaming-repack rewrite) or any
+  other C extension.  It is **not** a bug in cfitsio's patch path
+  and **not** a fitsio bug at the crash site.  Distinct from entry 1.
 - **Documented:** `CLAUDE.md` § "Performance TODO" item 6;
-  `perf/perf-compressed-image-setitem.py`; the C probe above.
-- **Workaround:** the cross-tool comparison was dropped from the
-  `__setitem__` perf bench (rustfits-self per-tile cost is reported
-  instead).
-- **Upstream status:** not a cfitsio bug (per the C probe).  If
-  pursued, file on fitsio after isolating the wrapper call that
-  triggers it.
+  `perf/perf-compressed-image-setitem.py`;
+  `tools/cfitsio-repro/setitem_sweep_corruption.c` +
+  `README.md` § "Negative result".
+- **Upstream status:** nothing to file — no reproducer, ASAN-clean.
+  If the abort ever recurs, run the full pytest suite under an ASAN
+  build of rustfits + cfitsio; ASAN names the real overflow site
+  regardless of where `free()` trips.
 
 ### 7. Unbounded tile cache OOMs on large compressed images
 
