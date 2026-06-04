@@ -347,6 +347,19 @@ impl CompressedTableHDU {
         Ok(slf.meta(super_)?.nrows)
     }
 
+    /// Shape of the decompressed table: ``(nrows,)``.
+    ///
+    /// Overridden so the row count comes from the decompressed
+    /// view (``ZNAXIS2``); the inherited :attr:`TableHDU.shape`
+    /// reads the on-disk ``NAXIS2``, which for a compressed table
+    /// is the tile count, not the user-visible row count.
+    #[getter]
+    fn shape(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let super_ = slf.as_super().as_super();
+        let nrows = slf.meta(super_)?.nrows;
+        Ok(PyTuple::new(py, vec![nrows])?.unbind())
+    }
+
     /// Number of columns in the table (``TFIELDS``).
     #[getter]
     fn ncols(slf: PyRef<'_, Self>) -> PyResult<usize> {

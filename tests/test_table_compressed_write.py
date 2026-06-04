@@ -385,6 +385,25 @@ def test_read_column_rows_subset():
             )
 
 
+def test_shape_reports_rows_not_tiles():
+    # Regression: inherited TableHDU.shape read the on-disk NAXIS2
+    # (the tile count) instead of the decompressed row count.
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 2000
+        dt = np.dtype([("x", "i4")])
+        src = np.zeros(nrows, dtype=dt)
+        src["x"] = np.arange(nrows, dtype="i4")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, compress=True, ztilelen=100)
+            f[1].write(src)
+        with rustfits.FITS(fname, "r") as f:
+            hdu = f[1]
+            assert hdu.n_tiles == 20  # 2000 / 100
+            assert hdu.shape == (nrows,)
+            assert hdu.shape == (hdu.nrows,) == (len(hdu),)
+
+
 def test_read_column_as_bytes_and_mask_null_rejected():
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
