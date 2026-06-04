@@ -7,7 +7,7 @@ or the fitsio Python wrapper** — pure libcfitsio plus the
 
 See [`docs/internal/upstream-bugs.md`](../../docs/internal/upstream-bugs.md)
 for the full inventory of upstream bugs rustfits has found; this
-directory holds the two with clean pure-C reproducers.
+directory holds the three with clean pure-C reproducers.
 
 ## Building / running
 
@@ -16,15 +16,23 @@ conda env that provides cfitsio it works out of the box
 (`$CONDA_PREFIX` supplies the include/lib paths):
 
 ```bash
-bash run.sh          # both reproducers
+bash run.sh          # all three reproducers
 bash run.sh pa       # just #3 (PA-VLA funpack crash)
 bash run.sh cplx     # just #5 (GZIP_2 complex)
+bash run.sh plio     # just #1 (PLIO_1 small-image write overflow)
 ```
 
 Override the cfitsio location with `CFITSIO_PREFIX=/path bash run.sh`.
 
 Confirmed against cfitsio 4.6.0 (fpack/funpack 1.7.0) on Linux
 x86_64.
+
+Two of the three (`pa`, `cplx`) crash inside `funpack`; the third
+(`plio`) overflows a buffer inside **libcfitsio at write time**, so
+it has no `fpack`/`funpack` step — the program is the reproducer.  On
+glibc/Linux that few-byte overrun is usually tolerated (a plain run
+exits 0); to make it abort with an exact site, link it against an
+ASAN-instrumented cfitsio (next section).
 
 ### Running under AddressSanitizer
 
@@ -48,6 +56,157 @@ ASAN_OPTIONS=detect_leaks=0 "$B/.libs/funpack" -O out.fits pa.fits.fz
 ```
 
 This is how the root-cause traces below were captured.
+
+For the write-time overflow (`#1`, PLIO) there is no funpack step —
+compile the reproducer itself against the instrumented cfitsio so
+the overrun in `pl_p2li` is caught the moment cfitsio compresses the
+tile:
+
+```bash
+# $B is the ASAN cfitsio build dir from above (header in $B, lib in
+# $B/.libs).  -lm because the instrumented lib pulls in libm.
+cc -O1 -g -fsanitize=address -fno-omit-frame-pointer -I"$B" \
+   plio_small_image_overflow.c -o plio_asan \
+   -L"$B/.libs" -lcfitsio -lm -Wl,-rpath,"$B/.libs"
+ASAN_OPTIONS=detect_leaks=0 ./plio_asan
+# (run.sh plio does the same when ASAN=1 and CFITSIO_PREFIX point at
+#  an instrumented build laid out as prefix/include + prefix/lib)
+```
+
+---
+
+## #1 — PLIO_1 small-image compression buffer overflow (write time)
+
+**filed:** cfitsio [#136](https://github.com/heasarc/cfitsio/issues/136)
+· **also:** fitsio [#496](https://github.com/esheldon/fitsio/issues/496)
+· **file:** `plio_small_image_overflow.c`
+
+Writing a PLIO_1-compressed image with small tiles overflows
+cfitsio's per-tile compression buffer.  `imcomp_calc_max_elem()`
+sizes the PLIO buffer (the catch-all `else` branch) at
+`nx * sizeof(int)` **bytes** with no minimum — unlike HCOMPRESS_1
+just above it, which adds a `+ 26` overhead "only significant for
+very small tiles".  cfitsio then `calloc`s `cbuf` to that many bytes
+and hands it to `pl_p2li()`, which writes the IRAF line-list as
+`short` (2-byte) elements with a fixed **7-short (14-byte) header**
+before any pixel data (`lldst[1..7]`; the data cursor `op` starts at
+8).  For a 2×2 tile, `nx = 4`, so the buffer is `4*sizeof(int) = 16`
+bytes = only 8 shorts: the header nearly fills it and the first
+encoded data short writes past the allocation.
+
+This is macOS-surfaced (the nano allocator's guard bytes abort the
+process ~50% of the time — how it first showed up as a flaky
+compressed-image-write crash on CI) but the under-allocation is
+platform-independent: glibc usually tolerates the few-byte overrun,
+and an ASAN build flags it exactly on Linux.
+
+Observed (reproducer linked against an ASAN-instrumented cfitsio):
+
+```
+==ERROR: AddressSanitizer: heap-buffer-overflow
+WRITE of size 2 at 0x... thread T0
+    #0 pl_p2li                       pliocomp.c:136
+    #1 imcomp_compress_tile          imcompress.c:1970   <- pl_p2li(idata,1,cbuf,tilelen)
+    #2 fits_write_compressed_img     imcompress.c:3739
+    ...
+    #7 main  plio_small_image_overflow.c:97              <- fits_write_img
+
+0x... is located 0 bytes after a 16-byte region
+allocated by thread T0 here:
+    #0 calloc
+    #1 imcomp_compress_tile          imcompress.c:1924   <- cbuf = calloc(clen,1); clen = nx*sizeof(int) = 16
+    ...
+SUMMARY: AddressSanitizer: heap-buffer-overflow pliocomp.c:136 in pl_p2li
+```
+
+The overflow is a 2-byte (`short`) WRITE 0 bytes past the 16-byte
+`nx*sizeof(int)` buffer — exactly the predicted off-by-header-size.
+
+### Draft cfitsio issue
+
+Everything from here to the next `---` is self-contained — copy it
+straight into a new cfitsio issue.
+
+**Title:** PLIO_1 compression buffer is under-allocated for small
+tiles (heap-buffer-overflow in `pl_p2li`)
+
+**Summary:** Writing a PLIO_1-compressed image with small tiles
+overflows the per-tile compression buffer.
+`imcomp_calc_max_elem()` sizes the PLIO buffer (its catch-all `else`
+branch) at `nx * sizeof(int)` bytes with no floor, but `pl_p2li()`
+writes the line-list as `short`s preceded by a fixed 7-short
+(14-byte) header. For a 2×2 tile (`nx = 4`) the buffer is 16 bytes =
+8 shorts, so the header alone nearly fills it and the first data
+short writes out of bounds. glibc usually tolerates the overrun;
+macOS's allocator aborts; ASAN reports it precisely.
+
+**Environment:** cfitsio 4.6.x, Linux x86_64 (ASAN) / macOS arm64.
+
+**Reproduce.** Compile and run this program (no fpack/funpack — the
+overflow is at write time inside libcfitsio):
+
+```c
+/* plio_small.c — build: cc plio_small.c -o plio_small -lcfitsio */
+#include <stdio.h>
+#include "fitsio.h"
+
+int main(void) {
+    fitsfile *fptr = NULL;
+    int status = 0;
+    remove("plio_small.fits.fz");
+    fits_create_file(&fptr, "plio_small.fits.fz", &status);
+    fits_set_compression_type(fptr, PLIO_1, &status);
+    long tile[2] = {2, 2};
+    fits_set_tile_dim(fptr, 2, tile, &status);   /* nx = 4 */
+    long naxes[2] = {4, 4};
+    fits_create_img(fptr, LONG_IMG, 2, naxes, &status);
+    int pix[16];
+    for (int i = 0; i < 16; i++) pix[i] = i % 4;
+    fits_write_img(fptr, TINT, 1, 16, pix, &status);  /* overflow here */
+    fits_close_file(fptr, &status);
+    fits_report_error(stderr, status);
+    return status;
+}
+```
+
+Build cfitsio with `CFLAGS="-fsanitize=address -g" ./configure
+--disable-curl`, compile the program with `-fsanitize=address`, and
+run:
+
+```
+==ERROR: AddressSanitizer: heap-buffer-overflow
+WRITE of size 2 ... 0 bytes after a 16-byte region
+  #0 pl_p2li               pliocomp.c
+  #1 imcomp_compress_tile  imcompress.c   (pl_p2li(idata,1,cbuf,tilelen))
+  ...
+allocated by:
+  #1 imcomp_compress_tile  imcompress.c   (cbuf = calloc(nx*sizeof(int), 1))
+```
+
+**Root cause** — `imcomp_calc_max_elem()` (`imcompress.c`):
+
+```c
+    else
+        return(nx * sizeof(int));   /* PLIO_1: BYTES, no minimum */
+```
+
+`cbuf` is then `calloc`'d to that many bytes, but `pl_p2li()`
+(`pliocomp.c`) writes `short`s after a 14-byte header, so small
+`nx` overflows.
+
+**Proposed fix** — floor the PLIO branch at 32 bytes:
+
+```c
+    else {
+        if (nx * sizeof(int) < 32)
+            return 32;
+        return(nx * sizeof(int));
+    }
+```
+
+**Expected:** PLIO_1 compresses small tiles without overrunning.
+**Actual:** heap-buffer-overflow write in `pl_p2li` (aborts on
+macOS / under ASAN; silently corrupts the heap on glibc).
 
 ---
 

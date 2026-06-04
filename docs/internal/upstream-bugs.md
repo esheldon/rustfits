@@ -18,7 +18,12 @@ Filed upstream so far:
   issue #9).  Pure-C repro in `tools/cfitsio-repro/`.
 - cfitsio **#135** — GZIP_2 complex-column `funpack` rejection
   (entry 4).  Pure-C repro in `tools/cfitsio-repro/`.
-- fitsio **#496** — macOS compressed-image-write crash (entry 1).
+- cfitsio **#136** — PLIO_1 small-image compression-buffer
+  under-allocation (entry 1; the C-level root cause of the macOS
+  crash also reported as fitsio #496).  Pure-C repro in
+  `tools/cfitsio-repro/`.
+- fitsio **#496** — macOS compressed-image-write crash (entry 1;
+  root-caused to cfitsio #136).
 
 Everything else is documented inline at the cited locations.
 
@@ -48,17 +53,38 @@ Everything else is documented inline at the cited locations.
 - **Documented:** `CLAUDE.md` §§ "CI: macOS fitsio workaround" +
   "macOS CI flakes — resolved 2026-06-01";
   `tests/test_image_compressed_accessors.py`
-  (`_SKIP_FITSIO_PLIO_ON_MACOS`).
+  (`_SKIP_FITSIO_PLIO_ON_MACOS`); pure-C repro
+  `tools/cfitsio-repro/plio_small_image_overflow.c` (ASAN-confirmed).
 - **Workaround:** CI replaces the conda-forge fitsio with a pip
   source build on the macOS legs only (dodges the `ffbinit`
   variant); a skipif mark on just the PLIO_1 parametrize case
   dodges the source-build variant.  PLIO read coverage on macOS is
   preserved via `test_image_compressed_read_plio.py` (non-crashing
   path).
-- **Upstream status:** filed as **fitsio #496**
-  (https://github.com/esheldon/fitsio/issues/496); a maintainer
-  with a Mac is investigating.  macOS-only — not reproducible on
-  the Linux dev box.
+- **Root cause (cfitsio #136):** PLIO_1's compression work buffer
+  is under-allocated for very small tiles.  The crashing test
+  writes a 4×4 image with 2×2 tiles, so each PLIO tile has
+  `nx = 4` and cfitsio sizes the buffer at
+  `nx * sizeof(int) = 16` bytes — too small for PLIO's framing
+  overhead.  The encoder then writes a few bytes past the 16-byte
+  region: macOS's nano allocator catches the overrun (~50%,
+  guard-layout dependent), glibc silently tolerates it (hence
+  Linux-clean).  This subsumes BOTH manifestations above — the
+  conda-forge `ffbinit` bad-free and the source-build
+  `Fatal Python error: Aborted` are the same overrun caught by
+  different allocators at different points.  Proposed upstream
+  fix: floor the allocation at 32 bytes
+  (`if (nx * sizeof(int) < 32) return 32;`) in `imcompress.c`.
+  The under-allocation itself is platform-independent — provable
+  on Linux under ASAN even though only macOS aborts on it.
+- **Upstream status:** root-caused and filed as cfitsio **#136**
+  (https://github.com/heasarc/cfitsio/issues/136) with a proposed
+  patch; previously reported as fitsio **#496**
+  (https://github.com/esheldon/fitsio/issues/496).  The
+  `_SKIP_FITSIO_PLIO_ON_MACOS` mark + the macOS source-build of
+  fitsio stay in place until a cfitsio release carrying the #136
+  fix reaches the macOS CI legs; the skip can then be dropped and
+  the PLIO_1 case re-enabled.
 
 ### 2. String-VLA (PA/QA) ZTABLE columns crash `funpack`
 
@@ -303,7 +329,7 @@ Everything else is documented inline at the cited locations.
 
 ## Filing cfitsio issues
 
-Two clean pure-C reproducers (no rustfits, no fitsio) are filed
+Three clean pure-C reproducers (no rustfits, no fitsio) are filed
 with cfitsio; their source + draft issue text live in
 `tools/cfitsio-repro/`:
 
@@ -313,16 +339,22 @@ with cfitsio; their source + draft issue text live in
 2. **Entry 4 — GZIP_2 complex self-incompatibility** → cfitsio
    **#135**.  `gzip2_complex_funpack.c`: `fpack -g2 -table` a `1C`
    column, `funpack` → status 414.
+3. **Entry 1 — PLIO_1 small-image write overflow** → cfitsio
+   **#136** (also reported as fitsio #496).
+   `plio_small_image_overflow.c`: write a 4×4 PLIO_1 image with 2×2
+   tiles; cfitsio overflows the `nx*sizeof(int)`-byte tile buffer
+   inside `pl_p2li` at compress time (no fpack/funpack step).  ASAN
+   (instrumented cfitsio) pins it to a 2-byte WRITE 0 bytes past the
+   16-byte buffer — `pliocomp.c` / `imcompress.c:1924`+`:1970`.
+   macOS aborts on it; glibc tolerates the overrun, so the repro is
+   built against an ASAN cfitsio to make it fail on Linux.
 
 Investigated, **not** filed on cfitsio:
 
-3. **Entry 6 — setitem `free()` corruption** — the pure-C probe
+4. **Entry 6 — setitem `free()` corruption** — the pure-C probe
    (`setitem_sweep_corruption.c`) runs clean, so this is not a
    cfitsio bug; it belongs to the fitsio wrapper.  File there if
    pursued.
-4. **Entry 1 — macOS compressed-image-write crash** — filed on
-   fitsio (**#496**); macOS-only, not reproducible on the Linux
-   dev box, so no pure-C reproducer here.
 
 Reference C source for building repros lives in the bundled
 cfitsio tarball — see `CLAUDE.md` § "Reference sources for
