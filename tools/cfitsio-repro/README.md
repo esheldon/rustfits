@@ -51,31 +51,75 @@ funpack exit code: 134
 
 ### Draft cfitsio issue
 
-> **Title:** funpack crashes (heap corruption) on tile-compressed
-> tables with variable-length string (`1PA`) columns
->
-> **Summary:** A binary table with a variable-length character
-> column (TFORM `1PA`) compressed with `fpack -table` cannot be
-> decompressed by `funpack` — it aborts with
-> `realloc(): invalid next size` (SIGABRT). cfitsio crashes on its
-> own output, so no third-party tooling is involved.
->
-> **Reproduce** (cfitsio + CLIs only):
-> ```c
-> /* see pa_vla_funpack_crash.c: create a BINTABLE with one 1PA
->    column, write ~3000 variable-length strings, close. */
-> ```
-> ```
-> fpack -table pa_vla.fits     # rc 0, writes pa_vla.fits.fz
-> funpack pa_vla.fits.fz       # realloc(): invalid next size -> SIGABRT
-> ```
->
-> **Expected:** funpack reconstructs the original table.
-> **Actual:** heap corruption / abort.
->
-> **Environment:** cfitsio 4.6.0, Linux x86_64. Numeric VLA inner
-> types (`1PE`, `1PJ`, …) compress and funpack fine — only the
-> string (`A`) inner type triggers it.
+Everything from here to the next `---` is self-contained — copy it
+straight into a new cfitsio issue.
+
+**Title:** funpack crashes (heap corruption) on tile-compressed
+tables with variable-length string (`1PA`) columns
+
+**Summary:** A binary table with a variable-length character column
+(TFORM `1PA`) compressed with `fpack -table` cannot be decompressed
+by `funpack` — it aborts with `realloc(): invalid next size`
+(SIGABRT). cfitsio crashes on its own `fpack` output, so no
+third-party tooling is involved. Numeric VLA inner types (`1PE`,
+`1PJ`, …) compress and funpack fine; only the string (`A`) inner
+type triggers it.
+
+**Environment:** cfitsio 4.6.0, fpack/funpack 1.7.0, Linux x86_64
+(glibc).
+
+**Reproduce.** Compile and run this program (writes an ordinary
+uncompressed BINTABLE with one `1PA` column), then `fpack`/`funpack`
+it:
+
+```c
+/* pa_vla.c — build: cc pa_vla.c -o pa_vla -lcfitsio */
+#include <stdio.h>
+#include <stdlib.h>
+#include "fitsio.h"
+
+int main(void) {
+    const char *fname = "pa_vla.fits";
+    fitsfile *fptr = NULL;
+    int status = 0;
+
+    remove(fname);
+    fits_create_file(&fptr, fname, &status);
+
+    const long nrows = 3000;
+    char *ttype[] = {"name"};
+    char *tform[] = {"1PA"};  /* variable-length string column */
+    char *tunit[] = {""};
+    fits_create_tbl(fptr, BINARY_TBL, 0, 1,
+                    ttype, tform, tunit, "DATA", &status);
+
+    /* One variable-length string per row: "obj_" + (i % 15) 'x's. */
+    for (long i = 0; i < nrows; i++) {
+        char buf[64];
+        int xn = (int)(i % 15);
+        int p = snprintf(buf, sizeof buf, "obj_");
+        for (int k = 0; k < xn; k++) buf[p++] = 'x';
+        buf[p] = '\0';
+        char *cell[1] = {buf};
+        fits_write_col(fptr, TSTRING, 1, i + 1, 1, 1, cell, &status);
+    }
+
+    fits_close_file(fptr, &status);
+    fits_report_error(stderr, status);
+    return status;
+}
+```
+
+```console
+$ cc pa_vla.c -o pa_vla -lcfitsio && ./pa_vla
+$ fpack -table pa_vla.fits          # rc 0, writes pa_vla.fits.fz
+$ funpack -O out.fits pa_vla.fits.fz
+realloc(): invalid next size
+Aborted (core dumped)               # exit 134 = 128 + SIGABRT
+```
+
+**Expected:** funpack reconstructs the original table.
+**Actual:** heap corruption / abort.
 
 ---
 
@@ -105,30 +149,74 @@ funpack exit code: 158
 
 ### Draft cfitsio issue
 
-> **Title:** `fpack -g2` produces GZIP_2 complex-column tables that
-> `funpack` rejects ("unsuitable data type")
->
-> **Summary:** When a binary table with a complex column (TFORM
-> `1C` or `1M`) is compressed with `fpack -g2 -table`, cfitsio
-> writes the column with `ZCTYP='GZIP_2'`. `funpack` then fails
-> with `status 414 — unexpected attempt to use GZIP_2 to compress a
-> column unsuitable data type`. The GZIP_2 *encoder* skips
-> byte-shuffling complex but still tags the column GZIP_2, while
-> the GZIP_2 *decompressor*'s unshuffle switch has no `C`/`M` case.
->
-> **Reproduce** (cfitsio + CLIs only):
-> ```c
-> /* see gzip2_complex_funpack.c: create a BINTABLE with one 1C
->    column, write ~2000 complex values, close. */
-> ```
-> ```
-> fpack -g2 -table cplx.fits   # rc 0; ZCTYP1='GZIP_2'
-> funpack cplx.fits.fz         # status 414, unsuitable data type
-> ```
->
-> **Expected:** either funpack decompresses it, or fpack declines
-> to use GZIP_2 for complex columns (falling back to GZIP_1, which
-> round-trips).
-> **Actual:** cfitsio writes a file it cannot read back.
->
-> **Environment:** cfitsio 4.6.0, Linux x86_64.
+Everything from here to the end is self-contained — copy it
+straight into a new cfitsio issue.
+
+**Title:** `fpack -g2` produces GZIP_2 complex-column tables that
+`funpack` rejects ("unsuitable data type")
+
+**Summary:** When a binary table with a complex column (TFORM `1C`
+or `1M`) is compressed with `fpack -g2 -table`, cfitsio writes the
+column with `ZCTYP='GZIP_2'`. `funpack` then fails with
+`status 414 — unexpected attempt to use GZIP_2 to compress a column
+unsuitable data type`. The GZIP_2 *encoder* skips byte-shuffling
+complex columns (it shuffles only 2/4/8-byte I/J/E/D/K) but still
+tags the column GZIP_2, while the GZIP_2 *decompressor*'s unshuffle
+`switch` has no `C`/`M` case — so cfitsio writes a file it cannot
+read back.
+
+**Environment:** cfitsio 4.6.0, fpack/funpack 1.7.0, Linux x86_64.
+
+**Reproduce.** Compile and run this program (writes an ordinary
+uncompressed BINTABLE with one `1C` column), then `fpack`/`funpack`
+it:
+
+```c
+/* cplx.c — build: cc cplx.c -o cplx -lcfitsio */
+#include <stdio.h>
+#include <stdlib.h>
+#include "fitsio.h"
+
+int main(void) {
+    const char *fname = "cplx.fits";
+    fitsfile *fptr = NULL;
+    int status = 0;
+
+    remove(fname);
+    fits_create_file(&fptr, fname, &status);
+
+    const long nrows = 2000;
+    char *ttype[] = {"z"};
+    char *tform[] = {"1C"};  /* single-precision complex */
+    char *tunit[] = {""};
+    fits_create_tbl(fptr, BINARY_TBL, 0, 1,
+                    ttype, tform, tunit, "DATA", &status);
+
+    /* fits_write_col with TCOMPLEX takes float pairs [re, im, ...]. */
+    float *cell = malloc((size_t)nrows * 2 * sizeof(float));
+    for (long i = 0; i < nrows; i++) {
+        cell[2 * i] = (float)i * 0.5f;
+        cell[2 * i + 1] = (float)(-i) * 0.25f;
+    }
+    fits_write_col(fptr, TCOMPLEX, 1, 1, 1, nrows, cell, &status);
+    free(cell);
+
+    fits_close_file(fptr, &status);
+    fits_report_error(stderr, status);
+    return status;
+}
+```
+
+```console
+$ cc cplx.c -o cplx -lcfitsio && ./cplx
+$ fpack -g2 -table cplx.fits        # rc 0; writes ZCTYP1='GZIP_2'
+$ funpack -O out.fits cplx.fits.fz
+FITSIO status = 414: error uncompressing image
+Error: unexpected attempt to use GZIP_2 to compress a column
+       unsuitable data type                # exit 158
+```
+
+**Expected:** either funpack decompresses it, or fpack declines to
+use GZIP_2 for complex columns (falling back to GZIP_1, which
+round-trips).
+**Actual:** cfitsio writes a file it cannot read back.
