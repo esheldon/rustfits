@@ -332,6 +332,78 @@ def test_string_column_round_trip():
 
 
 # ---------------------------------------------------------------------
+# read_column (regression: was returning raw 1QB heap bytes because the
+# inherited TableHDU.read_column read against the on-disk compressed
+# schema; CompressedTableHDU now overrides it to decode)
+# ---------------------------------------------------------------------
+
+
+def test_read_column_decodes_not_raw_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 2000
+        dt = np.dtype([("a", "i4"), ("b", "f8")])
+        src = np.zeros(nrows, dtype=dt)
+        src["a"] = np.arange(nrows, dtype="i4")
+        src["b"] = np.arange(nrows, dtype="f8") * 0.5
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, compress=True)
+            f[1].write(src)
+        with rustfits.FITS(fname, "r") as f:
+            hdu = f[1]
+            assert isinstance(hdu, rustfits.CompressedTableHDU)
+            col_a = hdu.read_column("a")
+            col_b = hdu.read_column("b")
+            # Decoded values + dtype, NOT raw uint8 heap bytes.
+            assert col_a.dtype == np.dtype("i4")
+            assert col_b.dtype == np.dtype("f8")
+            np.testing.assert_array_equal(col_a, src["a"])
+            np.testing.assert_array_equal(col_b, src["b"])
+            # Matches the read(columns=...) path exactly.
+            np.testing.assert_array_equal(col_a, hdu.read(columns=["a"])["a"])
+
+
+def test_read_column_rows_subset():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 2000
+        dt = np.dtype([("a", "i4")])
+        src = np.zeros(nrows, dtype=dt)
+        src["a"] = np.arange(nrows, dtype="i4")
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, compress=True)
+            f[1].write(src)
+        with rustfits.FITS(fname, "r") as f:
+            hdu = f[1]
+            np.testing.assert_array_equal(
+                hdu.read_column("a", rows=slice(100, 150)),
+                src["a"][100:150],
+            )
+            np.testing.assert_array_equal(
+                hdu.read_column("a", rows=[3, 9, 1, 1999]),
+                src["a"][[3, 9, 1, 1999]],
+            )
+
+
+def test_read_column_as_bytes_and_mask_null_rejected():
+    with tempfile.TemporaryDirectory() as td:
+        fname = os.path.join(td, "t.fits")
+        nrows = 50
+        dt = np.dtype([("name", "S8")])
+        src = np.empty(nrows, dtype=dt)
+        src["name"] = [f"r{i:03d}".encode() for i in range(nrows)]
+        with rustfits.FITS(fname, "w+") as f:
+            f.create_table_hdu(dt, nrows=nrows, compress=True)
+            f[1].write(src)
+        with rustfits.FITS(fname, "r") as f:
+            hdu = f[1]
+            with pytest.raises(NotImplementedError):
+                hdu.read_column("name", as_bytes=True)
+            with pytest.raises(NotImplementedError):
+                hdu.read_column("name", mask_null=True)
+
+
+# ---------------------------------------------------------------------
 # Tiling
 # ---------------------------------------------------------------------
 
