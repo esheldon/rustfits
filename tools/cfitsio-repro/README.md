@@ -92,10 +92,33 @@ allocated by thread T0 here:
     #1 fits_uncompress_table (libcfitsio)
 ```
 
-So `fits_uncompress_table` **under-allocates the decompression
-output buffer** for the variable-length-string column (24000 bytes
-here), and zlib's `inflate`/`updatewindow` window copy reads 32 KiB
-off the end.
+C-level cause — `fits_uncompress_table` reserves `cm_buffer` space
+for VLA *descriptors*, then asks `uncompress2mem_from_mem` to
+`realloc`-grow a slice of that shared buffer it doesn't own:
+
+- `imcompress.c:8857` / `:8898` — per VLA column, `addspace += 16`,
+  and `cm_size = naxis1*rowspertile + addspace*rowspertile`.  So a
+  VLA column's reservation is sized for its descriptors
+  (`descriptor_width + 16` bytes/row), **not** the decompressed
+  string payload.
+- `imcompress.c:9008` (the `default:` VLA branch) gunzips the
+  payload into `cptr = cm_buffer + cmajor_colstart[ii]` with
+  `fullsize` = that descriptor-sized reservation, passing `realloc`
+  as the grow callback.
+- `zcompress.c:227` — when the decompressed strings exceed
+  `fullsize`, `uncompress2mem_from_mem` does
+  `realloc(cm_buffer + offset, …)` on a pointer **interior** to the
+  shared `cm_buffer` (undefined behavior → heap corruption).  For
+  the first column (`cptr == cm_buffer`) the realloc instead
+  silently moves the block, leaving `cm_buffer` dangling for the
+  transpose loop at `:9018`.
+
+The contract mismatch: `uncompress2mem_from_mem` is built to own and
+`realloc`-grow its output buffer, but it's handed a slice of a
+shared one.  Fix is a maintainer design call — decompress each VLA
+column's payload into a separate owned buffer then copy into
+`cm_buffer`, or size the reservation to the true uncompressed
+extent.
 
 ### Draft cfitsio issue
 
@@ -179,14 +202,19 @@ READ of size 32768 ... 0 bytes after a 24000-byte region
   #6 main           utilities/funpack.c:23
 ```
 
-`fits_uncompress_table` under-allocates the decompression output
-buffer for the variable-length-string column (24000 bytes in this
-repro); zlib's `inflate`/`updatewindow` window copy then reads
-32 KiB past the end of it.
+C-level cause: `fits_uncompress_table` reserves `cm_buffer` space
+for VLA *descriptors* only (`imcompress.c:8857`/`:8898`), then the
+`default:` VLA branch (`:9008`) gunzips the larger string *payload*
+into an interior pointer of that shared buffer with a `realloc` grow
+callback.  When the payload exceeds the reservation,
+`uncompress2mem_from_mem` (`zcompress.c:227`) reallocs an interior
+pointer of `cm_buffer` — undefined behavior, which corrupts the
+heap.  `uncompress2mem_from_mem` is built to own and grow its output
+buffer; here it's handed a slice of a shared one.
 
 **Expected:** funpack reconstructs the original table.
-**Actual:** heap corruption / abort (ASAN: out-of-bounds read in
-`fits_uncompress_table`'s output buffer).
+**Actual:** heap corruption / abort (ASAN: out-of-bounds read off
+`fits_uncompress_table`'s under-sized output buffer).
 
 ---
 
