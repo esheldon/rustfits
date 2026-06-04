@@ -30,7 +30,8 @@ x86_64.
 
 ## #3 — String-VLA (`1PA`) ZTABLE columns crash `funpack`
 
-**rustfits issue:** [#9](https://github.com/esheldon/rustfits/issues/9)
+**filed:** cfitsio [#134](https://github.com/heasarc/cfitsio/issues/134)
+· **rustfits issue:** [#9](https://github.com/esheldon/rustfits/issues/9)
 · **file:** `pa_vla_funpack_crash.c`
 
 A variable-length string column (`1PA`/`1QA`) in a tile-compressed
@@ -125,7 +126,8 @@ Aborted (core dumped)               # exit 134 = 128 + SIGABRT
 
 ## #5 — `GZIP_2` complex (`1C`/`1M`) columns: cfitsio can't funpack its own output
 
-**rustfits doc:** `docs/internal/ztable.md` (referenced as issue #8
+**filed:** cfitsio [#135](https://github.com/heasarc/cfitsio/issues/135)
+· **rustfits doc:** `docs/internal/ztable.md` (referenced as issue #8
 on the rustfits side) · **file:** `gzip2_complex_funpack.c`
 
 `fpack -g2 -table` writes a complex column with `ZCTYP='GZIP_2'`,
@@ -220,3 +222,24 @@ Error: unexpected attempt to use GZIP_2 to compress a column
 use GZIP_2 for complex columns (falling back to GZIP_1, which
 round-trips).
 **Actual:** cfitsio writes a file it cannot read back.
+
+---
+
+## Negative result — compressed-image `__setitem__` sweep
+
+**file:** `setitem_sweep_corruption.c` · `bash run.sh sweep`
+
+`upstream-bugs.md` entry 6 records a `free(): invalid next size`
+heap corruption seen on Linux through fitsio's `write(start=)` when
+patching a compressed image repeatedly across an algorithm sweep in
+one process.  This program is the pure-C check of whether cfitsio is
+at fault: for each of the five algorithms it creates a (256,256)
+int image with (32,32) tiles, writes it, then patches sub-regions
+via `fits_write_subset` repeatedly — in both same-handle and
+reopen-then-patch variants, all in one process.
+
+**Result: it runs clean** — no corruption, no abort, exit 0.  So
+cfitsio's compressed-image patch path is *not* the culprit; the
+corruption is most likely in the fitsio Python wrapper's buffer /
+call handling.  Kept as the documented baseline so the wrapper hunt
+(if anyone picks it up) starts from "pure C is fine."

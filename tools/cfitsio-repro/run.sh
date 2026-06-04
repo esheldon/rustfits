@@ -7,8 +7,10 @@
 # include/lib paths automatically.  Override with CFITSIO_PREFIX=...
 #
 # Usage:  bash run.sh          # run all reproducers
-#         bash run.sh pa       # just the PA-VLA funpack crash (#3)
-#         bash run.sh cplx     # just the GZIP_2 complex case (#5)
+#         bash run.sh pa       # just the PA-VLA funpack crash (entry 2)
+#         bash run.sh cplx     # just the GZIP_2 complex case (entry 4)
+#         bash run.sh sweep    # negative-result probe (entry 6): pure-C
+#                              # compressed-image patch sweep runs CLEAN
 #
 # Each reproducer is pure cfitsio + fpack/funpack -- no Python, no
 # rustfits.  See README.md for the per-bug write-up and draft cfitsio
@@ -53,9 +55,23 @@ run_cplx() {
     echo "funpack exit code: $?"
 }
 
+run_sweep() {
+    echo "==================================================================="
+    echo " entry 6  compressed-image patch sweep -- NEGATIVE RESULT probe"
+    echo "          (pure cfitsio runs clean; bug is in the fitsio wrapper)"
+    echo "==================================================================="
+    compile setitem_sweep_corruption || return 1
+    local t
+    t="$(mktemp -d)"
+    ( cd "$t" && "$DIR/setitem_sweep_corruption" )
+    echo "exit code: $?   (0 = clean, as expected -- NOT a cfitsio bug)"
+    rm -rf "$t"
+}
+
 case "${1:-all}" in
-    pa)   run_pa ;;
-    cplx) run_cplx ;;
-    all)  run_pa; echo; run_cplx ;;
-    *)    echo "usage: bash run.sh [pa|cplx|all]" >&2; exit 2 ;;
+    pa)    run_pa ;;
+    cplx)  run_cplx ;;
+    sweep) run_sweep ;;
+    all)   run_pa; echo; run_cplx ;;
+    *)     echo "usage: bash run.sh [pa|cplx|sweep|all]" >&2; exit 2 ;;
 esac

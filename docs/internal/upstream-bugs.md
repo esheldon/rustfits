@@ -12,54 +12,55 @@ it's documented/pinned in this repo, how rustfits works around
 it, and whether it's been filed upstream.  When you fix or file
 one of these, update its **Upstream status** line.
 
-Only **issue #9** (PA-VLA funpack crash) has a rustfits issue so
-far; everything else is documented inline at the cited locations.
+Filed upstream so far:
 
-The candidates worth turning into standalone C reproducers + real
-cfitsio issues are flagged **[C-repro candidate]** — see the
-"Filing cfitsio issues" section at the end.
+- cfitsio **#134** — PA-VLA `funpack` crash (entry 2; also rustfits
+  issue #9).  Pure-C repro in `tools/cfitsio-repro/`.
+- cfitsio **#135** — GZIP_2 complex-column `funpack` rejection
+  (entry 4).  Pure-C repro in `tools/cfitsio-repro/`.
+- fitsio **#496** — macOS compressed-image-write crash (entry 1).
+
+Everything else is documented inline at the cited locations.
 
 ---
 
 ## cfitsio (C library) — crashes / memory corruption
 
-### 1. `ffbinit` libmalloc bad-free on macOS compressed-image create
+### 1. macOS compressed-image-write crash (`ffbinit` bad-free / PLIO_1 abort)
 
-- **Tool:** cfitsio (conda-forge binary), surfaced via the fitsio
-  Python wrapper.
-- **Trigger:** the first compressed-image *write* on macOS (the
-  `PyFITSObject_create_image_hdu` path), both py3.12 and py3.14 —
-  so it's the conda-forge build, not the Python version.
-- **Symptom:** libmalloc bad-free crash inside cfitsio's `ffbinit`.
-- **Documented:** `CLAUDE.md` § "CI: macOS fitsio workaround";
-  first aborting test was
+- **Tool:** cfitsio on macOS, surfaced via the fitsio Python
+  wrapper.
+- **Trigger:** writing a compressed image on macOS, at
   `tests/test_image_compressed_accessors.py::test_other_compression_types_dispatched`.
+  Two manifestations, almost certainly **one underlying bug** seen
+  under two cfitsio builds:
+  - **conda-forge binary:** the *first* compressed-image write
+    (`PyFITSObject_create_image_hdu` path), both py3.12 and py3.14.
+  - **pip source build:** specifically the `compress="PLIO_1"` +
+    default-qlevel *create* path, py3.12 only, ~50% hit rate.  The
+    read-side path (`compress="PLIO"` + explicit `qlevel=None`) does
+    NOT trigger it.
+- **Symptom:** conda binary → libmalloc bad-free inside cfitsio's
+  `ffbinit`; source build → bare `Fatal Python error: Aborted` with
+  the stack entirely inside `_fitsio_wrap.create_image_hdu`.  The
+  two signatures are plausibly the same heap overrun caught at
+  different points by two allocators.
+- **Documented:** `CLAUDE.md` §§ "CI: macOS fitsio workaround" +
+  "macOS CI flakes — resolved 2026-06-01";
+  `tests/test_image_compressed_accessors.py`
+  (`_SKIP_FITSIO_PLIO_ON_MACOS`).
 - **Workaround:** CI replaces the conda-forge fitsio with a pip
-  source build on the macOS legs only
-  (`pip install --force-reinstall --no-deps --no-binary=fitsio fitsio`);
-  Linux keeps the fast conda install.
-- **Upstream status:** not filed (suspected conda-forge build /
-  toolchain interaction; needs isolating before it's a clean
-  cfitsio bug).
+  source build on the macOS legs only (dodges the `ffbinit`
+  variant); a skipif mark on just the PLIO_1 parametrize case
+  dodges the source-build variant.  PLIO read coverage on macOS is
+  preserved via `test_image_compressed_read_plio.py` (non-crashing
+  path).
+- **Upstream status:** filed as **fitsio #496**
+  (https://github.com/esheldon/fitsio/issues/496); a maintainer
+  with a Mac is investigating.  macOS-only — not reproducible on
+  the Linux dev box.
 
-### 2. `free(): invalid next size` on compressed-image `__setitem__` sweep
-
-- **Tool:** cfitsio, via fitsio's `write(start=)`.
-- **Trigger:** running fitsio's `write(start=)` compressed-image
-  patch across an *algorithm sweep in one process* (each call is
-  fine standalone; the sweep tickles it).
-- **Symptom:** cfitsio `free(): invalid next size` heap corruption
-  (same shape as #1).
-- **Documented:** `CLAUDE.md` § "Performance TODO" item 6;
-  `perf/perf-compressed-image-setitem.py`;
-  `perf/perf-all.py`.
-- **Workaround:** the cross-tool comparison was dropped from the
-  `__setitem__` perf bench (rustfits-self per-tile cost is reported
-  instead); subprocess isolation would dodge it but wasn't worth it.
-- **Upstream status:** not filed (needs a pure-C minimal sweep to
-  confirm it's cfitsio, not the wrapper).
-
-### 3. String-VLA (PA/QA) ZTABLE columns crash `funpack`  **[C-repro candidate]**
+### 2. String-VLA (PA/QA) ZTABLE columns crash `funpack`
 
 - **Tool:** cfitsio table (de)compression, surfaced via `funpack`.
 - **Trigger:** a variable-length string column (`1PA` / `1QA`) in a
@@ -73,6 +74,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
   is reproducible without rustfits or fitsio's high-level API.
 - **Documented:** rustfits **issue #9**
   (https://github.com/esheldon/rustfits/issues/9);
+  pure-C repro `tools/cfitsio-repro/pa_vla_funpack_crash.c`;
   `tests/test_table_compressed_write_vla.py`
   (`test_pa_vla_ztable_rustfits_roundtrip` proves rustfits is
   correct; `test_funpack_pa_vla_ztable_cfitsio_crash_documented`
@@ -80,10 +82,11 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 - **Workaround:** none needed in rustfits (our PA-VLA ZTABLE
   read/write is correct).  Interop limitation: PA-VLA ZTABLE files
   are not funpack-readable with current cfitsio.
-- **Upstream status:** rustfits issue #9 open; **not yet filed on
-  cfitsio**.
+- **Upstream status:** filed as **cfitsio #134**
+  (https://github.com/heasarc/cfitsio/issues/134); rustfits issue
+  #9 open.
 
-### 4. Platform-dependent dequantization (macOS vs Linux)
+### 3. Platform-dependent dequantization (macOS vs Linux)
 
 - **Tool:** cfitsio (compiler codegen / libm — FMA fusion, Apple
   libm vs glibc), via fitsio.
@@ -103,7 +106,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 
 ## cfitsio (C library) — wrong output / self-incompatibility
 
-### 5. GZIP_2 table decompressor can't read complex (C/M) columns it writes  **[C-repro candidate]**
+### 4. GZIP_2 table decompressor can't read complex (C/M) columns it writes
 
 - **Tool:** cfitsio (and therefore `funpack`), affecting fitsio.
 - **Trigger:** a GZIP_2-compressed complex (`C` / `M`) column in a
@@ -113,17 +116,19 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
   `default: "...unsuitable data type"` → `DATA_DECOMPRESSION_ERR`
   (`imcompress.c`).
 - **Symptom:** cfitsio cannot `funpack` even its own GZIP_2-complex
-  output.
+  output (`fpack -g2 -table` writes `ZCTYP='GZIP_2'` on the complex
+  column; `funpack` then fails with status 414).
 - **Documented:** `docs/internal/ztable.md` § "Complex columns
-  (C / M)" (referenced there as issue #8, a rustfits-side fix).
+  (C / M)" (referenced there as rustfits-side issue #8);
+  pure-C repro `tools/cfitsio-repro/gzip2_complex_funpack.c`.
 - **Workaround:** rustfits **defaults complex columns to GZIP_1**
   (round-trips in both tools).  Explicit
   `compress={"col": "GZIP_2"}` on complex round-trips in rustfits
   but won't funpack.
-- **Upstream status:** not filed; clean pure-C repro is feasible
-  (fpack a complex column with GZIP_2, funpack it).
+- **Upstream status:** filed as **cfitsio #135**
+  (https://github.com/heasarc/cfitsio/issues/135).
 
-### 6. i8 (TLONGLONG) RICE / GZIP compressed images refused
+### 5. i8 (TLONGLONG) RICE / GZIP compressed images refused
 
 - **Tool:** cfitsio encoder family, via fitsio.
 - **Trigger:** RICE_1 or GZIP compression of an int64 image.
@@ -146,26 +151,36 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 
 ## fitsio (Python wrapper)
 
-### 7. PLIO_1 write abort on macOS
+### 6. compressed-image `__setitem__` sweep `free(): invalid next size`
 
-- **Tool:** fitsio Python wrapper + its source-built cfitsio.
-- **Trigger:** `create_image_hdu` with `compress="PLIO_1"` and
-  default qlevel, on macOS py3.12 (~50% hit rate).  The read-side
-  path (`compress="PLIO"` + explicit `qlevel=None`) does NOT
-  trigger it, so it's fitsio's specific PLIO_1 + default-qlevel
-  *write* path.
-- **Symptom:** bare `Fatal Python error: Aborted`, crash stack
-  entirely inside fitsio's `_fitsio_wrap.create_image_hdu` (no
-  rustfits frames).
-- **Documented:** `CLAUDE.md` § "macOS CI flakes — resolved
-  2026-06-01"; `tests/test_image_compressed_accessors.py`
-  (`_SKIP_FITSIO_PLIO_ON_MACOS`).
-- **Workaround:** skipif mark on just the PLIO_1 parametrize case;
-  PLIO read coverage on macOS preserved via
-  `test_image_compressed_read_plio.py` (non-crashing path).
-- **Upstream status:** not filed (intermittent, macOS-specific).
+- **Tool:** fitsio Python wrapper (Linux).  **Reclassified from
+  "cfitsio" — see finding below.**
+- **Trigger:** running fitsio's `write(start=)` compressed-image
+  patch across an *algorithm sweep in one process* (each call is
+  fine standalone; the cumulative sweep tickles it).
+- **Symptom:** `free(): invalid next size` heap corruption that
+  aborts the Python process.
+- **Finding (2026-06):** a pure-C reproducer
+  (`tools/cfitsio-repro/setitem_sweep_corruption.c`) exercises the
+  same shape with NO Python — create a (256,256) int image with
+  (32,32) tiles, then patch sub-regions via `fits_write_subset`
+  repeatedly, for all five algorithms in one process, in both
+  same-handle and reopen-then-patch variants.  **It runs clean** —
+  no corruption, no abort.  So the bug is **not** in cfitsio's
+  compressed-image patch path; it's most likely in the fitsio
+  wrapper's buffer/call handling (or a wrapper-specific call
+  sequence).  Distinct from entry 1 (different platform — Linux vs
+  macOS; different path — patch vs create).
+- **Documented:** `CLAUDE.md` § "Performance TODO" item 6;
+  `perf/perf-compressed-image-setitem.py`; the C probe above.
+- **Workaround:** the cross-tool comparison was dropped from the
+  `__setitem__` perf bench (rustfits-self per-tile cost is reported
+  instead).
+- **Upstream status:** not a cfitsio bug (per the C probe).  If
+  pursued, file on fitsio after isolating the wrapper call that
+  triggers it.
 
-### 8. Unbounded tile cache OOMs on large compressed images
+### 7. Unbounded tile cache OOMs on large compressed images
 
 - **Tool:** fitsio Python wrapper (cfitsio cache layer).
 - **Trigger:** scattered/random reads on a multi-GB compressed
@@ -180,7 +195,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
   `hdu.set_tile_cache_size(bytes)`; fitsio has no such bound.
 - **Upstream status:** known fitsio design limitation; not filed.
 
-### 9. VLA-append per-call HDU close/reopen (200× slowdown)
+### 8. VLA-append per-call HDU close/reopen (200× slowdown)
 
 - **Tool:** fitsio Python wrapper (`fitsio_pywrap.c`) on top of
   cfitsio's flush (`ffflus` / `fits_flush_file`).
@@ -198,7 +213,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 - **Upstream status:** fixable in fitsio (the underlying
   `fits_write_col` doesn't need the flush); not filed.
 
-### 10. fitsio can't extend compressed images or write ZTABLE
+### 9. fitsio can't extend compressed images or write ZTABLE
 
 - **Tool:** fitsio Python wrapper (capability gap; cfitsio status
   107 on the extend path).
@@ -217,7 +232,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 
 ## astropy (`astropy.io.fits`)
 
-### 11. `1PX(N)` / `1QX` bit-packed VLA column parser rejection
+### 10. `1PX(N)` / `1QX` bit-packed VLA column parser rejection
 
 - **Trigger:** reading a spec-conforming bit-packed VLA column
   (`1PX(maxbits)` / `1QX(maxbits)`).  astropy's `FITS2NUMPY` map
@@ -231,7 +246,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 - **Note:** fitsio reads PX/QX fine (one-time maxlen warning);
   cfitsio supports it natively — astropy-only.
 
-### 12. `CompImageHDU.verify_checksum` internal TypeError
+### 11. `CompImageHDU.verify_checksum` internal TypeError
 
 - **Trigger:** calling `verify_checksum` on a compressed-image HDU
   (even on astropy's own writes).
@@ -241,7 +256,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 - **Workaround:** rustfits doesn't cross-verify compressed
   ZHECKSUM against astropy; its own self-verify is correct.
 
-### 13. Silent i64 → i32 downcast before RICE encoding
+### 12. Silent i64 → i32 downcast before RICE encoding
 
 - **Trigger:** RICE-compressing an int64 image with astropy.
 - **Symptom:** astropy silently truncates i64 → i32 before
@@ -249,7 +264,7 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 - **Documented:** `docs/internal/zimage.md` (RICE i8 section).
 - **Workaround:** rustfits rejects the combination upfront.
 
-### 14. PLIO_1 + float hard-rejected; unquantized-float RICE/HCOMPRESS silently lossy
+### 13. PLIO_1 + float hard-rejected; unquantized-float RICE/HCOMPRESS silently lossy
 
 - **Trigger:** compressing float images: PLIO_1 (a mask-only
   encoder) is hard-rejected; RICE_1 / HCOMPRESS_1 with
@@ -267,34 +282,30 @@ cfitsio issues are flagged **[C-repro candidate]** — see the
 
 ## Filing cfitsio issues
 
-The cleanest candidates for standalone C reproducers + real
-cfitsio issues are the ones that reproduce **without rustfits or
-fitsio's high-level API** — i.e. pure libcfitsio + the
-`fpack` / `funpack` CLIs:
+Two clean pure-C reproducers (no rustfits, no fitsio) are filed
+with cfitsio; their source + draft issue text live in
+`tools/cfitsio-repro/`:
 
-1. **#3 PA-VLA funpack crash** — the strongest case (cfitsio
-   crashes on its own `fpack -table` output; already rustfits
-   issue #9).  A pure-C repro: build an uncompressed table with a
-   `1PA` column via `fits_create_tbl` + `fits_write_col`, then
-   either shell out to `fpack`/`funpack` or call the internal
-   compress/uncompress directly.
-2. **#5 GZIP_2 complex self-incompatibility** — write a `C`/`M`
-   column, `fpack -table` with GZIP_2, `funpack` → decompression
-   error.  Pure-C and deterministic.
+1. **Entry 2 — PA-VLA funpack crash** → cfitsio **#134**.
+   `pa_vla_funpack_crash.c`: build an uncompressed table with a
+   `1PA` column, `fpack -table`, `funpack` → SIGABRT.
+2. **Entry 4 — GZIP_2 complex self-incompatibility** → cfitsio
+   **#135**.  `gzip2_complex_funpack.c`: `fpack -g2 -table` a `1C`
+   column, `funpack` → status 414.
 
-Secondary (need more isolation before they're clean cfitsio
-issues, since they currently only manifest through a wrapper or a
-specific platform/build):
+Investigated, **not** filed on cfitsio:
 
-3. **#2 setitem free-corruption** — needs a pure-C minimal
-   algorithm-sweep to confirm it's cfitsio and not the wrapper.
-4. **#1 ffbinit macOS bad-free** — platform/build-specific;
-   isolate the conda-forge toolchain factor first.
+3. **Entry 6 — setitem `free()` corruption** — the pure-C probe
+   (`setitem_sweep_corruption.c`) runs clean, so this is not a
+   cfitsio bug; it belongs to the fitsio wrapper.  File there if
+   pursued.
+4. **Entry 1 — macOS compressed-image-write crash** — filed on
+   fitsio (**#496**); macOS-only, not reproducible on the Linux
+   dev box, so no pure-C reproducer here.
 
 Reference C source for building repros lives in the bundled
 cfitsio tarball — see `CLAUDE.md` § "Reference sources for
 byte-exact ports" for the untar-and-locate recipe (e.g.
 `<cfitsio>/imcompress.c` for the table compress/uncompress
-paths).  Standalone repro programs, when written, should live in
-`tools/cfitsio-repro/` with a short README per bug and a
-build/run line that links against the system or bundled cfitsio.
+paths).  Build/run the existing reproducers with
+`bash tools/cfitsio-repro/run.sh`.

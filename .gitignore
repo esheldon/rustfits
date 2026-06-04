@@ -52,6 +52,7 @@ docs/_build/
 # cfitsio reproducer binaries + their generated FITS artifacts
 /tools/cfitsio-repro/pa_vla_funpack_crash
 /tools/cfitsio-repro/gzip2_complex_funpack
+/tools/cfitsio-repro/setitem_sweep_corruption
 /tools/cfitsio-repro/*.fits
 /tools/cfitsio-repro/*.fits.fz
 /tools/cfitsio-repro/core
