@@ -45,6 +45,20 @@ Both forms accept the FITS BITPIX-direct dtypes
 trick" dtypes (``i1 / u2 / u4 / u8``), which round-trip via a
 signed BITPIX plus BSCALE/BZERO cards.
 
+If you have an open handle and don't want to branch on the HDU
+type — copying HDUs across files, say — the minimal
+:meth:`~rustfits.FITS.write` method auto-detects image vs table
+from the value and accepts only the universal kwargs
+(``extname``, ``header``).  A plain ndarray becomes an image:
+
+.. code-block:: python
+
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write(img, extname="sci")        # plain ndarray → image
+
+Use ``write_image`` instead only when you need a type-specific
+knob (``compress=``, ``blank=``, ``quantize=``).
+
 Allocating then filling
 -----------------------
 
@@ -142,6 +156,42 @@ is the last, the file simply grows.
 After ``extend``, ``hdu.shape[0]`` is the new total row count;
 previously-cached handles to later HDUs still work — the offsets
 update transparently.
+
+Streaming extend with ``extending()``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When you build an image incrementally from many small chunks —
+a mosaic assembled strip by strip, a detector read out row group
+by row group — wrap the loop in the
+:meth:`~rustfits.ImageHDU.extending` context manager:
+
+.. code-block:: python
+
+   with rustfits.FITS("out.fits", "w+") as fits:
+       # Start empty: a zero in the slow axis, real inner axes.
+       hdu = fits.create_image_hdu("f4", (0, 4096), extname="sci")
+       with hdu.extending():
+           for strip in produce_strips():        # each (k, 4096)
+               hdu.extend(strip)
+       # buffer is flushed on exit from the `with` block
+
+Inside the ``with`` block, ``extend`` is the only data operation
+permitted — ``read`` / ``__getitem__`` / ``__setitem__`` /
+``repack`` raise until the context exits.
+
+On an **uncompressed** HDU ``extending()`` is a no-op wrapper:
+each ``extend`` writes straight through, exactly as it would
+without the context.  It exists so generic "any image HDU" code
+can use one shape regardless of the on-disk encoding.
+
+On a **tile-compressed** HDU it is a real optimization.  Each
+``extend`` buffers its rows in memory and drains to disk only at
+tile-row boundaries (or when a soft memory cap is reached),
+collapsing many partial-last-tile re-encodes into one.  For
+sub-tile chunks this is the difference between ~22× and ~1.3×
+the cost of a single whole-array write — see
+:doc:`compression` for the mechanics and :doc:`performance` for
+the measured numbers.
 
 BLANK masking and MaskedArrays
 ------------------------------

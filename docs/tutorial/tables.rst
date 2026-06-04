@@ -49,6 +49,20 @@ and use :meth:`~rustfits.FITS.write_table`:
 Pass ``units={"ra": "deg", "dec": "deg"}`` to attach informational
 TUNITn cards.
 
+When you have an open handle but don't want to care whether the
+value is an image or a table — copying HDUs across files, say —
+:meth:`~rustfits.FITS.write` is the minimal, type-agnostic method.
+Like the top-level :func:`rustfits.write` it accepts only the
+universal kwargs (``extname``, ``header``) and auto-detects the
+HDU type; reach for ``write_table`` only when you need a
+type-specific knob:
+
+.. code-block:: python
+
+   with rustfits.FITS("out.fits", "w+") as fits:
+       fits.write(cat, extname="cat")        # structured ndarray → table
+       fits.write({"x": np.arange(10)})      # dict → table
+
 Allocating then filling
 -----------------------
 

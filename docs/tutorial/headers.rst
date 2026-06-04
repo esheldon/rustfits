@@ -97,7 +97,8 @@ queue rather than committing one card at a time.
 ``update()`` and copy patterns
 ------------------------------
 
-``header.update(source)`` accepts either another
+``header.update(source)`` performs batched atomic writes, the
+same as the edit mode.  ``update`` accepts either another
 :class:`~rustfits.FITSHeader` (for HDU-to-HDU metadata copy) or
 a plain dict.  The two sources have different rules around
 protected keys:

@@ -61,8 +61,7 @@ What raises what
        by another process; write failed mid-flush (e.g.
        ``ENOSPC``); the per-file taint flag is set (see below).
    * - ``NotImplementedError``
-     - You called a method on a stub HDU type
-       (:class:`~rustfits.AsciiTableHDU.read`), or asked for a
+     - You called a method on a stub HDU type or asked for a
        feature listed in :doc:`limitations` as "(not yet)".
 
 The taint flag and recovery
