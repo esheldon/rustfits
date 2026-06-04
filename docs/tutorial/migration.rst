@@ -95,13 +95,14 @@ fitsio takes flat kwargs:
    fits.write(data, compress="GZIP_1", tile_dims=(100, 100),
               qlevel=4.0, qmethod=1)
 
-rustfits takes structured config objects:
+rustfits also takes string forms such as "GZIP_1", but to get non-default
+behavior it takes a structured config object:
 
 .. code-block:: python
 
    fits.write_image(
        data,
-       compress=rustfits.Gzip1(tile_shape=(100, 100)),
+       compress=rustfits.Gzip1(tile_shape=(100, 100), level=9),
        quantize=rustfits.Quantize(level=4.0, method="dither1"),
    )
 
@@ -193,7 +194,10 @@ Write an image to a fresh file
 
    # rustfits — explicit handle for type-specific kwargs
    with rustfits.FITS(path, "w+") as fits:
-       fits.write_image(data, extname="sci")
+       fits.write(data, extname="sci")
+
+       # for non-universal keywords, use write_image
+       fits.write_image(data, blank=-1)
 
    # rustfits — minimal one-liner, auto-dispatches by data type
    rustfits.write(path, data, extname="sci")
@@ -213,7 +217,10 @@ Write a table to a fresh file
 
    # rustfits — explicit, gets table-side kwargs
    with rustfits.FITS(path, "w+") as fits:
-       fits.write_table(table, extname="cat")
+       fits.write(table, extname="cat")
+
+       # for non-universal keywords, use write_table
+       fits.write_table(table, bit_columns=['x'])
 
    # rustfits — minimal, auto-dispatches by data type
    rustfits.write(path, table, extname="cat")
@@ -227,7 +234,8 @@ Compressed image
    with fitsio.FITS(path, "rw", clobber=True) as f:
        f.write(data, compress="RICE_1", tile_dims=(100, 100))
 
-   # rustfits
+   # rustfits also takes the string form, but for more control
+   # use a structured config class
    with rustfits.FITS(path, "w+") as fits:
        fits.write_image(
            data,
