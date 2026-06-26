@@ -6,9 +6,11 @@ build-backend = "maturin"
 name = "rustfits"
 version = "0.1.2"
 description = "A Python FITS library with the heavy lifting written in Rust."
+readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+dependencies = ["numpy"]
 
 [project.urls]
 Homepage = "https://github.com/esheldon/rustfits"
