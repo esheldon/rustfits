@@ -1609,13 +1609,21 @@ impl FITS {
             Storage::Mem(Cursor::new(bytes))
         } else if is_gz_path(&filename) {
             // Whole-file gzip: read-only.  Write-back (recompress on
-            // close) is not yet implemented, so reject r+ / w+ with a
+            // close) is not implemented, so reject r+ / w+ with a
             // clear pointer rather than silently dropping mutations.
+            // We steer users toward per-HDU compression, which beats
+            // whole-file gzip on storage, memory, and speed.
             if mode != "r" {
                 return Err(PyIOError::new_err(format!(
                     "gzipped files are read-only; open '{}' with mode='r' \
-                     (write-back to .gz is not yet implemented — to edit, \
-                     read it, write to a plain .fits, and gzip that)",
+                     (write-back to .gz is not implemented). For a \
+                     compressed file, prefer per-HDU compression over \
+                     whole-file gzip: write a plain .fits and use \
+                     tile-compressed images or compressed tables (the \
+                     compress=... argument to create_image_hdu / \
+                     create_table_hdu / write_image / write_table), which \
+                     generally beat whole-file gzip on storage, memory, \
+                     and speed",
                     filename
                 )));
             }
