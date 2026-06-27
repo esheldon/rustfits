@@ -1,4 +1,5 @@
 # flake8: noqa
+from ._rust import __version__
 from ._rust import (
     FITS,
     HDU,
