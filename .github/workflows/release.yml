@@ -1,0 +1,136 @@
+name: wheels
+
+# Build binary wheels (+ sdist) for the lean native target set, and
+# publish to PyPI on a version tag via Trusted Publishing (OIDC).
+#
+# Dry run (build only, no publish): runs on pull_request and on manual
+# workflow_dispatch — use these to confirm every target builds, including
+# Windows, before tagging.
+#
+# Publish: push a tag matching v* (e.g. `git tag v0.1.3 && git push --tags`).
+# The publish job needs a Trusted Publisher configured on PyPI for this
+# repo + workflow filename (release.yml) + environment (pypi).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux wheels (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: auto
+          # The manylinux container ships every CPython, so --find-interpreter
+          # builds a wheel per version in this single job.
+          args: --release --out dist --find-interpreter
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+
+  windows:
+    name: windows wheel (x64, py${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: x64
+      # ring (the rustls TLS backend, pulled in by ureq/suppaftp) assembles
+      # its asm with nasm on the windows-msvc target.
+      - uses: ilammy/setup-nasm@v1
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist -i python
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.python-version }}
+          path: dist
+
+  macos:
+    name: macos wheel (universal2, py${{ matrix.python-version }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          # One universal2 wheel covers Apple Silicon + Intel.
+          target: universal2-apple-darwin
+          args: --release --out dist -i python
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.python-version }}
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [linux, windows, macos, sdist]
+    # Only publish on a version tag; PR / dispatch runs stop after building.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rustfits
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Lets a tag add wheels to an already-uploaded version (e.g. the
+          # 0.1.2 sdist already on PyPI) instead of failing on the dupe.
+          skip-existing: true
+          packages-dir: dist
