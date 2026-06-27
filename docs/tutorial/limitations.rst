@@ -58,6 +58,39 @@ General
 * **Random groups** (``GROUPS=T``, ``PTYPEn``) *(by design)* — legacy format;
   vanishingly rare in new files.  Not on the roadmap.
 
+Files and compression
+---------------------
+
+* **Whole-file gzip is read-only** *(not yet)* — a ``.gz`` path is
+  decompressed into memory on open, so reads work, but ``r+`` /
+  ``w+`` on a ``.gz`` raise.  Write-back (recompress-on-close)
+  isn't implemented.
+
+  More to the point, **prefer per-HDU compression over whole-file
+  compression**.  Tile-compressed images (the ``compress=...``
+  argument to ``create_image_hdu`` / ``write_image``) and
+  compressed tables (``compress=...`` on ``create_table_hdu`` /
+  ``write_table``) generally beat a whole-file ``.gz`` on every
+  axis that matters:
+
+  - **Storage** — the tile-compression conventions apply the codec
+    suited to the data (RICE / HCOMPRESS / GZIP with byte-shuffle,
+    optional float quantization), so they typically compress
+    tighter than gzipping the raw byte stream.
+  - **Memory** — a ``.gz`` must be decompressed *in full* into RAM
+    before any byte is readable (gzip isn't seekable; FITS needs
+    random access).  Tile compression decodes only the tiles you
+    touch, keeping peak memory near the size of your slice rather
+    than the whole image or table.
+  - **Speed** — partial and scattered reads pull only the needed
+    tiles (and the per-tile cache makes repeated access cheap),
+    whereas whole-file gzip pays the full-decompress cost up front
+    on every open.
+
+  To write a compressed file, write a plain ``.fits`` and choose
+  tile/HDU compression per HDU — see the compression sections of
+  the image and table guides.
+
 Cross-tool interop caveats
 --------------------------
 

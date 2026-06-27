@@ -48,6 +48,10 @@ use crate::zimage::compression_config::{
 
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Baked in from Cargo.toml at compile time — the single source of
+    // truth for the version (pyproject reads it dynamically from there
+    // too).  Re-exported as rustfits.__version__ in the Python package.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<FITS>()?;
     m.add_class::<HDU>()?;
     m.add_class::<ImageHDU>()?;
