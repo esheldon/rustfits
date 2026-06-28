@@ -71,6 +71,23 @@ impl Storage {
         self.read_exact(&mut buf)?;
         Ok(buf)
     }
+
+    // Consume the storage and return its bytes.  Zero-copy for the
+    // in-memory backend (moves the inner Vec straight out of the
+    // Cursor — no second full-size allocation like read_all); reads
+    // the whole file for the disk backend.  Used by close()'s `.gz`
+    // write-back, which only ever holds a Mem backend.
+    pub(crate) fn into_vec(self) -> io::Result<Vec<u8>> {
+        match self {
+            Storage::Mem(c) => Ok(c.into_inner()),
+            Storage::Disk(mut f) => {
+                f.seek(SeekFrom::Start(0))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+        }
+    }
 }
 
 impl Read for Storage {

@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::OpenOptions;
@@ -15,7 +15,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use suppaftp::types::FileType;
 use suppaftp::{FtpStream, RustlsConnector, RustlsFtpStream};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::common::{
     lock_file, parse_keyword, parse_string_keyword,
@@ -181,30 +181,74 @@ fn maybe_gunzip_url(bytes: Vec<u8>, url: &str) -> PyResult<Vec<u8>> {
         return Ok(bytes);
     }
     let mut out = Vec::new();
-    GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| {
+    // MultiGzDecoder (not GzDecoder) so a multi-member gzip stream is
+    // decoded in full rather than silently truncated to its first member.
+    MultiGzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| {
         PyIOError::new_err(format!("Failed to gunzip remote '{}': {}", url, e))
     })?;
     Ok(out)
 }
 
-// Recompress `raw` with gzip and write it to `filename` (truncate /
-// create).  Used by close() to write back a `.gz` file opened r+/w+:
-// the decompressed bytes live in a Mem buffer while open, and this
-// streams them back through a GzEncoder so the compressed output is
-// never fully materialized in RAM (only the already-in-RAM raw bytes
-// are).  Level 6 (Compression::default) matches the gzip-tile encoder
-// default and the de-facto gzip CLI default.
+// Bumped per write-back to make the temp filename unique within the
+// process (the pid distinguishes processes).  Avoids two threads
+// closing two handles to the same `.gz` path colliding on the temp.
+static GZ_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// Recompress `raw` with gzip and **atomically** replace `filename`.
+// Used by close() to write back a `.gz` opened r+/w+: the decompressed
+// bytes live in a Mem buffer while open, and this streams them back
+// through a GzEncoder so the compressed output is never fully
+// materialized in RAM (only the already-in-RAM raw bytes are).
+//
+// The write goes to a sibling temp file which is then `rename`d over
+// the target.  This is the critical correctness property: a failure
+// part-way through (ENOSPC, I/O error) leaves the ORIGINAL file
+// completely untouched rather than truncated/half-written — there is
+// no in-place truncate.  The temp lives in the target's own directory
+// so the rename is a same-filesystem (atomic) metadata op, not a
+// cross-device copy.  On any error the partial temp is removed.
+//
+// Consistent with the codebase's "close does NOT fsync" contract, the
+// temp is not fsync'd before the rename; power-loss durability is the
+// caller's job via `FITS.sync()`.  Level 6 (Compression::default)
+// matches the gzip-tile encoder default and the gzip CLI default.
 fn gzip_write_back(filename: &str, raw: &[u8]) -> io::Result<()> {
-    let out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(filename)?;
-    let mut enc = GzEncoder::new(out, Compression::default());
-    enc.write_all(raw)?;
-    // finish() flushes the deflate trailer + gzip CRC/size footer.
-    enc.finish()?;
-    Ok(())
+    let target = std::path::Path::new(filename);
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid .gz path '{}'", filename),
+        )
+    })?;
+    let n = GZ_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".rustfits-tmp.{}.{}", std::process::id(), n));
+    let tmp_path = dir.join(tmp_name);
+
+    // Closure so any `?` failure routes through the temp cleanup below.
+    let result = (|| -> io::Result<()> {
+        let out = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut enc = GzEncoder::new(out, Compression::default());
+        enc.write_all(raw)?;
+        // finish() flushes the deflate trailer + gzip CRC/size footer.
+        enc.finish()?;
+        std::fs::rename(&tmp_path, target)
+    })();
+    if result.is_err() {
+        // Best-effort cleanup of the partial temp; keep the original
+        // error.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 // True for an ftp/ftps URL.
@@ -1664,7 +1708,13 @@ impl FITS {
                                 "Failed to open '{}': {}", filename, e))
                         })?;
                     let mut buf = Vec::new();
-                    GzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
+                    // MultiGzDecoder (not GzDecoder) so a multi-member
+                    // gzip stream is decoded in full.  This matters for
+                    // write-back: GzDecoder would read only the first
+                    // member, and close() would then recompress just
+                    // that member over the whole file, destroying the
+                    // trailing members.
+                    MultiGzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
                         PyIOError::new_err(format!(
                             "Failed to gunzip '{}': {}", filename, e))
                     })?;
@@ -1845,29 +1895,39 @@ impl FITS {
                 }
             }
         }
-        let mut guard = lock_file(&self.file)?;
-        // For a `.gz` opened r+/w+, recompress the in-memory buffer and
-        // write it back to the `.gz` path before dropping it.  Skipped
-        // once already closed (guard.take() below left None), so a
-        // double close() is a no-op — it never re-writes a stale or
-        // truncated buffer.
+        // Take the storage OUT of the handle and release the file
+        // mutex BEFORE the (potentially slow) gz recompression.  Holding
+        // the mutex across `py.detach()` (which drops the GIL) would
+        // deadlock: another thread could take the freed GIL, block on
+        // this same mutex, and we could never re-acquire the GIL to
+        // finish.  Taking first also makes the handle `closed` and the
+        // double-close path a clean no-op even if the write-back below
+        // fails (the bytes are consumed, nothing left to re-truncate).
+        let storage = {
+            let mut guard = lock_file(&self.file)?;
+            guard.take()
+        };
+        // For a `.gz` opened r+/w+, recompress the just-taken buffer and
+        // atomically write it back to the `.gz` path.  `gzip_write_back`
+        // writes a temp file and renames it over the target, so a
+        // failure here leaves the original file intact.  `into_vec`
+        // moves the bytes out of the Mem buffer (no second full copy).
         if self.gz_writeback {
-            if let Some(storage) = guard.as_mut() {
-                storage.flush()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                let raw = storage.read_all()
+            if let Some(storage) = storage {
+                let raw = storage.into_vec()
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
                 let filename = self.filename.clone();
-                // Release the GIL across the (potentially slow)
-                // compression + disk write.
+                // GIL released across compression + disk write; safe now
+                // that no lock is held and the handle already reads
+                // closed (see the explanation on `storage` above).
                 py.detach(|| gzip_write_back(&filename, &raw))
                     .map_err(|e| PyIOError::new_err(format!(
                         "Failed to write gzipped file '{}': {}",
                         self.filename, e)))?;
             }
         }
-        // Drop the handle without fsync; rely on the page cache.
-        let _ = guard.take();
+        // Non-gz: `storage` is dropped here, closing the handle without
+        // fsync (rely on the page cache).
         Ok(())
     }
 

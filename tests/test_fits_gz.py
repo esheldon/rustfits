@@ -206,6 +206,8 @@ def test_gz_wplus_writeback():
         gz = os.path.join(d, "w.fits.gz")
         with rustfits.FITS(gz, "w+") as f:
             f.write_image(data)
+            # same-handle: visible before close
+            np.testing.assert_array_equal(f[0].read(), data)
         # The on-disk file is real gzip (stdlib can decompress it).
         with rustfits.FITS(gz) as f:  # reopen read-only
             np.testing.assert_array_equal(f[0].read(), data)
@@ -224,6 +226,8 @@ def test_gz_wplus_creates_new_file():
         assert not os.path.exists(gz)
         with rustfits.FITS(gz, "w+") as f:
             f.write_image(data)
+            # same-handle
+            np.testing.assert_array_equal(f[0].read(), data)
         assert os.path.exists(gz)
         with rustfits.FITS(gz) as f:
             np.testing.assert_array_equal(f[0].read(), data)
@@ -241,6 +245,9 @@ def test_gz_wplus_truncates_existing():
             f.write_image(old)
         with rustfits.FITS(gz, "w+") as f:
             f.write_image(new)
+            # same-handle: only the new image is present
+            assert len(f.hdus) == 1
+            np.testing.assert_array_equal(f[0].read(), new)
         with rustfits.FITS(gz) as f:
             assert len(f.hdus) == 1
             np.testing.assert_array_equal(f[0].read(), new)
@@ -286,6 +293,9 @@ def test_gz_rplus_append_hdu_writeback():
 
         with rustfits.FITS(gz, "r+") as f:
             f.write_table(rec)
+            # same-handle: appended HDU visible before close
+            assert len(f.hdus) == 2
+            np.testing.assert_array_equal(f[1].read()["n"], rec["n"])
 
         with rustfits.FITS(gz) as f:
             assert len(f.hdus) == 2
@@ -356,6 +366,135 @@ def test_gz_non_gzip_content_raises():
             fh.write(b"this is not gzip data" * 100)
         with pytest.raises(IOError):
             rustfits.FITS(bad)
+
+
+def _write_multi_member_gz(plain_path, gz_path):
+    """
+    Write `plain_path`'s bytes as a TWO-member gzip stream to `gz_path`.
+
+    Concatenated gzip members are valid per the gzip spec and decompress
+    to the concatenation of their payloads, so the on-disk .gz
+    decompresses back to the original file bytes.  A single-member
+    decoder would read only the first member (truncated); this fixture
+    exists to prove the reader uses a multi-member decoder.
+    """
+    with open(plain_path, "rb") as fh:
+        raw = fh.read()
+    half = len(raw) // 2
+    member1 = gzip.compress(raw[:half])
+    member2 = gzip.compress(raw[half:])
+    with open(gz_path, "wb") as fh:
+        fh.write(member1 + member2)
+
+
+def test_gz_multi_member_read():
+    """
+    A multi-member gzip .gz is decoded in FULL, not truncated to its
+    first member (regression: single-member GzDecoder would silently
+    lose the trailing members)."""
+    img = np.arange(20 * 8, dtype="i4").reshape(20, 8)
+    rec = np.array(
+        [(i, i * 1.5) for i in range(30)], dtype=[("n", "i8"), ("x", "f8")]
+    )
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "mm.fits")
+        gz = plain + ".gz"
+        with rustfits.FITS(plain, "w+") as f:
+            f.write_image(img)
+            f.write_table(rec)
+        _write_multi_member_gz(plain, gz)
+
+        # Sanity: it really is multi-member (the stdlib still reads it,
+        # and the byte stream contains two gzip magic headers).
+        with open(gz, "rb") as fh:
+            blob = fh.read()
+        assert blob.count(b"\x1f\x8b") >= 2
+        assert _read_gz_bytes(gz) == open(plain, "rb").read()
+
+        with rustfits.FITS(gz) as f:
+            assert len(f.hdus) == 2
+            np.testing.assert_array_equal(f[0].read(), img)
+            got = f[1].read()
+            np.testing.assert_array_equal(got["n"], rec["n"])
+            np.testing.assert_array_equal(got["x"], rec["x"])
+
+
+def test_gz_multi_member_writeback_preserves_content():
+    """
+    Opening a multi-member .gz r+, mutating, and closing preserves ALL
+    the original content — the trailing members are not lost (regression:
+    single-member read + recompress-on-close would have destroyed them)."""
+    img = np.arange(20 * 8, dtype="i4").reshape(20, 8)
+    rec = np.array([(i,) for i in range(30)], dtype=[("n", "i8")])
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "mm2.fits")
+        gz = plain + ".gz"
+        with rustfits.FITS(plain, "w+") as f:
+            f.write_image(img)
+            f.write_table(rec)
+        _write_multi_member_gz(plain, gz)
+
+        with rustfits.FITS(gz, "r+") as f:
+            f[0].header["EDITED"] = 7
+
+        with rustfits.FITS(gz) as f:
+            assert len(f.hdus) == 2
+            assert f[0].header["EDITED"] == 7
+            np.testing.assert_array_equal(f[0].read(), img)
+            np.testing.assert_array_equal(f[1].read()["n"], rec["n"])
+
+
+def test_gz_writeback_leaves_no_temp_litter():
+    """
+    A successful write-back renames its temp file into place and leaves
+    no stray temp files in the directory."""
+    data = np.arange(6, dtype="i4").reshape(2, 3)
+    with tempfile.TemporaryDirectory() as d:
+        gz = os.path.join(d, "clean.fits.gz")
+        with rustfits.FITS(gz, "w+") as f:
+            f.write_image(data)
+        entries = os.listdir(d)
+        assert entries == ["clean.fits.gz"], entries
+        assert not any("rustfits-tmp" in e for e in entries)
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="dir permission bits do not block writes when running as root",
+)
+def test_gz_writeback_failure_preserves_original():
+    """
+    If the recompress-on-close fails (here: the directory is made
+    unwritable so the temp file cannot be created), the ORIGINAL .gz is
+    left intact — the write is atomic (temp + rename), never an in-place
+    truncate.  A second close() after the failure is a clean no-op."""
+    orig = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "atomic.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, orig)
+        _gzip_file(plain, gz)
+        original_bytes = open(gz, "rb").read()
+
+        f = rustfits.FITS(gz, "r+")
+        f[0].header["NEWKEY"] = 123
+        f[0][0, 0] = 999  # mutate the in-RAM buffer
+        os.chmod(d, 0o500)  # read + execute, no write -> temp create fails
+        try:
+            with pytest.raises(IOError):
+                f.close()
+            # Second close after a failed write-back must not raise and
+            # must not re-attempt the (still-failing) write.
+            f.close()
+        finally:
+            os.chmod(d, 0o700)
+
+        # The on-disk file is byte-for-byte the original: not truncated,
+        # not partially written, mutation NOT applied.
+        assert open(gz, "rb").read() == original_bytes
+        with rustfits.FITS(gz) as g:
+            assert "NEWKEY" not in g[0].header
+            np.testing.assert_array_equal(g[0].read(), orig)
 
 
 if __name__ == "__main__":

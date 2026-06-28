@@ -2228,24 +2228,45 @@ mem case.
 
 **Gzip read + write-back (shipped).**  A path with a `.gz` extension
 (case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
-whole into a `Storage::Mem` buffer at open via `flate2::read::GzDecoder`,
-then parsed like any in-memory file.  Decompressed file lives in RAM
-(gzip isn't seekable; FITS needs random access) — same caveat as
-`mem://`.  `to_bytes()` returns the decompressed bytes.
+whole into a `Storage::Mem` buffer at open via
+`flate2::read::MultiGzDecoder`, then parsed like any in-memory file.
+**MultiGzDecoder, not GzDecoder** — a multi-member gzip stream (valid
+per the spec; produced by concatenation/`pigz`/appended writes) is
+decoded in full rather than silently truncated to its first member;
+this is load-bearing for write-back (a single-member read would
+recompress only the first member over the whole file on close,
+destroying the rest).  Decompressed file lives in RAM (gzip isn't
+seekable; FITS needs random access) — same caveat as `mem://`.
+`to_bytes()` returns the decompressed bytes.
 
 Writable modes are supported: `r+` gunzips the existing file into the
 `Mem` buffer (must exist); `w+` starts from an empty buffer (truncate /
 create).  Both set the `gz_writeback: bool` flag on `FITS`; on `close()`
-the buffer is flushed + `read_all()`'d and the raw bytes streamed back
-through a `flate2::write::GzEncoder` (`Compression::default()` = level 6)
-to the `.gz` path (`gzip_write_back` helper, GIL released via
-`py.detach`).  Write-back happens **only at close** — a `.gz` opened
-writable but never closed loses its mutations (they live only in RAM);
-the `with` context manager is the safe path.  A double `close()` is a
-no-op (the flag is checked but `guard.take()` already left `None`).
-`from_bytes`/`mem://` files never set the flag.  Only gzip (`.gz`);
-`.Z` (LZW) and `.zip` are out of scope (different codecs).
-Tests: `tests/test_fits_gz.py` (19 cases — read + write-back).
+the storage is taken out of the handle (releasing the file mutex
+**before** any compression — holding it across `py.detach` would
+deadlock), the bytes are moved out zero-copy via `Storage::into_vec`
+(no second full-size allocation), and streamed through a
+`flate2::write::GzEncoder` (`Compression::default()` = level 6) by
+`gzip_write_back` with the GIL released via `py.detach`.
+
+`gzip_write_back` is **atomic**: it writes a sibling temp file
+(`.<name>.rustfits-tmp.<pid>.<n>`, counter `GZ_TMP_COUNTER` for
+intra-process uniqueness) in the target's own directory, then
+`rename`s it over the target.  A failure part-way (ENOSPC, I/O error,
+unwritable dir) therefore leaves the **original file completely
+intact** — there is no in-place truncate — and the partial temp is
+removed.  Consistent with "close does NOT fsync", the temp is not
+fsync'd before rename (power-loss durability is `FITS.sync()`'s job).
+
+Write-back happens **only at close** — a `.gz` opened writable but
+never closed loses its mutations (they live only in RAM); the `with`
+context manager is the safe path.  A double `close()` is a clean no-op
+even after a *failed* write-back: the storage is taken (handle reads
+closed) before the write, so the retry finds `None` and never
+re-attempts.  `from_bytes`/`mem://` files never set the flag.  Only
+gzip (`.gz`); `.Z` (LZW) and `.zip` are out of scope (different codecs).
+Tests: `tests/test_fits_gz.py` (23 cases — read incl. multi-member,
+write-back, atomic-failure-preserves-original, no-temp-litter).
 
 The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
 `Box<dyn FitsStorage>` — see "The shape (as built)" below for the
