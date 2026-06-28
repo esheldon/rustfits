@@ -8,6 +8,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::Bound;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::OpenOptions;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use suppaftp::types::FileType;
@@ -128,14 +130,15 @@ fn is_mem_url(filename: &str) -> bool {
     filename == "mem://" || filename == "memkeep://"
 }
 
-// True for a whole-file gzip path (read-only).  Detection is by the
-// `.gz` extension (case-insensitive), matching cfitsio.  cfitsio also
+// True for a whole-file gzip path.  Detection is by the `.gz`
+// extension (case-insensitive), matching cfitsio.  cfitsio also
 // transparently handles `.Z` (LZW) and `.zip`, but those need different
 // codecs and are out of scope; only gzip is supported, via flate2 (an
 // existing dependency).  The whole file is gunzipped into a `Mem`
 // buffer at open — gzip streams aren't randomly seekable and FITS needs
 // random access — so the decompressed file lives in RAM (same caveat as
-// `mem://`).
+// `mem://`).  A writable mode (r+/w+) recompresses the buffer back to
+// the `.gz` path on close (gz_writeback flag + close()).
 fn is_gz_path(filename: &str) -> bool {
     std::path::Path::new(filename)
         .extension()
@@ -182,6 +185,26 @@ fn maybe_gunzip_url(bytes: Vec<u8>, url: &str) -> PyResult<Vec<u8>> {
         PyIOError::new_err(format!("Failed to gunzip remote '{}': {}", url, e))
     })?;
     Ok(out)
+}
+
+// Recompress `raw` with gzip and write it to `filename` (truncate /
+// create).  Used by close() to write back a `.gz` file opened r+/w+:
+// the decompressed bytes live in a Mem buffer while open, and this
+// streams them back through a GzEncoder so the compressed output is
+// never fully materialized in RAM (only the already-in-RAM raw bytes
+// are).  Level 6 (Compression::default) matches the gzip-tile encoder
+// default and the de-facto gzip CLI default.
+fn gzip_write_back(filename: &str, raw: &[u8]) -> io::Result<()> {
+    let out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(filename)?;
+    let mut enc = GzEncoder::new(out, Compression::default());
+    enc.write_all(raw)?;
+    // finish() flushes the deflate trailer + gzip CRC/size footer.
+    enc.finish()?;
+    Ok(())
 }
 
 // True for an ftp/ftps URL.
@@ -736,6 +759,11 @@ pub(crate) struct FITS {
     // Per-file taint flag (see TaintFlag).  Owned here; cloned into every
     // HDU and FITSHeader so a mid-write failure anywhere taints the lot.
     tainted: TaintFlag,
+    // True for a `.gz` path opened r+/w+: the decompressed file lives in
+    // a Mem buffer while open, and close() recompresses it back to the
+    // `.gz` path on disk.  False for plain disk files, mem://, remote,
+    // and read-only `.gz` (which never writes back).
+    gz_writeback: bool,
 }
 
 use crate::zimage::compression_config::CompressionConfigKind;
@@ -1579,6 +1607,10 @@ impl FITS {
             )));
         }
 
+        // Set true only by the `.gz` branch below when the mode is
+        // writable; drives the recompress-on-close in close().
+        let mut gz_writeback = false;
+
         // mem:// / memkeep:// (aliases) open an empty in-memory file —
         // no disk access.  Build HDUs in RAM, then extract with
         // to_bytes(); or use FITS.from_bytes(...) to parse existing
@@ -1608,34 +1640,38 @@ impl FITS {
             let bytes = maybe_gunzip_url(download_ftp(py, &filename)?, &filename)?;
             Storage::Mem(Cursor::new(bytes))
         } else if is_gz_path(&filename) {
-            // Whole-file gzip: read-only.  Write-back (recompress on
-            // close) is not implemented, so reject r+ / w+ with a
-            // clear pointer rather than silently dropping mutations.
-            // We steer users toward per-HDU compression, which beats
-            // whole-file gzip on storage, memory, and speed.
-            if mode != "r" {
-                return Err(PyIOError::new_err(format!(
-                    "gzipped files are read-only; open '{}' with mode='r' \
-                     (write-back to .gz is not implemented). For a \
-                     compressed file, prefer per-HDU compression over \
-                     whole-file gzip: write a plain .fits and use \
-                     tile-compressed images or compressed tables (the \
-                     compress=... argument to create_image_hdu / \
-                     create_table_hdu / write_image / write_table), which \
-                     generally beat whole-file gzip on storage, memory, \
-                     and speed",
-                    filename
-                )));
-            }
-            let file = OpenOptions::new().read(true).open(&filename).map_err(|e| {
-                PyIOError::new_err(format!("Failed to open '{}': {}", filename, e))
-            })?;
-            // Gunzip the whole file into RAM, then parse it like any
-            // other in-memory file.
-            let mut buf = Vec::new();
-            GzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
-                PyIOError::new_err(format!("Failed to gunzip '{}': {}", filename, e))
-            })?;
+            // Whole-file gzip.  The decompressed bytes live in a Mem
+            // buffer while the file is open; gzip streams aren't
+            // randomly seekable and FITS needs random access, so the
+            // whole file is held in RAM (same caveat as mem://).  For
+            // r+/w+ the buffer is recompressed and written back to the
+            // `.gz` path on close().  Per-HDU compression (the
+            // compress=... argument to create_image_hdu /
+            // create_table_hdu / write_image / write_table) generally
+            // beats whole-file gzip on storage, memory, and speed, but
+            // whole-file gzip is supported for tooling that expects it.
+            let buf = match mode {
+                // w+ truncates: start from an empty buffer regardless
+                // of whether the file already exists.  Recompressed on
+                // close.
+                "w+" => Vec::new(),
+                // r / r+ read + gunzip the existing file (which must
+                // exist).  r+ also writes back on close.
+                _ => {
+                    let file = OpenOptions::new().read(true).open(&filename)
+                        .map_err(|e| {
+                            PyIOError::new_err(format!(
+                                "Failed to open '{}': {}", filename, e))
+                        })?;
+                    let mut buf = Vec::new();
+                    GzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
+                        PyIOError::new_err(format!(
+                            "Failed to gunzip '{}': {}", filename, e))
+                    })?;
+                    buf
+                }
+            };
+            gz_writeback = mode != "r";
             Storage::Mem(Cursor::new(buf))
         } else {
             let mut options = OpenOptions::new();
@@ -1666,6 +1702,7 @@ impl FITS {
             hdus,
             layout,
             tainted,
+            gz_writeback,
         })
     }
 
@@ -1718,6 +1755,7 @@ impl FITS {
             hdus,
             layout,
             tainted,
+            gz_writeback: false,
         })
     }
 
@@ -1808,6 +1846,26 @@ impl FITS {
             }
         }
         let mut guard = lock_file(&self.file)?;
+        // For a `.gz` opened r+/w+, recompress the in-memory buffer and
+        // write it back to the `.gz` path before dropping it.  Skipped
+        // once already closed (guard.take() below left None), so a
+        // double close() is a no-op — it never re-writes a stale or
+        // truncated buffer.
+        if self.gz_writeback {
+            if let Some(storage) = guard.as_mut() {
+                storage.flush()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let raw = storage.read_all()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let filename = self.filename.clone();
+                // Release the GIL across the (potentially slow)
+                // compression + disk write.
+                py.detach(|| gzip_write_back(&filename, &raw))
+                    .map_err(|e| PyIOError::new_err(format!(
+                        "Failed to write gzipped file '{}': {}",
+                        self.filename, e)))?;
+            }
+        }
         // Drop the handle without fsync; rely on the page cache.
         let _ = guard.take();
         Ok(())

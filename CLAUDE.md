@@ -1439,15 +1439,17 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
   file from a URL.  **Shipped** (download-then-open, read-only; see the
   "Remote file reads" roadmap below).  Range-based partial reads, and
   `root`/`gsiftp`, are still deferred.
-- **In-memory files (`mem://` / `memkeep://`) + gzip read** —
+- **In-memory files (`mem://` / `memkeep://`) + gzip read/write** —
   create / read / extract a FITS file with no disk access, via
   `FITS("mem://", "w+")` + `to_bytes()` / `FITS.from_bytes(b)`; and
-  read a gzipped file via a `.gz` path.  **Shipped** (the `Storage`
-  seam + `Disk`/`Mem` backends + gunzip-on-open).  The rest of the
-  cfitsio driver set (`.gz` write-back, stdin/stdout, shared memory,
-  remote range reads) is still sketched — see the "In-memory files +
-  the storage-driver abstraction" roadmap below, which plugs each
-  remaining backend into the shipped `enum Storage`.
+  read OR write a gzipped file via a `.gz` path (`r+`/`w+` recompress
+  the in-memory buffer back to the `.gz` on close).  **Shipped** (the
+  `Storage` seam + `Disk`/`Mem` backends + gunzip-on-open +
+  recompress-on-close).  The rest of the cfitsio driver set (`.Z`/
+  `.zip` codecs, stdin/stdout, shared memory, remote range reads) is
+  still sketched — see the "In-memory files + the storage-driver
+  abstraction" roadmap below, which plugs each remaining backend into
+  the shipped `enum Storage`.
 
 ## Top-level convenience functions
 
@@ -2218,20 +2220,32 @@ mem case.
 | `Disk` backend (`file://`) | ✅ Shipped |
 | `Mem` backend + `mem://` / `memkeep://` + `to_bytes`/`from_bytes` | ✅ Shipped |
 | Whole-file `.gz` **read** (gunzip-on-open → `Mem`) | ✅ Shipped |
-| `.gz` write-back (recompress-on-close), `.Z`/`.zip` | ⬜ Sketched below |
+| Whole-file `.gz` **write-back** (recompress-on-close) | ✅ Shipped |
+| `.Z`/`.zip` whole-file codecs | ⬜ Sketched below |
 | `stdin://` / `stdout://`, `shmem://` | ⬜ Sketched below |
 | `http`/`https`/`ftp`/`ftps` **download** read (→ `Mem`) | ✅ Shipped |
 | `http`/`https` range reads, `root`/`gsiftp` | ⬜ See "Remote file reads" roadmap |
 
-**Gzip read (shipped).**  A path with a `.gz` extension
+**Gzip read + write-back (shipped).**  A path with a `.gz` extension
 (case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
 whole into a `Storage::Mem` buffer at open via `flate2::read::GzDecoder`,
-then parsed like any in-memory file.  Read-only: `r+`/`w+` on a `.gz`
-raise (write-back not implemented).  Decompressed file lives in RAM
+then parsed like any in-memory file.  Decompressed file lives in RAM
 (gzip isn't seekable; FITS needs random access) — same caveat as
-`mem://`.  `to_bytes()` returns the decompressed bytes.  Only gzip
-(`.gz`); `.Z` (LZW) and `.zip` are out of scope (different codecs).
-Tests: `tests/test_fits_gz.py` (13 cases).
+`mem://`.  `to_bytes()` returns the decompressed bytes.
+
+Writable modes are supported: `r+` gunzips the existing file into the
+`Mem` buffer (must exist); `w+` starts from an empty buffer (truncate /
+create).  Both set the `gz_writeback: bool` flag on `FITS`; on `close()`
+the buffer is flushed + `read_all()`'d and the raw bytes streamed back
+through a `flate2::write::GzEncoder` (`Compression::default()` = level 6)
+to the `.gz` path (`gzip_write_back` helper, GIL released via
+`py.detach`).  Write-back happens **only at close** — a `.gz` opened
+writable but never closed loses its mutations (they live only in RAM);
+the `with` context manager is the safe path.  A double `close()` is a
+no-op (the flag is checked but `guard.take()` already left `None`).
+`from_bytes`/`mem://` files never set the flag.  Only gzip (`.gz`);
+`.Z` (LZW) and `.zip` are out of scope (different codecs).
+Tests: `tests/test_fits_gz.py` (19 cases — read + write-back).
 
 The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
 `Box<dyn FitsStorage>` — see "The shape (as built)" below for the
@@ -2323,7 +2337,8 @@ store** or **(b) something materialized into a memory buffer**.  The
 | `file://` | the `Disk` variant | ✅ |
 | `mem://` / `memkeep://` | the `Mem` (`Cursor<Vec<u8>>`) variant; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair | ✅ |
 | whole-file `.gz` (read) | `Mem` filled by gunzip-on-open | ✅ |
-| `.gz` write-back / `.Z` / `.zip` | `Mem` + recompress-on-close (gz); LZW / zip codecs (others) | ⬜ |
+| whole-file `.gz` (write-back) | `Mem` + recompress-on-close (`GzEncoder` → `.gz` path) | ✅ |
+| `.Z` / `.zip` whole-file codecs | LZW / zip codecs (different from gzip) | ⬜ |
 | `stdin://` / `stdout://` / `"-"` | `Mem`: slurp the non-seekable reader at open / flush the sink at close | ⬜ |
 | `http`/`https` (download) | fill the `Mem` buffer from the network at open (`ureq`); read-only; gunzips a `.gz` URL | ✅ |
 | `ftp`/`ftps` (download) | same, via `suppaftp` (shares ureq's rustls); anonymous default, binary mode | ✅ |
