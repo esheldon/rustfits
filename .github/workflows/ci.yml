@@ -74,14 +74,20 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ['3.12', '3.14']
-        # One extra Intel x86_64 macOS leg.  macos-13 is the last free
-        # Intel runner (macos-latest is arm64 = macos-15-arm64), so this
-        # is smoke coverage that the Rust code + the macOS dequant
-        # tolerance behave on x86_64 darwin, without doubling the macOS
-        # matrix.  Intel runners are on GitHub's deprecation path; drop
-        # this leg when macos-13 is retired.
+        # Two extra single-version legs via include (kept lean — one
+        # python each rather than doubling the whole matrix):
+        #   - macos-13: the last free Intel x86_64 macOS runner
+        #     (macos-latest is arm64 = macos-15-arm64) — smoke coverage
+        #     that the Rust code + the macOS dequant tolerance behave on
+        #     x86_64 darwin.  Intel runners are on GitHub's deprecation
+        #     path; drop this leg when macos-13 is retired.
+        #   - ubuntu-24.04-arm: native aarch64 Linux (free on public
+        #     repos) so we TEST the same target we ship an aarch64-linux
+        #     wheel for, rather than only build-checking it.
         include:
           - os: macos-13
+            python: '3.12'
+          - os: ubuntu-24.04-arm
             python: '3.12'
     steps:
       - uses: actions/checkout@v4
