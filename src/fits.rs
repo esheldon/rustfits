@@ -11,7 +11,7 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::OpenOptions;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use suppaftp::types::FileType;
 use suppaftp::{FtpStream, RustlsConnector, RustlsFtpStream};
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::common::{
     lock_file, parse_keyword, parse_string_keyword,
-    FileHandle, FileLayout, HduOffsets, Storage, TaintFlag,
+    FileHandle, FileLayout, HduOffsets, MemStore, Storage, TaintFlag,
     BLOCK_SIZE, CARDS_PER_BLOCK, CARD_SIZE,
 };
 use crate::hdu::HDU;
@@ -208,11 +208,13 @@ static GZ_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 // so the rename is a same-filesystem (atomic) metadata op, not a
 // cross-device copy.  On any error the partial temp is removed.
 //
-// Consistent with the codebase's "close does NOT fsync" contract, the
-// temp is not fsync'd before the rename; power-loss durability is the
-// caller's job via `FITS.sync()`.  Level 6 (Compression::default)
-// matches the gzip-tile encoder default and the gzip CLI default.
-fn gzip_write_back(filename: &str, raw: &[u8]) -> io::Result<()> {
+// `fsync` controls durability: close() passes false (matching the
+// codebase's "close does NOT fsync" contract — rely on the page cache);
+// `FITS.sync()` passes true so the new file's data is on stable storage
+// before the rename, giving the power-loss durability `sync()` promises.
+// Level 6 (Compression::default) matches the gzip-tile encoder default
+// and the gzip CLI default.
+fn gzip_write_back(filename: &str, raw: &[u8], fsync: bool) -> io::Result<()> {
     let target = std::path::Path::new(filename);
     let dir = target
         .parent()
@@ -239,8 +241,14 @@ fn gzip_write_back(filename: &str, raw: &[u8]) -> io::Result<()> {
             .open(&tmp_path)?;
         let mut enc = GzEncoder::new(out, Compression::default());
         enc.write_all(raw)?;
-        // finish() flushes the deflate trailer + gzip CRC/size footer.
-        enc.finish()?;
+        // finish() flushes the deflate trailer + gzip CRC/size footer
+        // and returns the inner File.
+        let out = enc.finish()?;
+        if fsync {
+            // Durable before the rename, so a crash can't leave the
+            // target name pointing at unflushed data.
+            out.sync_all()?;
+        }
         std::fs::rename(&tmp_path, target)
     })();
     if result.is_err() {
@@ -808,6 +816,41 @@ pub(crate) struct FITS {
     // `.gz` path on disk.  False for plain disk files, mem://, remote,
     // and read-only `.gz` (which never writes back).
     gz_writeback: bool,
+}
+
+// Best-effort write-back for a `.gz` opened r+/w+ that the user forgot
+// to `close()`.  The recompressed bytes live only in the in-memory
+// buffer until close, so a normal program exit would silently lose
+// them — unlike a plain disk file, whose page-cache writes survive.
+// This finalizer flushes them.
+//
+// Deliberately pure-Rust (no GIL, no `py.detach`): `Drop` can run
+// during interpreter shutdown when calling into Python is unsafe, and
+// the compression + atomic write are filesystem-only.  Errors can't be
+// propagated from `Drop`, so they're swallowed — but `gzip_write_back`'s
+// atomic temp+rename means even a failed flush leaves the original file
+// intact.  If `close()` already ran (the normal/`with` path), the
+// storage is `None` and this is a no-op (no double write); only a
+// *mutated* buffer is written (skips the needless-rewrite case).
+impl Drop for FITS {
+    fn drop(&mut self) {
+        if !self.gz_writeback {
+            return;
+        }
+        // Lock directly (not via lock_file, which needs a Python token
+        // for its error type); give up on a poisoned lock.
+        let storage = match self.file.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => return,
+        };
+        if let Some(storage) = storage {
+            if storage.is_dirty() {
+                if let Ok(raw) = storage.into_vec() {
+                    let _ = gzip_write_back(&self.filename, &raw, false);
+                }
+            }
+        }
+    }
 }
 
 use crate::zimage::compression_config::CompressionConfigKind;
@@ -1661,7 +1704,7 @@ impl FITS {
         // bytes.  Unlike a disk file, the backing buffer is always
         // writable, so read-only mode is advisory only for mem files.
         let storage = if is_mem_url(&filename) {
-            Storage::Mem(Cursor::new(Vec::new()))
+            Storage::Mem(MemStore::new(Vec::new()))
         } else if is_remote_url(&filename) {
             // Download-then-open over http/https: fetch the whole file
             // into RAM, then parse like any in-memory file.  Read-only.
@@ -1672,7 +1715,7 @@ impl FITS {
                 )));
             }
             let bytes = maybe_gunzip_url(download_remote(py, &filename)?, &filename)?;
-            Storage::Mem(Cursor::new(bytes))
+            Storage::Mem(MemStore::new(bytes))
         } else if is_ftp_url(&filename) {
             // Download-then-open over ftp/ftps.  Read-only.
             if mode != "r" {
@@ -1682,7 +1725,7 @@ impl FITS {
                 )));
             }
             let bytes = maybe_gunzip_url(download_ftp(py, &filename)?, &filename)?;
-            Storage::Mem(Cursor::new(bytes))
+            Storage::Mem(MemStore::new(bytes))
         } else if is_gz_path(&filename) {
             // Whole-file gzip.  The decompressed bytes live in a Mem
             // buffer while the file is open; gzip streams aren't
@@ -1694,35 +1737,44 @@ impl FITS {
             // create_table_hdu / write_image / write_table) generally
             // beats whole-file gzip on storage, memory, and speed, but
             // whole-file gzip is supported for tooling that expects it.
-            let buf = match mode {
-                // w+ truncates: start from an empty buffer regardless
-                // of whether the file already exists.  Recompressed on
-                // close.
-                "w+" => Vec::new(),
-                // r / r+ read + gunzip the existing file (which must
-                // exist).  r+ also writes back on close.
-                _ => {
-                    let file = OpenOptions::new().read(true).open(&filename)
-                        .map_err(|e| {
-                            PyIOError::new_err(format!(
-                                "Failed to open '{}': {}", filename, e))
-                        })?;
-                    let mut buf = Vec::new();
-                    // MultiGzDecoder (not GzDecoder) so a multi-member
-                    // gzip stream is decoded in full.  This matters for
-                    // write-back: GzDecoder would read only the first
-                    // member, and close() would then recompress just
-                    // that member over the whole file, destroying the
-                    // trailing members.
-                    MultiGzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
-                        PyIOError::new_err(format!(
-                            "Failed to gunzip '{}': {}", filename, e))
-                    })?;
-                    buf
-                }
+            // Open the target with the SAME OpenOptions the plain-disk
+            // branch below uses for this mode, so creation / truncation
+            // and permission errors surface HERE (at open) rather than
+            // being deferred to the close()-time write-back.  For w+
+            // this also creates/claims the file immediately (it exists,
+            // 0 bytes, until the close() write-back replaces it) — the
+            // same observable state as a plain w+.  The actual decode /
+            // write-back then runs on top of the validated handle.
+            let mut options = OpenOptions::new();
+            match mode {
+                "r"  => options.read(true),
+                "r+" => options.read(true).write(true),
+                "w+" => options.read(true).write(true).truncate(true).create(true),
+                _ => unreachable!(),
+            };
+            let file = options.open(&filename).map_err(|e| {
+                PyIOError::new_err(format!(
+                    "Failed to open '{}': {}", filename, e))
+            })?;
+            let buf = if mode == "w+" {
+                // Truncated/created above — start from an empty buffer.
+                Vec::new()
+            } else {
+                // r / r+: gunzip the existing file.  MultiGzDecoder (not
+                // GzDecoder) so a multi-member gzip stream is decoded in
+                // full.  This matters for write-back: GzDecoder would
+                // read only the first member, and close() would then
+                // recompress just that member over the whole file,
+                // destroying the trailing members.
+                let mut buf = Vec::new();
+                MultiGzDecoder::new(file).read_to_end(&mut buf).map_err(|e| {
+                    PyIOError::new_err(format!(
+                        "Failed to gunzip '{}': {}", filename, e))
+                })?;
+                buf
             };
             gz_writeback = mode != "r";
-            Storage::Mem(Cursor::new(buf))
+            Storage::Mem(MemStore::new(buf))
         } else {
             let mut options = OpenOptions::new();
             match mode {
@@ -1792,7 +1844,7 @@ impl FITS {
             )));
         }
         let handle: FileHandle =
-            Arc::new(Mutex::new(Some(Storage::Mem(Cursor::new(data)))));
+            Arc::new(Mutex::new(Some(Storage::Mem(MemStore::new(data)))));
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
         let layout = FileLayout::new();
         let hdus = parse_hdus_from_file(
@@ -1912,18 +1964,25 @@ impl FITS {
         // writes a temp file and renames it over the target, so a
         // failure here leaves the original file intact.  `into_vec`
         // moves the bytes out of the Mem buffer (no second full copy).
+        //
+        // Only write when the buffer was actually mutated: a `.gz`
+        // opened r+ and merely read (or w+ with nothing written) is
+        // left untouched on disk rather than needlessly rewritten with
+        // a fresh mtime / re-compressed bytes.
         if self.gz_writeback {
             if let Some(storage) = storage {
-                let raw = storage.into_vec()
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                let filename = self.filename.clone();
-                // GIL released across compression + disk write; safe now
-                // that no lock is held and the handle already reads
-                // closed (see the explanation on `storage` above).
-                py.detach(|| gzip_write_back(&filename, &raw))
-                    .map_err(|e| PyIOError::new_err(format!(
-                        "Failed to write gzipped file '{}': {}",
-                        self.filename, e)))?;
+                if storage.is_dirty() {
+                    let raw = storage.into_vec()
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    let filename = self.filename.clone();
+                    // GIL released across compression + disk write; safe
+                    // now that no lock is held and the handle already
+                    // reads closed (see the explanation on `storage`).
+                    py.detach(|| gzip_write_back(&filename, &raw, false))
+                        .map_err(|e| PyIOError::new_err(format!(
+                            "Failed to write gzipped file '{}': {}",
+                            self.filename, e)))?;
+                }
             }
         }
         // Non-gz: `storage` is dropped here, closing the handle without
@@ -1941,7 +2000,50 @@ impl FITS {
     /// Expensive: blocks until the storage device confirms the
     /// write.  Cheap to call repeatedly when there are no new
     /// dirty pages.  No-op on already-closed files.
-    fn sync(&self) -> PyResult<()> {
+    ///
+    /// For a ``.gz`` opened ``r+``/``w+`` (whose bytes otherwise reach
+    /// disk only at :meth:`close`), ``sync`` recompresses the current
+    /// in-memory buffer, writes it atomically to the ``.gz`` path, and
+    /// fsyncs it -- so the on-disk file is durable mid-session.  It is
+    /// a no-op when nothing has been mutated since the last sync.
+    fn sync(&self, py: Python<'_>) -> PyResult<()> {
+        if self.gz_writeback {
+            // Snapshot the dirty buffer under the lock and clear the
+            // dirty flag, then release the lock BEFORE compressing
+            // (deadlock-safe, same reasoning as close()).  Nothing to
+            // do when the file is closed or unmutated.
+            let raw = {
+                let mut guard = lock_file(&self.file)?;
+                match guard.as_mut() {
+                    Some(storage) if storage.is_dirty() => {
+                        let raw = storage.read_all()
+                            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                        storage.mark_clean();
+                        Some(raw)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(raw) = raw {
+                let filename = self.filename.clone();
+                // fsync=true: durable on disk before the rename.
+                let res = py.detach(|| gzip_write_back(&filename, &raw, true));
+                if let Err(e) = res {
+                    // The durable write failed; re-mark dirty so the
+                    // pending mutation isn't dropped (close()/a later
+                    // sync() will retry) rather than silently lost.
+                    if let Ok(mut guard) = self.file.lock() {
+                        if let Some(storage) = guard.as_mut() {
+                            storage.mark_dirty();
+                        }
+                    }
+                    return Err(PyIOError::new_err(format!(
+                        "Failed to sync gzipped file '{}': {}",
+                        self.filename, e)));
+                }
+            }
+            return Ok(());
+        }
         let guard = lock_file(&self.file)?;
         if let Some(file) = guard.as_ref() {
             file.sync().map_err(|e| PyIOError::new_err(e.to_string()))?;

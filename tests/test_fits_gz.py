@@ -12,12 +12,18 @@ re-open with the stdlib gzip module to confirm the on-disk file is
 valid gzip with the expected decompressed bytes.
 """
 
+import gc
 import gzip
 import os
 import tempfile
 import numpy as np
 import pytest
 import rustfits
+
+_skip_as_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="permission bits do not block writes when running as root",
+)
 
 
 def _gzip_file(plain_path, gz_path):
@@ -458,10 +464,7 @@ def test_gz_writeback_leaves_no_temp_litter():
         assert not any("rustfits-tmp" in e for e in entries)
 
 
-@pytest.mark.skipif(
-    hasattr(os, "geteuid") and os.geteuid() == 0,
-    reason="dir permission bits do not block writes when running as root",
-)
+@_skip_as_root
 def test_gz_writeback_failure_preserves_original():
     """
     If the recompress-on-close fails (here: the directory is made
@@ -495,6 +498,203 @@ def test_gz_writeback_failure_preserves_original():
         with rustfits.FITS(gz) as g:
             assert "NEWKEY" not in g[0].header
             np.testing.assert_array_equal(g[0].read(), orig)
+
+
+# ----------------------------------------------------------------------
+# Open-time semantics: writable .gz now matches plain-disk open, so
+# creation / permission errors surface at open (not deferred to close).
+# ----------------------------------------------------------------------
+
+
+def test_gz_wplus_file_exists_after_open():
+    """
+    #7: w+ creates/claims the .gz on disk at OPEN (like a plain w+),
+    before any write or close — not only once close() runs."""
+    data = np.arange(6, dtype="i4")
+    with tempfile.TemporaryDirectory() as d:
+        gz = os.path.join(d, "claim.fits.gz")
+        assert not os.path.exists(gz)
+        f = rustfits.FITS(gz, "w+")
+        try:
+            # File exists immediately after construction.
+            assert os.path.exists(gz)
+        finally:
+            f.write_image(data)
+            f.close()
+        with rustfits.FITS(gz) as g:
+            np.testing.assert_array_equal(g[0].read(), data)
+
+
+@_skip_as_root
+def test_gz_wplus_unwritable_dir_raises_at_open():
+    """
+    #5: w+ on a .gz in a read-only directory raises at construction
+    (not after all the work, at close), and creates no file."""
+    with tempfile.TemporaryDirectory() as d:
+        sub = os.path.join(d, "ro")
+        os.mkdir(sub)
+        gz = os.path.join(sub, "x.fits.gz")
+        os.chmod(sub, 0o500)  # read + execute, no write
+        try:
+            with pytest.raises(IOError):
+                rustfits.FITS(gz, "w+")
+            assert not os.path.exists(gz)
+        finally:
+            os.chmod(sub, 0o700)
+
+
+@_skip_as_root
+def test_gz_rplus_readonly_file_raises_at_open():
+    """
+    #5: r+ on a read-only .gz file raises at open (matches plain r+),
+    rather than succeeding and failing only at the close() write-back."""
+    data = np.arange(6, dtype="i4")
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "ro.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        os.chmod(gz, 0o400)  # read-only file
+        try:
+            with pytest.raises(IOError):
+                rustfits.FITS(gz, "r+")
+        finally:
+            os.chmod(gz, 0o600)
+        # 'r' still works on a read-only file.
+        with rustfits.FITS(gz) as f:
+            np.testing.assert_array_equal(f[0].read(), data)
+
+
+# ----------------------------------------------------------------------
+# #6: an r+/w+ .gz is rewritten on close ONLY if it was mutated.  The
+# atomic write replaces the file (new inode); a skipped write leaves the
+# inode unchanged, which is what these assert.
+# ----------------------------------------------------------------------
+
+
+def test_gz_rplus_read_only_does_not_rewrite():
+    """
+    Opening r+ and only reading leaves the on-disk file untouched (same
+    inode) — no needless recompress / mtime churn."""
+    data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "ro2.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        ino0 = os.stat(gz).st_ino
+
+        with rustfits.FITS(gz, "r+") as f:
+            np.testing.assert_array_equal(f[0].read(), data)  # read only
+
+        assert os.stat(gz).st_ino == ino0  # not rewritten
+
+
+def test_gz_rplus_mutation_does_rewrite():
+    """
+    The mutating counterpart: an actual edit DOES rewrite the file (new
+    inode), confirming the inode check above is meaningful."""
+    data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "rw.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        ino0 = os.stat(gz).st_ino
+
+        with rustfits.FITS(gz, "r+") as f:
+            f[0].header["EDIT"] = 1
+
+        assert os.stat(gz).st_ino != ino0  # rewritten
+
+
+# ----------------------------------------------------------------------
+# #8: sync() makes a writable .gz durable mid-session.
+# ----------------------------------------------------------------------
+
+
+def test_gz_sync_writes_back_mid_session():
+    """
+    sync() recompresses + writes the .gz to disk before close, so a
+    fresh read-only handle sees the mutation; the subsequent close()
+    then does not rewrite again (dirty was cleared by sync)."""
+    data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "s.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+
+        with rustfits.FITS(gz, "r+") as f:
+            f[0].header["SYNCED"] = 5
+            f.sync()
+            # On-disk file already reflects the edit, before close.
+            with rustfits.FITS(gz) as g:
+                assert g[0].header["SYNCED"] == 5
+            ino_after_sync = os.stat(gz).st_ino
+        # close() saw a clean buffer (sync cleared dirty) -> no rewrite.
+        assert os.stat(gz).st_ino == ino_after_sync
+
+
+def test_gz_sync_noop_when_unmutated():
+    """
+    sync() on a writable .gz with no pending mutation is a no-op (does
+    not rewrite the file)."""
+    data = np.arange(8, dtype="i4")
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "sn.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        ino0 = os.stat(gz).st_ino
+
+        with rustfits.FITS(gz, "r+") as f:
+            f.sync()  # nothing mutated
+            assert os.stat(gz).st_ino == ino0
+
+        assert os.stat(gz).st_ino == ino0
+
+
+# ----------------------------------------------------------------------
+# #4: a writable .gz that is never explicitly closed is flushed by the
+# Drop finalizer instead of silently losing the data.
+# ----------------------------------------------------------------------
+
+
+def test_gz_drop_flushes_unclosed():
+    """
+    Forgetting to close() a written w+ .gz still persists the data: the
+    Drop finalizer writes it back when the object is GC'd."""
+    data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        gz = os.path.join(d, "drop.fits.gz")
+        f = rustfits.FITS(gz, "w+")
+        f.write_image(data)
+        del f  # no close() — rely on the finalizer
+        gc.collect()
+
+        with rustfits.FITS(gz) as g:
+            np.testing.assert_array_equal(g[0].read(), data)
+
+
+def test_gz_drop_noop_when_clean():
+    """
+    The Drop finalizer does not rewrite an unmutated r+ .gz (same inode
+    after GC)."""
+    data = np.arange(8, dtype="i4")
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "dropclean.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        ino0 = os.stat(gz).st_ino
+
+        f = rustfits.FITS(gz, "r+")
+        _ = f[0].read()  # read only
+        del f
+        gc.collect()
+
+        assert os.stat(gz).st_ino == ino0
 
 
 if __name__ == "__main__":

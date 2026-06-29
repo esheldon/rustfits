@@ -2239,34 +2239,63 @@ destroying the rest).  Decompressed file lives in RAM (gzip isn't
 seekable; FITS needs random access) — same caveat as `mem://`.
 `to_bytes()` returns the decompressed bytes.
 
-Writable modes are supported: `r+` gunzips the existing file into the
-`Mem` buffer (must exist); `w+` starts from an empty buffer (truncate /
-create).  Both set the `gz_writeback: bool` flag on `FITS`; on `close()`
-the storage is taken out of the handle (releasing the file mutex
-**before** any compression — holding it across `py.detach` would
-deadlock), the bytes are moved out zero-copy via `Storage::into_vec`
-(no second full-size allocation), and streamed through a
-`flate2::write::GzEncoder` (`Compression::default()` = level 6) by
-`gzip_write_back` with the GIL released via `py.detach`.
+Writable modes are supported.  At **open** the target is opened with
+the *same* `OpenOptions` the plain-disk branch uses for that mode, so
+creation/truncation and permission/path errors surface at construction
+rather than being deferred to the close-time write-back: `r+` opens
+read+write (must exist, must be writable — matches plain `r+`) and
+gunzips it into the `Mem` buffer; `w+` does `create+truncate+write`,
+so the file exists/claimed on disk immediately (0 bytes until the
+close write-back replaces it), then starts from an empty buffer.  Both
+set the `gz_writeback: bool` flag on `FITS`.
 
-`gzip_write_back` is **atomic**: it writes a sibling temp file
-(`.<name>.rustfits-tmp.<pid>.<n>`, counter `GZ_TMP_COUNTER` for
-intra-process uniqueness) in the target's own directory, then
-`rename`s it over the target.  A failure part-way (ENOSPC, I/O error,
-unwritable dir) therefore leaves the **original file completely
-intact** — there is no in-place truncate — and the partial temp is
-removed.  Consistent with "close does NOT fsync", the temp is not
-fsync'd before rename (power-loss durability is `FITS.sync()`'s job).
+On `close()` the storage is taken out of the handle (releasing the
+file mutex **before** any compression — holding it across `py.detach`
+would deadlock), and **only if the buffer is dirty** (see below) the
+bytes are moved out zero-copy via `Storage::into_vec` and streamed
+through a `flate2::write::GzEncoder` (`Compression::default()` = level
+6) by `gzip_write_back` with the GIL released via `py.detach`.
 
-Write-back happens **only at close** — a `.gz` opened writable but
-never closed loses its mutations (they live only in RAM); the `with`
-context manager is the safe path.  A double `close()` is a clean no-op
-even after a *failed* write-back: the storage is taken (handle reads
-closed) before the write, so the retry finds `None` and never
-re-attempts.  `from_bytes`/`mem://` files never set the flag.  Only
-gzip (`.gz`); `.Z` (LZW) and `.zip` are out of scope (different codecs).
-Tests: `tests/test_fits_gz.py` (23 cases — read incl. multi-member,
-write-back, atomic-failure-preserves-original, no-temp-litter).
+`gzip_write_back(filename, raw, fsync)` is **atomic**: it writes a
+sibling temp file (`.<name>.rustfits-tmp.<pid>.<n>`, counter
+`GZ_TMP_COUNTER` for intra-process uniqueness) in the target's own
+directory, then `rename`s it over the target.  A failure part-way
+(ENOSPC, I/O error, unwritable dir) therefore leaves the **original
+file completely intact** — there is no in-place truncate — and the
+partial temp is removed.  `fsync=false` for `close()` (matches "close
+does NOT fsync"); `fsync=true` for `sync()`.
+
+**Dirty tracking (`MemStore`).**  `Storage::Mem` carries a `dirty`
+bool set by any `Write::write`/`set_len` (reads/seeks don't touch it).
+A `.gz` opened `r+` and only **read** is therefore left untouched on
+disk at close — no needless recompress / inode / mtime churn.  This is
+the single seam every gz mutation funnels through, so no per-write-site
+bookkeeping is needed.  `is_dirty` / `mark_clean` / `mark_dirty` on
+`Storage` drive it.
+
+**`sync()`** on a writable `.gz`: snapshots the dirty buffer under the
+lock + `mark_clean`, releases the lock, then `gzip_write_back(...,
+fsync=true)` (durable mid-session), so a subsequent `close()` skips the
+redundant rewrite.  No-op when clean.  On write failure it re-`mark_dirty`s
+so the pending mutation isn't dropped.
+
+**`Drop for FITS`** is a best-effort finalizer: a writable `.gz` that
+the user forgot to `close()` is still flushed when the object is GC'd
+(without it, the RAM-only bytes would be silently lost on normal exit,
+unlike a page-cache-backed plain file).  Pure-Rust (locks the mutex
+directly, no GIL / no `py.detach`) so it's safe during interpreter
+shutdown; errors are swallowed but the atomic temp+rename keeps the
+original intact; skips when already closed (`None`) or clean.
+
+A double `close()` is a clean no-op even after a *failed* write-back:
+the storage is taken (handle reads closed) before the write, so the
+retry finds `None`.  `from_bytes`/`mem://` files never set the flag.
+Only gzip (`.gz`); `.Z` (LZW) and `.zip` are out of scope (different
+codecs).  Tests: `tests/test_fits_gz.py` (32 cases — read incl.
+multi-member; write-back; atomic-failure-preserves-original;
+no-temp-litter; open-time create/permission errors; dirty-skip via
+inode checks; `sync()` mid-session durability + no-op-when-clean;
+`Drop` flush-on-forgotten-close + no-op-when-clean).
 
 The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
 `Box<dyn FitsStorage>` — see "The shape (as built)" below for the

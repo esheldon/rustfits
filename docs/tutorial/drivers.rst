@@ -165,22 +165,35 @@ recompresses the buffer and writes the gzip stream back to the
    with rustfits.FITS("image.fits.gz", "r+") as fits:
        fits[0].header["HISTORY"] = "edited in place"
 
-.. warning::
-
-   The write-back happens **only at close**.  If the process exits
-   without closing the file (no ``with`` block, no explicit
-   :meth:`~rustfits.FITS.close`), your changes are lost — they live
-   only in the in-memory buffer.  Always use the context manager, or
-   call ``close()`` yourself.
+The write-back is **atomic**: rustfits compresses to a temporary file
+in the same directory and renames it over the target, so an
+interrupted write (out of disk space, I/O error) leaves the original
+``.gz`` intact rather than half-written.
 
 A few details:
 
+* The new bytes reach disk **at close** (or :meth:`~rustfits.FITS.sync`
+  — see below).  As a safety net, if you forget to close a written
+  ``.gz``, a finalizer flushes it when the object is garbage-collected;
+  still, prefer the context manager so errors surface and timing is
+  deterministic.
+* :meth:`~rustfits.FITS.sync` forces the current buffer to disk
+  durably mid-session (recompress + atomic write + ``fsync``), so you
+  don't have to close to checkpoint.
+* Opening ``r+``/``w+`` behaves like a plain-disk open: ``w+`` creates
+  and claims the file immediately, and a permission/path error is
+  raised at ``FITS(...)`` time, not deferred to close.
+* A ``.gz`` opened ``r+`` is rewritten on close **only if you actually
+  mutated it** — opening to read leaves the on-disk file (bytes,
+  mtime) untouched.
 * Because a gzip stream can't be seeked and FITS needs random access,
   the *decompressed* file is held in RAM — the same caveat as
   ``mem://``.  Fine for typical files; for very large data prefer an
   uncompressed path on disk.  Per-HDU (tile) compression is almost
   always the better choice than a whole-file ``.gz`` — see
   :doc:`limitations`.
+* Multi-member gzip streams are decoded in full (not truncated to the
+  first member).
 * :meth:`~rustfits.FITS.to_bytes` on a ``.gz``-opened file returns the
   **decompressed** bytes (the in-memory representation), not the gzip
   stream.
