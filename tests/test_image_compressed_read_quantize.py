@@ -25,6 +25,7 @@ Coverage:
 """
 
 import os
+import platform
 import sys
 import tempfile
 
@@ -36,21 +37,32 @@ import rustfits
 fitsio = pytest.importorskip("fitsio")
 
 
-# On macOS, cfitsio's dequantization produces slightly different
-# float results than on Linux — almost certainly compiler-codegen
-# variance (FMA fusion, Apple libm vs glibc).  rustfits's Rust
-# dequant bit-matches Linux cfitsio.  We pin the divergence here
-# so the level is documented and a future regression beyond this
-# bound surfaces visibly.  Current observations across all dither
-# methods on macOS arm64 + py3.12:
-#   - rtol up to ~1.6e-5 on near-zero values (where the tiny
-#     denominator inflates the ratio)
-#   - atol up to ~2.6e-9 in the same near-zero case
-# Bumping atol gives room on small values without weakening the
-# per-value relative bound for normal-magnitude data.
-_MACOS_FP_RTOL = 1e-5
-_MACOS_FP_ATOL = 1e-8
-_IS_MACOS = sys.platform == "darwin"
+# cfitsio's quantized-float dequant diverges slightly from rustfits's
+# strict-IEEE Rust dequant on arm64: cfitsio's C contracts the
+# `value*scale + zero` dequant into a single FMA (one rounding) where
+# rustfits rounds twice.  This is an ARCH property, not an OS one —
+# observed on BOTH macOS arm64 and Linux aarch64, and ABSENT on
+# x86_64 Linux.  rustfits's own output is bit-identical across arches
+# (pinned by test_rustfits_quantized_bytes_stable_across_os in the
+# write-quantize tests, which passes on aarch64), so when this
+# cross-check diverges it is fitsio's side that moved, not ours.
+#
+# So loosen the fitsio comparison on any arm64 target.  We also keep
+# it loose on macOS generally: macos-latest is arm64 anyway, and the
+# Intel macos-13 leg is harmless to keep loose (Apple clang may
+# contract on x86 too; allclose still passes an exact match).  x86_64
+# Linux / Windows stay strict.
+#
+# Observed magnitude (arm64, all dither methods): max relative diff
+# ~9.5e-6 on normal-magnitude values (under the 1e-5 rtol); near-zero
+# values inflate the ratio but their ~1e-16 absolute diff is caught
+# by atol.
+_FITSIO_FP_RTOL = 1e-5
+_FITSIO_FP_ATOL = 1e-8
+_FITSIO_FP_LOOSE = (
+    platform.machine().lower() in ("arm64", "aarch64")
+    or sys.platform == "darwin"
+)
 
 
 def _write_quantized(
@@ -93,24 +105,24 @@ def _arrays_match(got, ref):
     """
     NaN-aware cross-tool equality.
 
-    Linux: bit-for-bit (the dequant formula is deterministic and
-    rustfits's Rust port matches conda-forge linux cfitsio
-    exactly).  macOS: allclose at the level documented by
-    ``_MACOS_FP_RTOL`` / ``_MACOS_FP_ATOL`` — cfitsio's dequant
-    on macOS computes the same formula but the platform's
-    compiler/libm produces ULP-level differences.
+    x86_64: bit-for-bit (the dequant formula is deterministic and
+    rustfits's Rust port matches conda-forge x86_64 cfitsio
+    exactly).  arm64 (+ macOS): allclose at the level documented by
+    ``_FITSIO_FP_RTOL`` / ``_FITSIO_FP_ATOL`` — cfitsio's dequant
+    computes the same formula but contracts it to an FMA on arm64,
+    producing ULP-level differences from rustfits's strict-IEEE port.
     """
     assert got.dtype == ref.dtype, (got.dtype, ref.dtype)
     assert got.shape == ref.shape, (got.shape, ref.shape)
     got_nan = np.isnan(got)
     ref_nan = np.isnan(ref)
     np.testing.assert_array_equal(got_nan, ref_nan)
-    if _IS_MACOS:
+    if _FITSIO_FP_LOOSE:
         np.testing.assert_allclose(
             got[~got_nan],
             ref[~ref_nan],
-            rtol=_MACOS_FP_RTOL,
-            atol=_MACOS_FP_ATOL,
+            rtol=_FITSIO_FP_RTOL,
+            atol=_FITSIO_FP_ATOL,
         )
     else:
         np.testing.assert_array_equal(got[~got_nan], ref[~ref_nan])

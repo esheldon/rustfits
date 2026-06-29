@@ -124,21 +124,45 @@ Everything else is documented inline at the cited locations.
   (https://github.com/heasarc/cfitsio/issues/134); rustfits issue
   #9 open.
 
-### 3. Platform-dependent dequantization (macOS vs Linux)
+### 3. Arch-dependent dequantization (arm64 vs x86_64)
 
-- **Tool:** cfitsio (compiler codegen / libm — FMA fusion, Apple
-  libm vs glibc), via fitsio.
-- **Trigger:** reading quantized-float compressed images on macOS
-  arm64 vs Linux.
-- **Symptom:** slightly different decoded float values on macOS
-  (rtol up to ~1.6e-5, atol up to ~2.6e-9 near zero).  rustfits's
-  Rust dequant bit-matches Linux cfitsio.
-- **Documented:** `tests/test_image_compressed_read_quantize.py`
-  (`_MACOS_FP_RTOL` / `_MACOS_FP_ATOL`).
-- **Workaround:** loosened macOS tolerances pin the divergence so a
-  regression beyond the bound surfaces.
+- **Tool:** cfitsio (compiler codegen — FMA contraction of the
+  `value*scale + zero` dequant), via fitsio.
+- **Trigger:** reading quantized-float compressed images on **arm64**
+  (both macOS arm64 AND Linux aarch64) vs x86_64.
+- **Symptom:** slightly different decoded float values on arm64 (max
+  relative diff ~9.5e-6 on normal-magnitude values; near-zero values
+  inflate the ratio but their ~1e-16 absolute diff is atol-bounded).
+  rustfits's Rust dequant bit-matches x86_64 cfitsio.
+- **It's arch, not OS.**  Originally read as "macOS vs Linux" because
+  macos-latest is arm64 and Linux CI was x86_64 — the two confounded
+  OS with arch.  Adding a Linux **aarch64** test leg (`ubuntu-24.04-
+  arm`) reproduced the exact same divergence on Linux, isolating the
+  cause to the arm64 arch (cfitsio's C fuses the multiply-add into a
+  single-rounding FMA; rustfits's strict-IEEE Rust rounds twice).
+- **Isolation (which side drifts):** empirically fitsio's, not
+  rustfits's.  `test_rustfits_quantized_bytes_stable_across_os`
+  (in `tests/test_image_compressed_write_quantize.py`) pins
+  rustfits's written `.fz` bytes AND decoded f4 bytes to x86_64-
+  captured SHA-256 goldens across the (algorithm, dither) matrix, and
+  **passes on aarch64** — proving rustfits is byte-identical across
+  arches, so the divergence the cross-check tolerates is entirely on
+  fitsio/cfitsio's side.  (All supported targets are little-endian,
+  so the byte compare is direct.  The encode pin relies on the
+  committed `Cargo.lock` pinning miniz_oxide for the gzip payloads.)
+- **Documented:** `tests/test_image_compressed_read_quantize.py` and
+  `tests/test_image_compressed_write_quantize.py` — the fitsio
+  cross-check tolerance is gated on `_FITSIO_FP_LOOSE`
+  (`platform.machine()` arm64/aarch64, or any macOS), with
+  `_FITSIO_FP_RTOL` / `_FITSIO_FP_ATOL`, plus the
+  `test_rustfits_quantized_bytes_stable_across_os` byte pin.
+- **Workaround:** loosen the fitsio cross-check on arm64 (and macOS
+  generally) so the fitsio-side divergence is tolerated but a
+  regression beyond the bound surfaces; x86_64 stays strictly
+  bit-exact; the byte test pins rustfits's side exactly everywhere.
 - **Upstream status:** not a clean bug to file (numerical
-  reproducibility, not a defect); documented for our own sake.
+  reproducibility in cfitsio, not a defect); documented for our own
+  sake, with the rustfits side empirically ruled out.
 
 ---
 

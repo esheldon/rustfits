@@ -2652,11 +2652,17 @@ the file's *content* doesn't matter, just its size and tile count.
    so the wrapper can resolve libpython) and runs
    `tools/cargo-test.sh`.
 3. `test` matrix — {ubuntu-latest, macos-latest} × {py3.12,
-   py3.14}, full conda env from the requirements files +
-   `maturin develop` + `pytest`.  macOS legs additionally
+   py3.14}, plus two single-version `include` legs: `macos-13`
+   (Intel x86_64) and `ubuntu-24.04-arm` (native aarch64),
+   both × py3.12.  Full conda env from the requirements files
+   + `maturin develop` + `pytest`.  macOS legs additionally
    source-build fitsio via pip — see "CI: macOS fitsio
-   workaround" below.
-4. `coverage` — single ubuntu/py3.12 leg, uploads Python +
+   workaround" below.  **Windows ships a wheel but is NOT
+   tested** — see "CI: Windows testing" below for the blocker.
+4. `docs` — Sphinx `-W` build (autodoc imports rustfits; a new
+   warning is a hard failure — catches broken cross-refs / rst
+   errors before they reach readthedocs).
+5. `coverage` — single ubuntu/py3.12 leg, uploads Python +
    Rust coverage to codecov via `cargo-llvm-cov`.
 
 ## Testing conventions
@@ -2712,23 +2718,27 @@ work item that introduced it (no "phaseN" / dev-stage names).
 ## CI: macOS fitsio workaround
 
 The test matrix runs `{ubuntu-latest, macos-latest} x
-{python 3.12, 3.14}`.  On macOS, conda-forge's
-fitsio/cfitsio binary crashes with a libmalloc bad-free
-inside cfitsio's `ffbinit` on the first test that writes a
-compressed-image fixture (`PyFITSObject_create_image_hdu`
-path).  Both py3.12 and py3.14 hit it, so it's the
-conda-forge build, not the Python version.  rustfits CI
-works around it by replacing the broken conda binary with
-a pip source build on the macOS legs only:
+{python 3.12, 3.14}` plus the `macos-13` (Intel) and
+`ubuntu-24.04-arm` (aarch64) single-version legs.  On macOS,
+conda-forge's fitsio/cfitsio binary crashes with a libmalloc
+bad-free inside cfitsio's `ffbinit` on the first test that
+writes a compressed-image fixture
+(`PyFITSObject_create_image_hdu` path).  Both py3.12 and
+py3.14 hit it, so it's the conda-forge build, not the Python
+version.  rustfits CI works around it by replacing the broken
+conda binary with a pip source build on the macOS legs only:
 
 ```yaml
 - name: Replace conda-forge fitsio with source build (macOS)
-  if: matrix.os == 'macos-latest'
+  if: startsWith(matrix.os, 'macos')   # arm64 macos-latest + Intel macos-13
   shell: bash -el {0}
   run: |
     pip install --force-reinstall --no-deps --no-binary=fitsio fitsio
 ```
 
+The `startsWith` (not `== 'macos-latest'`) is load-bearing:
+it covers BOTH the arm64 `macos-latest` and the Intel
+`macos-13` leg, so neither runs the broken conda binary.
 This matches fitsio's own CI (which source-builds on every
 leg — see `~/git/fitsio/.github/workflows/tests.yml`).  Linux
 keeps the fast conda install.  When upstream conda-forge
@@ -2736,6 +2746,62 @@ fitsio is fixed, the macOS pip step can be removed.  First
 test to abort with the conda binary was
 `tests/test_image_compressed_accessors.py`'s
 `test_other_compression_types_dispatched`.
+
+## CI: Windows testing (not yet wired — needs no-fitsio restructuring)
+
+The `wheels` workflow builds + releases a **Windows x64
+wheel**, but `ci.yml` has **no Windows test leg** — so the
+shipped Windows wheel has zero runtime coverage.  The
+aarch64-linux leg (added alongside its wheel) closed the
+analogous gap on arm Linux; Windows is the remaining
+"ship-but-don't-test" target and the higher-risk one, because
+it has genuinely platform-specific FS surface the Rust code
+touches: file locking via `lock_file`, the atomic
+temp-file-and-rename in the `.gz` write-back (`gzip_write_back`
+in `fits.rs`), `shift_file_tail_*`, and path handling.
+
+**Why it's not a one-line matrix add — the blocker:**
+
+- `conda-test-requirements.txt` hard-requires `fitsio`, which
+  has **no win-64 conda-forge build** (its bundled cfitsio uses
+  a Unix build system; fitsio's own CI is Linux + macOS only).
+  So `micromamba install --file conda-test-requirements.txt`
+  won't solve on Windows, and the macOS-style `pip ...
+  --no-binary=fitsio` source build won't work there either.
+- **~22 test files do a plain `import fitsio`** (not
+  `pytest.importorskip`), so without fitsio they error at
+  *collection* — a Windows leg would go red from setup noise,
+  masking real signal.  (Another ~20 files already use
+  `importorskip("fitsio")`, so the suite is inconsistent here.)
+
+**Two ways to do it when this is picked up:**
+
+1. **Full suite, fitsio-free (recommended).**  Convert the ~22
+   hard `import fitsio` to `fitsio = pytest.importorskip(
+   "fitsio")` — a genuine consistency fix matching the other
+   ~20 files — install the test deps minus fitsio on Windows
+   (a Windows-specific deps step, since the requirements file
+   lists fitsio), and add `nasm` (ring's asm needs it on the
+   windows-msvc target — see the wheels `windows` job, which
+   already does `ilammy/setup-nasm@v1`).  Per-test
+   `importorskip` then keeps the rustfits-only tests running,
+   including the Windows-critical FS paths above, while the
+   fitsio cross-checks skip individually (NOT whole-file —
+   that's the point of per-test skip over a `collect_ignore`
+   list, which would drop e.g. the gz atomic-rename coverage
+   in `test_fits_gz.py` just because it imports fitsio at top).
+2. **Build + smoke only.**  `maturin develop` (proves nasm +
+   ring + pyo3 link on Windows) + a small inline write/read
+   smoke script, no pytest.  Low effort, but doesn't exercise
+   the FS paths that are the actual Windows risk.
+
+Either way, the fitsio (and any fitsio/cfitsio cross-check)
+tests can't run on Windows, so Windows coverage is
+rustfits-vs-rustfits + astropy-vs-rustfits only (astropy DOES
+have win-64 builds, so those cross-checks can stay).  That's
+fine — the point of a Windows leg is the rustfits FS / locking
+/ path code, not cross-tool byte agreement, which is
+arch/OS-independent and already covered on Linux + macOS.
 
 ## macOS CI flakes — resolved 2026-06-01 (fitsio PLIO_1)
 
