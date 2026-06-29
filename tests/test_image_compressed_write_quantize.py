@@ -23,6 +23,7 @@ Coverage:
       without compress=
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -36,11 +37,14 @@ fitsio = pytest.importorskip("fitsio")
 
 
 # On macOS, cfitsio's dequantization produces slightly different
-# float results than on Linux — almost certainly compiler-codegen
-# variance (FMA fusion, Apple libm vs glibc).  rustfits's Rust
-# dequant bit-matches Linux cfitsio.  Linux remains strictly
-# bit-exact below; macOS allows allclose at the documented level
-# (rtol up to ~1.6e-5 on near-zero values, atol up to ~2.6e-9).
+# float results than on Linux — compiler-codegen variance (FMA
+# fusion, Apple libm vs glibc).  rustfits's Rust dequant bit-matches
+# Linux cfitsio, and test_rustfits_quantized_bytes_stable_across_os
+# (below) pins rustfits's own written + decoded bytes byte-identical
+# across platforms — so the drift is empirically isolated to
+# fitsio/cfitsio, not rustfits.  Linux remains strictly bit-exact in
+# the matrix test below; macOS allows allclose at the documented
+# level (rtol up to ~1.6e-5 on near-zero values, atol up to ~2.6e-9).
 _MACOS_FP_RTOL = 1e-5
 _MACOS_FP_ATOL = 1e-8
 _IS_MACOS = sys.platform == "darwin"
@@ -403,6 +407,142 @@ def test_fitsio_read_agrees_across_matrix(algorithm_name, method):
             )
         else:
             np.testing.assert_array_equal(rust_out, fitsio_out)
+
+
+# ------------------ cross-OS rustfits byte stability ----------------
+#
+# The complement to test_fitsio_read_agrees_across_matrix above.  That
+# test documents that *fitsio*'s decoded floats drift on macOS (forcing
+# the allclose fallback at the top of this file).  Attributing that
+# drift to fitsio rather than rustfits rested on the inference that
+# "rustfits's Rust dequant is deterministic and bit-matches Linux
+# cfitsio" — but nothing pinned that rustfits's OWN output is identical
+# across platforms.  This test supplies that missing link.
+#
+# Each (algorithm, dither-method) combo is pinned to two SHA-256
+# digests captured on Linux x86_64: one over the written .fz bytes
+# (rustfits ENCODE is OS-invariant) and one over the decoded f4 bytes
+# (rustfits DECODE / dequant is OS-invariant).  Both supported
+# platforms (Linux x86_64, macOS arm64) are little-endian, so the
+# decoded bytes compare directly.  A macOS CI pass here therefore
+# proves rustfits is byte-identical macOS↔Linux end to end, which —
+# together with the matrix test showing fitsio drifts on the same
+# files — isolates the documented dequant divergence entirely to
+# fitsio/cfitsio (compiler codegen / Apple libm), not rustfits.
+#
+# Notes:
+#   - The decode digest is the same across all four codecs for a given
+#     dither method (only 3 distinct values): the codecs losslessly
+#     compress the SAME quantized i32 stream, so the decoded output
+#     depends only on the quantization, not the codec.
+#   - The encode digest depends on the pinned miniz_oxide version
+#     (Cargo.lock, committed) for the gzip payloads; a deliberate
+#     encoder/quantizer or flate2 bump may require regenerating these.
+#     To regenerate: for each combo, write the file exactly as below,
+#     sha256 the .fz bytes and sha256(np.ascontiguousarray(out)
+#     .tobytes()) of the read-back array.
+_GOLDEN = {
+    ("Rice1", "no_dither"): (
+        "5b6642a8a04aae8a08dddaf6dbe11ce8f46f9e15a1efb645ca4e43f29c915161",
+        "29d9f483f6ff296bb0ebce1c506c8cdceaab1a82f5f76bc25644cb41af15f2d8",
+    ),
+    ("Rice1", "dither1"): (
+        "093b5bd4de9ff0c4b1b8b83ca5fdbb9f741f5a916457992228ed068c737cc7b7",
+        "3f03700d94cb30c18934f6dc89e573664adfe02ef5e41a76de275edaa102c595",
+    ),
+    ("Rice1", "dither2"): (
+        "8c1ef03a32f296a4d392d16ba160023dc78fda7e7fdb44c37a73f72b122e4f8e",
+        "c6c867886dce1ec8c7059e60fecd0d3cd03673099f1fbd5324a9878808459407",
+    ),
+    ("Gzip1", "no_dither"): (
+        "1054c62dc5869513edb2f27ebcce5753d5618a3d4fc67f8fab2695c52dc52975",
+        "29d9f483f6ff296bb0ebce1c506c8cdceaab1a82f5f76bc25644cb41af15f2d8",
+    ),
+    ("Gzip1", "dither1"): (
+        "bd834607acebf70774402fe33f462c859fb1b50125c6d115bf2b551b5c1e610b",
+        "3f03700d94cb30c18934f6dc89e573664adfe02ef5e41a76de275edaa102c595",
+    ),
+    ("Gzip1", "dither2"): (
+        "d16fd5158c0c75ae63f1e9950befe602cd9fb498260b811debba57ebf40d0e97",
+        "c6c867886dce1ec8c7059e60fecd0d3cd03673099f1fbd5324a9878808459407",
+    ),
+    ("Gzip2", "no_dither"): (
+        "df799ab20fa6d04b4ddc7cd63fd99a77fc740b2398fd0d9b621bcfb1854610c7",
+        "29d9f483f6ff296bb0ebce1c506c8cdceaab1a82f5f76bc25644cb41af15f2d8",
+    ),
+    ("Gzip2", "dither1"): (
+        "21e2e70ef68a38d4199788e2270ed181f2dfa41392078a03aed25467962ba25f",
+        "3f03700d94cb30c18934f6dc89e573664adfe02ef5e41a76de275edaa102c595",
+    ),
+    ("Gzip2", "dither2"): (
+        "6ba177d563318f662ad9ddb92fdc12e91eb139e3d0b056cfeef016398910d828",
+        "c6c867886dce1ec8c7059e60fecd0d3cd03673099f1fbd5324a9878808459407",
+    ),
+    ("Hcompress1", "no_dither"): (
+        "573834ec20a9d79d473e18a25a7f4445628edde6feae415a225f59b77b622b13",
+        "29d9f483f6ff296bb0ebce1c506c8cdceaab1a82f5f76bc25644cb41af15f2d8",
+    ),
+    ("Hcompress1", "dither1"): (
+        "e8e22e1400247cf9bdd7b452fe443da3a79904cd19dfacab9bf69487a44c39a2",
+        "3f03700d94cb30c18934f6dc89e573664adfe02ef5e41a76de275edaa102c595",
+    ),
+    ("Hcompress1", "dither2"): (
+        "feb74cd00e2c767758ca1ea8cd06919863d534084f8b793889a8ecfb576480b4",
+        "c6c867886dce1ec8c7059e60fecd0d3cd03673099f1fbd5324a9878808459407",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "algorithm_name",
+    ["Rice1", "Gzip1", "Gzip2", "Hcompress1"],
+)
+@pytest.mark.parametrize(
+    "method",
+    ["no_dither", "dither1", "dither2"],
+)
+def test_rustfits_quantized_bytes_stable_across_os(algorithm_name, method):
+    """
+    rustfits's written and decoded bytes are byte-identical across
+    platforms (pinned to Linux-captured goldens).
+
+    Complement to test_fitsio_read_agrees_across_matrix: that test
+    shows fitsio drifts on macOS; this one shows rustfits does not,
+    isolating the documented dequant divergence to fitsio/cfitsio.
+    """
+    algo_cls = getattr(rustfits, algorithm_name)
+    data = _smooth((32, 48), seed=88)
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = os.path.join(tmp, "t.fits.fz")
+        with rustfits.FITS(fn, "w+") as f:
+            f.create_image_hdu(
+                "f4",
+                data.shape,
+                compress=algo_cls(tile_shape=(16, 24)),
+                quantize=rustfits.Quantize(
+                    level=4.0,
+                    method=method,
+                    seed=2024,
+                ),
+            )
+            f[1].write(data)
+        with open(fn, "rb") as fh:
+            fz_sha = hashlib.sha256(fh.read()).hexdigest()
+        with rustfits.FITS(fn, "r") as f:
+            out = f[1].read()
+
+    want_fz, want_dec = _GOLDEN[(algorithm_name, method)]
+    dec_sha = hashlib.sha256(np.ascontiguousarray(out).tobytes()).hexdigest()
+    assert fz_sha == want_fz, (
+        f"encoded .fz bytes drifted from the Linux golden for "
+        f"{algorithm_name}/{method}: rustfits encode is not "
+        f"OS-invariant (got {fz_sha})"
+    )
+    assert dec_sha == want_dec, (
+        f"decoded f4 bytes drifted from the Linux golden for "
+        f"{algorithm_name}/{method}: rustfits dequant is not "
+        f"OS-invariant (got {dec_sha})"
+    )
 
 
 def test_default_seed_emits_one():

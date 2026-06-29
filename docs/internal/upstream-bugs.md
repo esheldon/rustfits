@@ -133,12 +133,27 @@ Everything else is documented inline at the cited locations.
 - **Symptom:** slightly different decoded float values on macOS
   (rtol up to ~1.6e-5, atol up to ~2.6e-9 near zero).  rustfits's
   Rust dequant bit-matches Linux cfitsio.
-- **Documented:** `tests/test_image_compressed_read_quantize.py`
-  (`_MACOS_FP_RTOL` / `_MACOS_FP_ATOL`).
-- **Workaround:** loosened macOS tolerances pin the divergence so a
-  regression beyond the bound surfaces.
+- **Isolation (which side drifts):** empirically fitsio's, not
+  rustfits's.  `test_rustfits_quantized_bytes_stable_across_os`
+  (in `tests/test_image_compressed_write_quantize.py`) pins
+  rustfits's written `.fz` bytes AND decoded f4 bytes to Linux-
+  captured SHA-256 goldens across the (algorithm, dither) matrix;
+  a macOS CI pass proves rustfits is byte-identical macOS↔Linux end
+  to end, so the divergence the matrix test tolerates is entirely on
+  fitsio/cfitsio's side.  (Both supported platforms are little-
+  endian, so the byte compare is direct.  The encode pin relies on
+  the committed `Cargo.lock` pinning miniz_oxide for the gzip
+  payloads.)
+- **Documented:** `tests/test_image_compressed_read_quantize.py` and
+  `tests/test_image_compressed_write_quantize.py`
+  (`_MACOS_FP_RTOL` / `_MACOS_FP_ATOL` tolerance pin +
+  `test_rustfits_quantized_bytes_stable_across_os` byte pin).
+- **Workaround:** loosened macOS tolerances pin the fitsio-side
+  divergence so a regression beyond the bound surfaces; the cross-OS
+  byte test pins rustfits's side exactly.
 - **Upstream status:** not a clean bug to file (numerical
-  reproducibility, not a defect); documented for our own sake.
+  reproducibility in cfitsio, not a defect); documented for our own
+  sake, now with the rustfits side empirically ruled out.
 
 ---
 
