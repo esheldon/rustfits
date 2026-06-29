@@ -61,10 +61,16 @@ General
 Files and compression
 ---------------------
 
-* **Whole-file gzip is read-only** *(not yet)* — a ``.gz`` path is
-  decompressed into memory on open, so reads work, but ``r+`` /
-  ``w+`` on a ``.gz`` raise.  Write-back (recompress-on-close)
-  isn't implemented.
+* **Whole-file gzip holds the file in RAM** *(by design)* — a
+  ``.gz`` path is decompressed into memory on open, and for a
+  writable mode (``r+`` / ``w+``) the in-memory buffer is
+  recompressed and written back (atomically) to the ``.gz`` path on
+  :meth:`~rustfits.FITS.close` or :meth:`~rustfits.FITS.sync`.
+  Because gzip isn't randomly seekable and FITS needs random access,
+  the *entire* file lives in RAM while open (the same caveat as
+  ``mem://``).  The new bytes reach disk at close/sync (a finalizer
+  flushes a forgotten-to-close file as a safety net, but the context
+  manager is the reliable path).
 
   More to the point, **prefer per-HDU compression over whole-file
   compression**.  Tile-compressed images (the ``compress=...``

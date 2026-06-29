@@ -24,7 +24,28 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // `dyn`.
 pub(crate) enum Storage {
     Disk(std::fs::File),
-    Mem(Cursor<Vec<u8>>),
+    Mem(MemStore),
+}
+
+// In-memory backing buffer plus a `dirty` flag.  `dirty` starts false
+// and is set true by any `write`/`set_len` (i.e. any actual mutation);
+// reads/seeks leave it untouched.  It exists for the `.gz` write-back
+// path: a `.gz` opened r+ that is only read should NOT be recompressed
+// and rewritten on close (which would change the file's bytes/mtime for
+// nothing), and `FITS.sync()` on a `.gz` should be a no-op when there's
+// nothing new to flush.  Every gz mutation funnels through this one
+// seam (all writers go through `Write`/`set_len` on the shared
+// `Storage`), so the flag catches them all without per-call-site
+// bookkeeping.
+pub(crate) struct MemStore {
+    cursor: Cursor<Vec<u8>>,
+    dirty: bool,
+}
+
+impl MemStore {
+    pub(crate) fn new(buf: Vec<u8>) -> Self {
+        MemStore { cursor: Cursor::new(buf), dirty: false }
+    }
 }
 
 impl Storage {
@@ -33,12 +54,13 @@ impl Storage {
     // backend resizes its `Vec`; every caller already holds `&mut Storage`
     // via `guard.as_mut()`.  The cursor position is left unchanged (matches
     // `File::set_len`, which never moves the file offset) — every read/write
-    // site seeks explicitly anyway.
+    // site seeks explicitly anyway.  Counts as a mutation (sets `dirty`).
     pub(crate) fn set_len(&mut self, size: u64) -> io::Result<()> {
         match self {
             Storage::Disk(f) => f.set_len(size),
-            Storage::Mem(c) => {
-                c.get_mut().resize(size as usize, 0);
+            Storage::Mem(m) => {
+                m.cursor.get_mut().resize(size as usize, 0);
+                m.dirty = true;
                 Ok(())
             }
         }
@@ -49,7 +71,7 @@ impl Storage {
     pub(crate) fn len(&self) -> io::Result<u64> {
         match self {
             Storage::Disk(f) => Ok(f.metadata()?.len()),
-            Storage::Mem(c) => Ok(c.get_ref().len() as u64),
+            Storage::Mem(m) => Ok(m.cursor.get_ref().len() as u64),
         }
     }
 
@@ -58,6 +80,38 @@ impl Storage {
         match self {
             Storage::Disk(f) => f.sync_all(),
             Storage::Mem(_) => Ok(()),
+        }
+    }
+
+    // Whether the in-memory buffer has been mutated since it was filled
+    // (or since the last `mark_clean`).  Always false for the disk
+    // backend, whose writes go straight to the OS rather than buffering
+    // a pending recompress — the flag is only consulted on the gz path,
+    // which is always Mem-backed.
+    pub(crate) fn is_dirty(&self) -> bool {
+        match self {
+            Storage::Disk(_) => false,
+            Storage::Mem(m) => m.dirty,
+        }
+    }
+
+    // Clear the dirty flag.  Called by `FITS.sync()` after it has
+    // durably written the current buffer back to the `.gz`, so a
+    // subsequent `close()` doesn't redundantly rewrite an unchanged
+    // file.  No-op for the disk backend.
+    pub(crate) fn mark_clean(&mut self) {
+        if let Storage::Mem(m) = self {
+            m.dirty = false;
+        }
+    }
+
+    // Re-set the dirty flag.  Called by `FITS.sync()` if the durable
+    // write-back FAILS after it optimistically cleared the flag, so the
+    // pending mutation isn't dropped — a later sync()/close() retries.
+    // No-op for the disk backend.
+    pub(crate) fn mark_dirty(&mut self) {
+        if let Storage::Mem(m) = self {
+            m.dirty = true;
         }
     }
 
@@ -71,13 +125,30 @@ impl Storage {
         self.read_exact(&mut buf)?;
         Ok(buf)
     }
+
+    // Consume the storage and return its bytes.  Zero-copy for the
+    // in-memory backend (moves the inner Vec straight out of the
+    // Cursor — no second full-size allocation like read_all); reads
+    // the whole file for the disk backend.  Used by close()'s `.gz`
+    // write-back, which only ever holds a Mem backend.
+    pub(crate) fn into_vec(self) -> io::Result<Vec<u8>> {
+        match self {
+            Storage::Mem(m) => Ok(m.cursor.into_inner()),
+            Storage::Disk(mut f) => {
+                f.seek(SeekFrom::Start(0))?;
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+        }
+    }
 }
 
 impl Read for Storage {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Storage::Disk(f) => f.read(buf),
-            Storage::Mem(c) => c.read(buf),
+            Storage::Mem(m) => m.cursor.read(buf),
         }
     }
 }
@@ -86,13 +157,17 @@ impl Write for Storage {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Storage::Disk(f) => f.write(buf),
-            Storage::Mem(c) => c.write(buf),
+            Storage::Mem(m) => {
+                m.dirty = true;
+                m.cursor.write(buf)
+            }
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Storage::Disk(f) => f.flush(),
-            Storage::Mem(c) => c.flush(),
+            // flush is not a mutation — don't set dirty.
+            Storage::Mem(m) => m.cursor.flush(),
         }
     }
 }
@@ -101,7 +176,7 @@ impl Seek for Storage {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             Storage::Disk(f) => f.seek(pos),
-            Storage::Mem(c) => c.seek(pos),
+            Storage::Mem(m) => m.cursor.seek(pos),
         }
     }
 }

@@ -6,8 +6,9 @@ small set of *driver* prefixes that select where the bytes live.  The
 prefix is part of the filename string — the same convention cfitsio
 and fitsio use — so existing muscle memory carries over.
 
-Today the in-memory, gzip-read, and remote (``http`` / ``https`` /
-``ftp`` / ``ftps``) read drivers are implemented.
+Today the in-memory, gzip (read + write-back), and remote
+(``http`` / ``https`` / ``ftp`` / ``ftps``) read drivers are
+implemented.
 
 .. list-table::
    :header-rows: 1
@@ -24,7 +25,7 @@ Today the in-memory, gzip-read, and remote (``http`` / ``https`` /
      - build or parse a FITS file with no disk access
    * - ``"path/to.fits.gz"``
      - in memory (gunzipped)
-     - read a gzipped FITS file (read-only)
+     - read+write a gzipped FITS file; ``r+`` / ``w+`` recompress on close
    * - ``"http://..."`` / ``"https://..."``
      - in memory (downloaded)
      - read a FITS file from a URL (read-only)
@@ -141,26 +142,58 @@ files, work from a path on disk.
 Gzipped files
 -------------
 
-Opening a path ending in ``.gz`` reads a gzipped FITS file: rustfits
-gunzips the whole file into an in-memory buffer and then parses it
-exactly like any in-memory file.
+Opening a path ending in ``.gz`` supports reading and writing a gzipped FITS
+file. When reading, rustfits gunzips the whole file into an in-memory buffer
+and then parses it exactly like any in-memory file.
 
 .. code-block:: python
 
    with rustfits.FITS("image.fits.gz") as fits:   # read-only
        image = fits[0].read()
 
-Gzipped files are **read-only** — open them with the default
-``mode="r"``; ``"r+"`` and ``"w+"`` raise, because write-back
-(recompress on close) is not yet implemented.  To edit a gzipped
-file, read it, write a plain ``.fits``, and gzip that yourself.
+Writing is supported too: open a ``.gz`` with ``"w+"`` (truncate /
+create) or ``"r+"`` (edit in place).  rustfits builds the file in the
+in-memory buffer and, when you :meth:`~rustfits.FITS.close` it,
+recompresses the buffer and writes the gzip stream back to the
+``.gz`` path.
+
+.. code-block:: python
+
+   with rustfits.FITS("image.fits.gz", "w+") as fits:
+       fits.write_image(image)          # recompressed + saved on close
+
+   with rustfits.FITS("image.fits.gz", "r+") as fits:
+       fits[0].header["HISTORY"] = "edited in place"
+
+The write-back is **atomic**: rustfits compresses to a temporary file
+in the same directory and renames it over the target, so an
+interrupted write (out of disk space, I/O error) leaves the original
+``.gz`` intact rather than half-written.
 
 A few details:
 
+* The new bytes reach disk **at close** (or :meth:`~rustfits.FITS.sync`
+  — see below).  As a safety net, if you forget to close a written
+  ``.gz``, a finalizer flushes it when the object is garbage-collected;
+  still, prefer the context manager so errors surface and timing is
+  deterministic.
+* :meth:`~rustfits.FITS.sync` forces the current buffer to disk
+  durably mid-session (recompress + atomic write + ``fsync``), so you
+  don't have to close to checkpoint.
+* Opening ``r+``/``w+`` behaves like a plain-disk open: ``w+`` creates
+  and claims the file immediately, and a permission/path error is
+  raised at ``FITS(...)`` time, not deferred to close.
+* A ``.gz`` opened ``r+`` is rewritten on close **only if you actually
+  mutated it** — opening to read leaves the on-disk file (bytes,
+  mtime) untouched.
 * Because a gzip stream can't be seeked and FITS needs random access,
   the *decompressed* file is held in RAM — the same caveat as
   ``mem://``.  Fine for typical files; for very large data prefer an
-  uncompressed path on disk.
+  uncompressed path on disk.  Per-HDU (tile) compression is almost
+  always the better choice than a whole-file ``.gz`` — see
+  :doc:`limitations`.
+* Multi-member gzip streams are decoded in full (not truncated to the
+  first member).
 * :meth:`~rustfits.FITS.to_bytes` on a ``.gz``-opened file returns the
   **decompressed** bytes (the in-memory representation), not the gzip
   stream.
