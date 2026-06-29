@@ -2287,15 +2287,26 @@ directly, no GIL / no `py.detach`) so it's safe during interpreter
 shutdown; errors are swallowed but the atomic temp+rename keeps the
 original intact; skips when already closed (`None`) or clean.
 
+**Taint guard.**  All three persistence paths (`close()`, `sync()`,
+`Drop`) call `gz_writeback_taint_check` (Drop checks the flag inline,
+since it can't return) and decline to persist when the file is tainted
+— an earlier mid-write failure left the in-memory buffer inconsistent,
+so writing it back would bake the divergence into the `.gz`.  The
+atomic write means the existing on-disk file is left intact; the user
+reopens to recover.  This is belt-and-suspenders for the Mem backend
+(a `Cursor<Vec<u8>>` write can't fail partway, so a gz buffer is
+essentially never tainted), but it guards the invariant.
+
 A double `close()` is a clean no-op even after a *failed* write-back:
 the storage is taken (handle reads closed) before the write, so the
 retry finds `None`.  `from_bytes`/`mem://` files never set the flag.
 Only gzip (`.gz`); `.Z` (LZW) and `.zip` are out of scope (different
-codecs).  Tests: `tests/test_fits_gz.py` (32 cases — read incl.
+codecs).  Tests: `tests/test_fits_gz.py` (34 cases — read incl.
 multi-member; write-back; atomic-failure-preserves-original;
 no-temp-litter; open-time create/permission errors; dirty-skip via
 inode checks; `sync()` mid-session durability + no-op-when-clean;
-`Drop` flush-on-forgotten-close + no-op-when-clean).
+`Drop` flush-on-forgotten-close + no-op-when-clean; close/sync refuse a
+tainted buffer).
 
 The seam is realized as an **`enum Storage`** (in `common.rs`), NOT
 `Box<dyn FitsStorage>` — see "The shape (as built)" below for the

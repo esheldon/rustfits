@@ -697,5 +697,60 @@ def test_gz_drop_noop_when_clean():
         assert os.stat(gz).st_ino == ino0
 
 
+# ----------------------------------------------------------------------
+# #11: a buffer left inconsistent by a mid-write failure (taint flag) is
+# NOT persisted; the existing .gz on disk is preserved.
+# ----------------------------------------------------------------------
+
+
+def test_gz_close_refuses_tainted_buffer():
+    """
+    close() does not write back a tainted buffer: it raises, and the
+    original .gz is left untouched so a reopen recovers the good file."""
+    data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "taint.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        original_bytes = open(gz, "rb").read()
+
+        f = rustfits.FITS(gz, "r+")
+        f[0].header["EDIT"] = 1  # mutate -> buffer dirty
+        f[0]._force_taint()  # simulate a prior mid-write failure
+        with pytest.raises(IOError):
+            f.close()  # refuses to persist the inconsistent buffer
+
+        # Original .gz untouched; the edit was not written.
+        assert open(gz, "rb").read() == original_bytes
+        with rustfits.FITS(gz) as g:
+            assert "EDIT" not in g[0].header
+            np.testing.assert_array_equal(g[0].read(), data)
+
+
+def test_gz_sync_refuses_tainted_buffer():
+    """
+    sync() likewise refuses to persist a tainted buffer, leaving the
+    on-disk .gz unchanged."""
+    data = np.arange(8, dtype="i4")
+    with tempfile.TemporaryDirectory() as d:
+        plain = os.path.join(d, "tsync.fits")
+        gz = plain + ".gz"
+        _write_plain_image(plain, data)
+        _gzip_file(plain, gz)
+        original_bytes = open(gz, "rb").read()
+
+        f = rustfits.FITS(gz, "r+")
+        f[0].header["EDIT"] = 1
+        f[0]._force_taint()
+        with pytest.raises(IOError):
+            f.sync()
+        # close() is still tainted -> also refuses; swallow it.
+        with pytest.raises(IOError):
+            f.close()
+
+        assert open(gz, "rb").read() == original_bytes
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -259,6 +259,29 @@ fn gzip_write_back(filename: &str, raw: &[u8], fsync: bool) -> io::Result<()> {
     result
 }
 
+// Refuse to recompress a `.gz`'s in-memory buffer back to disk when the
+// file is tainted.  The taint flag means an earlier mid-write failure
+// left the in-memory state inconsistent, so persisting the buffer would
+// bake the divergence into the `.gz`.  Because the write-back is atomic
+// (temp + rename), declining here leaves the existing on-disk `.gz`
+// untouched; the user recovers by reopening.  Belt-and-suspenders for
+// the Mem backend (a `Cursor<Vec<u8>>` write can't fail partway, so a
+// gz buffer is essentially never tainted), but it guards the invariant
+// if a future code path can taint an in-memory file.  Used by `close()`
+// and `sync()`; `Drop` checks the flag inline (it cannot return).
+fn gz_writeback_taint_check(tainted: &TaintFlag, filename: &str) -> PyResult<()> {
+    if tainted.load(Ordering::Acquire) {
+        return Err(PyIOError::new_err(format!(
+            "not writing back '{}': the file is in an indeterminate state \
+             after a mid-write I/O failure, so its in-memory buffer may be \
+             inconsistent; the existing .gz on disk is left unchanged — \
+             reopen to recover",
+            filename
+        )));
+    }
+    Ok(())
+}
+
 // True for an ftp/ftps URL.
 fn is_ftp_url(filename: &str) -> bool {
     filename.starts_with("ftp://") || filename.starts_with("ftps://")
@@ -844,7 +867,10 @@ impl Drop for FITS {
             Err(_) => return,
         };
         if let Some(storage) = storage {
-            if storage.is_dirty() {
+            // Skip a tainted buffer (inconsistent after a mid-write
+            // failure): the atomic-write contract leaves the existing
+            // .gz intact, matching close()/sync(), which refuse here.
+            if storage.is_dirty() && !self.tainted.load(Ordering::Acquire) {
                 if let Ok(raw) = storage.into_vec() {
                     let _ = gzip_write_back(&self.filename, &raw, false);
                 }
@@ -1972,6 +1998,10 @@ impl FITS {
         if self.gz_writeback {
             if let Some(storage) = storage {
                 if storage.is_dirty() {
+                    // Don't persist a buffer left inconsistent by an
+                    // earlier mid-write failure; the existing .gz stays
+                    // intact (atomic write-back) and the user reopens.
+                    gz_writeback_taint_check(&self.tainted, &self.filename)?;
                     let raw = storage.into_vec()
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
                     let filename = self.filename.clone();
@@ -2008,6 +2038,9 @@ impl FITS {
     /// a no-op when nothing has been mutated since the last sync.
     fn sync(&self, py: Python<'_>) -> PyResult<()> {
         if self.gz_writeback {
+            // Refuse to persist a tainted (inconsistent) buffer; the
+            // existing .gz stays intact and the user reopens to recover.
+            gz_writeback_taint_check(&self.tainted, &self.filename)?;
             // Snapshot the dirty buffer under the lock and clear the
             // dirty flag, then release the lock BEFORE compressing
             // (deadlock-safe, same reasoning as close()).  Nothing to
