@@ -25,6 +25,7 @@ Coverage:
 
 import hashlib
 import os
+import platform
 import sys
 import tempfile
 
@@ -36,18 +37,26 @@ import rustfits
 fitsio = pytest.importorskip("fitsio")
 
 
-# On macOS, cfitsio's dequantization produces slightly different
-# float results than on Linux — compiler-codegen variance (FMA
-# fusion, Apple libm vs glibc).  rustfits's Rust dequant bit-matches
-# Linux cfitsio, and test_rustfits_quantized_bytes_stable_across_os
-# (below) pins rustfits's own written + decoded bytes byte-identical
-# across platforms — so the drift is empirically isolated to
-# fitsio/cfitsio, not rustfits.  Linux remains strictly bit-exact in
-# the matrix test below; macOS allows allclose at the documented
-# level (rtol up to ~1.6e-5 on near-zero values, atol up to ~2.6e-9).
-_MACOS_FP_RTOL = 1e-5
-_MACOS_FP_ATOL = 1e-8
-_IS_MACOS = sys.platform == "darwin"
+# cfitsio's quantized-float dequant diverges slightly from rustfits's
+# strict-IEEE Rust dequant on arm64 — cfitsio's C contracts the
+# `value*scale + zero` dequant into a single FMA (one rounding) where
+# rustfits rounds twice.  This is an ARCH property, not an OS one:
+# observed on BOTH macOS arm64 and Linux aarch64, and ABSENT on
+# x86_64 Linux.  rustfits's Rust dequant is bit-identical across
+# arches — test_rustfits_quantized_bytes_stable_across_os (below)
+# pins rustfits's written + decoded bytes to x86_64-captured goldens
+# and PASSES on aarch64 — so the drift is empirically isolated to
+# fitsio/cfitsio, not rustfits.  x86_64 stays strictly bit-exact in
+# the matrix test below; arm64 (and macOS generally — macos-latest is
+# arm64, the Intel macos-13 leg is harmless to keep loose) allows
+# allclose at the documented level (max relative diff ~9.5e-6 on
+# normal-magnitude values; near-zero values caught by atol).
+_FITSIO_FP_RTOL = 1e-5
+_FITSIO_FP_ATOL = 1e-8
+_FITSIO_FP_LOOSE = (
+    platform.machine().lower() in ("arm64", "aarch64")
+    or sys.platform == "darwin"
+)
 
 
 def _smooth(shape, dtype="f4", seed=0):
@@ -398,12 +407,12 @@ def test_fitsio_read_agrees_across_matrix(algorithm_name, method):
             rust_out = f[1].read()
         with fitsio.FITS(fn) as f:
             fitsio_out = f[1].read()
-        if _IS_MACOS:
+        if _FITSIO_FP_LOOSE:
             np.testing.assert_allclose(
                 rust_out,
                 fitsio_out,
-                rtol=_MACOS_FP_RTOL,
-                atol=_MACOS_FP_ATOL,
+                rtol=_FITSIO_FP_RTOL,
+                atol=_FITSIO_FP_ATOL,
             )
         else:
             np.testing.assert_array_equal(rust_out, fitsio_out)
