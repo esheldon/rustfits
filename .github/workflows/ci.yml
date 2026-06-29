@@ -74,6 +74,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ['3.12', '3.14']
+        # One extra Intel x86_64 macOS leg.  macos-13 is the last free
+        # Intel runner (macos-latest is arm64 = macos-15-arm64), so this
+        # is smoke coverage that the Rust code + the macOS dequant
+        # tolerance behave on x86_64 darwin, without doubling the macOS
+        # matrix.  Intel runners are on GitHub's deprecation path; drop
+        # this leg when macos-13 is retired.
+        include:
+          - os: macos-13
+            python: '3.12'
     steps:
       - uses: actions/checkout@v4
 
@@ -115,7 +124,7 @@ jobs:
       # using a PyPI wheel (which may have been built by the same
       # toolchain that produces the buggy conda-forge binary).
       - name: Replace conda-forge fitsio with source build (macOS)
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos')
         shell: bash -el {0}
         run: |
           pip install --force-reinstall --no-deps --no-binary=fitsio fitsio
