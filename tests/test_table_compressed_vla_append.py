@@ -448,7 +448,7 @@ def test_funpack_decompresses_vla_appended_file():
     fitsio reads VLAs as max-width zero-padded arrays; we compare
     each cell's first `len(src_cell)` elements.
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
     import warnings
 
     with tempfile.TemporaryDirectory() as td:

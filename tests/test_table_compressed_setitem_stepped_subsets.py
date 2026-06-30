@@ -420,7 +420,7 @@ def test_subset_multi_col_non_vla_subset_on_vla_table_works():
     reason="funpack required for cross-tool verification",
 )
 def test_funpack_decompresses_stepped_and_subset_modified_file():
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

@@ -177,7 +177,7 @@ def test_gz_reads_fitsio_written_file():
     """
     A .gz produced from a fitsio-written file reads correctly (cross
     tool)."""
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     data = np.arange(5 * 4, dtype="f4").reshape(5, 4)
     with tempfile.TemporaryDirectory() as d:
@@ -344,7 +344,7 @@ def test_gz_writeback_close_idempotent():
 def test_gz_writeback_fitsio_can_read():
     """
     A .gz written by rustfits is readable by fitsio (cross-tool)."""
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     data = np.arange(5 * 4, dtype="f4").reshape(5, 4)
     with tempfile.TemporaryDirectory() as d:

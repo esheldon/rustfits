@@ -21,6 +21,8 @@ import pytest
 
 import rustfits
 
+fitsio = pytest.importorskip("fitsio")
+
 
 # ---------------------------------------------------------------------
 # Fixture helpers
@@ -44,8 +46,6 @@ def _make_ztable_fixture(td, dtype, data, units=None):
     Build a ZTABLE-compressed fixture via fitsio (write) + fpack -table.
     fpack writes alongside the input file with a .fz suffix.
     """
-    import fitsio
-
     src = os.path.join(td, "src.fits")
     with fitsio.FITS(src, "rw", clobber=True) as f:
         f.write(data, units=units)

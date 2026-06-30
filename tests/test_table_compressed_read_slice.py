@@ -19,6 +19,8 @@ import pytest
 
 import rustfits
 
+fitsio = pytest.importorskip("fitsio")
+
 
 pytestmark = pytest.mark.skipif(
     shutil.which("fpack") is None,
@@ -34,8 +36,6 @@ def _make_ztable_fixture(td, data, *, ztilelen=None):
     is under 5760 bytes — easy trap when shrinking a fixture for a
     test).
     """
-    import fitsio
-
     src = os.path.join(td, "src.fits")
     with fitsio.FITS(src, "rw", clobber=True) as f:
         f.write(data)

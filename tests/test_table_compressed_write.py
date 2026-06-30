@@ -473,7 +473,7 @@ def test_funpack_decompresses_our_file():
     cfitsio's funpack reads a file we wrote and reconstructs the
     original BINTABLE bit-exactly.
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
@@ -546,7 +546,7 @@ def test_funpack_reads_complex():
     GZIP_1) and reconstructs the values bit-exactly -- the interop the
     GZIP_1 default exists to preserve.  Issue #8.
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     n = 3000
     dt = np.dtype([("z", "c8"), ("w", "c16")])

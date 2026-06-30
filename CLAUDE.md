@@ -2787,30 +2787,51 @@ in `fits.rs`), `shift_file_tail_*`, and path handling.
     and must skip there.
 
   State of the guards (as of 2026-06-29): **zero** hard
-  module-level `import fitsio` remain.  ~20 files use a
-  module-level `fitsio = pytest.importorskip("fitsio")`; ~4 use a
-  `_have_fitsio()` try/except + `@skipif`.  Both skip cleanly when
-  fitsio is absent.  The remaining gap is a handful of *unguarded
-  function-local* `import fitsio` calls inside individual
-  cross-tool tests (e.g. `test_fits_gz.py`, `test_fits_mem.py`)
-  that would error (red), not skip — those need a per-test
-  `importorskip`/skip guard before a Windows leg is green.
+  module-level `import fitsio` remain, and **zero unguarded
+  function-local imports** remain either.  The guard scheme:
+  - Files where EVERY test needs the fitsio+fpack fixture (the
+    read-side `test_table_compressed_{accessors,read,read_slice,
+    read_vla}.py`, plus the ~16 image-compressed read/write
+    files) carry a module-level
+    `fitsio = pytest.importorskip("fitsio")` → whole module skips
+    at collection.  ~24 files total.
+  - MIXED files (mostly pure-rustfits ztable write/setitem/
+    append/repack, with one `test_funpack_*` cross-verify test)
+    use a per-test guard: the funpack test is
+    `@skipif(not _have_funpack())` AND its body does
+    `fitsio = pytest.importorskip("fitsio")` (belt-and-suspenders
+    — the funpack-CLI skip fires first on Windows; the
+    importorskip covers the funpack-present-but-fitsio-absent
+    edge).  The pure-rustfits tests in these files RUN on
+    Windows.
+  - `test_fits_gz.py` / `test_fits_mem.py`: the FS-surface tests
+    (gz write-back, atomic temp+rename, taint, mem round-trip)
+    RUN; only the 2-3 explicit fitsio cross-tool tests carry a
+    per-test `importorskip`.
+  - ~4 files use the older `_have_fitsio()` try/except + `@skipif`
+    pattern; equivalent effect.
+
+  Verified by running the whole compressed-table + gz + mem
+  subset with `sys.modules['fitsio'] = None` AND
+  `shutil.which('fpack'/'funpack') -> None` (a faithful Windows
+  simulation): **0 failed, 0 errored** — the pure-rustfits tests
+  pass, the cross-tool tests skip with correct reasons.
 
 **To wire the Windows leg when this is picked up:**
 
-1. **Finish the per-test guards (recommended).**  Add a per-test
-   `importorskip("fitsio")` (or move the call up to module level
-   where the whole file is cross-tool) to the unguarded
-   function-local cases above.  Install the test deps minus
-   fitsio on Windows (a Windows-specific deps step, since the
-   requirements file lists fitsio), and add `nasm` (ring's asm
-   needs it on the windows-msvc target — see the wheels `windows`
-   job, which already does `ilammy/setup-nasm@v1`).  Per-test
-   skip keeps the rustfits-only tests running, including the
-   Windows-critical FS paths above, while the fitsio cross-checks
-   skip individually (NOT whole-file via a `collect_ignore` list,
-   which would drop e.g. the gz atomic-rename coverage in
-   `test_fits_gz.py` just because two tests in it touch fitsio).
+1. **CI mechanics (the guards are done).**  The per-test /
+   module-level `importorskip` guards above already make the
+   suite green on a no-fitsio platform; what's left is the CI
+   wiring.  Install the test deps minus fitsio on Windows (a
+   Windows-specific deps step, since the requirements file lists
+   fitsio), and add `nasm` (ring's asm needs it on the
+   windows-msvc target — see the wheels `windows` job, which
+   already does `ilammy/setup-nasm@v1`).  The guards keep the
+   rustfits-only tests running, including the Windows-critical FS
+   paths above, while the fitsio cross-checks skip individually
+   (NOT whole-file via a `collect_ignore` list, which would drop
+   e.g. the gz atomic-rename coverage in `test_fits_gz.py` just
+   because two tests in it touch fitsio).
 2. **Build + smoke only.**  `maturin develop` (proves nasm +
    ring + pyo3 link on Windows) + a small inline write/read
    smoke script, no pytest.  Low effort, but doesn't exercise

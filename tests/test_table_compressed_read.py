@@ -20,6 +20,8 @@ import pytest
 
 import rustfits
 
+fitsio = pytest.importorskip("fitsio")
+
 
 # ---------------------------------------------------------------------
 # Fixture helpers
@@ -50,8 +52,6 @@ def _make_ztable_fixture(
     given) sets fpack's per-tile row count via the FZTILELN header
     keyword on the source HDU — fpack has no CLI flag for it.
     """
-    import fitsio
-
     src = os.path.join(td, "src.fits")
     with fitsio.FITS(src, "rw", clobber=True) as f:
         if primary_data is not None:

@@ -284,7 +284,7 @@ def test_funpack_decompresses_vla_file():
     as max-width zero-padded fixed arrays, so we compare each cell
     to the first `len(src_cell)` elements of fitsio's output cell.
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
     import warnings
 
     with tempfile.TemporaryDirectory() as td:
@@ -396,7 +396,7 @@ def test_funpack_pa_vla_ztable_cfitsio_crash_documented():
     """
     if not _have_funpack():
         pytest.skip("funpack (cfitsio CLI) required")
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
     import warnings
 
     with tempfile.TemporaryDirectory() as td:
