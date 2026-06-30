@@ -535,7 +535,7 @@ def test_setitem_whole_column_non_last_hdu_preserves_trailing():
     reason="funpack (cfitsio CLI) required for cross-tool verification",
 )
 def test_funpack_decompresses_col_cell_multi_modified_file():
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

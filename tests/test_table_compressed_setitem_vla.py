@@ -531,7 +531,7 @@ def test_setitem_vla_string_pa_cell():
     reason="funpack required for cross-tool verification",
 )
 def test_funpack_decompresses_vla_mutated_file():
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

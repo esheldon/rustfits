@@ -182,7 +182,7 @@ def test_from_bytes_reads_disk_written_bytes():
 def test_from_bytes_reads_fitsio_written_bytes():
     """
     from_bytes parses bytes produced by an external tool (fitsio)."""
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     data = np.arange(5 * 6, dtype="i4").reshape(5, 6)
     with tempfile.TemporaryDirectory() as tmp:

@@ -276,7 +276,7 @@ def test_funpack_decompresses_appended_table():
     cfitsio's funpack reads a file we created + appended to and
     reconstructs the full row sequence byte-exactly.
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

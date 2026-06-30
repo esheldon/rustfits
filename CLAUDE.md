@@ -2747,18 +2747,62 @@ test to abort with the conda binary was
 `tests/test_image_compressed_accessors.py`'s
 `test_other_compression_types_dispatched`.
 
-## CI: Windows testing (not yet wired — needs no-fitsio restructuring)
+## CI: Windows testing (wired 2026-06-29 — `test-windows` job)
 
 The `wheels` workflow builds + releases a **Windows x64
-wheel**, but `ci.yml` has **no Windows test leg** — so the
-shipped Windows wheel has zero runtime coverage.  The
+wheel**.  Until 2026-06-29 `ci.yml` had **no Windows test leg**
+— the shipped wheel had zero runtime coverage.  It now has a
+`test-windows` job (windows-latest, py3.12).  The
 aarch64-linux leg (added alongside its wheel) closed the
-analogous gap on arm Linux; Windows is the remaining
+analogous gap on arm Linux; Windows was the remaining
 "ship-but-don't-test" target and the higher-risk one, because
 it has genuinely platform-specific FS surface the Rust code
 touches: file locking via `lock_file`, the atomic
 temp-file-and-rename in the `.gz` write-back (`gzip_write_back`
 in `fits.rs`), `shift_file_tail_*`, and path handling.
+
+**The job (`test-windows` in `ci.yml`).**  Separate job, not a
+matrix entry, because the steps diverge from the shared `test`
+job: (1) `ilammy/setup-nasm@v1` (ring's rustls asm needs nasm
+on windows-msvc — same action the wheels `windows` job uses);
+(2) deps installed from `conda-requirements.txt` + a
+`grep -vi '^fitsio' conda-test-requirements.txt` filtered list
+(conda-forge has no win-64 fitsio; filtering the file keeps the
+dep set in sync automatically rather than hardcoding it); (3)
+no macOS fitsio source-build step.  Otherwise the same
+micromamba + `maturin develop` + `pytest` shape (the Rust side
+already compiles on Windows — the wheels job proves it).
+
+**First-run caveat.**  This leg was authored without a local
+windows-msvc box to validate against; the no-fitsio behavior
+was verified by simulation on Linux (`sys.modules['fitsio'] =
+None` + `shutil.which('fpack'/'funpack') -> None` → 0 failed).
+Genuinely platform-specific behavior (the aioftp FTP-server
+test's asyncio event loop on Windows, file-locking semantics)
+can only be confirmed by a real run.  The known POSIX-only
+tests are already guarded: the three chmod-based
+failure-injection tests in `test_fits_gz.py` carry
+`@_skip_on_windows` (`sys.platform == "win32"`) because Windows
+doesn't enforce `chmod(0o500)` on a directory.
+
+**First real run (2026-06-30): 8 failures, all one root cause —
+astropy memmap, NOT rustfits.**  Result was 8 failed / 2139
+passed / 57 skipped.  Every rustfits FS path (file locking, the
+`.gz` atomic temp+rename, `shift_file_tail`, mem/disk round-trip)
+PASSED — rustfits's own Windows behavior is sound; `close()`
+releases the OS handle so a `tempfile.TemporaryDirectory()` is
+removable right after.  The 8 failures were all
+`test_astropy_*` table cross-reads that bind `hdul[1].data` to a
+local: `astropy.io.fits.open()` memory-maps by default, the bound
+view keeps the OS handle open past the `with` block, and Windows
+can't delete a still-open file, so the temp-dir cleanup raised
+`PermissionError: [WinError 32]`.  (Unix unlinks open files, so
+it's invisible there.)  Fixed centrally in `tests/conftest.py`:
+on `win32` it sets `astropy.io.fits.conf.use_memmap = False`
+(loads data into RAM, identical values/dtypes, handle released on
+close).  One place, Windows-only, covers current + future astropy
+cross-reads.  Verified the 8 pass on Linux with memmap forced off
+(values unchanged).
 
 **Why it's not a one-line matrix add — the blocker:**
 
@@ -2768,32 +2812,81 @@ in `fits.rs`), `shift_file_tail_*`, and path handling.
   So `micromamba install --file conda-test-requirements.txt`
   won't solve on Windows, and the macOS-style `pip ...
   --no-binary=fitsio` source build won't work there either.
-- **~22 test files do a plain `import fitsio`** (not
-  `pytest.importorskip`), so without fitsio they error at
-  *collection* — a Windows leg would go red from setup noise,
-  masking real signal.  (Another ~20 files already use
-  `importorskip("fitsio")`, so the suite is inconsistent here.)
+- The test suite uses `fitsio` for two distinct purposes, and
+  only one of them is a real Windows blocker:
+  - **fixture-writer (incidental).**  A handful of pure-rustfits
+    open/parse tests used fitsio only to *build* the input file.
+    These don't need a FITS writer at runtime — the inputs are
+    now committed under `tests/data/` (cfitsio-produced reference
+    bytes, frozen; regenerate via `tests/data/regenerate.py`) and
+    read with `shutil.copy`.  Done for `test_fits_open.py` +
+    `test_fits_open_multi.py` (2026-06-29); these run on a
+    no-fitsio platform unchanged.  Any future "fitsio is just the
+    fixture-writer" case should follow the same pattern, not a
+    skip.
+  - **cross-tool agreement (genuine).**  Tests that assert
+    byte-for-byte agreement with fitsio (and the ZTABLE suite,
+    which also shells out to `fpack`/`funpack`) genuinely need
+    fitsio + cfitsio CLIs at runtime.  These can't run on Windows
+    and must skip there.
 
-**Two ways to do it when this is picked up:**
+  State of the guards (as of 2026-06-29): **zero** hard
+  module-level `import fitsio` remain, and **zero unguarded
+  function-local imports** remain either.  The guard scheme:
+  - Files where EVERY test needs the fitsio+fpack fixture (the
+    read-side `test_table_compressed_{accessors,read,read_slice,
+    read_vla}.py`, plus the ~16 image-compressed read/write
+    files) carry a module-level
+    `fitsio = pytest.importorskip("fitsio")` → whole module skips
+    at collection.  ~24 files total.
+  - MIXED files (mostly pure-rustfits ztable write/setitem/
+    append/repack, with one `test_funpack_*` cross-verify test)
+    use a per-test guard: the funpack test is
+    `@skipif(not _have_funpack())` AND its body does
+    `fitsio = pytest.importorskip("fitsio")` (belt-and-suspenders
+    — the funpack-CLI skip fires first on Windows; the
+    importorskip covers the funpack-present-but-fitsio-absent
+    edge).  The pure-rustfits tests in these files RUN on
+    Windows.
+  - `test_fits_gz.py` / `test_fits_mem.py`: the FS-surface tests
+    (gz write-back, atomic temp+rename, taint, mem round-trip)
+    RUN; only the 2-3 explicit fitsio cross-tool tests carry a
+    per-test `importorskip`.
+  - ~4 files use the older `_have_fitsio()` try/except + `@skipif`
+    pattern; equivalent effect.
 
-1. **Full suite, fitsio-free (recommended).**  Convert the ~22
-   hard `import fitsio` to `fitsio = pytest.importorskip(
-   "fitsio")` — a genuine consistency fix matching the other
-   ~20 files — install the test deps minus fitsio on Windows
-   (a Windows-specific deps step, since the requirements file
-   lists fitsio), and add `nasm` (ring's asm needs it on the
-   windows-msvc target — see the wheels `windows` job, which
-   already does `ilammy/setup-nasm@v1`).  Per-test
-   `importorskip` then keeps the rustfits-only tests running,
-   including the Windows-critical FS paths above, while the
-   fitsio cross-checks skip individually (NOT whole-file —
-   that's the point of per-test skip over a `collect_ignore`
-   list, which would drop e.g. the gz atomic-rename coverage
-   in `test_fits_gz.py` just because it imports fitsio at top).
-2. **Build + smoke only.**  `maturin develop` (proves nasm +
-   ring + pyo3 link on Windows) + a small inline write/read
-   smoke script, no pytest.  Low effort, but doesn't exercise
-   the FS paths that are the actual Windows risk.
+  Verified by running the whole compressed-table + gz + mem
+  subset with `sys.modules['fitsio'] = None` AND
+  `shutil.which('fpack'/'funpack') -> None` (a faithful Windows
+  simulation): **0 failed, 0 errored** — the pure-rustfits tests
+  pass, the cross-tool tests skip with correct reasons.
+
+**What shipped — the "full suite, fitsio-free" approach.**  The
+guards above make the suite green on a no-fitsio platform, so the
+`test-windows` job runs the FULL `pytest` (not a smoke script).
+The fitsio cross-checks skip individually via the per-test /
+module-level `importorskip` (NOT whole-file via a
+`collect_ignore` list, which would drop e.g. the gz atomic-rename
+coverage in `test_fits_gz.py` just because two tests in it touch
+fitsio).  What runs is the Windows-critical FS surface.
+
+The rejected alternative was **build + smoke only** (`maturin
+develop` + a tiny inline write/read script, no pytest) — lower
+effort but it doesn't exercise the FS paths that are the actual
+Windows risk, so it wasn't worth shipping.
+
+**If the first Windows run is red**, triage by category:
+- A POSIX-semantics test that can't hold on Windows (more chmod /
+  permission / locking injection) → add `@_skip_on_windows` with
+  a reason, the way the three `test_fits_gz.py` chmod tests are
+  marked.
+- aioftp (`test_fits_ftp.py`) failing on the Windows asyncio
+  event loop → either set a SelectorEventLoop policy in that
+  test's server thread or `importorskip`/skip the FTP-server
+  tests on Windows.
+- A real rustfits bug on Windows (locking, path handling, the
+  `.gz` temp+rename) → that's the leg doing its job; fix the Rust
+  side.
 
 Either way, the fitsio (and any fitsio/cfitsio cross-check)
 tests can't run on Windows, so Windows coverage is

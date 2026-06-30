@@ -229,7 +229,7 @@ def test_repack_clears_tile_cache():
     reason="funpack (cfitsio CLI) required for cross-tool verification",
 )
 def test_funpack_decompresses_repacked_file():
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")

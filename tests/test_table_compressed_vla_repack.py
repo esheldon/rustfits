@@ -460,7 +460,7 @@ def test_funpack_decompresses_repacked_vla_file():
     original BINTABLE byte-exactly (within the per-row nelements
     bound that fitsio's max-width-pad VLA read returns).
     """
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
     import warnings
 
     with tempfile.TemporaryDirectory() as td:

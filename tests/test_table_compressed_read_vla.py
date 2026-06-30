@@ -24,6 +24,8 @@ import pytest
 
 import rustfits
 
+fitsio = pytest.importorskip("fitsio")
+
 
 pytestmark = pytest.mark.skipif(
     shutil.which("fpack") is None,
@@ -33,8 +35,6 @@ pytestmark = pytest.mark.skipif(
 
 def _fpack(td, data, *, ztilelen=None):
     """Write `data` to BINTABLE via fitsio, fpack -table, return (src, fz)."""
-    import fitsio
-
     src = os.path.join(td, "src.fits")
     with fitsio.FITS(src, "rw", clobber=True) as f:
         f.write(data)

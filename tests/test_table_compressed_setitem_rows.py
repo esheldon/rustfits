@@ -546,7 +546,7 @@ def test_setitem_subarray_column_round_trip():
     reason="funpack (cfitsio CLI) required for cross-tool verification",
 )
 def test_funpack_decompresses_setitem_modified_file():
-    import fitsio
+    fitsio = pytest.importorskip("fitsio")
 
     with tempfile.TemporaryDirectory() as td:
         fname = os.path.join(td, "t.fits")
