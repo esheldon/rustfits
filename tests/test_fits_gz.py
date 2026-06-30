@@ -15,6 +15,7 @@ valid gzip with the expected decompressed bytes.
 import gc
 import gzip
 import os
+import sys
 import tempfile
 import numpy as np
 import pytest
@@ -23,6 +24,17 @@ import rustfits
 _skip_as_root = pytest.mark.skipif(
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="permission bits do not block writes when running as root",
+)
+
+# These tests inject a write failure via POSIX chmod (remove write
+# permission on a dir / file).  Windows does not enforce those bits the
+# same way — chmod(0o500) on a directory still allows file creation — so
+# the failure can't be provoked this way.  Skip on Windows; the
+# atomic-write / open-error code paths themselves are still covered on
+# Linux + macOS.
+_skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX chmod permission enforcement is unavailable on Windows",
 )
 
 
@@ -465,6 +477,7 @@ def test_gz_writeback_leaves_no_temp_litter():
 
 
 @_skip_as_root
+@_skip_on_windows
 def test_gz_writeback_failure_preserves_original():
     """
     If the recompress-on-close fails (here: the directory is made
@@ -526,6 +539,7 @@ def test_gz_wplus_file_exists_after_open():
 
 
 @_skip_as_root
+@_skip_on_windows
 def test_gz_wplus_unwritable_dir_raises_at_open():
     """
     #5: w+ on a .gz in a read-only directory raises at construction
@@ -544,6 +558,7 @@ def test_gz_wplus_unwritable_dir_raises_at_open():
 
 
 @_skip_as_root
+@_skip_on_windows
 def test_gz_rplus_readonly_file_raises_at_open():
     """
     #5: r+ on a read-only .gz file raises at open (matches plain r+),

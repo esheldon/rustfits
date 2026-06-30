@@ -2747,18 +2747,44 @@ test to abort with the conda binary was
 `tests/test_image_compressed_accessors.py`'s
 `test_other_compression_types_dispatched`.
 
-## CI: Windows testing (not yet wired — needs no-fitsio restructuring)
+## CI: Windows testing (wired 2026-06-29 — `test-windows` job)
 
 The `wheels` workflow builds + releases a **Windows x64
-wheel**, but `ci.yml` has **no Windows test leg** — so the
-shipped Windows wheel has zero runtime coverage.  The
+wheel**.  Until 2026-06-29 `ci.yml` had **no Windows test leg**
+— the shipped wheel had zero runtime coverage.  It now has a
+`test-windows` job (windows-latest, py3.12).  The
 aarch64-linux leg (added alongside its wheel) closed the
-analogous gap on arm Linux; Windows is the remaining
+analogous gap on arm Linux; Windows was the remaining
 "ship-but-don't-test" target and the higher-risk one, because
 it has genuinely platform-specific FS surface the Rust code
 touches: file locking via `lock_file`, the atomic
 temp-file-and-rename in the `.gz` write-back (`gzip_write_back`
 in `fits.rs`), `shift_file_tail_*`, and path handling.
+
+**The job (`test-windows` in `ci.yml`).**  Separate job, not a
+matrix entry, because the steps diverge from the shared `test`
+job: (1) `ilammy/setup-nasm@v1` (ring's rustls asm needs nasm
+on windows-msvc — same action the wheels `windows` job uses);
+(2) deps installed from `conda-requirements.txt` + a
+`grep -vi '^fitsio' conda-test-requirements.txt` filtered list
+(conda-forge has no win-64 fitsio; filtering the file keeps the
+dep set in sync automatically rather than hardcoding it); (3)
+no macOS fitsio source-build step.  Otherwise the same
+micromamba + `maturin develop` + `pytest` shape (the Rust side
+already compiles on Windows — the wheels job proves it).
+
+**First-run caveat.**  This leg was authored without a local
+windows-msvc box to validate against; the no-fitsio behavior
+was verified by simulation on Linux (`sys.modules['fitsio'] =
+None` + `shutil.which('fpack'/'funpack') -> None` → 0 failed).
+Genuinely platform-specific behavior (the aioftp FTP-server
+test's asyncio event loop on Windows, file-locking semantics)
+can only be confirmed by a real run — the first Windows CI run
+is expected to possibly surface a few more platform skips to
+add.  The known POSIX-only tests are already guarded: the three
+chmod-based failure-injection tests in `test_fits_gz.py` carry
+`@_skip_on_windows` (`sys.platform == "win32"`) because Windows
+doesn't enforce `chmod(0o500)` on a directory.
 
 **Why it's not a one-line matrix add — the blocker:**
 
@@ -2817,25 +2843,32 @@ in `fits.rs`), `shift_file_tail_*`, and path handling.
   simulation): **0 failed, 0 errored** — the pure-rustfits tests
   pass, the cross-tool tests skip with correct reasons.
 
-**To wire the Windows leg when this is picked up:**
+**What shipped — the "full suite, fitsio-free" approach.**  The
+guards above make the suite green on a no-fitsio platform, so the
+`test-windows` job runs the FULL `pytest` (not a smoke script).
+The fitsio cross-checks skip individually via the per-test /
+module-level `importorskip` (NOT whole-file via a
+`collect_ignore` list, which would drop e.g. the gz atomic-rename
+coverage in `test_fits_gz.py` just because two tests in it touch
+fitsio).  What runs is the Windows-critical FS surface.
 
-1. **CI mechanics (the guards are done).**  The per-test /
-   module-level `importorskip` guards above already make the
-   suite green on a no-fitsio platform; what's left is the CI
-   wiring.  Install the test deps minus fitsio on Windows (a
-   Windows-specific deps step, since the requirements file lists
-   fitsio), and add `nasm` (ring's asm needs it on the
-   windows-msvc target — see the wheels `windows` job, which
-   already does `ilammy/setup-nasm@v1`).  The guards keep the
-   rustfits-only tests running, including the Windows-critical FS
-   paths above, while the fitsio cross-checks skip individually
-   (NOT whole-file via a `collect_ignore` list, which would drop
-   e.g. the gz atomic-rename coverage in `test_fits_gz.py` just
-   because two tests in it touch fitsio).
-2. **Build + smoke only.**  `maturin develop` (proves nasm +
-   ring + pyo3 link on Windows) + a small inline write/read
-   smoke script, no pytest.  Low effort, but doesn't exercise
-   the FS paths that are the actual Windows risk.
+The rejected alternative was **build + smoke only** (`maturin
+develop` + a tiny inline write/read script, no pytest) — lower
+effort but it doesn't exercise the FS paths that are the actual
+Windows risk, so it wasn't worth shipping.
+
+**If the first Windows run is red**, triage by category:
+- A POSIX-semantics test that can't hold on Windows (more chmod /
+  permission / locking injection) → add `@_skip_on_windows` with
+  a reason, the way the three `test_fits_gz.py` chmod tests are
+  marked.
+- aioftp (`test_fits_ftp.py`) failing on the Windows asyncio
+  event loop → either set a SelectorEventLoop policy in that
+  test's server thread or `importorskip`/skip the FTP-server
+  tests on Windows.
+- A real rustfits bug on Windows (locking, path handling, the
+  `.gz` temp+rename) → that's the leg doing its job; fix the Rust
+  side.
 
 Either way, the fitsio (and any fitsio/cfitsio cross-check)
 tests can't run on Windows, so Windows coverage is

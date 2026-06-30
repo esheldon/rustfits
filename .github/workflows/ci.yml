@@ -139,6 +139,67 @@ jobs:
         shell: bash -el {0}
         run: pytest
 
+  # ----- Windows test leg -------------------------------------------
+  # Windows ships a wheel (see the wheels workflow) but had no runtime
+  # coverage.  Kept a separate job rather than a matrix entry because
+  # the steps genuinely diverge: conda-forge has no win-64 fitsio, and
+  # ring (rustls TLS, via ureq/suppaftp) needs nasm on windows-msvc.
+  #
+  # The suite is guarded so every fitsio / fpack cross-tool test skips
+  # cleanly without fitsio (module-level or per-test importorskip).
+  # What RUNS is the rustfits-vs-rustfits + astropy cross-check
+  # coverage — which is the whole point here: the platform-specific FS
+  # surface (file locking, the .gz atomic temp+rename, shift_file_tail,
+  # path handling), not cross-tool byte agreement (arch/OS-independent,
+  # already covered on Linux + macOS).  A handful of POSIX-chmod
+  # failure-injection tests skip on Windows (marked _skip_on_windows).
+  test-windows:
+    name: Test (windows-latest, py3.12)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ring builds assembly with nasm on the windows-msvc target; the
+      # wheels `windows` job uses the same action.
+      - name: Set up nasm (ring asm on windows-msvc)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Set up conda env (python 3.12)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: rustfits-test-win
+          create-args: >-
+            python=3.12
+            python-gil
+          cache-environment: true
+          init-shell: bash
+
+      # conda-forge has no win-64 fitsio build, so install the test deps
+      # with fitsio filtered out.  Filtering the requirements file keeps
+      # this in sync with conda-test-requirements.txt automatically
+      # (no hardcoded package list to drift).
+      - name: Install conda deps (no fitsio on win-64)
+        shell: bash -el {0}
+        run: |
+          grep -vi '^fitsio' conda-test-requirements.txt > win-test-reqs.txt
+          micromamba install -y -c conda-forge \
+            --file conda-requirements.txt \
+            --file win-test-reqs.txt
+
+      - name: maturin develop
+        shell: bash -el {0}
+        run: maturin develop
+
+      - name: pytest
+        shell: bash -el {0}
+        run: pytest
+
   # ----- Sphinx docs build -----------------------------------------
   # Mirrors what readthedocs.io does on every push: install rustfits
   # (autodoc imports the module), install docs/requirements.txt, run
