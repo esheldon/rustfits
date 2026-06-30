@@ -1,35 +1,22 @@
 import os
+import shutil
 import tempfile
-import numpy as np
 import rustfits
 from pprint import pprint
 
+# Canonical fixtures committed under tests/data/ (cfitsio-produced
+# reference bytes).  See the note in test_fits_open.py / the docstring
+# in tests/data/regenerate.py for why these are frozen files rather
+# than fitsio-written at runtime.
+_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
 
 def _write_test_file_two_images(fname):
-    import fitsio
-
-    with fitsio.FITS(fname, 'rw', clobber=True) as fits:
-        data1 = np.arange(5 * 20, dtype='i4').reshape(5, 20)
-        fits.write(data1, extname='image1')
-
-        data2 = np.arange(3 * 15, dtype='f8').reshape(3, 15)
-        fits.write(data2, extname='image2')
+    shutil.copy(os.path.join(_DATA, 'two_images.fits'), fname)
 
 
 def _write_test_file_two_images_and_table(fname):
-    import fitsio
-
-    with fitsio.FITS(fname, 'rw', clobber=True) as fits:
-        data1 = np.arange(5 * 20, dtype='i4').reshape(5, 20)
-        fits.write(data1, extname='image1')
-
-        data2 = np.arange(3 * 15, dtype='f8').reshape(3, 15)
-        fits.write(data2, extname='image2')
-
-        tab1 = np.zeros(3, dtype=[('index', 'i4'), ('x', 'f4')])
-        tab1['index'] = np.arange(tab1.size)
-        tab1['x'] = [8, -2.25, 5.51]
-        fits.write(tab1, extname='table1')
+    shutil.copy(os.path.join(_DATA, 'two_images_table.fits'), fname)
 
 
 def test_fits_open_two_images():

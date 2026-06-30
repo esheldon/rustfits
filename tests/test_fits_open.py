@@ -1,16 +1,19 @@
 import os
+import shutil
 import tempfile
-import numpy as np
 import rustfits
 from pprint import pprint
 
+# Canonical fixtures committed under tests/data/ (cfitsio-produced
+# reference bytes).  Copying a frozen file instead of writing one via
+# fitsio keeps these open/parse tests free of any FITS-writer
+# dependency at runtime, so they run on platforms with no fitsio build.
+# Regenerate with tests/data/regenerate.py.
+_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
 
 def _write_test_file_one_image(fname):
-    import fitsio
-
-    with fitsio.FITS(fname, 'rw', clobber=True) as fits:
-        data = np.arange(5 * 20, dtype='i4').reshape(5, 20)
-        fits.write(data, extname='image1')
+    shutil.copy(os.path.join(_DATA, 'one_image.fits'), fname)
 
 
 def test_fits_open_single_image():

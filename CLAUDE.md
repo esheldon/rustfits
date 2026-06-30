@@ -2768,28 +2768,49 @@ in `fits.rs`), `shift_file_tail_*`, and path handling.
   So `micromamba install --file conda-test-requirements.txt`
   won't solve on Windows, and the macOS-style `pip ...
   --no-binary=fitsio` source build won't work there either.
-- **~22 test files do a plain `import fitsio`** (not
-  `pytest.importorskip`), so without fitsio they error at
-  *collection* — a Windows leg would go red from setup noise,
-  masking real signal.  (Another ~20 files already use
-  `importorskip("fitsio")`, so the suite is inconsistent here.)
+- The test suite uses `fitsio` for two distinct purposes, and
+  only one of them is a real Windows blocker:
+  - **fixture-writer (incidental).**  A handful of pure-rustfits
+    open/parse tests used fitsio only to *build* the input file.
+    These don't need a FITS writer at runtime — the inputs are
+    now committed under `tests/data/` (cfitsio-produced reference
+    bytes, frozen; regenerate via `tests/data/regenerate.py`) and
+    read with `shutil.copy`.  Done for `test_fits_open.py` +
+    `test_fits_open_multi.py` (2026-06-29); these run on a
+    no-fitsio platform unchanged.  Any future "fitsio is just the
+    fixture-writer" case should follow the same pattern, not a
+    skip.
+  - **cross-tool agreement (genuine).**  Tests that assert
+    byte-for-byte agreement with fitsio (and the ZTABLE suite,
+    which also shells out to `fpack`/`funpack`) genuinely need
+    fitsio + cfitsio CLIs at runtime.  These can't run on Windows
+    and must skip there.
 
-**Two ways to do it when this is picked up:**
+  State of the guards (as of 2026-06-29): **zero** hard
+  module-level `import fitsio` remain.  ~20 files use a
+  module-level `fitsio = pytest.importorskip("fitsio")`; ~4 use a
+  `_have_fitsio()` try/except + `@skipif`.  Both skip cleanly when
+  fitsio is absent.  The remaining gap is a handful of *unguarded
+  function-local* `import fitsio` calls inside individual
+  cross-tool tests (e.g. `test_fits_gz.py`, `test_fits_mem.py`)
+  that would error (red), not skip — those need a per-test
+  `importorskip`/skip guard before a Windows leg is green.
 
-1. **Full suite, fitsio-free (recommended).**  Convert the ~22
-   hard `import fitsio` to `fitsio = pytest.importorskip(
-   "fitsio")` — a genuine consistency fix matching the other
-   ~20 files — install the test deps minus fitsio on Windows
-   (a Windows-specific deps step, since the requirements file
-   lists fitsio), and add `nasm` (ring's asm needs it on the
-   windows-msvc target — see the wheels `windows` job, which
-   already does `ilammy/setup-nasm@v1`).  Per-test
-   `importorskip` then keeps the rustfits-only tests running,
-   including the Windows-critical FS paths above, while the
-   fitsio cross-checks skip individually (NOT whole-file —
-   that's the point of per-test skip over a `collect_ignore`
-   list, which would drop e.g. the gz atomic-rename coverage
-   in `test_fits_gz.py` just because it imports fitsio at top).
+**To wire the Windows leg when this is picked up:**
+
+1. **Finish the per-test guards (recommended).**  Add a per-test
+   `importorskip("fitsio")` (or move the call up to module level
+   where the whole file is cross-tool) to the unguarded
+   function-local cases above.  Install the test deps minus
+   fitsio on Windows (a Windows-specific deps step, since the
+   requirements file lists fitsio), and add `nasm` (ring's asm
+   needs it on the windows-msvc target — see the wheels `windows`
+   job, which already does `ilammy/setup-nasm@v1`).  Per-test
+   skip keeps the rustfits-only tests running, including the
+   Windows-critical FS paths above, while the fitsio cross-checks
+   skip individually (NOT whole-file via a `collect_ignore` list,
+   which would drop e.g. the gz atomic-rename coverage in
+   `test_fits_gz.py` just because two tests in it touch fitsio).
 2. **Build + smoke only.**  `maturin develop` (proves nasm +
    ring + pyo3 link on Windows) + a small inline write/read
    smoke script, no pytest.  Low effort, but doesn't exercise
