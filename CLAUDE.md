@@ -2779,12 +2779,30 @@ was verified by simulation on Linux (`sys.modules['fitsio'] =
 None` + `shutil.which('fpack'/'funpack') -> None` → 0 failed).
 Genuinely platform-specific behavior (the aioftp FTP-server
 test's asyncio event loop on Windows, file-locking semantics)
-can only be confirmed by a real run — the first Windows CI run
-is expected to possibly surface a few more platform skips to
-add.  The known POSIX-only tests are already guarded: the three
-chmod-based failure-injection tests in `test_fits_gz.py` carry
+can only be confirmed by a real run.  The known POSIX-only
+tests are already guarded: the three chmod-based
+failure-injection tests in `test_fits_gz.py` carry
 `@_skip_on_windows` (`sys.platform == "win32"`) because Windows
 doesn't enforce `chmod(0o500)` on a directory.
+
+**First real run (2026-06-30): 8 failures, all one root cause —
+astropy memmap, NOT rustfits.**  Result was 8 failed / 2139
+passed / 57 skipped.  Every rustfits FS path (file locking, the
+`.gz` atomic temp+rename, `shift_file_tail`, mem/disk round-trip)
+PASSED — rustfits's own Windows behavior is sound; `close()`
+releases the OS handle so a `tempfile.TemporaryDirectory()` is
+removable right after.  The 8 failures were all
+`test_astropy_*` table cross-reads that bind `hdul[1].data` to a
+local: `astropy.io.fits.open()` memory-maps by default, the bound
+view keeps the OS handle open past the `with` block, and Windows
+can't delete a still-open file, so the temp-dir cleanup raised
+`PermissionError: [WinError 32]`.  (Unix unlinks open files, so
+it's invisible there.)  Fixed centrally in `tests/conftest.py`:
+on `win32` it sets `astropy.io.fits.conf.use_memmap = False`
+(loads data into RAM, identical values/dtypes, handle released on
+close).  One place, Windows-only, covers current + future astropy
+cross-reads.  Verified the 8 pass on Linux with memmap forced off
+(values unchanged).
 
 **Why it's not a one-line matrix add — the blocker:**
 
