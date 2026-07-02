@@ -1,6 +1,7 @@
 """
 Tests for FITSHeader mutation basics:
     - __setitem__ (bare value and (value, comment) tuple)
+    - set_comment (value-preserving comment set/clear)
     - __delitem__
     - update() from dict, mapping, FITSHeader source
     - Position semantics (existing key in place, new key before END)
@@ -176,6 +177,131 @@ def test_set_with_malformed_tuple_raises():
         with rustfits.FITS(fname, "r+") as fits:
             with pytest.raises(ValueError):
                 fits[0].header["EXPTIME"] = (5.0, "extra", "elements")
+
+
+# ------------------------------ set_comment --------------------------------
+
+
+def test_set_comment_preserves_value():
+    """set_comment adds a comment without changing the value."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["EXPTIME"] = 5.0
+            h.set_comment("EXPTIME", "exposure time in seconds")
+            # same-handle
+            assert h["EXPTIME"] == 5.0
+            assert h.comment_of("EXPTIME") == "exposure time in seconds"
+        with rustfits.FITS(fname, "r") as fits:  # post-reopen
+            h = fits[0].header
+            assert h["EXPTIME"] == 5.0
+            assert h.comment_of("EXPTIME") == "exposure time in seconds"
+
+
+def test_set_comment_overwrites_existing_comment():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["EXPTIME"] = (5.0, "first")
+            h.set_comment("EXPTIME", "second")
+            assert h.comment_of("EXPTIME") == "second"
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].header.comment_of("EXPTIME") == "second"
+
+
+def test_set_comment_empty_clears():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["EXPTIME"] = (5.0, "exposure (s)")
+            h.set_comment("EXPTIME", "")
+            assert h["EXPTIME"] == 5.0
+            assert h.comment_of("EXPTIME") == ""
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].header.comment_of("EXPTIME") == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [42, -7, 3.5, True, "M31 field"],
+)
+def test_set_comment_various_value_types_preserved(value):
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["OBJECT"] = value
+            h.set_comment("OBJECT", "annotated")
+        with rustfits.FITS(fname, "r") as fits:
+            h = fits[0].header
+            assert h["OBJECT"] == value
+            assert h.comment_of("OBJECT") == "annotated"
+
+
+def test_set_comment_preserves_continue_chain_value():
+    """A long (CONTINUE-chained) string value survives set_comment."""
+    long_val = "x" * 150
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["LONGKEY"] = long_val
+            h.set_comment("LONGKEY", "chained")
+        with rustfits.FITS(fname, "r") as fits:
+            h = fits[0].header
+            assert h["LONGKEY"] == long_val
+            assert h.comment_of("LONGKEY") == "chained"
+
+
+def test_set_comment_preserves_position():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["OBJECT"] = "M31"
+            keys_before = list(h)
+            h.set_comment("OBJECT", "target field")
+            assert list(h) == keys_before
+
+
+def test_set_comment_case_insensitive_key():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            h = fits[0].header
+            h["OBJECT"] = "M31"
+            h.set_comment("object", "lowercase lookup")
+            assert h.comment_of("OBJECT") == "lowercase lookup"
+
+
+def test_set_comment_missing_key_raises_keyerror():
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(KeyError):
+                fits[0].header.set_comment("NOPE", "x")
+
+
+@pytest.mark.parametrize("key", ["COMMENT", "HISTORY", ""])
+def test_set_comment_commentary_key_raises(key):
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(ValueError):
+                fits[0].header.set_comment(key, "x")
+
+
+@pytest.mark.parametrize("key", ["BITPIX", "NAXIS", "SIMPLE"])
+def test_set_comment_protected_key_raises(key):
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            with pytest.raises(ValueError):
+                fits[0].header.set_comment(key, "x")
+
+
+def test_set_comment_in_edit_context():
+    """set_comment works inside a batched edit() context."""
+    with _new_file() as fname:
+        with rustfits.FITS(fname, "r+") as fits:
+            fits[0].header["EXPTIME"] = 5.0
+            with fits[0].header.edit() as h:
+                h.set_comment("EXPTIME", "batched comment")
+        with rustfits.FITS(fname, "r") as fits:
+            assert fits[0].header.comment_of("EXPTIME") == "batched comment"
 
 
 # --------------------------- Position semantics ----------------------------

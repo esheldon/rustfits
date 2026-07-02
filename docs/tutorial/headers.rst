@@ -59,8 +59,46 @@ Open the file in ``"r+"`` (read-write) and assign directly:
        fits[1].header.add_history("Calibrated 2026-05-27")
        del fits[1].header["unwanted"]
 
-Pass a ``(value, comment)`` tuple to attach a comment when
-setting the value.
+Comments on cards
+-----------------
+
+Every FITS card has an optional ``/ comment`` field after the
+value.  There are three ways to work with it:
+
+* **Value and comment together** — assign a ``(value, comment)``
+  tuple:
+
+  .. code-block:: python
+
+     hdr["exptime"] = (60.0, "exposure in seconds")
+
+  The tuple form also works through :meth:`~rustfits.FITSHeader.update`
+  and the ``header=`` keyword at HDU creation
+  (e.g. ``f.write_image(data, header={"EXPTIME": (60.0, "seconds")})``).
+
+* **Comment only** — use
+  :meth:`~rustfits.FITSHeader.set_comment` to annotate an
+  existing keyword without restating its value:
+
+  .. code-block:: python
+
+     hdr.set_comment("exptime", "exposure in seconds")
+     hdr.set_comment("exptime", "")   # pass "" to clear it
+
+  ``set_comment`` raises ``KeyError`` if the keyword is absent
+  and ``ValueError`` for commentary keys (``comment`` /
+  ``history`` / blank) or protected structural keywords.
+
+* **Reading it back** — :meth:`~rustfits.FITSHeader.comment_of`
+  returns the comment string (empty when there is none):
+
+  .. code-block:: python
+
+     hdr.comment_of("exptime")   # -> "exposure in seconds"
+
+Assigning a **bare** value to a key that already carries a
+comment leaves that comment intact — only ``set_comment`` (or a
+``(value, comment)`` tuple with an empty string) clears it.
 
 Mutations follow disk-write-before-commit ordering: the new
 cards are serialized to disk first, and only on success is the
@@ -90,9 +128,9 @@ single rewrite — both faster and atomic across the whole batch:
        # ↑ one disk write here, on `__exit__`.
 
 The edit object exposes the same ``__setitem__`` /
-``__delitem__`` / ``update`` / ``add_comment`` surface as
-:class:`~rustfits.FITSHeader`; the difference is that mutations
-queue rather than committing one card at a time.
+``__delitem__`` / ``set_comment`` / ``update`` / ``add_comment``
+surface as :class:`~rustfits.FITSHeader`; the difference is that
+mutations queue rather than committing one card at a time.
 
 ``update()`` and copy patterns
 ------------------------------
