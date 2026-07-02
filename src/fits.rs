@@ -2191,13 +2191,11 @@ impl FITS {
 
     /// Create a new image HDU and append it to the file.
     ///
-    /// Allocates the data section as zeros via sparse-file extension
-    /// — call :meth:`ImageHDU.write` (or use the returned HDU as
-    /// ``fits[-1]``) to actually write pixel data.
+    /// Allocates the data section as all zeros.  Call write()
+    /// on the newly created HDU to actually write the pixel data.
     ///
-    /// The first HDU created becomes the primary HDU (``SIMPLE=T``,
-    /// ``EXTEND=T``); subsequent calls produce ``XTENSION='IMAGE'``
-    /// extensions.
+    /// The first HDU created becomes the primary HDU.
+    /// subsequent calls produce extensions.
     ///
     /// Parameters
     /// ----------
@@ -2224,12 +2222,12 @@ impl FITS {
     ///     requires every axis ``>= 4``, so the empty-axis-0 form
     ///     is unavailable under ``compress=Hcompress1(...)``.)
     /// extname : str, optional
-    ///     ``EXTNAME`` to assign.  Defaults to no EXTNAME card.
+    ///     name to assign to this HDU.
     /// extver : int, optional
-    ///     ``EXTVER`` to assign.  Defaults to no EXTVER card.
+    ///     Version to assign to this extension.
     /// compress : Gzip1 / Gzip2 / Rice1 / Hcompress1 / Plio1, optional
-    ///     If set, create a tile-compressed image
-    ///     (``BINTABLE`` + ``ZIMAGE`` on disk, returned in Python
+    ///     If set, create a tile-compressed image.
+    ///     Returned in Python
     ///     as a :class:`CompressedImageHDU`) instead of a plain
     ///     ``IMAGE`` extension.  All five algorithms are
     ///     supported for integer dtypes; only GZIP_1 / GZIP_2
@@ -2401,16 +2399,10 @@ impl FITS {
         self.finalize_hdu(py, &cards, offsets, HduKind::Image)
     }
 
-    /// Create a new BINTABLE extension HDU and append it to the file.
+    /// Create a new binary table extension append it to the file.
     ///
-    /// Allocates the data section as zeros — call
-    /// :meth:`TableHDU.write` (or use the returned HDU as
-    /// ``fits[-1]``) to actually write row data.
-    ///
-    /// If the file has no HDUs yet, an empty primary image
-    /// (``SIMPLE=T``, ``NAXIS=0``) is written first so the
-    /// BINTABLE can land as an extension — the FITS standard
-    /// forbids BINTABLE as the primary HDU.
+    /// Allocates the data section as all zeros.  Call write()
+    /// on the newly created HDU to actually write the pixel data.
     ///
     /// Parameters
     /// ----------
@@ -2426,9 +2418,9 @@ impl FITS {
     ///     this exactly, while :meth:`TableHDU.append` adds
     ///     rows beyond it.
     /// extname : str, optional
-    ///     ``EXTNAME`` to assign.
+    ///     name to assign to this HDU.
     /// extver : int, optional
-    ///     ``EXTVER`` to assign.
+    ///     Version to assign to this extension.
     /// units : dict, optional
     ///     ``{column_name: unit_string}`` to populate ``TUNITn``
     ///     cards.  Unspecified columns get no TUNIT.
@@ -2454,8 +2446,8 @@ impl FITS {
     ///     :class:`CompressedTableHDU` in Python) instead of a
     ///     plain BINTABLE.  Accepts:
     ///
-    ///     * ``True`` — compress every column with cfitsio's
-    ///       per-dtype defaults.
+    ///     * ``True`` — compress every column with 
+    ///       per-dtype defaults.  These defaults match cfitsio.
     ///     * a string alias (``'GZIP_1'`` / ``'GZIP_2'`` /
     ///       ``'RICE_1'``) or config-class instance
     ///       (``Gzip1()`` / ``Gzip2()`` / ``Rice1()``) — apply
