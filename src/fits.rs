@@ -2190,12 +2190,10 @@ impl FITS {
     }
 
     /// Create a new image HDU and append it to the file.
-    ///
-    /// Allocates the data section as all zeros.  Call write()
-    /// on the newly created HDU to actually write the pixel data.
-    ///
-    /// The first HDU created becomes the primary HDU.
-    /// subsequent calls produce extensions.
+    //
+    /// Allocates the data section as all zeros.  Call 
+    /// :meth:`ImageHDU.write` on the newly created HDU to actually
+    /// write data.
     ///
     /// Parameters
     /// ----------
@@ -2255,6 +2253,11 @@ impl FITS {
     ///     other algorithm/dtype incompatibilities (see
     ///     :class:`Rice1` / :class:`Hcompress1` / :class:`Plio1`
     ///     for per-algorithm constraints).
+    ///
+    /// Notes
+    /// -----
+    /// The first HDU created becomes the primary HDU.
+    /// subsequent calls produce extensions.
     ///
     /// See Also
     /// --------
@@ -2401,8 +2404,8 @@ impl FITS {
 
     /// Create a new binary table extension append it to the file.
     ///
-    /// Allocates the data section as all zeros.  Call write()
-    /// on the newly created HDU to actually write the pixel data.
+    /// Allocates the data section as all zeros.  Call :meth:`TableHDU.write`
+    /// on the newly created HDU to actually write data.
     ///
     /// Parameters
     /// ----------
@@ -2551,21 +2554,11 @@ impl FITS {
         self.finalize_hdu(py, &table_cards, offsets, HduKind::Table)
     }
 
-    /// Create a new ASCII-table (``XTENSION='TABLE'``) HDU and
-    /// append it to the file.
+    /// Create a new ascii table HDU and append it to the file.
     ///
-    /// Allocates the data section as ASCII spaces — call
-    /// :meth:`AsciiTableHDU.write` (or the returned HDU via
-    /// ``fits[-1]``) to write row data.
-    ///
-    /// ASCII tables are rare in modern FITS files; most data
-    /// pipelines use binary tables (:meth:`create_table_hdu`).
-    /// The ASCII form is provided for compatibility with tools
-    /// that emit it (e.g. legacy pipelines, hand-edited files).
-    ///
-    /// If the file has no HDUs yet, an empty primary image
-    /// (``SIMPLE=T``, ``NAXIS=0``) is written first — ASCII
-    /// tables can't be primary HDUs per the FITS standard.
+    /// Allocates the data section as ASCII spaces.  Call
+    /// :meth:`AsciiTableHDU.write` on the newly created HDU
+    /// to write row data.
     ///
     /// Parameters
     /// ----------
@@ -2722,7 +2715,7 @@ impl FITS {
         Ok(hdu)
     }
 
-    /// Create a BINTABLE HDU from ``data`` and write the rows.
+    /// Create a new binary table HDU from ``data`` and write the rows.
     ///
     /// One-call convenience that combines
     /// :meth:`create_table_hdu` and :meth:`TableHDU.write`.  The
