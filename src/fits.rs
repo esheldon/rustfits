@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::Bound;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -128,6 +128,33 @@ fn calculate_data_size(header_cards: &[String]) -> u64 {
 // FITS pyclass and to_bytes() copies it out regardless (see CLAUDE.md).
 fn is_mem_url(filename: &str) -> bool {
     filename == "mem://" || filename == "memkeep://"
+}
+
+// Coerce the `filename` argument to a Rust `String`.  A `str` is taken
+// verbatim (so URL schemes like `mem://` / `http://` and `.gz` suffixes
+// are preserved byte-for-byte — a str is NOT routed through path
+// normalization); anything else is passed through `os.fspath()`, which
+// accepts `pathlib.Path` and any other `os.PathLike`, matching astropy /
+// fitsio.  Bytes paths (fspath returning `bytes`) are rejected with a
+// clear error rather than lossily decoded.
+fn coerce_filename(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(s);
+    }
+    let fspath = py
+        .import("os")?
+        .call_method1("fspath", (obj,))
+        .map_err(|_| {
+            PyTypeError::new_err(
+                "filename must be a str or os.PathLike (e.g. pathlib.Path)",
+            )
+        })?;
+    fspath.extract::<String>().map_err(|_| {
+        PyTypeError::new_err(
+            "filename os.PathLike must resolve to a str path; \
+             bytes paths are not supported",
+        )
+    })
 }
 
 // True for a whole-file gzip path.  Detection is by the `.gz`
@@ -756,8 +783,11 @@ fn append_header_and_data_to_file(
 ///
 /// Parameters
 /// ----------
-/// filename : str
-///     Path to the FITS file.
+/// filename : str or os.PathLike
+///     Path to the FITS file.  Accepts a plain string or any
+///     ``os.PathLike`` (e.g. :class:`pathlib.Path`).  String
+///     forms also carry the driver URL schemes (``mem://``,
+///     ``http(s)://``, ``ftp(s)://``) and the ``.gz`` suffix.
 /// mode : {'r', 'r+', 'w+'}, optional
 ///     File open mode.
 ///
@@ -1709,10 +1739,13 @@ impl FITS {
     #[pyo3(signature = (filename, mode="r", *, lenient=false))]
     fn new(
         py: Python<'_>,
-        filename: String,
+        filename: &Bound<'_, PyAny>,
         mode: &str,
         lenient: bool,
     ) -> PyResult<Self> {
+        // Accept str or os.PathLike (pathlib.Path); everything downstream
+        // works with the owned String.
+        let filename = coerce_filename(py, filename)?;
         if !matches!(mode, "r" | "r+" | "w+") {
             return Err(PyIOError::new_err(format!(
                 "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",

@@ -34,8 +34,10 @@ def read(filename, ext=None, *, header=False):
 
     Parameters
     ----------
-    filename : str
-        Path to the FITS file (read-only mode is used).
+    filename : str or os.PathLike
+        Path to the FITS file (read-only mode is used).  Accepts
+        a plain string or any ``os.PathLike`` (e.g.
+        ``pathlib.Path``).
     ext : int, str, or None, optional
         HDU selector.  None (default) reads from the first HDU whose
         `has_data` is True — typical for image-bearing files where
@@ -101,8 +103,10 @@ def read_header(filename, ext=0):
 
     Parameters
     ----------
-    filename : str
-        Path to the FITS file (read-only mode is used).
+    filename : str or os.PathLike
+        Path to the FITS file (read-only mode is used).  Accepts
+        a plain string or any ``os.PathLike`` (e.g.
+        ``pathlib.Path``).
     ext : int or str, default 0
         HDU selector.  Default ``0`` reads the primary HDU's
         header, which is where file-level metadata typically
@@ -140,8 +144,9 @@ def write(filename, data, *, mode="w+", extname=None, header=None):
 
     Parameters
     ----------
-    filename : str
-        Path to the FITS file.
+    filename : str or os.PathLike
+        Path to the FITS file.  Accepts a plain string or any
+        ``os.PathLike`` (e.g. ``pathlib.Path``).
     data : numpy.ndarray or dict
         Image: a numpy ndarray with a plain (non-structured) dtype.
         Table: a structured ndarray (``dtype.fields is not None``)
