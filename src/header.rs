@@ -868,6 +868,56 @@ fn apply_setitem(
     Ok(())
 }
 
+// Replace ONLY the comment on an existing card, preserving its value.
+// `key` is the RAW user key; `comment` is the new comment text (pass "" to
+// clear).  Reuses the same rebuild path as `header[key] = (value, comment)`
+// so CONTINUE-chained strings, HIERARCH keys, and comment-overflow
+// validation all behave identically.  Operates on the working card list;
+// the caller handles disk-write-before-commit.
+//
+// Errors: KeyError when `key` is absent; ValueError for commentary keys
+// (COMMENT/HISTORY/blank — those cards ARE their text), protected keys
+// (rustfits may rewrite the card), or an undefined (valueless) card (there
+// is no value to preserve).
+fn apply_set_comment(
+    py: Python<'_>,
+    cards: &mut Vec<String>,
+    key: &str,
+    comment: &str,
+) -> PyResult<()> {
+    let lookup = normalize_keyword(key);
+    if matches!(lookup.as_str(), "COMMENT" | "HISTORY" | "") {
+        return Err(PyValueError::new_err(
+            "set_comment() is not defined for commentary keys \
+             (COMMENT/HISTORY/blank); those cards ARE their text",
+        ));
+    }
+    if is_protected_key(&lookup) {
+        return Err(PyValueError::new_err(format!(
+            "'{}' is a protected keyword managed by rustfits (file structure, \
+             integrity, or compression layout); its comment cannot be set \
+             because rustfits may rewrite the card",
+            lookup
+        )));
+    }
+    let (idx, value_part) = find_card_for_key(cards, &lookup).ok_or_else(|| {
+        pyo3::exceptions::PyKeyError::new_err(format!("'{}' not in header", lookup))
+    })?;
+    let (value, _old_comment) =
+        parse_value_with_continue(py, cards, idx, &value_part)?;
+    if value.is_none(py) {
+        return Err(PyValueError::new_err(format!(
+            "'{}' has an undefined (valueless) card; set_comment() has no value \
+             to preserve — assign a value first with header[key] = (value, comment)",
+            lookup
+        )));
+    }
+    // Same path as `header[key] = (value, comment)`: the existing card's
+    // storage spelling and position are preserved, only value+comment are
+    // rebuilt (value is unchanged, comment is the new one).
+    apply_setitem(cards, key, value.bind(py), Some(comment.to_string()))
+}
+
 // If an existing card matches the lookup form, return its on-disk keyword
 // spelling (canonicalized via storage_keyword to collapse stray whitespace).
 // Returns None when no card matches — in that case apply_setitem falls back
@@ -1366,6 +1416,15 @@ fn build_string_value_cards(key: &str, value: &str, comment: &str) -> PyResult<V
 /// comments come from :meth:`comment_of`.  ``header.to_dict()``
 /// returns the legacy shape for serialization or tests.
 ///
+/// **Comments.**  To write a value *and* a card comment in one
+/// assignment, give a ``(value, comment)`` tuple:
+/// ``header["EXPTIME"] = (30.0, "exposure time in seconds")``.
+/// The tuple form also works through :meth:`update` and the
+/// ``header=`` kwarg at HDU creation.  To change only the
+/// comment of an existing card without restating its value, use
+/// :meth:`set_comment`.  Assigning a bare value to a key that
+/// already has a comment leaves that comment intact.
+///
 /// **Writing:** every mutation follows disk-write-before-commit:
 /// the file is updated first, and only on success is the
 /// in-memory card list replaced.  Pre-I/O errors (e.g. a header
@@ -1403,7 +1462,9 @@ fn build_string_value_cards(key: &str, value: &str, comment: &str) -> PyResult<V
 /// Single mutation::
 ///
 ///     header["EXPTIME"] = 30.0
-///     header["COMMENT"] = "calibration frame"  # via add_comment
+///     header["FILTER"] = ("g", "SDSS g band")   # value + comment
+///     header.set_comment("EXPTIME", "seconds")  # comment only
+///     header.add_comment("calibration frame")   # a COMMENT card
 ///     del header["JUNK"]
 ///
 /// Batched mutation::
@@ -1652,6 +1713,59 @@ impl FITSHeader {
                 format!("'{}' not in header", key)
             )),
         }
+    }
+
+    /// Set (or clear) the comment on an existing header card,
+    /// leaving its value unchanged.
+    ///
+    /// FITS cards have an optional ``/ comment`` field after the
+    /// value.  This is the value-preserving counterpart to the
+    /// ``header[key] = (value, comment)`` tuple form: use it when
+    /// you want to annotate a keyword without restating its
+    /// value.  Read the comment back with :meth:`comment_of`.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : str
+    ///     Keyword name.  Case-insensitive.  Must already exist
+    ///     in the header.
+    /// comment : str
+    ///     New comment text.  Pass ``""`` to clear the comment.
+    ///     A comment too long to fit on the card (alongside the
+    ///     preserved value) raises rather than truncating.
+    ///
+    /// Raises
+    /// ------
+    /// KeyError
+    ///     ``key`` is absent from the header.
+    /// ValueError
+    ///     ``key`` is a commentary keyword (``COMMENT`` /
+    ///     ``HISTORY`` / blank), a protected structural /
+    ///     integrity / compression keyword, or a card with an
+    ///     undefined (valueless) value.
+    ///
+    /// Examples
+    /// --------
+    /// ::
+    ///
+    ///     header["EXPTIME"] = 30.0
+    ///     header.set_comment("EXPTIME", "exposure time in seconds")
+    ///     header.comment_of("EXPTIME")  # -> "exposure time in seconds"
+    ///     header.set_comment("EXPTIME", "")  # clear it
+    fn set_comment(&self, py: Python<'_>, key: &str, comment: &str) -> PyResult<()> {
+        check_not_tainted(&self.tainted)?;
+        let guard = self.cards_write_lock()?;
+        let mut new_cards = guard.clone_cards();
+        apply_set_comment(py, &mut new_cards, key, comment)?;
+        rewrite_header_to_disk(
+            &self.file,
+            &self.offsets,
+            &self.layout,
+            &new_cards,
+            &self.tainted,
+        )?;
+        guard.commit(new_cards);
+        Ok(())
     }
 
     /// The raw 80-character header card strings.
@@ -1934,8 +2048,9 @@ impl FITSHeader {
 /// I/O for the whole batch.
 ///
 /// The mutation surface (``__setitem__`` / ``__delitem__`` /
-/// :meth:`add_comment` / :meth:`add_history` / :meth:`add_blank`
-/// / :meth:`update`) mirrors :class:`FITSHeader`'s exactly.
+/// :meth:`set_comment` / :meth:`add_comment` / :meth:`add_history`
+/// / :meth:`add_blank` / :meth:`update`) mirrors
+/// :class:`FITSHeader`'s exactly.
 /// Read accessors (``__getitem__`` / ``__contains__`` /
 /// ``__repr__``) reflect the in-progress staged state, not the
 /// on-disk header.
@@ -2097,6 +2212,15 @@ impl FITSHeaderEdit {
         validate_commentary_text(text)?;
         append_commentary_to_cards(&mut self.cards, "", text);
         Ok(())
+    }
+
+    /// Set (or clear) the comment on an existing staged card,
+    /// leaving its value unchanged.  See
+    /// :meth:`FITSHeader.set_comment`; the change is held in the
+    /// staged card list and written to disk at ``__exit__``.
+    fn set_comment(&mut self, py: Python<'_>, key: &str, comment: &str) -> PyResult<()> {
+        self.ensure_active()?;
+        apply_set_comment(py, &mut self.cards, key, comment)
     }
 
     /// Bulk-copy entries from another header or a dict into
