@@ -2657,24 +2657,39 @@ the file's *content* doesn't matter, just its size and tile count.
 
 ### CI
 
-`.github/workflows/ci.yml` runs five jobs:
+`.github/workflows/ci.yml` runs six jobs:
 1. `lint` — `ruff format --check` + `ruff check`.
 2. `rust-test` — installs Python via `setup-python` (needed
    so the wrapper can resolve libpython) and runs
-   `tools/cargo-test.sh`.
+   `tools/cargo-test.sh`.  Also runs `cargo metadata --locked`
+   first (sub-second, no compile) — fails the PR if Cargo.lock
+   is out of sync with Cargo.toml, the "version bump committed
+   only Cargo.toml" drift that otherwise surfaces only in a
+   downstream `--locked` build.
 3. `test` matrix — {ubuntu-latest, macos-latest} × {py3.12,
    py3.14}, plus two single-version `include` legs: `macos-13`
    (Intel x86_64) and `ubuntu-24.04-arm` (native aarch64),
    both × py3.12.  Full conda env from the requirements files
    + `maturin develop` + `pytest`.  macOS legs additionally
    source-build fitsio via pip — see "CI: macOS fitsio
-   workaround" below.  **Windows ships a wheel but is NOT
-   tested** — see "CI: Windows testing" below for the blocker.
-4. `docs` — Sphinx `-W` build (autodoc imports rustfits; a new
+   workaround" below.
+4. `test-windows` — windows-latest, py3.12, full pytest with
+   fitsio-dependent tests skipping individually — see "CI:
+   Windows testing" below.
+5. `docs` — Sphinx `-W` build (autodoc imports rustfits; a new
    warning is a hard failure — catches broken cross-refs / rst
    errors before they reach readthedocs).
-5. `coverage` — single ubuntu/py3.12 leg, uploads Python +
+6. `coverage` — single ubuntu/py3.12 leg, uploads Python +
    Rust coverage to codecov via `cargo-llvm-cov`.
+
+The wheel jobs in `release.yml` build with `--locked` (2026-07),
+so release artifacts are provably built from the committed
+dependency resolution; the sdist job isn't (`maturin sdist` has
+no cargo build), but publish requires every wheel job, so a
+stale lock can't reach PyPI.  Local dev stays `--locked`-free —
+the auto-sync on `maturin develop` is what writes Cargo.lock
+after a version bump (commit Cargo.toml + Cargo.lock together;
+see the bump procedure note in the memory file).
 
 ## Testing conventions
 

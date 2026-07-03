@@ -39,8 +39,13 @@ jobs:
           target: x86_64
           manylinux: auto
           # The manylinux container ships every CPython, so --find-interpreter
-          # builds a wheel per version in this single job.
-          args: --release --out dist --find-interpreter
+          # builds a wheel per version in this single job.  --locked (here
+          # and in every wheel job below) makes cargo fail if Cargo.lock is
+          # out of sync with Cargo.toml instead of silently re-resolving —
+          # release artifacts must be built from the committed resolution,
+          # and the sdist ships the lockfile to downstream --locked
+          # builders (distro / conda-forge packagers).
+          args: --release --out dist --find-interpreter --locked
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: actions/upload-artifact@v4
         with:
@@ -68,7 +73,7 @@ jobs:
           # Same single-job-per-arch pattern as the x86_64 job: the
           # manylinux container ships every CPython, so --find-interpreter
           # builds a wheel per version here too.
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --find-interpreter --locked
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: actions/upload-artifact@v4
         with:
@@ -95,7 +100,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          args: --release --out dist -i python
+          args: --release --out dist -i python --locked
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: actions/upload-artifact@v4
         with:
@@ -119,7 +124,7 @@ jobs:
         with:
           # One universal2 wheel covers Apple Silicon + Intel.
           target: universal2-apple-darwin
-          args: --release --out dist -i python
+          args: --release --out dist -i python --locked
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - uses: actions/upload-artifact@v4
         with:
@@ -131,6 +136,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No --locked here: `maturin sdist` only packages source (no cargo
+      # build to gate).  A stale Cargo.lock still can't reach PyPI — the
+      # publish job needs every --locked wheel job to pass first.
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
