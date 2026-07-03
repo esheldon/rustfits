@@ -598,6 +598,35 @@ fn parse_hdus_from_file(
     Ok(hdus)
 }
 
+// Build the open-time error for a file that parsed to zero HDUs in a
+// read mode.  A well-formed FITS file contains at least one complete
+// 2880-byte header block, so a zero-HDU parse means the readable
+// content was shorter than one block (empty file, truncated stub, or
+// sub-block junk; anything one block or longer either parses or raises
+// inside parse_hdus_from_file).  Zero HDUs is a legal *starting* state
+// only when creating a file — mode 'w+' (and the empty mem:// buffer it
+// implies).  In 'r' / 'r+' the constructor raises this at open so the
+// failure surfaces where the problem is, instead of as a confusing
+// "HDU index out of range" on first access.  Matches fitsio and
+// astropy, which both reject an empty file at open in every mode.
+fn empty_open_error(handle: &FileHandle, filename: &str) -> PyErr {
+    let nbytes = lock_file(handle)
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|s| s.len().ok()));
+    let detail = match nbytes {
+        Some(0) => "the file is empty (0 bytes)".to_string(),
+        Some(n) => format!(
+            "only {} bytes — shorter than one 2880-byte FITS block", n
+        ),
+        None => "no FITS HDU found".to_string(),
+    };
+    PyIOError::new_err(format!(
+        "'{}' is not a valid FITS file: {}. To create a new file, open \
+         with mode='w+'.",
+        filename, detail
+    ))
+}
+
 // HDU kind tag used by FITS::finalize_hdu to pick the right pyclass
 // constructor when appending a freshly-written HDU.  The
 // `CompressedImage` variant carries the create-time `Quantize`
@@ -797,6 +826,11 @@ fn append_header_and_data_to_file(
 ///     * ``'w+'`` — read+write; creates the file if it doesn't
 ///       exist, **truncates** to zero length if it does.
 ///       Equivalent to fitsio's ``'rw'`` + ``clobber=True``.
+///
+///     In ``'r'`` and ``'r+'`` the file must contain at least one
+///     HDU: opening an empty (or shorter-than-one-block) file
+///     raises ``OSError`` at open.  Create new files with
+///     ``'w+'``, whose starting state is zero HDUs.
 /// lenient : bool, optional, keyword-only
 ///     If ``False`` (default), header blocks must contain only
 ///     printable ASCII bytes (0x20-0x7E); any other byte is
@@ -1856,6 +1890,13 @@ impl FITS {
             py, &filename, &handle, &layout, &tainted, lenient,
         )?;
 
+        // Zero HDUs is the legal starting state when creating (w+), but
+        // in the read modes it means the file is empty or shorter than
+        // one FITS block — raise here rather than on first HDU access.
+        if hdus.is_empty() && mode != "w+" {
+            return Err(empty_open_error(&handle, &filename));
+        }
+
         Ok(FITS {
             filename,
             mode: mode.to_string(),
@@ -1874,7 +1915,9 @@ impl FITS {
     /// data : bytes
     ///     Raw FITS bytes.  Copied into a private in-memory buffer,
     ///     so the returned :class:`FITS` is fully independent of
-    ///     the original object.
+    ///     the original object.  Must contain at least one HDU;
+    ///     empty (or shorter-than-one-block) input raises
+    ///     ``ValueError``.
     /// mode : {'r', 'r+'}, optional
     ///     ``'r'`` (default) opens read-only; ``'r+'`` allows
     ///     in-memory mutation of the private copy.  ``'w+'`` is
@@ -1902,6 +1945,7 @@ impl FITS {
                 mode
             )));
         }
+        let nbytes = data.len();
         let handle: FileHandle =
             Arc::new(Mutex::new(Some(Storage::Mem(MemStore::new(data)))));
         let tainted: TaintFlag = Arc::new(AtomicBool::new(false));
@@ -1909,6 +1953,16 @@ impl FITS {
         let hdus = parse_hdus_from_file(
             py, "mem://", &handle, &layout, &tainted, lenient,
         )?;
+        // from_bytes only supports the read modes, so zero HDUs always
+        // means the input wasn't a FITS file (empty or shorter than one
+        // block; longer inputs either parse or raise above).
+        if hdus.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "from_bytes: input is not a valid FITS file ({} bytes — \
+                 shorter than one 2880-byte FITS header block)",
+                nbytes
+            )));
+        }
         Ok(FITS {
             filename: "mem://".to_string(),
             mode: mode.to_string(),
