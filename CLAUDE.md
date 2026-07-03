@@ -2461,8 +2461,19 @@ everyone else gets a Pythonic path:
   returned `FITS` is fully independent of the source object; accepts
   `mode='r'` (default) or `'r+'`; rejects `'w+'` (it would discard the
   bytes you just passed — use `FITS("mem://", "w+")` to start empty).
-- An empty `mem://` file has zero HDUs (same as a fresh `w+` disk
-  file); `to_bytes()` on it returns `b""`.
+- An empty `mem://` file opened `w+` has zero HDUs (same as a fresh
+  `w+` disk file); `to_bytes()` on it returns `b""`.
+- **Zero HDUs is only legal in `w+`** (2026-07).  In `'r'`/`'r+'` a
+  parse that yields zero HDUs — an empty file, a sub-block stub, or
+  `mem://` itself (always empty at open) — raises `OSError` at open
+  instead of deferring to a confusing "HDU index out of range" on
+  first access.  `from_bytes` (read modes only) likewise raises
+  `ValueError` on empty/short input.  Matches fitsio and astropy,
+  which both reject an empty file at open in every mode.  A zero-HDU
+  parse result is equivalent to "content shorter than one 2880-byte
+  block": anything one block or longer either parses or raises inside
+  `parse_hdus_from_file`, so `empty_open_error` (fits.rs) can report
+  the byte count precisely.
 - **Read-only mode is advisory for mem files.**  A `Cursor<Vec<u8>>`
   has no OS permission layer, so (unlike a `Disk` file opened `"r"`)
   writes to a `mem://`/`from_bytes` file aren't rejected by the OS.
