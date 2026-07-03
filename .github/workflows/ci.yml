@@ -55,6 +55,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+      # A Cargo.toml change (version bump, dep edit) only lands in
+      # Cargo.lock on the NEXT cargo run, so a commit can easily forget
+      # the lock.  This sub-second check (graph resolution, no compile)
+      # fails the PR on that drift, instead of it surfacing in a
+      # downstream --locked build (release.yml wheels, distro packagers).
+      - name: Check Cargo.lock is in sync with Cargo.toml
+        run: cargo metadata --format-version 1 --locked > /dev/null
       - name: cargo test (via libpython-aware wrapper)
         run: tools/cargo-test.sh
 
