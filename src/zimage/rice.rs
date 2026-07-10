@@ -380,7 +380,13 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
                     let lz = buf.leading_zeros();
                     nzero += lz;
                     // Consume the lz zeros + the terminating 1 bit.
-                    buf <<= lz + 1;
+                    // Two shifts, not `buf <<= lz + 1`: when a full
+                    // 64-bit buffer is all zeros except a terminating
+                    // 1 in bit 0 (a long unary run, e.g. a u8 image
+                    // whose flat runs jump by ~50 — healsparse
+                    // widemasks), lz is 63 and a single shift by
+                    // lz + 1 = 64 overflows the shift count.
+                    buf = (buf << lz) << 1;
                     nbits -= lz + 1;
                     break;
                 }
@@ -402,7 +408,12 @@ fn decode_rice_int_u32buf<T: PixelWrite>(
                     nbits -= fs_u;
                     v
                 };
-                let diff: u32 = (nzero << fs_u) | bottom;
+                // u64 intermediate: a legit diff always fits bbits
+                // (≤ 32) bits, but on a corrupt stream nzero (capped
+                // at 1024) << fs_u (up to 24) can exceed u32 — keep
+                // the truncating garbage-in-garbage-out semantics
+                // (matches cfitsio) instead of a debug-build panic.
+                let diff: u32 = (((nzero as u64) << fs_u) as u32) | bottom;
                 let zz: i32 = if (diff & 1) == 0 {
                     (diff >> 1) as i32
                 } else {
@@ -793,5 +804,64 @@ fn cast_i64_to_target_bytes(values: &[i64], zbitpix: i32) -> Vec<u8> {
             out
         }
         _ => Vec::new(), // unreachable: zbitpix validated upstream
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a unary run whose refill lands a full 64-bit
+    // buffer that is all zeros except the terminating 1 in bit 0.
+    // The decoder then consumes lz + 1 = 64 bits at once — the
+    // single-shift version (`buf <<= lz + 1`) overflowed the shift
+    // count (debug panic; release left a stale bit that corrupted
+    // the rest of the stream).  Seen in the wild on a healsparse
+    // widemask: u8 pixels, flat runs jumping by ~50, so diffs
+    // zigzag to >100 and fs=0 emits >100-zero unary runs.
+    //
+    // Hand-crafted BYTEPIX=1 stream (fsbits=3, one 32-pixel block):
+    //   byte 0        seed = 0            (lastpix = 0)
+    //   byte 1        0x20 = 001 00000    fs stored = 1 → fs = 0,
+    //                                     then 5 zero bits
+    //   bytes 2..9    0x00 x7             56 more zeros (unary
+    //                                     run at 61 zeros; buffer
+    //                                     now empty → refill)
+    //   bytes 9..17   0x00 x7, 0x01       refill lands buf = 1,
+    //                                     nbits = 64 → lz = 63.
+    //                                     Unary total 124 → diff
+    //                                     +62 (pixel 0 = 62)
+    //   bytes 17..21  0xFF x4             pixels 1..31: unary "1"
+    //                                     each → diff 0
+    #[test]
+    fn unary_run_spans_full_refill_buffer() {
+        let mut c = vec![0x00u8, 0x20];
+        c.extend_from_slice(&[0x00; 7]);
+        c.extend_from_slice(&[0x00; 7]);
+        c.push(0x01);
+        c.extend_from_slice(&[0xFF; 4]);
+        assert_eq!(c.len(), 21);
+
+        let out = decode_rice(&c, 32, 1, 32, 8).unwrap();
+        assert_eq!(out, vec![62u8; 32]);
+    }
+
+    // A corrupt stream whose decoded diff exceeds 32 bits
+    // (nzero << fs no longer fits u32) must not panic in a debug
+    // build — the decoder keeps cfitsio's garbage-in-garbage-out
+    // truncation.  BYTEPIX=4 (fsbits=5): fs = 24 with a 299-zero
+    // unary run gives diff = 299 << 24 > u32::MAX.
+    #[test]
+    fn corrupt_overlong_diff_truncates_without_panic() {
+        let mut c = vec![0x00u8; 4]; // seed = 0
+        c.push(0xC8); // 11001 000: fs stored = 25 → fs = 24, 3 zeros
+        c.extend_from_slice(&[0x00; 37]); // 296 more zeros (299 total)
+        c.push(0x80); // terminating 1, then 7 of the 24 bottom bits
+        c.extend_from_slice(&[0x00; 3]); // rest of the bottom bits
+        assert_eq!(c.len(), 46);
+
+        // Garbage values are fine; panicking is not.
+        let out = decode_rice(&c, 1, 4, 32, 32).unwrap();
+        assert_eq!(out.len(), 4);
     }
 }
