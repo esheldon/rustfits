@@ -3,6 +3,11 @@ exclude = [
     "build",
     "dist",
     ".github",
+    # ruff >= 0.16 format-checks Python code blocks inside Markdown.
+    # Our .md snippets are deliberately compact documentation examples
+    # (CLAUDE.md, docs/internal/*.md) — auto-reflowing them hurts
+    # readability, and older-ruff users couldn't reproduce the result.
+    "*.md",
 ]
 line-length = 79
 
