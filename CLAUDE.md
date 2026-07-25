@@ -1439,7 +1439,7 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
   file from a URL.  **Shipped** (download-then-open, read-only; see the
   "Remote file reads" roadmap below).  Ranged partial reads also
   **shipped** (`remote="ranged"` / `rustfits.Remote(...)`: block-cached
-  HTTP Range requests, no whole-file download; docs pending);
+  HTTP Range requests, no whole-file download);
   `root`/`gsiftp` deferred.
 - **In-memory files (`mem://` / `memkeep://`) + gzip read/write** —
   create / read / extract a FITS file with no disk access, via
@@ -2105,10 +2105,10 @@ verification strategy, see
 cfitsio can open files over the network (HTTP/FTP/root drivers).
 This is the rustfits plan for the equivalent.  **Status: flavor #1
 download-then-open shipped for `http`/`https` (2026-05-28) and
-`ftp`/`ftps` (2026-05-28); flavor #2 (ranged reads) Phases 1 + 2
-shipped 2026-07-24 (`remote="ranged"` / `Remote(...)` incl. the
-download-mode `headers=`/`timeout=` retrofit) — Phase 3 (docs)
-remaining; `root`/`gsiftp` deferred (need separate protocol
+`ftp`/`ftps` (2026-05-28); flavor #2 (ranged reads) fully shipped
+2026-07-24 — Phases 1 + 2 (`remote="ranged"` / `Remote(...)` incl.
+the download-mode `headers=`/`timeout=` retrofit) and Phase 3
+(docs); `root`/`gsiftp` deferred (need separate protocol
 crates).**
 
 Two distinct flavors, very different cost:
@@ -2212,8 +2212,8 @@ the connector build + `into_secure` run).
 
 ### Design (flavor #2, ranged reads — shipped 2026-07-24)
 
-Designed and shipped 2026-07-24 (Phases 1 + 2 below in one pass;
-Phase 3, docs, remaining).  `FITS(url, "r", remote="ranged")`
+Designed and shipped 2026-07-24 (all three phases below).
+`FITS(url, "r", remote="ranged")`
 opens a remote file WITHOUT downloading it; header reads, image
 slices, table column reads, and compressed-tile reads fetch only
 the byte ranges they touch via HTTP `Range` requests.  The payoff
@@ -2438,11 +2438,18 @@ local and deterministic):
    `download_remote` takes `Option<&Remote>` and threads
    headers/timeout through the shared `build_agent`.  FTP stays
    knob-free (validation rejects).
-3. ⬜ **Docs** — tutorial remote section gains the ranged
-   subsection + tuning guidance (block/cache rules of thumb, the
-   ranged-vs-download decision); `limitations.rst` note.
-   Optional perf sanity script (`perf/perf-remote-ranged.py`)
-   comparing a ranged slice vs full download on a local server.
+3. ✅ **Docs** (2026-07-24) — `docs/tutorial/drivers.rst` gains the
+   `ranged-reads` section (payoff example, how-it-works, the
+   `Remote` object, ranged-vs-download decision + block/cache
+   tuning rules of thumb, caveats incl. the hard-error rule);
+   `limitations.rst` gains the ranged-remote entry and the updated
+   GIL bullet (block fetches hold the GIL deliberately — the
+   lock-order rationale); `docs/api/fits.rst` autodocs
+   `rustfits.Remote`.  The optional perf sanity script
+   (`perf/perf-remote-ranged.py`) was NOT built — against a
+   localhost server the RTT is ~0 so the ranged-vs-download
+   comparison would be uninformative; revisit only if someone
+   wants real-network numbers.
 
 **Deferred follow-ups (don't build without a real ask):**
 adaptive readahead; retries/backoff; persistent on-disk block

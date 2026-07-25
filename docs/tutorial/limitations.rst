@@ -48,13 +48,18 @@ General
 -------
 
 * **Multithreaded throughput (GIL release)** *(not yet)* — rustfits
-  releases the GIL only during remote (``http`` / ``ftp``) downloads.
-  The heavy CPU paths — tile decode/encode, large chunked I/O,
-  checksum — currently hold it, so several Python threads calling into
-  rustfits serialize on those.  Single-threaded use is unaffected (the
-  common case).  Releasing the GIL around the pure-Rust decode/encode
-  spans is a targeted future change, gated on a real multithreaded
-  workload — file an issue if you have one.
+  releases the GIL only during remote (``http`` / ``ftp``) whole-file
+  downloads and the ranged-mode open probe.  The heavy CPU paths —
+  tile decode/encode, large chunked I/O, checksum — currently hold
+  it, so several Python threads calling into rustfits serialize on
+  those.  Ranged-mode block fetches also hold it, and that one is
+  deliberate, not a gap: releasing the GIL mid-read while the
+  per-file lock is held would invert the lock/GIL ordering and risk
+  deadlocking multithreaded callers, so other threads instead wait
+  out the network round trip.  Single-threaded use is unaffected
+  (the common case).  Releasing the GIL around the pure-Rust
+  decode/encode spans is a targeted future change, gated on a real
+  multithreaded workload — file an issue if you have one.
 * **Random groups** (``GROUPS=T``, ``PTYPEn``) *(by design)* — legacy format;
   vanishingly rare in new files.  Not on the roadmap.
 
@@ -96,6 +101,20 @@ Files and compression
   To write a compressed file, write a plain ``.fits`` and choose
   tile/HDU compression per HDU — see the compression sections of
   the image and table guides.
+
+* **Ranged remote reads are read-only and need server ``Range``
+  support** *(by design)* — ``remote="ranged"`` requires the HTTP
+  server to honor ``Range`` requests; a server that ignores them
+  raises at open rather than silently downloading the whole file
+  you specifically asked not to download (the error suggests
+  ``ranged=False``).  Ranged files are read-only, ``.gz`` URLs are
+  rejected (gzip isn't seekable), and
+  :meth:`~rustfits.FITS.to_bytes` raises.  Reading *most* of a
+  file through ranged mode is slower than the default
+  download-then-open — the bytes arrive as serialized block
+  fetches, each paying a network round trip — so match the mode to
+  the access pattern: small fraction → ``"ranged"``, whole file →
+  default download.  See :ref:`ranged-reads`.
 
 Cross-tool interop caveats
 --------------------------

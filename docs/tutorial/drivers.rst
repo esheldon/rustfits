@@ -8,7 +8,10 @@ and fitsio use — so existing muscle memory carries over.
 
 Today the in-memory, gzip (read + write-back), and remote
 (``http`` / ``https`` / ``ftp`` / ``ftps``) read drivers are
-implemented.
+implemented.  For ``http`` / ``https``, two transports are
+available: download-then-open (the default) and *ranged* partial
+reads that fetch only the bytes you touch (``remote="ranged"`` —
+see :ref:`ranged-reads` below).
 
 .. list-table::
    :header-rows: 1
@@ -27,8 +30,9 @@ implemented.
      - in memory (gunzipped)
      - read+write a gzipped FITS file; ``r+`` / ``w+`` recompress on close
    * - ``"http://..."`` / ``"https://..."``
-     - in memory (downloaded)
-     - read a FITS file from a URL (read-only)
+     - downloaded, or ranged
+     - read a FITS file from a URL (read-only); ``remote="ranged"``
+       fetches only the bytes you touch
    * - ``"ftp://..."`` / ``"ftps://..."``
      - in memory (downloaded)
      - read a FITS file from an FTP server (read-only)
@@ -229,8 +233,8 @@ Details:
 * **Whole file in RAM.** The entire file is downloaded into memory and
   parsed there, so this pays the full transfer even for a one-tile
   read, and peak RSS is the file size (same caveat as ``mem://``).
-  Range-based partial reads — pulling only the bytes a slice needs —
-  are a planned follow-up.
+  To pull only the bytes a slice needs instead, open with
+  ``remote="ranged"`` — see :ref:`ranged-reads` below.
 * A URL whose path ends in ``.gz`` is **gunzipped** after download,
   just like a local ``.gz`` path.
 * The GIL is released during the transfer, so other Python threads
@@ -242,6 +246,108 @@ Details:
   are forced to binary mode so FITS bytes aren't mangled.
 * cfitsio's ``root://`` / ``gsiftp://`` are **not** supported — see
   *Deferred drivers* below.
+
+.. _ranged-reads:
+
+Ranged reads — open without downloading
+---------------------------------------
+
+For a large remote file you only want a piece of, downloading the
+whole thing is the wrong deal.  ``remote="ranged"`` opens the URL
+*without* downloading it; every read then fetches only the byte
+ranges it touches, via HTTP ``Range`` requests:
+
+.. code-block:: python
+
+   url = "https://archive.example.org/survey/tile_042.fits.fz"
+
+   with rustfits.FITS(url, "r", remote="ranged") as fits:
+       hdr = fits[1].header                     # a few KB fetched
+       cut = fits[1][4000:4200, 1000:1200]      # only the touched tiles
+
+The payoff case is a tile-compressed (``.fz``) file on an archive
+server: a cutout decodes only the tiles overlapping the slice, so
+only those tiles' compressed bytes (plus headers and the tile
+descriptor table) cross the network — typically a few hundred KB
+out of a multi-GB file.  Uncompressed images and tables work the
+same way (a row slice fetches just those rows' bytes).
+
+How it works: at open, rustfits probes the server with a tiny
+``Range`` request to learn the file length and verify that the
+server honors ranges.  Reads are then served from a bounded LRU
+cache of fixed-size blocks (1 MiB fetch granularity and a 32 MiB
+budget by default); missing blocks are fetched in coalesced runs,
+so a large sequential read costs a single request and re-reads of
+cached regions cost nothing.
+
+The ``Remote`` config object
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``remote="ranged"`` is shorthand for
+``remote=rustfits.Remote(ranged=True)``.  The full
+:class:`rustfits.Remote` object carries every transport knob —
+the same pattern as ``compress=Gzip1(...)`` for compression:
+
+.. code-block:: python
+
+   cfg = rustfits.Remote(
+       ranged=True,
+       headers={"Authorization": f"Bearer {token}"},
+       timeout=30.0,          # seconds per request
+       block_bytes=1 << 20,   # fetch granularity (ranged only)
+       cache_bytes=32 << 20,  # block-cache budget (ranged only)
+   )
+   with rustfits.FITS(url, "r", remote=cfg) as fits:
+       ...
+
+``headers=`` and ``timeout=`` apply to the default download mode
+too: ``Remote(headers={...})`` *without* ``ranged=True`` is how
+you download from a token-authenticated archive.
+
+Ranged or download?
+~~~~~~~~~~~~~~~~~~~
+
+Match the transport to how much of the file you will touch:
+
+* **Touching a small fraction** (cutouts, header inspection, a few
+  columns, scattered tiles) → ``remote="ranged"``.
+* **Reading most of the file** → the default download mode.
+  Whole-file access through ranged mode is *slower* than a plain
+  download: the bytes arrive as serialized block requests, each
+  paying a network round trip.
+
+Tuning, when the defaults disappoint:
+
+* ``block_bytes`` (default 1 MiB) — the over-fetch per touch.
+  Lower it (e.g. 64–256 KiB) for many small scattered reads on a
+  high-bandwidth link; raise it for long strips on a high-latency
+  link.
+* ``cache_bytes`` (default 32 MiB) — size it to your working set
+  for repeated scattered access, the same reasoning as the
+  compressed-image tile cache (see :doc:`performance`).  The tile
+  cache sits *above* this block cache; both are bounded.
+
+Caveats
+~~~~~~~
+
+* **The server must honor ``Range``.**  If the probe shows it
+  doesn't (a ``200`` instead of ``206``), the open **raises** —
+  there is no silent fallback to downloading a file you
+  specifically asked not to download.  The error suggests
+  ``ranged=False``.
+* **Read-only**, like all remote opens; ``"r+"`` / ``"w+"`` raise.
+* ``http`` / ``https`` only — ``ftp`` URLs can't be ranged.
+* A ``.gz`` URL can't be ranged (gzip isn't seekable); download
+  mode handles those.
+* :meth:`~rustfits.FITS.to_bytes` raises on a ranged file (it
+  would download everything; use download mode for that).
+* Opening walks every HDU header, roughly one small fetch per HDU
+  — a couple of round trips for typical files.
+* The top-level :func:`rustfits.read` / :func:`rustfits.read_header`
+  don't take ``remote=``; they use download mode on URLs.  Ranged
+  access is the explicit two-line ``FITS(...)`` form.
+* While a fetch is in flight, other Python threads calling into
+  rustfits wait (see :doc:`limitations`).
 
 Deferred drivers
 ----------------
