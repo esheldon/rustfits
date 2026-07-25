@@ -35,6 +35,9 @@ use crate::hdu_table::{
 };
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
+use crate::remote_range::{
+    build_agent, parse_remote_arg, HttpRangeStore, Remote,
+};
 
 // Per the FITS standard, the primary HDU must begin with `SIMPLE`, extension
 // HDUs must begin with `XTENSION`, and every HDU must declare BITPIX, NAXIS,
@@ -189,10 +192,26 @@ fn url_path_is_gz(url: &str) -> bool {
 // Fetch a remote file whole into memory (blocking).  The GIL is released
 // for the duration of the network I/O so other Python threads run.  The
 // whole file lands in RAM (download-then-open); for huge remote files,
-// range reads are the future answer (see CLAUDE.md).
-fn download_remote(py: Python<'_>, url: &str) -> PyResult<Vec<u8>> {
+// ranged reads (remote="ranged") avoid the download entirely.  `opts`
+// carries the download-mode transport knobs from a
+// `remote=Remote(headers=..., timeout=...)` argument; None means the
+// plain defaults (no extra headers, no timeout).
+fn download_remote(
+    py: Python<'_>,
+    url: &str,
+    opts: Option<&Remote>,
+) -> PyResult<Vec<u8>> {
+    let (headers, timeout) = match opts {
+        Some(o) => (o.headers.clone(), o.timeout),
+        None => (Vec::new(), None),
+    };
     py.detach(|| -> Result<Vec<u8>, String> {
-        let response = ureq::get(url).call().map_err(|e| e.to_string())?;
+        let agent = build_agent(timeout);
+        let mut req = agent.get(url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let response = req.call().map_err(|e| e.to_string())?;
         let mut reader = response.into_body().into_reader();
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
@@ -1768,14 +1787,18 @@ impl FITS {
 impl FITS {
     // Default mode is 'r' so FITS(filename) reads — matches the
     // built-in open(filename) convention.  'r+' opens for in-place
-    // mutation; 'w+' truncates / creates.
+    // mutation; 'w+' truncates / creates.  `remote=` selects the
+    // transport for URL opens: None (default) downloads the whole
+    // file; "ranged" / Remote(ranged=True) serves reads via HTTP
+    // Range requests without downloading.
     #[new]
-    #[pyo3(signature = (filename, mode="r", *, lenient=false))]
+    #[pyo3(signature = (filename, mode="r", *, lenient=false, remote=None))]
     fn new(
         py: Python<'_>,
         filename: &Bound<'_, PyAny>,
         mode: &str,
         lenient: bool,
+        remote: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Accept str or os.PathLike (pathlib.Path); everything downstream
         // works with the owned String.
@@ -1785,6 +1808,42 @@ impl FITS {
                 "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",
                 mode
             )));
+        }
+
+        // remote= validation, all before any network I/O.  Intent
+        // errors (remote= on a local path, ranged on a transport that
+        // can't do it) are ValueError; environmental failures (probe,
+        // fetch) surface later as IOError.
+        let remote_opts = parse_remote_arg(remote)?;
+        if let Some(opts) = &remote_opts {
+            if !is_remote_url(&filename) && !is_ftp_url(&filename) {
+                return Err(PyValueError::new_err(format!(
+                    "remote= is only valid for http(s):// or ftp(s):// \
+                     URLs; got '{}'", filename
+                )));
+            }
+            if is_ftp_url(&filename) {
+                if opts.ranged {
+                    return Err(PyValueError::new_err(
+                        "ranged reads are supported for http/https \
+                         URLs only (FTP has no Range mechanism here); \
+                         use ranged=False to download the whole file",
+                    ));
+                }
+                if !opts.headers.is_empty() || opts.timeout.is_some() {
+                    return Err(PyValueError::new_err(
+                        "headers= and timeout= are supported for \
+                         http/https URLs only",
+                    ));
+                }
+            }
+            if opts.ranged && url_path_is_gz(&filename) {
+                return Err(PyValueError::new_err(
+                    "ranged reads cannot open a .gz URL (gzip is not \
+                     seekable); use ranged=False to download and \
+                     decompress the whole file",
+                ));
+            }
         }
 
         // Set true only by the `.gz` branch below when the mode is
@@ -1799,16 +1858,43 @@ impl FITS {
         let storage = if is_mem_url(&filename) {
             Storage::Mem(MemStore::new(Vec::new()))
         } else if is_remote_url(&filename) {
-            // Download-then-open over http/https: fetch the whole file
-            // into RAM, then parse like any in-memory file.  Read-only.
+            // Remote http/https.  Read-only in both transports.
             if mode != "r" {
                 return Err(PyIOError::new_err(format!(
                     "remote files are read-only; open '{}' with mode='r'",
                     filename
                 )));
             }
-            let bytes = maybe_gunzip_url(download_remote(py, &filename)?, &filename)?;
-            Storage::Mem(MemStore::new(bytes))
+            match &remote_opts {
+                Some(opts) if opts.ranged => {
+                    // Ranged: probe the server (learning the file
+                    // length and that Range is honored), then serve
+                    // reads via block-cached Range requests — the
+                    // whole file is never downloaded.  GIL released
+                    // for the probe like every other network call.
+                    let store = py
+                        .detach(|| {
+                            HttpRangeStore::open(
+                                &filename,
+                                &opts.headers,
+                                opts.timeout,
+                                opts.block_bytes,
+                                opts.cache_bytes,
+                            )
+                        })
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    Storage::HttpRange(store)
+                }
+                _ => {
+                    // Download-then-open: fetch the whole file into
+                    // RAM, then parse like any in-memory file.
+                    let bytes = maybe_gunzip_url(
+                        download_remote(py, &filename, remote_opts.as_ref())?,
+                        &filename,
+                    )?;
+                    Storage::Mem(MemStore::new(bytes))
+                }
+            }
         } else if is_ftp_url(&filename) {
             // Download-then-open over ftp/ftps.  Read-only.
             if mode != "r" {

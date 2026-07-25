@@ -1437,8 +1437,10 @@ and `tests/test_table_vla_x_bit.py` (16 cases, VLA PX/QX).
   vanishingly rare in new files.
 - **Remote file reads (`http`/`https`/`ftp`/`ftps`)** — open a FITS
   file from a URL.  **Shipped** (download-then-open, read-only; see the
-  "Remote file reads" roadmap below).  Range-based partial reads, and
-  `root`/`gsiftp`, are still deferred.
+  "Remote file reads" roadmap below).  Ranged partial reads also
+  **shipped** (`remote="ranged"` / `rustfits.Remote(...)`: block-cached
+  HTTP Range requests, no whole-file download; docs pending);
+  `root`/`gsiftp` deferred.
 - **In-memory files (`mem://` / `memkeep://`) + gzip read/write** —
   create / read / extract a FITS file with no disk access, via
   `FITS("mem://", "w+")` + `to_bytes()` / `FITS.from_bytes(b)`; and
@@ -2103,8 +2105,11 @@ verification strategy, see
 cfitsio can open files over the network (HTTP/FTP/root drivers).
 This is the rustfits plan for the equivalent.  **Status: flavor #1
 download-then-open shipped for `http`/`https` (2026-05-28) and
-`ftp`/`ftps` (2026-05-28); flavor #2 (range reads) deferred;
-`root`/`gsiftp` deferred (need separate protocol crates).**
+`ftp`/`ftps` (2026-05-28); flavor #2 (ranged reads) Phases 1 + 2
+shipped 2026-07-24 (`remote="ranged"` / `Remote(...)` incl. the
+download-mode `headers=`/`timeout=` retrofit) — Phase 3 (docs)
+remaining; `root`/`gsiftp` deferred (need separate protocol
+crates).**
 
 Two distinct flavors, very different cost:
 
@@ -2114,19 +2119,20 @@ Two distinct flavors, very different cost:
    pays the full download even for a one-tile read.  This is
    essentially what cfitsio does for most of its network drivers.
    See "Design (flavor #1, as built)" below.
-2. **Range-based partial reads (deferred, NOT this roadmap).**
-   HTTP `Range` requests so `fits["sci"][100:200]` or a single
-   compressed tile pulls only the bytes it needs — the real
+2. **Ranged partial reads (shipped — see "Design (flavor #2)"
+   below).**  HTTP `Range` requests so `fits["sci"][100:200]` or a
+   single compressed tile pulls only the bytes it needs — the real
    payoff for a multi-GB `.fz` on a server.  The storage seam this
    needs is **already done**: `common.rs`'s `FileHandle` is now
    `Arc<Mutex<Option<Storage>>>` (see the "In-memory files +
-   storage-driver abstraction" roadmap below).  A range-read source
-   is a lazy, read-only backend; because it carries its own state
-   (URL, http client, position) and isn't cheaply enumerable, it's
-   the specific case that would justify switching `enum Storage` to
-   `Box<dyn FitsStorage>` rather than adding a variant.  Read-only
+   storage-driver abstraction" roadmap below).  Decision (2026-07):
+   a new `Storage::HttpRange` enum variant, NOT the
+   `Box<dyn FitsStorage>` switch earlier notes mused about — a
+   variant carries its own state (URL, http client, position,
+   block cache) just fine and keeps monomorphization.  Read-only
    (the in-place grow / `shift_file_tail` / taint machinery is
-   fundamentally local), and depends on the server honoring Range.
+   fundamentally local); requires the server to honor Range
+   (hard error otherwise, no silent fallback).
 
 ### Design (flavor #1, as built)
 
@@ -2204,6 +2210,246 @@ all inside `ureq`, and the `ftps` path is exercised by a negative test
 (`ftps://` to the plain server → the `AUTH TLS` upgrade fails, proving
 the connector build + `into_secure` run).
 
+### Design (flavor #2, ranged reads — shipped 2026-07-24)
+
+Designed and shipped 2026-07-24 (Phases 1 + 2 below in one pass;
+Phase 3, docs, remaining).  `FITS(url, "r", remote="ranged")`
+opens a remote file WITHOUT downloading it; header reads, image
+slices, table column reads, and compressed-tile reads fetch only
+the byte ranges they touch via HTTP `Range` requests.  The payoff
+case is slicing a multi-GB `.fz` sitting on an archive server.
+
+**Rust-native, not fsspec.**  We considered wrapping a Python
+fsspec file object inside `Storage` (the model astropy's
+`use_fsspec=True` rides on); rejected:
+
+- *GIL / lock-order inversion.*  `Storage` ops run under the
+  per-file mutex and today never need the GIL (some callers run
+  under `py.detach`).  A Python-backed storage would have to
+  re-acquire the GIL while holding the file mutex — the classic
+  two-lock deadlock, made real by fsspec's asyncio machinery
+  running arbitrary Python on callbacks.
+- *It inverts the value proposition.*  The I/O path being pure
+  Rust from numpy buffer to syscall is the product; per-read
+  Python calls reintroduce the per-call overhead the meta-cache
+  phases removed.
+- *Dependency philosophy.*  rustfits runs on numpy alone, and the
+  Rust side needs ~nothing new: `ureq` (already shipped for
+  download mode), `BytesBoundLruCache` (`cache.rs`), rustls.
+
+Plain HTTPS covers most real archives (MAST / IRSA / ESA; public
+S3/GCS objects and presigned URLs are plain HTTPS).  The escape
+hatch for exotic backends is fsspec-downloads-then-
+`FITS.from_bytes`, not fsspec-inside-Storage.
+
+**API.**  A `Remote` config object — parallel to the
+`compress=Gzip1(...)` pattern, and like those a Rust pyclass
+(new sibling of `src/zimage/compression_config.rs`) re-exported
+in `rustfits/__init__.py` — keeps transport knobs out of the
+`FITS()` signature:
+
+```python
+rustfits.Remote(
+    ranged=False,          # False = download-then-open
+    headers=None,          # dict[str, str]; BOTH modes; http(s) only
+    timeout=None,          # seconds; BOTH modes; http(s) only
+    block_bytes=1 << 20,   # ranged only: fetch granularity
+    cache_bytes=32 << 20,  # ranged only: block-LRU budget
+)
+
+f = rustfits.FITS(url, "r", remote="ranged")        # shorthand
+f = rustfits.FITS(
+    url, "r",
+    remote=rustfits.Remote(ranged=True,
+                           headers={"Authorization": tok}))
+```
+
+- **One class, not two.**  `compress=` uses per-algorithm classes
+  because their parameters are disjoint; here the two modes SHARE
+  `headers`/`timeout` and only `block_bytes`/`cache_bytes` are
+  ranged-only, so a single class with a `ranged` flag wins.
+  `headers=`/`timeout=` retrofit onto the shipped download mode
+  (token-gated archives need auth for full downloads too) — the
+  object is not range-specific.
+- **Accepted forms for `remote=`:** `None` (default: download for
+  URLs, exactly today's behavior), the string `"ranged"`
+  (≡ `Remote(ranged=True)`), or a `Remote` instance.
+  `remote=True` is rejected — "remote: yes" is already implied by
+  the URL, so a bare True has no meaning.  No `"download"` string
+  either: that's just the default, and
+  `Remote(ranged=False, headers=...)` is the download-with-knobs
+  spelling.
+- **Validation (all before any network I/O):**
+  - `block_bytes=` / `cache_bytes=` with `ranged=False` →
+    ValueError (explicit-mistake rejection, same policy as the
+    dict-source protected-key rule).
+  - `remote=` with a non-URL path → ValueError.
+  - `remote=` with `mode != "r"` → ValueError (remote is
+    read-only in both modes already).
+  - `ranged=True` + `ftp://`/`ftps://` → ValueError (http/https
+    only; FTP REST-based ranges are out of scope).
+  - `ranged=True` + `.gz` URL → ValueError (gzip isn't seekable;
+    download mode handles those).
+  - `headers=` / `timeout=` + ftp URL → ValueError (HTTP-only
+    knobs in the MVP; extend to suppaftp later if asked).
+- **Hard error, no silent fallback**, when the server ignores
+  `Range` (probe returns 200): a user who constructed
+  `Remote(ranged=True)` stated intent, and silently downloading a
+  40 GB file they specifically asked NOT to download wholesale is
+  the worse surprise.  The error message suggests `ranged=False`.
+  A `fallback=` knob can be added later if this annoys anyone.
+- **Convenience boundary intact:** `rustfits.read` /
+  `read_header` do NOT grow `remote=` (they keep working on URLs
+  via default download).  Range/auth users write the two-line
+  explicit `FITS(...)` form — same rule that kept `compress=` out
+  of `convenience.py`.
+- `to_bytes()` on a ranged file raises (it would download the
+  whole file; the message points at download mode).
+
+**Storage backend.**  A third variant —
+`Storage::HttpRange(HttpRangeStore)`, struct in a new
+`src/remote_range.rs`, variant wired in `common.rs`:
+
+```rust
+pub(crate) struct HttpRangeStore {
+    url: String,
+    agent: ureq::Agent,     // keep-alive: one TLS handshake,
+                            // then per-request RTT
+    headers: Vec<(String, String)>,
+    len: u64,               // from the open-time probe
+    pos: u64,               // Seek is arithmetic, no network
+    block_bytes: u64,
+    cache: BytesBoundLruCache<u64>,  // block idx -> Arc<Vec<u8>>
+    bytes_fetched: u64,     // stats (tests / future accessor)
+    requests: u64,
+}
+```
+
+- `read(buf)`: clamp the span to `len` (File-like EOF: short
+  read / 0 at EOF).  Find the blocks the span touches, collect
+  the misses, group them into contiguous runs, fetch each run
+  with ONE `Range: bytes=a-b` request (the response body is split
+  into block-sized cache entries; the file's last block is
+  short).  Copy from the cached `Arc<Vec<u8>>`s into `buf`.
+  This block cache is the load-bearing piece: the codebase does
+  many tiny reads (2880-byte header blocks, 8/16-byte heap
+  descriptors), and per-read requests would cost one WAN round
+  trip each.  Block caching + run coalescing makes tiny reads
+  cache hits and big strip reads single requests.
+- `seek`: pure position arithmetic (`SeekFrom::End` uses `len`).
+- `write` / `set_len`: `Err` (unreachable — mode-gated — but
+  defensive).  `sync`: no-op.  Never dirty, never taints
+  (read-only: nothing can diverge).
+- Extract two pure functions so the block machinery gets Rust
+  unit tests with no network (rice.rs-style `#[cfg(test)]`):
+  `plan_block_fetches(span, block_bytes, have) -> Vec<Run>` and
+  `parse_content_range(&str) -> Option<u64>`.
+
+**Probe at open** (in the `FITS::new` remote branch, after mode
+validation): `GET` with `Range: bytes=0-0` + user headers.
+
+- `206` + `Content-Range: bytes 0-0/TOTAL` → ranged mode with
+  `len = TOTAL`.  Unknown total (`*/...`) → error.
+- `200` → server ignores Range → the hard error above.
+- Anything else → error naming the status code.
+
+GET-with-tiny-range rather than HEAD: some servers mishandle
+HEAD, and the probe doubles as a reachability + auth check
+(fsspec uses the same trick).
+
+**Semantics + caveats (document in the tutorial):**
+
+- Whole-file reads through ranged mode are WORSE than download
+  mode: N serialized block requests, each paying an RTT.
+  Guidance: touching a small fraction → `"ranged"`; reading most
+  of the file → default download.  Adaptive readahead (grow the
+  fetch span on sequential access, fsspec-style) is the follow-up
+  if a real workload needs both patterns in one session.
+- Eager open costs ~1 block fetch per HDU header — fine for
+  typical files.  The shelved lazy-open design (Performance TODO
+  #2, Option C) composes naturally if many-HDU remote files show
+  up.
+- Fetches run under whatever GIL state the calling read path has;
+  where the GIL is held, other Python threads wait out the RTT.
+  Two consequences, discovered while building the test suite:
+  - An HTTP server running as a THREAD in the same process cannot
+    serve ranged fetches: the fetch blocks holding the GIL, and
+    the server thread needs the GIL to answer → deadlock.  (The
+    open-time probe runs under `py.detach`, so probe-only
+    interactions are safe.)  This is why the test server runs in
+    a SUBPROCESS.  Real remote servers are unaffected.
+  - Do NOT "fix" that by detaching around fetches
+    (attach-then-detach inside `fetch_blocks`): releasing the GIL
+    while holding the file mutex creates the mutex/GIL lock-order
+    inversion — another thread holding the GIL and blocked on the
+    file mutex would deadlock against the fetch thread trying to
+    re-acquire the GIL.  Holding the GIL through the fetch is the
+    deadlock-free choice for multithreaded callers; the cost is
+    just latency for other threads.
+- Network errors surface as `OSError` (the io::Error mapping).
+  No retries in the MVP.
+- The compressed-HDU tile cache sits ABOVE this block cache; both
+  are bounded (32 MB defaults each).
+
+**Testing** (`tests/test_fits_remote_ranged.py`, 26 cases; all
+local and deterministic):
+
+- Python's stock `http.server` handler ignores `Range` (returns
+  200 full-body) — convenient: a subclass that honors single
+  ranges and counts requests + bytes served powers the positive
+  tests, while the STOCK handler exercises the hard-error path.
+  The Range server runs in a SUBPROCESS (see the GIL caveat
+  above; an in-process thread server deadlocks against GIL-held
+  fetches), with `/__stats__` + `/__reset__` control endpoints
+  the test process queries via urllib.  Stats are updated BEFORE
+  the response body is sent, so a stats query issued after a
+  client read completes can never race the last update.  The
+  in-process PLAIN server is fine for the hard-error test —
+  only the detached probe ever talks to it.
+- Correctness: full read / image slice / table column /
+  multi-HDU walk / compressed-tile slice, each vs a local read
+  of the same fixture.
+- PARTIALITY (the point of the feature): server-side
+  bytes-served assertions — header-only read ≪ file size;
+  compressed slice ≈ touched tiles + headers, ≪ heap size.
+- Block machinery: tiny `block_bytes` (e.g. 4096) forcing
+  multi-block spans + run coalescing; tiny `cache_bytes` (thrash
+  but stay correct); reads spanning block boundaries; EOF
+  semantics.
+- Headers: handler asserts `Authorization` arrives — in ranged
+  AND download modes.
+- Every rejection path in the validation matrix above, plus
+  `remote=True`, `to_bytes()`, and the stock-handler 200 hard
+  error (message mentions `ranged=False`).
+- Shorthand equivalence: `remote="ranged"` behaves identically
+  to `remote=Remote(ranged=True)`.
+- Rust unit tests on the two extracted pure functions.
+
+**Phasing** (independently landable):
+
+1. ✅ **Core** (2026-07-24) — `Remote` pyclass + `remote=` kwarg
+   parsing + validation matrix; `HttpRangeStore` +
+   `Storage::HttpRange`; probe; block cache; headers/timeout
+   applied in ranged mode; the test file.  http/https only.
+2. ✅ **Retrofit knobs onto download mode** (2026-07-24, folded
+   into the Phase 1 change — it was ~10 lines once `build_agent`
+   existed, and silently IGNORING `Remote(headers=...)` in
+   download mode would have been an auth hazard) —
+   `download_remote` takes `Option<&Remote>` and threads
+   headers/timeout through the shared `build_agent`.  FTP stays
+   knob-free (validation rejects).
+3. ⬜ **Docs** — tutorial remote section gains the ranged
+   subsection + tuning guidance (block/cache rules of thumb, the
+   ranged-vs-download decision); `limitations.rst` note.
+   Optional perf sanity script (`perf/perf-remote-ranged.py`)
+   comparing a ranged slice vs full download on a local server.
+
+**Deferred follow-ups (don't build without a real ask):**
+adaptive readahead; retries/backoff; persistent on-disk block
+cache (fsspec `filecache::` analog); a public `bytes_fetched`
+accessor; native S3/GCS auth (presigned URLs already work);
+multipart ranges; lazy-open composition.
+
 ## In-memory files + the storage-driver abstraction — roadmap
 
 cfitsio's `mem://` driver opens a FITS file entirely in RAM (create,
@@ -2224,7 +2470,8 @@ mem case.
 | `.Z`/`.zip` whole-file codecs | ⬜ Sketched below |
 | `stdin://` / `stdout://`, `shmem://` | ⬜ Sketched below |
 | `http`/`https`/`ftp`/`ftps` **download** read (→ `Mem`) | ✅ Shipped |
-| `http`/`https` range reads, `root`/`gsiftp` | ⬜ See "Remote file reads" roadmap |
+| `http`/`https` **ranged** reads (`Storage::HttpRange`) | ✅ Shipped |
+| `root`/`gsiftp` | ⬜ See "Remote file reads" roadmap |
 
 **Gzip read + write-back (shipped).**  A path with a `.gz` extension
 (case-insensitive, detected by `is_gz_path` in `fits.rs`) is gunzipped
@@ -2382,9 +2629,11 @@ impl Storage {
   truncates / zero-extends the `Vec`; `len` is `vec.len()`; `sync`
   is a no-op.
 
-A future lazy remote-range backend (its own state, not cheaply
-enumerable) would be the point to reconsider `dyn` — until then the
-enum is the right call.
+The lazy remote-range backend was once flagged as the point to
+reconsider `dyn`; decided (2026-07) to stay with the enum —
+`Storage::HttpRange` carries its own state (URL, client, position,
+block cache) fine as a variant.  Reconsider `dyn` only if several
+lazy backends accumulate.
 
 ### This is the basis for cfitsio's full driver set
 
@@ -2404,7 +2653,7 @@ store** or **(b) something materialized into a memory buffer**.  The
 | `http`/`https` (download) | fill the `Mem` buffer from the network at open (`ureq`); read-only; gunzips a `.gz` URL | ✅ |
 | `ftp`/`ftps` (download) | same, via `suppaftp` (shares ureq's rustls); anonymous default, binary mode | ✅ |
 | `root` / `gsiftp` (download) | needs a separate protocol crate (XRootD / GridFTP) | ⬜ |
-| http **range** reads (remote roadmap #2) | a *lazy* read-only backend: seek+read → Range requests, no full buffer (the case that would justify `dyn`) | ⬜ |
+| http **ranged** reads (remote roadmap #2) | `Storage::HttpRange`: block-cached lazy read-only backend, no full buffer (see "Design (flavor #2)" in the remote roadmap) | ✅ |
 | `shmem://` | `Mem` backed by an OS shared-memory mapping | ⬜ |
 | `root://` / `gsiftp://` | same as http — materialize-to-mem, or a lazy protocol backend | ⬜ |
 
@@ -2504,11 +2753,10 @@ though most sites didn't change semantically — a one-time cost.
 **Where the remaining work lives:** the unshipped rows in the coverage
 map above (gz / stdin / shmem) are each a new `enum Storage` variant
 filled at the open boundary.  The remote `http`/`https` *download*
-case is the same (fill `Mem` from the network); the remote **range**
-case (remote roadmap #2) is the lazy read-only backend that would
-justify switching `Storage` to `dyn` — build it together with the
-remote roadmap when a real workload needs partial reads of a remote
-multi-GB `.fz`.
+case is the same (fill `Mem` from the network); the remote **ranged**
+case (remote roadmap #2) shipped as its own lazy read-only variant,
+`Storage::HttpRange` in `src/remote_range.rs` (no `dyn` switch
+needed) — see "Design (flavor #2)" in the remote roadmap.
 
 ## cfitsio extended filename syntax (EFS) — deferred
 

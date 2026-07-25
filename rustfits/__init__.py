@@ -19,6 +19,7 @@ from ._rust import (
     Hcompress1,
     Plio1,
     Quantize,
+    Remote,
     Rice1,
     is_protected_key,
 )
