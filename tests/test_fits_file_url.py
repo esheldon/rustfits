@@ -6,6 +6,13 @@ The URL is decoded to the plain path at the top of FITS.__init__,
 so every mode (r / r+ / w+), the .gz write-back, and the repr all
 behave exactly as if the plain path had been passed.  FITS.filename
 returns the DECODED local path, not the URL.
+
+URLs are built with pathlib.Path.as_uri() so the tests are
+platform-portable: on Windows it emits file:///C:/... (forward
+slashes, drive-letter form — exercising the decoder's drive-letter
+branch for real), and it applies the same percent-encoding a
+browser or file manager would.  Hand-built file://<backslash-path>
+strings are not valid file URLs and are expected to fail.
 """
 
 import os
@@ -18,8 +25,9 @@ import rustfits
 
 def _url(path):
     """
-    Build a file:/// URL from an absolute path."""
-    return "file://" + str(path)
+    Build a file:/// URL from an absolute path, the way Python
+    itself does (correct on Windows too: file:///C:/...)."""
+    return pathlib.Path(path).as_uri()
 
 
 def _write_image(fname):
@@ -55,39 +63,47 @@ def test_localhost_form():
         fname = os.path.join(tmpdir, "img.fits")
         data = _write_image(fname)
         for host in ("localhost", "LOCALHOST"):
-            url = "file://" + host + fname
+            url = _url(fname).replace("file:///", f"file://{host}/", 1)
             with rustfits.FITS(url, "r") as f:
                 np.testing.assert_array_equal(f[0].read(), data)
 
 
 def test_filename_attribute_is_decoded_path():
     """
-    FITS.filename holds the decoded local path, not the URL."""
+    FITS.filename holds the decoded local path, not the URL.
+    Compared via pathlib.Path: the decoder emits forward slashes
+    on Windows (C:/...), which Path treats as equal to C:\\..."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "img.fits")
         _write_image(fname)
         with rustfits.FITS(_url(fname), "r") as f:
-            assert f.filename == fname
+            assert not f.filename.startswith("file:")
+            assert pathlib.Path(f.filename) == pathlib.Path(fname)
 
 
 def test_percent_encoded_space():
     """
-    %20 in the URL decodes to a space in the filename."""
+    %20 in the URL decodes to a space in the filename.  as_uri()
+    percent-encodes the space, so this pins that we decode what
+    the stdlib emits."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "my file.fits")
         data = _write_image(fname)
-        url = "file://" + fname.replace(" ", "%20")
+        url = _url(fname)
+        assert "%20" in url
         with rustfits.FITS(url, "r") as f:
             np.testing.assert_array_equal(f[0].read(), data)
 
 
 def test_percent_encoded_utf8():
     """
-    Multi-byte percent-escapes decode as UTF-8 (e-acute here)."""
+    Multi-byte percent-escapes decode as UTF-8 (e-acute here);
+    as_uri() encodes non-ASCII as UTF-8 escape pairs."""
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = os.path.join(tmpdir, "café.fits")
         data = _write_image(fname)
-        url = "file://" + fname.replace("café", "caf%C3%A9")
+        url = _url(fname)
+        assert "%C3%A9" in url
         with rustfits.FITS(url, "r") as f:
             np.testing.assert_array_equal(f[0].read(), data)
 
