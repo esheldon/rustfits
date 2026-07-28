@@ -2651,7 +2651,7 @@ store** or **(b) something materialized into a memory buffer**.  The
 
 | cfitsio driver | how it rides on `Storage` | status |
 |---|---|---|
-| `file://` | the `Disk` variant | ✅ |
+| `file://` | the `Disk` variant; the `file:///path` URL SPELLING is also accepted (decoded to the plain path at open — see "`file://` URL spelling" below) | ✅ |
 | `mem://` / `memkeep://` | the `Mem` (`Cursor<Vec<u8>>`) variant; aliases (same thing in rustfits — see "Python surface"); `from_bytes`/`to_bytes` are the byte I/O pair | ✅ |
 | whole-file `.gz` (read) | `Mem` filled by gunzip-on-open | ✅ |
 | whole-file `.gz` (write-back) | `Mem` + recompress-on-close (`GzEncoder` → `.gz` path) | ✅ |
@@ -2674,6 +2674,49 @@ standard pattern, not a limitation of the abstraction.
 So `Storage` is the **single seam** every non-`file://` driver plugs
 into — the argument for having done it once, properly, rather than
 bolting each backend on ad hoc.
+
+### `file://` URL spelling (shipped 2026-07-27)
+
+`FITS("file:///abs/path", mode)` is an alternate SPELLING of a local
+path (RFC 8089 / cfitsio's file driver prefix), not a new backend —
+the URL is decoded to the plain path at the very top of `FITS::new`,
+so everything downstream (mode handling incl. all three modes, `.gz`
+detection + write-back, disk open, repr) sees only the decoded path.
+`FITS.filename` returns the DECODED path, which is what makes the gz
+write-back and error messages work unchanged.
+
+Decode rules (`decode_file_url` in `fits.rs` — a pure function taking
+`windows: bool` so unit tests cover both platforms from Linux):
+
+- Accepted authorities: empty (`file:///path`) and `localhost`
+  (case-insensitive).  Any other host → ValueError (names a remote
+  machine; on Windows it would be a UNC share — out of scope).
+- Percent-escapes decode STRICTLY: both digits must be hex, the
+  decoded bytes must be valid UTF-8; malformed escapes raise
+  (explicit-mistake-rejection policy — deliberately NOT the
+  WHATWG-lenient pass-through the `percent-encoding` crate does).
+  `+` is left verbatim (query encoding, not path encoding); `?`/`#`
+  are left verbatim (legal Unix filename bytes; file URLs carry no
+  query/fragment).
+- Windows drive letters: `/C:/data` → `C:/data` (leading slash is
+  URL syntax), applied only when `cfg!(windows)`.
+- `remote=` + `file://` → tailored ValueError (it names a local
+  file), checked BEFORE decoding so the message references the URL.
+
+**No URL crate, deliberately.**  The `url` crate would pull in
+`idna` → ICU4X unicode tables (heavy) to strip a prefix; small
+crates like `file_url` are a supply-chain surface for ~60 auditable
+lines; and `percent-encoding` (already in-tree via ureq) is lenient
+where we want strict.  `decode_file_url` is a pure seam — swap in
+the `url` crate later if URL handling ever grows real complexity
+(UNC support, userinfo, query semantics).
+
+Tests: `tests/test_fits_file_url.py` (15 cases: read/localhost/
+percent-decode/UTF-8/convenience-read, w+ create + r+ mutate +
+`.gz` round-trip through the URL spelling, all rejection paths,
+filename-is-decoded, pathlib sanity) plus 4 Rust unit tests in
+`fits.rs` (basic forms, percent decoding, rejections incl. the
+`%+5` from_str_radix trap, drive-letter × windows flag matrix).
 
 ### Cheap shortcut (superseded for read-from-bytes)
 
@@ -2769,9 +2812,9 @@ needed) — see "Design (flavor #2)" in the remote roadmap.
 
 cfitsio parses a rich mini-language embedded in the filename string
 (`fits_open_file` does it in C, so fitsio gets it for free).  rustfits
-has **only** implemented the *driver-prefix* subset of EFS — `mem://`,
-`http(s)://`, `ftp(s)://`, and the `.gz` suffix (see the storage-driver
-and remote roadmaps above).  **Everything else is deferred until a user
+has **only** implemented the *driver-prefix* subset of EFS — `file://`,
+`mem://`, `http(s)://`, `ftp(s)://`, and the `.gz` suffix (see the
+storage-driver and remote roadmaps above).  **Everything else is deferred until a user
 asks**, and when it lands it should go in the planned
 `rustfits.compat.fitsio` shim (translating the string into core API
 calls), NOT in the core `FITS()` constructor — the core deliberately

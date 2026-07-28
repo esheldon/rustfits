@@ -6,12 +6,12 @@ small set of *driver* prefixes that select where the bytes live.  The
 prefix is part of the filename string — the same convention cfitsio
 and fitsio use — so existing muscle memory carries over.
 
-Today the in-memory, gzip (read + write-back), and remote
-(``http`` / ``https`` / ``ftp`` / ``ftps``) read drivers are
-implemented.  For ``http`` / ``https``, two transports are
-available: download-then-open (the default) and *ranged* partial
-reads that fetch only the bytes you touch (``remote="ranged"`` —
-see :ref:`ranged-reads` below).
+Today the ``file://`` URL spelling, the in-memory and gzip (read +
+write-back) drivers, and the remote (``http`` / ``https`` / ``ftp``
+/ ``ftps``) read drivers are implemented.  For ``http`` / ``https``,
+two transports are available: download-then-open (the default) and
+*ranged* partial reads that fetch only the bytes you touch
+(``remote="ranged"`` — see :ref:`ranged-reads` below).
 
 .. list-table::
    :header-rows: 1
@@ -23,6 +23,9 @@ see :ref:`ranged-reads` below).
    * - ``"path/to.fits"``
      - on disk
      - the default; streaming reads, ~1 MiB peak RSS
+   * - ``"file:///path/to.fits"``
+     - on disk
+     - alternate URL spelling of a local path; identical behavior
    * - ``"mem://"`` / ``"memkeep://"``
      - in memory
      - build or parse a FITS file with no disk access
@@ -36,6 +39,34 @@ see :ref:`ranged-reads` below).
    * - ``"ftp://..."`` / ``"ftps://..."``
      - in memory (downloaded)
      - read a FITS file from an FTP server (read-only)
+
+``file://`` URLs
+----------------
+
+A ``file://`` URL is an alternate spelling of a local path — handy
+when a path arrives URL-shaped from a catalog, a config file, or a
+file manager's "copy as URL".  The URL is decoded to the plain path
+at open, so everything downstream is identical to passing the path
+directly: all three modes work (it's the same disk file), ``.gz``
+paths route through the gzip driver, and
+:attr:`~rustfits.FITS.filename` returns the *decoded* local path.
+
+.. code-block:: python
+
+   with rustfits.FITS("file:///data/survey/img.fits") as fits:
+       image = fits[0].read()
+
+   # identical to:
+   with rustfits.FITS("/data/survey/img.fits") as fits:
+       image = fits[0].read()
+
+Accepted forms (RFC 8089): ``file:///abs/path`` and
+``file://localhost/abs/path``.  Percent-escapes decode
+(``my%20file.fits`` → ``my file.fits``; malformed escapes are
+rejected rather than passed through).  A non-``localhost`` host
+names a remote machine and is rejected — ``file://`` never touches
+the network.  Because it's a local file, ``remote=`` does not apply
+and raises ``ValueError``.
 
 In-memory files
 ---------------
