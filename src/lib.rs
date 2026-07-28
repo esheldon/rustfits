@@ -25,6 +25,7 @@ mod hdu_ascii_table;
 mod zimage;
 mod fits;
 mod checksum;
+mod remote_range;
 
 use crate::common::NoopExtendContext;
 use crate::header::{py_is_protected_key, FITSHeader, FITSHeaderEdit};
@@ -42,6 +43,7 @@ use crate::hdu_ascii_table::{
     AsciiColumnSubset, AsciiSingleColumnSubset, AsciiTableHDU,
 };
 use crate::fits::FITS;
+use crate::remote_range::Remote;
 use crate::zimage::compression_config::{
     Gzip1, Gzip2, Hcompress1, Plio1, Quantize, Rice1,
 };
@@ -77,6 +79,7 @@ fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Hcompress1>()?;
     m.add_class::<Plio1>()?;
     m.add_class::<Quantize>()?;
+    m.add_class::<Remote>()?;
     m.add_function(wrap_pyfunction!(py_is_protected_key, m)?)?;
     Ok(())
 }

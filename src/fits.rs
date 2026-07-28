@@ -35,6 +35,9 @@ use crate::hdu_table::{
 };
 use crate::hdu_ascii_table::AsciiTableHDU;
 use crate::header::{card_int, card_logical, card_string, card_uint, pad_to_card};
+use crate::remote_range::{
+    build_agent, parse_remote_arg, HttpRangeStore, Remote,
+};
 
 // Per the FITS standard, the primary HDU must begin with `SIMPLE`, extension
 // HDUs must begin with `XTENSION`, and every HDU must declare BITPIX, NAXIS,
@@ -130,6 +133,81 @@ fn is_mem_url(filename: &str) -> bool {
     filename == "mem://" || filename == "memkeep://"
 }
 
+// True for an RFC 8089 `file://` URL — an alternate spelling of a
+// local path (cfitsio's `file://` driver prefix).  Decoded to the
+// plain path up front in `FITS::new`, so every later stage (mode
+// handling, `.gz` detection, disk open, gz write-back, repr) sees
+// only the local path.
+fn is_file_url(filename: &str) -> bool {
+    filename.starts_with("file://")
+}
+
+// Decode a `file://` URL to a local filesystem path.  Accepted forms
+// (RFC 8089): `file:///abs/path` (empty host) and
+// `file://localhost/abs/path` (host compared case-insensitively).
+// Any other host is rejected — a non-localhost authority names a
+// remote machine (or a Windows UNC share, which is out of scope).
+// Percent-escapes (`%20` etc.) are decoded, strictly (both digits
+// must be hex); `+` is NOT a space in a path (that's query-string
+// encoding).  `?` and `#` are kept verbatim — file URLs carry no
+// query/fragment, and both are legal bytes in a Unix filename.
+// `windows` (callers pass `cfg!(windows)`; a parameter so unit tests
+// cover both platforms) strips the URL-syntax leading slash from
+// drive-letter paths (`/C:/data` -> `C:/data`).
+fn decode_file_url(url: &str, windows: bool) -> Result<String, String> {
+    let rest = &url["file://".len()..];
+    let slash = rest
+        .find('/')
+        .ok_or_else(|| format!("file:// URL has no path: '{}'", url))?;
+    let host = &rest[..slash];
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+        return Err(format!(
+            "unsupported host '{}' in file:// URL '{}'; only \
+             file:///path and file://localhost/path name local files",
+            host, url
+        ));
+    }
+    let bytes = &rest.as_bytes()[slash..];
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return Err(format!(
+                    "invalid percent-escape in file:// URL '{}'",
+                    url
+                ));
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap() as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let mut path = String::from_utf8(out).map_err(|_| {
+        format!("file:// URL '{}' does not decode to valid UTF-8", url)
+    })?;
+    // A drive-letter path arrives as `/C:/...`; the leading slash is
+    // URL syntax, not part of the Windows path.
+    if windows {
+        let b = path.as_bytes();
+        if b.len() >= 3
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && b[2] == b':'
+        {
+            path.remove(0);
+        }
+    }
+    Ok(path)
+}
+
 // Coerce the `filename` argument to a Rust `String`.  A `str` is taken
 // verbatim (so URL schemes like `mem://` / `http://` and `.gz` suffixes
 // are preserved byte-for-byte — a str is NOT routed through path
@@ -189,10 +267,26 @@ fn url_path_is_gz(url: &str) -> bool {
 // Fetch a remote file whole into memory (blocking).  The GIL is released
 // for the duration of the network I/O so other Python threads run.  The
 // whole file lands in RAM (download-then-open); for huge remote files,
-// range reads are the future answer (see CLAUDE.md).
-fn download_remote(py: Python<'_>, url: &str) -> PyResult<Vec<u8>> {
+// ranged reads (remote="ranged") avoid the download entirely.  `opts`
+// carries the download-mode transport knobs from a
+// `remote=Remote(headers=..., timeout=...)` argument; None means the
+// plain defaults (no extra headers, no timeout).
+fn download_remote(
+    py: Python<'_>,
+    url: &str,
+    opts: Option<&Remote>,
+) -> PyResult<Vec<u8>> {
+    let (headers, timeout) = match opts {
+        Some(o) => (o.headers.clone(), o.timeout),
+        None => (Vec::new(), None),
+    };
     py.detach(|| -> Result<Vec<u8>, String> {
-        let response = ureq::get(url).call().map_err(|e| e.to_string())?;
+        let agent = build_agent(timeout);
+        let mut req = agent.get(url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let response = req.call().map_err(|e| e.to_string())?;
         let mut reader = response.into_body().into_reader();
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
@@ -1768,14 +1862,18 @@ impl FITS {
 impl FITS {
     // Default mode is 'r' so FITS(filename) reads — matches the
     // built-in open(filename) convention.  'r+' opens for in-place
-    // mutation; 'w+' truncates / creates.
+    // mutation; 'w+' truncates / creates.  `remote=` selects the
+    // transport for URL opens: None (default) downloads the whole
+    // file; "ranged" / Remote(ranged=True) serves reads via HTTP
+    // Range requests without downloading.
     #[new]
-    #[pyo3(signature = (filename, mode="r", *, lenient=false))]
+    #[pyo3(signature = (filename, mode="r", *, lenient=false, remote=None))]
     fn new(
         py: Python<'_>,
         filename: &Bound<'_, PyAny>,
         mode: &str,
         lenient: bool,
+        remote: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Accept str or os.PathLike (pathlib.Path); everything downstream
         // works with the owned String.
@@ -1785,6 +1883,63 @@ impl FITS {
                 "Unsupported mode '{}'. Supported modes: 'r', 'r+', 'w+'",
                 mode
             )));
+        }
+
+        // remote= validation, all before any network I/O.  Intent
+        // errors (remote= on a local path, ranged on a transport that
+        // can't do it) are ValueError; environmental failures (probe,
+        // fetch) surface later as IOError.
+        let remote_opts = parse_remote_arg(remote)?;
+
+        // file:// is an alternate spelling of a LOCAL path (RFC 8089 /
+        // cfitsio's file driver), so remote= gets a tailored rejection
+        // rather than falling into the generic "not a URL" message
+        // below, and the URL is decoded here so everything downstream
+        // (.gz detection, disk open, gz write-back, repr) sees only
+        // the plain path.  All modes work — it's the same disk file.
+        if remote_opts.is_some() && is_file_url(&filename) {
+            return Err(PyValueError::new_err(
+                "remote= does not apply to a file:// URL (it names a \
+                 local file); remote= is for http(s):// and ftp(s):// \
+                 URLs",
+            ));
+        }
+        let filename = if is_file_url(&filename) {
+            decode_file_url(&filename, cfg!(windows))
+                .map_err(PyValueError::new_err)?
+        } else {
+            filename
+        };
+
+        if let Some(opts) = &remote_opts {
+            if !is_remote_url(&filename) && !is_ftp_url(&filename) {
+                return Err(PyValueError::new_err(format!(
+                    "remote= is only valid for http(s):// or ftp(s):// \
+                     URLs; got '{}'", filename
+                )));
+            }
+            if is_ftp_url(&filename) {
+                if opts.ranged {
+                    return Err(PyValueError::new_err(
+                        "ranged reads are supported for http/https \
+                         URLs only (FTP has no Range mechanism here); \
+                         use ranged=False to download the whole file",
+                    ));
+                }
+                if !opts.headers.is_empty() || opts.timeout.is_some() {
+                    return Err(PyValueError::new_err(
+                        "headers= and timeout= are supported for \
+                         http/https URLs only",
+                    ));
+                }
+            }
+            if opts.ranged && url_path_is_gz(&filename) {
+                return Err(PyValueError::new_err(
+                    "ranged reads cannot open a .gz URL (gzip is not \
+                     seekable); use ranged=False to download and \
+                     decompress the whole file",
+                ));
+            }
         }
 
         // Set true only by the `.gz` branch below when the mode is
@@ -1799,16 +1954,43 @@ impl FITS {
         let storage = if is_mem_url(&filename) {
             Storage::Mem(MemStore::new(Vec::new()))
         } else if is_remote_url(&filename) {
-            // Download-then-open over http/https: fetch the whole file
-            // into RAM, then parse like any in-memory file.  Read-only.
+            // Remote http/https.  Read-only in both transports.
             if mode != "r" {
                 return Err(PyIOError::new_err(format!(
                     "remote files are read-only; open '{}' with mode='r'",
                     filename
                 )));
             }
-            let bytes = maybe_gunzip_url(download_remote(py, &filename)?, &filename)?;
-            Storage::Mem(MemStore::new(bytes))
+            match &remote_opts {
+                Some(opts) if opts.ranged => {
+                    // Ranged: probe the server (learning the file
+                    // length and that Range is honored), then serve
+                    // reads via block-cached Range requests — the
+                    // whole file is never downloaded.  GIL released
+                    // for the probe like every other network call.
+                    let store = py
+                        .detach(|| {
+                            HttpRangeStore::open(
+                                &filename,
+                                &opts.headers,
+                                opts.timeout,
+                                opts.block_bytes,
+                                opts.cache_bytes,
+                            )
+                        })
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    Storage::HttpRange(store)
+                }
+                _ => {
+                    // Download-then-open: fetch the whole file into
+                    // RAM, then parse like any in-memory file.
+                    let bytes = maybe_gunzip_url(
+                        download_remote(py, &filename, remote_opts.as_ref())?,
+                        &filename,
+                    )?;
+                    Storage::Mem(MemStore::new(bytes))
+                }
+            }
         } else if is_ftp_url(&filename) {
             // Download-then-open over ftp/ftps.  Read-only.
             if mode != "r" {
@@ -2003,7 +2185,8 @@ impl FITS {
         Ok(list.unbind())
     }
 
-    /// Path passed to the constructor.
+    /// Path or URL passed to the constructor.  A ``file://`` URL is
+    /// stored as its decoded local path.
     #[getter]
     fn filename(&self) -> String {
         self.filename.clone()
@@ -3094,5 +3277,87 @@ impl FITS {
         // because Python guarantees inner __exit__ runs first.
         self.close(py)?;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_file_url;
+
+    #[test]
+    fn file_url_basic_forms() {
+        assert_eq!(
+            decode_file_url("file:///data/x.fits", false).unwrap(),
+            "/data/x.fits"
+        );
+        assert_eq!(
+            decode_file_url("file://localhost/data/x.fits", false).unwrap(),
+            "/data/x.fits"
+        );
+        // Hostnames compare case-insensitively.
+        assert_eq!(
+            decode_file_url("file://LOCALHOST/data/x.fits", false).unwrap(),
+            "/data/x.fits"
+        );
+    }
+
+    #[test]
+    fn file_url_percent_decoding() {
+        assert_eq!(
+            decode_file_url("file:///d/my%20file.fits", false).unwrap(),
+            "/d/my file.fits"
+        );
+        // Multi-byte UTF-8 escape sequence (e-acute).
+        assert_eq!(
+            decode_file_url("file:///d/caf%C3%A9.fits", false).unwrap(),
+            "/d/café.fits"
+        );
+        // `+` is query-string encoding, not path encoding: verbatim.
+        assert_eq!(
+            decode_file_url("file:///d/a+b.fits", false).unwrap(),
+            "/d/a+b.fits"
+        );
+        // `?` / `#` are legal filename bytes, kept verbatim.
+        assert_eq!(
+            decode_file_url("file:///d/a?b#c", false).unwrap(),
+            "/d/a?b#c"
+        );
+    }
+
+    #[test]
+    fn file_url_rejections() {
+        // Non-localhost authority.
+        assert!(decode_file_url("file://otherhost/x.fits", false)
+            .unwrap_err()
+            .contains("otherhost"));
+        // No path at all.
+        assert!(decode_file_url("file://", false).is_err());
+        assert!(decode_file_url("file://localhost", false).is_err());
+        // Malformed percent-escapes: non-hex, truncated, and the
+        // `+5` form u8::from_str_radix would otherwise accept.
+        assert!(decode_file_url("file:///d/x%2G.fits", false).is_err());
+        assert!(decode_file_url("file:///d/x%2", false).is_err());
+        assert!(decode_file_url("file:///d/x%+5.fits", false).is_err());
+        // Escape that decodes to invalid UTF-8.
+        assert!(decode_file_url("file:///d/x%ff", false).is_err());
+    }
+
+    #[test]
+    fn file_url_windows_drive_letter() {
+        // The leading slash before a drive letter is URL syntax.
+        assert_eq!(
+            decode_file_url("file:///C:/data/x.fits", true).unwrap(),
+            "C:/data/x.fits"
+        );
+        // Unix-shaped paths are untouched by the windows flag.
+        assert_eq!(
+            decode_file_url("file:///data/x.fits", true).unwrap(),
+            "/data/x.fits"
+        );
+        // On non-Windows a /C:/ path is a legal (odd) local path.
+        assert_eq!(
+            decode_file_url("file:///C:/data/x.fits", false).unwrap(),
+            "/C:/data/x.fits"
+        );
     }
 }

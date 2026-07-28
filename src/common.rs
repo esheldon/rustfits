@@ -19,12 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 //
 // `Disk` is the on-disk `file://` backend; `Mem` is the in-memory
 // `mem://` / `memkeep://` backend (the two URL spellings are aliases —
-// both land here, see CLAUDE.md).  A future lazy remote-range backend
-// that can't be enumerated cheaply would be the moment to reconsider
-// `dyn`.
+// both land here, see CLAUDE.md).  `HttpRange` is the lazy read-only
+// remote backend: a `FITS(url, "r", remote="ranged")` open, serving
+// reads via block-cached HTTP Range requests instead of downloading
+// the whole file (see src/remote_range.rs).  It carries its own state
+// fine as a variant, so the once-mused `dyn` switch stays unneeded
+// unless several lazy backends accumulate.
 pub(crate) enum Storage {
     Disk(std::fs::File),
     Mem(MemStore),
+    HttpRange(crate::remote_range::HttpRangeStore),
 }
 
 // In-memory backing buffer plus a `dirty` flag.  `dirty` starts false
@@ -63,6 +67,11 @@ impl Storage {
                 m.dirty = true;
                 Ok(())
             }
+            // Unreachable: ranged remote opens are mode-gated to "r"
+            // in FITS::new, so no mutation path can hold this variant.
+            Storage::HttpRange(_) => Err(io::Error::other(
+                "ranged remote file is read-only",
+            )),
         }
     }
 
@@ -72,14 +81,16 @@ impl Storage {
         match self {
             Storage::Disk(f) => Ok(f.metadata()?.len()),
             Storage::Mem(m) => Ok(m.cursor.get_ref().len() as u64),
+            Storage::HttpRange(s) => Ok(s.len()),
         }
     }
 
-    // Flush durable state: fsync on disk, no-op for an in-memory buffer.
+    // Flush durable state: fsync on disk, no-op for an in-memory buffer
+    // or a read-only remote view.
     pub(crate) fn sync(&self) -> io::Result<()> {
         match self {
             Storage::Disk(f) => f.sync_all(),
-            Storage::Mem(_) => Ok(()),
+            Storage::Mem(_) | Storage::HttpRange(_) => Ok(()),
         }
     }
 
@@ -90,7 +101,7 @@ impl Storage {
     // which is always Mem-backed.
     pub(crate) fn is_dirty(&self) -> bool {
         match self {
-            Storage::Disk(_) => false,
+            Storage::Disk(_) | Storage::HttpRange(_) => false,
             Storage::Mem(m) => m.dirty,
         }
     }
@@ -118,7 +129,16 @@ impl Storage {
     // Copy the entire backing store out as a fresh Vec, from byte 0.
     // Backs `FITS.to_bytes()`.  Seeks (and leaves the cursor at EOF);
     // harmless because every other I/O site seeks before reading/writing.
+    // Rejected for a ranged remote file: it would download the whole
+    // file, defeating the point of ranged mode.
     pub(crate) fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        if matches!(self, Storage::HttpRange(_)) {
+            return Err(io::Error::other(
+                "to_bytes() on a ranged remote file would download \
+                 the entire file; open with ranged=False (the default \
+                 download mode) instead",
+            ));
+        }
         let len = self.len()?;
         self.seek(SeekFrom::Start(0))?;
         let mut buf = vec![0u8; len as usize];
@@ -140,6 +160,11 @@ impl Storage {
                 f.read_to_end(&mut buf)?;
                 Ok(buf)
             }
+            // Unreachable (only the gz write-back calls this, and a
+            // gz path never opens ranged), but defensive.
+            Storage::HttpRange(_) => Err(io::Error::other(
+                "cannot extract the bytes of a ranged remote file",
+            )),
         }
     }
 }
@@ -149,6 +174,7 @@ impl Read for Storage {
         match self {
             Storage::Disk(f) => f.read(buf),
             Storage::Mem(m) => m.cursor.read(buf),
+            Storage::HttpRange(s) => s.read(buf),
         }
     }
 }
@@ -161,6 +187,11 @@ impl Write for Storage {
                 m.dirty = true;
                 m.cursor.write(buf)
             }
+            // Unreachable (ranged opens are mode-gated to "r"), but
+            // defensive.
+            Storage::HttpRange(_) => Err(io::Error::other(
+                "ranged remote file is read-only",
+            )),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -168,6 +199,10 @@ impl Write for Storage {
             Storage::Disk(f) => f.flush(),
             // flush is not a mutation — don't set dirty.
             Storage::Mem(m) => m.cursor.flush(),
+            // No-op: read-only, nothing buffered to flush.  Must
+            // succeed because read paths (e.g. to_bytes) flush
+            // before reading.
+            Storage::HttpRange(_) => Ok(()),
         }
     }
 }
@@ -177,6 +212,7 @@ impl Seek for Storage {
         match self {
             Storage::Disk(f) => f.seek(pos),
             Storage::Mem(m) => m.cursor.seek(pos),
+            Storage::HttpRange(s) => s.seek(pos),
         }
     }
 }
