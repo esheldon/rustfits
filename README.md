@@ -100,6 +100,17 @@ xdg-open docs/_build/html/index.html
 Sphinx and the [Furo theme](https://pradyunsg.me/furo/) are listed
 in `docs/requirements.txt` if you need them in your env.
 
+## Installing
+
+The package is on conda-forge
+```
+conda install rustfits
+```
+And PyPI
+```
+pip install rustfits
+```
+
 ## Building from source
 
 There's no PyPI or conda-forge release yet; install from source.
